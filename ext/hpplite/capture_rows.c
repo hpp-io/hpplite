@@ -794,6 +794,38 @@ static int mentionsSqliteTable(const char *zSql) {
   return 0;
 }
 
+/* UPDATE [OR ...] [schema.]sqlite_schema ... or DELETE FROM [schema.]sqlite_schema
+** ... with no WHERE at the top level (#124): under writable_schema it
+** rewrites every schema row, HPPLite's with the application's, and the
+** authorizer cannot see which rows a statement touches. A WHERE inside a
+** subquery or parentheses does not count. */
+int hpplite_sql_whole_schema_write(const char *zSql) {
+  static const char *aSchema[] = { "sqlite_schema", "sqlite_master", "sqlite_temp_schema", "sqlite_temp_master", NULL };
+  char name[64];
+  const char *z = skipSpace(zSql);
+  int depth = 0, i, isSchema = 0;
+  if (isWord(z, "UPDATE")) {
+    z = skipSpace(z + 6);
+    if (isWord(z, "OR")) z = skipSpace(skipToken(skipSpace(z + 2)));   /* OR ROLLBACK / ABORT / REPLACE / FAIL / IGNORE */
+  } else if (isWord(z, "DELETE")) {
+    z = skipSpace(z + 6);
+    if (!isWord(z, "FROM")) return 0;
+    z = skipSpace(z + 4);
+  } else {
+    return 0;
+  }
+  z = readName(z, name, sizeof name);
+  if (*skipSpace(z) == '.') z = readName(skipSpace(skipSpace(z) + 1), name, sizeof name);   /* schema.name */
+  for (i = 0; aSchema[i]; i++) if (sqlite3_stricmp(name, aSchema[i]) == 0) isSchema = 1;
+  if (!isSchema) return 0;
+  for (z = skipSpace(z); *z; z = skipSpace(skipToken(z))) {
+    if (*z == '(') { depth++; z++; continue; }
+    if (*z == ')') { if (depth > 0) depth--; z++; continue; }
+    if (depth == 0 && isWord(z, "WHERE")) return 0;
+  }
+  return 1;
+}
+
 /* A write reaches a virtual table when the table it writes is one, or has
 ** triggers or foreign key actions that reach one. Text that does not say
 ** plainly what it writes is judged by every name it mentions. */

@@ -784,6 +784,13 @@ static TextVerdict textVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *z
     snprintf(zWhy, nWhy, "%s%s; bind the value instead", zWhat, zAsText);
     if (!bWarn) return TEXT_VALUE;
   }
+  if ((pCtx->pragmaMode & HPPLITE_MODE_WRITABLE_SCHEMA) && hpplite_sql_whole_schema_write(zSql)) {
+    /* every schema row, HPPLite's too: "malformed database schema" on the
+    ** next open (#124); shadow tables (#18) are the structural answer */
+    snprintf(zWhy, nWhy, "an UPDATE or DELETE on sqlite_schema with no WHERE rewrites HPPLite's own schema rows as well;"
+                         " name the table (WHERE name = '...')");
+    return TEXT_NEVER;
+  }
   if (mentionsHppliteTable(zSql)) {
     /* A write that names our tables where the authorizer could not see it
     ** (RENAME TO _hpplite_x, a subquery over the log whose rows differ on

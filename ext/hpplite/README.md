@@ -587,7 +587,10 @@ mid-session is fine (#52). The same goes for `legacy_alter_table`,
 sets it before applying, and `PRAGMA schema_version = N` (the reload after
 editing `sqlite_schema`) is logged like `user_version`. Set them on the
 connection itself; a pragma set before `hpplite_init()` is read then,
-except `case_sensitive_like`, which SQLite cannot report.
+except `case_sensitive_like`, which SQLite cannot report. One edit under
+`writable_schema` is refused: an `UPDATE` or `DELETE` on `sqlite_schema`
+with no `WHERE`, which would rewrite HPPLite's own schema rows along with
+the application's and leave the file unreadable; name the table (#124).
 
 Not detectable, so not refused - know these:
 

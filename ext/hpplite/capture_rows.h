@@ -39,6 +39,8 @@ int hpplite_rows_covered_for_write(struct HppliteCtx *pCtx);
 /* Must this write be logged as text? (it names a virtual table, or a table
 ** or view whose triggers reach one) */
 int hpplite_rows_text_only(struct HppliteCtx *pCtx, const char *zSql);
+/* an UPDATE or DELETE on sqlite_schema with no top-level WHERE (#124) */
+int hpplite_sql_whole_schema_write(const char *zSql);
 
 /* ALTER TABLE x DROP COLUMN: x (else 0); and dropping one table's triggers
 ** before it, which would make it fail (they are rebuilt after) */

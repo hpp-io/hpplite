@@ -494,6 +494,39 @@ static void test_sqlite_tables_are_text(void) {
     PASS();
 }
 
+/* An UPDATE or DELETE on sqlite_schema with no WHERE rewrites HPPLite's own
+** schema rows with the application's (the file is "malformed database
+** schema" on reopen); the authorizer cannot see which rows a statement
+** touches, so the whole-schema form is refused and the qualified form, as
+** above, is logged (#124). */
+static void test_whole_schema_write_refused(void) {
+    TEST("UPDATE/DELETE on sqlite_schema without WHERE is refused under writable_schema; with WHERE it is logged (#124)");
+    reset_dir();
+    W w;
+    char metaBefore[400], metaAfter[400];
+    if (!open_writer(DIR "/whole.db", &w)) FAIL("open");
+    exec(w.db, "CREATE TABLE t(a)");
+    text_of(w.db, "SELECT sql FROM sqlite_schema WHERE name = '_hpplite_meta'", metaBefore, sizeof metaBefore);
+    exec(w.db, "PRAGMA writable_schema=ON");
+    int rcUpd = sqlite3_exec(w.db, "UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a, b)'", NULL, NULL, NULL);
+    text_of(w.db, "SELECT sql FROM sqlite_schema WHERE name = '_hpplite_meta'", metaAfter, sizeof metaAfter);
+    int rcDel = sqlite3_exec(w.db, "DELETE FROM sqlite_schema", NULL, NULL, NULL);
+    int rcSub = sqlite3_exec(w.db, "UPDATE main.sqlite_master SET sql = (SELECT sql FROM sqlite_schema WHERE name = 't')", NULL, NULL, NULL);
+    int rcOk = sqlite3_exec(w.db, "UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a, b)' WHERE name = 't'", NULL, NULL, NULL);
+    exec(w.db, "PRAGMA writable_schema=RESET");
+    sqlite3_int64 logged = scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE sql LIKE 'UPDATE%sqlite_%' OR sql LIKE 'DELETE%sqlite_%'");
+    sqlite3_int64 schemaRows = scalar(w.db, "SELECT count(*) FROM sqlite_schema WHERE name LIKE '\\_hpplite\\_%' ESCAPE '\\'");
+    close_writer(&w);
+    if (rcUpd != SQLITE_INTERRUPT) FAILF("whole-schema UPDATE rc=%d, want SQLITE_INTERRUPT (refused); _hpplite_meta's schema row is now: %.60s", rcUpd, metaAfter);
+    if (strcmp(metaBefore, metaAfter) != 0) FAIL("_hpplite_meta's schema row was rewritten");
+    if (rcDel != SQLITE_INTERRUPT) FAILF("whole-schema DELETE rc=%d, want SQLITE_INTERRUPT", rcDel);
+    if (rcSub != SQLITE_INTERRUPT) FAILF("UPDATE whose only WHERE is in a subquery rc=%d, want SQLITE_INTERRUPT", rcSub);
+    if (rcOk != SQLITE_OK) FAILF("the qualified UPDATE rc=%d, want 0", rcOk);
+    if (logged != 1) FAILF("%lld schema writes logged, want 1 (the qualified one)", (long long)logged);
+    if (schemaRows < 4) FAILF("%lld _hpplite_ schema rows left", (long long)schemaRows);
+    PASS();
+}
+
 /* hpplite_shutdown() on a connection that lives on: the triggers and
 ** functions that held the context go with it (#66) */
 static void test_shutdown_leaves_connection_usable(void) {
@@ -794,6 +827,7 @@ int main(void) {
     test_wide_table();
     test_rowid_named_columns();
     test_sqlite_tables_are_text();
+    test_whole_schema_write_refused();
     test_shutdown_leaves_connection_usable();
     test_malformed_records();
     test_rebuild_rolled_back();

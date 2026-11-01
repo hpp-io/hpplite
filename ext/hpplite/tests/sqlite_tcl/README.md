@@ -32,10 +32,10 @@ the file:
   and the log says so (`hpplite-wrap:` lines): the file's tests run on, on
   stock SQLite for that connection. Three things cause it: a file format
   SQLite cannot read (`alter2-4.1`, stock opens lazily and fails at the
-  first query), a schema rewritten whole through `writable_schema` (below),
-  and a second connection opened while the first holds a write transaction
-  (`savepoint-5.4.2`: HPPLite writes its bookkeeping at open and waits out
-  the busy timeout).
+  first query) and, before #124 and #123, a schema rewritten whole through
+  `writable_schema` (below) and a second connection opened while the first
+  holds a write transaction (`savepoint-5.4.2`: open now reads when the
+  bookkeeping is current).
 
 A few tests shut SQLite down mid-file; HPPLite is off from there on in those.
 
@@ -103,8 +103,10 @@ What fails in the other 44, by cause:
 - **The schema rewritten whole**: `UPDATE sqlite_master SET sql = '...'`
   with no WHERE under `writable_schema` (`alterdropcol-8.0`, `default-4.0`;
   `trigger7-99.1` writes `'nonsense'` on purpose). Stock has one schema
-  row then; with HPPLite the rows of `_hpplite_*` are rewritten too and the
-  file reads as `malformed database schema (_hpplite_meta)`.
+  row then; with HPPLite the rows of `_hpplite_*` would be rewritten too
+  and the file read as `malformed database schema (_hpplite_meta)`, so
+  since #124 the statement is refused (`SQLITE_INTERRUPT`) and those tests
+  fail on the refusal instead; the qualified form (`WHERE name = ...`) runs.
 - **HPPLite keeps the database in WAL**: a write straight into the main
   file (`alter2`'s `hexio_write` of the schema cookie and file format;
   `get_file_format` after VACUUM) is behind the WAL's copy of page 1 and
