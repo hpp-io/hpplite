@@ -62,4 +62,15 @@ int hppliteLoadMeta(HppliteCtx *pCtx);
 /* finalize.c: advance _hpplite_meta past a batch (finalize, adopt, replay, skip) */
 int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId, int bWriter);
 
+/* status.c: the close sentinel and the hpplite_status table on a registered connection */
+void hppliteStatusRegister(sqlite3 *db);
+
+/* hpplite.c: the registry of application connections and their nodes */
+struct HppliteNode *hppliteFindNode(sqlite3 *db);
+
+void hppliteRemoveNode(sqlite3 *db);
+
+/* hpplite.c: the connection close, from the status table's xDisconnect */
+void hppliteOnClose(sqlite3 *db);
+
 #endif /* HPPLITE_INT_H */

@@ -78,6 +78,7 @@ set(HPPLITE_SOURCES
     bookkeeping.c
     finalize.c
     replay.c
+    status.c
     capture_rows.c
     batch.c
     crypto.c
