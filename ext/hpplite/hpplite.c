@@ -185,15 +185,18 @@ void hpplite_internal_open_end(void) { tlInternalOpen--; }
 int hpplite_internal_open_active(void) { return tlInternalOpen > 0; }
 
 /* Every table of HPPLITE_SCHEMA, every column added since (#52, #56, #57,
-** #59, the rollup column) and the meta row: nothing of the schema would
-** write. A missing table makes the query fail to prepare, which is "no". */
+** #59, the rollup column, the tree columns of #9) and the meta row: nothing
+** of the schema would write. A missing table makes the query fail to
+** prepare, which is "no". Anything added later must be listed here too, or
+** a file from before never gets it (#131). */
 static int bookkeepingIsCurrent(sqlite3 *db) {
   static const char zSql[] =
     "SELECT (SELECT count(*) FROM pragma_table_info('_hpplite_meta')"
-    "          WHERE name IN ('open_txn','frag_id','frag_off','rollup','chain_hash')) = 5"
+    "          WHERE name IN ('open_txn','frag_id','frag_off','rollup','chain_hash','tree_seq','tree_stale')) = 7"
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_pending') WHERE name IN ('mode','now')) = 2"
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_carry') WHERE name IN ('now','frag')) = 2"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_posted'))"
+    "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_tree'))"
     "   AND EXISTS(SELECT 1 FROM _hpplite_meta WHERE id = 1)";
   sqlite3_stmt *q = NULL;
   int ok = 0;

@@ -155,12 +155,49 @@ static void test_version_1_history(void) {
     PASS();
 }
 
+/* 4. A file from before #9 (#131): its meta row has no tree columns and
+** there is no tree table. Opening on this build must add them, or every
+** flush fails with "no such column: tree_seq" (the demo, at height 229) */
+static void test_old_file_gains_trees(void) {
+    TEST("a bookkeeping file from before #9 gains the tree table and columns; it posts and a replica matches (#131)");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_writer(DIR "/old.db", l1, 1);
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); INSERT INTO t VALUES(1, 'before')", NULL);
+    if (hpplite_node_flush_batch(w) < 1) FAIL("flush before");
+    hpplite_node_destroy(w);
+    {   /* strip what #9 added: the shape of a file written by an earlier build */
+        sqlite3 *raw = NULL;
+        if (sqlite3_open(DIR "/old.db", &raw) != SQLITE_OK) FAIL("raw open");
+        if (exec_sql(raw, "DROP TABLE _hpplite_tree;"
+                          "ALTER TABLE _hpplite_meta DROP COLUMN tree_seq;"
+                          "ALTER TABLE _hpplite_meta DROP COLUMN tree_stale") != SQLITE_OK) {
+            printf("(%s) ", sqlite3_errmsg(raw)); sqlite3_close(raw); FAIL("strip");
+        }
+        sqlite3_close(raw);
+    }
+    w = open_writer(DIR "/old.db", l1, 1);
+    if (!w) FAIL("reopen");
+    if (scalar(w->ctx->bkDb, "SELECT count(*) FROM pragma_table_info('_hpplite_meta') WHERE name IN ('tree_seq','tree_stale')") != 2)
+        FAIL("the tree columns were not added to the old file");
+    if (scalar(w->ctx->bkDb, "SELECT count(*) FROM sqlite_master WHERE name = '_hpplite_tree'") != 1)
+        FAIL("the tree table was not created in the old file");
+    hpplite_node_exec(w, "INSERT INTO t VALUES(2, 'after')", NULL);
+    if (hpplite_node_flush_batch(w) < 1) FAIL("flush after the upgrade");
+    const char *why = test_replica_check(w, l1, DIR "/old_r.db", NULL, 0, 0, 1);
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite State Root Tests ===\n");
     test_suite_init("stateroot", NULL, DIR);
     test_incremental();
     test_matches_scan();
     test_version_1_history();
+    test_old_file_gains_trees();
     remove_dir();
     return test_report();
 }
