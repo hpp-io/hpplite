@@ -116,7 +116,7 @@ SQLITE_CONSTRAINT; it documents the order rather than guards HPPLite.
 ## 3. A statement run from a trace callback joins the running statement's transaction
 
 **Relied on.** HPPLite's log INSERT (and, under row capture, the lock
-no-op `UPDATE main._hpplite_meta SET id = id WHERE 0`) runs from the STMT
+no-op `PRAGMA main.incremental_vacuum(0)`, a write that changes nothing and leaves the change count alone, #121) runs from the STMT
 trace of the application's write, while that write's VM is active. In
 autocommit SQLite does not commit HPPLite's statement on its own: it joins
 the transaction the application's statement opened, and commits or rolls

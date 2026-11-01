@@ -641,8 +641,14 @@ int hpplite_rows_covered_for_write(HppliteCtx *pCtx) {
   if (pCtx->rowsBuiltFor < 0) return 0;
   if (sqlite3_txn_state(pCtx->db, "main") != SQLITE_TXN_WRITE) {
     int rc, saved = hppliteInternalBegin(pCtx);
+    /* The write that changes nothing: a pragma that begins a write
+    ** transaction (the lock, the schema cookie check) and does nothing on a
+    ** database not in incremental auto-vacuum mode. Not an UPDATE: a zero-row
+    ** UPDATE sets the connection's change count to 0, and changes() inside
+    ** the statement about to run must still say the previous statement's
+    ** count, as on stock SQLite (#121) */
     if (!pCtx->pRowsLockStmt
-        && sqlite3_prepare_v3(pCtx->db, "UPDATE main._hpplite_meta SET id = id WHERE 0", -1,
+        && sqlite3_prepare_v3(pCtx->db, "PRAGMA main.incremental_vacuum(0)", -1,
                               SQLITE_PREPARE_PERSISTENT, &pCtx->pRowsLockStmt, NULL) != SQLITE_OK) {
       pCtx->pRowsLockStmt = NULL;
     }

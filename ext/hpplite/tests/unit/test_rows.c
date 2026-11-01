@@ -706,6 +706,31 @@ static void test_own_txn_commit_pending_then_tracked(void) {
     PASS();
 }
 
+/* changes() inside a write is the previous statement's count, as on stock
+** SQLite: HPPLite's own statements at a write's start must not reset it (the
+** lock no-op used to be a zero-row UPDATE, #121) */
+static void test_changes_inside_a_write(void) {
+    TEST("changes() inside a write and sqlite3_changes() at a RETURNING row are what stock SQLite says (#121)");
+    reset_dir();
+    W a;
+    sqlite3_stmt *s = NULL;
+    if (!open_writer(DIR "/changes.db", &a)) FAIL("open");
+    exec(a.db, "CREATE TABLE t1(a, b); CREATE TABLE log(x)");
+    exec(a.db, "INSERT INTO t1 VALUES(1, 'v1'), (2, 'v2')");
+    exec(a.db, "INSERT INTO log VALUES(changes() || ' changes')");
+    char got[64];
+    text_of(a.db, "SELECT x FROM log", got, sizeof got);
+    if (strcmp(got, "2 changes") != 0) { close_writer(&a); FAILF("changes() inside the next write: '%s', want '2 changes'", got); }
+    if (sqlite3_prepare_v2(a.db, "UPDATE t1 SET b = 'w' WHERE a = 1 RETURNING a", -1, &s, NULL) != SQLITE_OK) FAIL("prepare");
+    int rc = sqlite3_step(s);
+    int changes = sqlite3_changes(a.db);
+    sqlite3_finalize(s);
+    close_writer(&a);
+    if (rc != SQLITE_ROW) FAILF("RETURNING step %d", rc);
+    if (changes != 1) FAILF("sqlite3_changes() at the RETURNING row: %d, want 1", changes);
+    PASS();
+}
+
 /* A statement HPPLite tracks for a rerun (prepared on a schema another
 ** connection changed) runs in a transaction of HPPLite's. One that changes
 ** the schema itself (a CREATE VIRTUAL TABLE: FTS5's nested DDL expires it)
@@ -778,6 +803,7 @@ int main(void) {
     test_refused_after_foreign_alter();
     test_tracked_schema_change_commits();
     test_own_txn_commit_pending_then_tracked();
+    test_changes_inside_a_write();
     test_groups();
     return test_report();
 }
