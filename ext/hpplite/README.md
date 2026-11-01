@@ -616,7 +616,11 @@ under the prefix, so the reference committed is the same CID a pin service
 or Kubo would commit and the bytes can be re-pinned anywhere; ctest runs it
 against a stand-in that checks the signature (`s3_mock.py`), and
 `HPPLITE_S3=s3://bucket/prefix` runs the same case against a real bucket.
-Not here yet: `upto` and payment channels, top-up.
+`tools/topup.sh AMOUNT` tops the wallet up: it bridges that many USDC from
+Ethereum Sepolia to USDC.e on HPP Sepolia through HPP's gateway with `cast`
+(approve, then `outboundTransfer` with a retryable ticket it prices from the
+chain; `--dry-run` prints the two transactions and sends nothing, `--to`
+sends to a node's wallet). Not here yet: `upto` and payment channels.
 
 ## Versions
 
