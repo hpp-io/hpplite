@@ -701,6 +701,8 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;
     nc->checkpointInterval = cfg->checkpointInterval;
+    nc->storeUrl = cfg->storeUrl;
+    nc->storeCap = cfg->storeCap;
 
     /* Role removed - always sequencer in simplified model */
 }

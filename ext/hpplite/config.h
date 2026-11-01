@@ -55,6 +55,8 @@ extern "C" {
 #define HPPLITE_ENV_DBNAME        "HPPLITE_DBNAME"
 #define HPPLITE_ENV_MAX_TX        "HPPLITE_MAX_TX_BYTES"
 #define HPPLITE_ENV_MAX_TX_GAS    "HPPLITE_MAX_TX_GAS"
+#define HPPLITE_ENV_STORE         "HPPLITE_STORE"          /* where batch bytes live instead of the chain (#11) */
+#define HPPLITE_ENV_STORE_CAP     "HPPLITE_STORE_CAP"
 
 /*
 ** URI parameter names (same as env vars but lowercase, no prefix)
@@ -77,6 +79,8 @@ extern "C" {
 #define HPPLITE_URI_MAX_TX_GAS    "maxtxgas"
 #define HPPLITE_URI_NODE_ID       "nodeid"
 #define HPPLITE_URI_FACTORY       "factory"
+#define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
+#define HPPLITE_URI_STORE_CAP     "storecap"    /* the most to pay the store per call, atomic units of its asset */
 
 /*
 ** Default values
@@ -129,6 +133,8 @@ typedef struct HppliteConfig {
                                      ** "{file}": the database file's name */
     size_t maxTxBytes;               /* Largest batch per transaction (0 = by chain id, else unknown) */
     uint64_t maxTxGas;               /* Gas cap per transaction (0 = by chain id, else unknown) */
+    char *storeUrl;                  /* store=: the batch bytes' store (#11); NULL = on chain */
+    uint64_t storeCap;               /* storecap=: the most to pay the store per call (0 = pay nothing) */
 
     /* Source tracking (for debugging) */
     int roleSource;                  /* 0=default, 1=env, 2=uri */

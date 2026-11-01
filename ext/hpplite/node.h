@@ -65,6 +65,8 @@ typedef struct HppliteNodeConfig {
     int localOnly;                  /* l1=local: finalize batches locally, keep no history (#38) */
     int verifyOnly;                 /* role=verify: rebuild and compare, never post, claim or create (#5) */
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
+    char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
+    uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;
 
@@ -98,6 +100,7 @@ typedef struct HppliteNode {
 
     /* L1 connection */
     HppliteL1 *l1;
+    struct HppliteStore *store;     /* the batch bytes' store when store= is given (#11); the chain commits hash, ref, receipt */
 
     /* Crypto */
     HppliteCrypto *crypto;

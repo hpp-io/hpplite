@@ -382,6 +382,20 @@ int hpplite_l1_get_da_state(
 */
 int hpplite_l1_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]);
 
+/*
+** A batch whose bytes live in a store (#11): the chain records its hash, a
+** reference into the store and the provider's receipt (DA v2 commitBatch).
+** commit_batch returns the transaction hash as submit_batch does, NULL when
+** refused or unsupported. get_commitment reads a height's commitment back:
+** 0 with the hash, the reference (sqlite3_malloc'd) and the receipt bytes
+** (sqlite3_malloc'd, may be NULL with length 0), -1 when the height holds
+** none or the backend keeps none (the mock, a directory, DA v1). The
+** receipt's form is the store's (store.h: a pin service's compact receipt).
+*/
+char *hpplite_l1_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32],
+                              const char *zRef, const uint8_t *receipt, size_t nReceipt);
+int hpplite_l1_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32], char **pzRef, uint8_t **pReceipt, size_t *pnReceipt);
+
 /* === Mock-specific functions for testing === */
 
 /*

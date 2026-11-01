@@ -60,7 +60,9 @@ static uint8_t SEL_GET_BATCH[4];        /* DA v1 (coordinator VERSION < 8): the 
 static uint8_t SEL_GET_BATCH_HASH[4];   /* DA v1 */
 static uint8_t SEL_GET_DA_STATE[4];
 static uint8_t SEL_BLOCK_OF[4];         /* DA v2 (#33): the block whose log carries a height */
+static uint8_t SEL_COMMIT_BATCH[4];     /* DA v2 (#11): commitBatch(bytes32,uint256,bytes32,bytes,bytes) */
 static uint8_t TOPIC_BATCH_SUBMITTED[32];   /* DA v2: BatchSubmitted(uint256 indexed height, bytes32 indexed hash, bytes data) */
+static uint8_t TOPIC_BATCH_COMMITTED[32];   /* DA v2: BatchCommitted(uint256 indexed height, bytes32 indexed hash, bytes ref, bytes receipt) */
 
 /* Function selectors - HPPLiteFactory contract */
 static uint8_t SEL_GET_ROLLUP[4];
@@ -101,9 +103,12 @@ static void init_selectors(void) {
     abi_function_selector("getBatchHash(uint256)", SEL_GET_BATCH_HASH);
     abi_function_selector("getDAState()", SEL_GET_DA_STATE);
     abi_function_selector("blockOf(uint256)", SEL_BLOCK_OF);
+    abi_function_selector("commitBatch(bytes32,uint256,bytes32,bytes,bytes)", SEL_COMMIT_BATCH);
     {
         static const char zSig[] = "BatchSubmitted(uint256,bytes32,bytes)";
+        static const char zCommit[] = "BatchCommitted(uint256,bytes32,bytes,bytes)";
         keccak256((const uint8_t *)zSig, sizeof(zSig) - 1, TOPIC_BATCH_SUBMITTED);
+        keccak256((const uint8_t *)zCommit, sizeof(zCommit) - 1, TOPIC_BATCH_COMMITTED);
     }
 
     /* HPPLiteFactory selectors */
@@ -920,12 +925,12 @@ static char *eth_submit_batch(
 ** log's third topic. A height recorded by commitBatch (bytes elsewhere, #11)
 ** has no such log: NULL, as a missing batch.
 */
-static uint8_t *eth_get_batch_from_log(HppliteL1 *l1, uint64_t height, size_t *data_len_out, uint8_t hash_out[32]) {
+/* The ABI-encoded data of the log at `height` whose signature is `topic0`, and its hash topic */
+static uint8_t *eth_height_log(HppliteL1 *l1, uint64_t height, const uint8_t topic0[32], size_t *raw_len, uint8_t hash_out[32]) {
     uint8_t calldata[4 + 32], topic1[32];
-    size_t result_len = 0, raw_len = 0;
+    size_t result_len = 0;
     uint64_t block;
-    uint8_t *result, *raw, *data;
-    uint64_t offset, len;
+    uint8_t *result;
 
     memcpy(calldata, SEL_BLOCK_OF, 4);
     abi_encode_uint64(height, calldata + 4);
@@ -933,23 +938,96 @@ static uint8_t *eth_get_batch_from_log(HppliteL1 *l1, uint64_t height, size_t *d
     if (!result || result_len < 32) { free(result); return NULL; }   /* "No such batch" reverts */
     block = abi_decode_uint64(result);
     free(result);
-
     abi_encode_uint64(height, topic1);
-    raw = eth_client_get_log(self->eth, self->da_contract, block, TOPIC_BATCH_SUBMITTED, topic1, &raw_len, hash_out);
-    if (!raw) return NULL;
-    /* ABI: offset (32) + length (32) + bytes */
-    if (raw_len < 64) { free(raw); return NULL; }
-    offset = abi_decode_uint64(raw);
-    if (offset + 32 > raw_len || offset + 32 < offset) { free(raw); return NULL; }
+    return eth_client_get_log(self->eth, self->da_contract, block, topic0, topic1, raw_len, hash_out);
+}
+
+/* The i-th dynamic `bytes` of an ABI tuple: malloc'd, terminated; NULL when malformed */
+static uint8_t *abi_dynamic_bytes(const uint8_t *raw, size_t raw_len, int i, size_t *pLen) {
+    uint64_t offset, len;
+    uint8_t *data;
+    if (raw_len < (size_t)(32 * (i + 1))) return NULL;
+    offset = abi_decode_uint64(raw + 32 * i);
+    if (offset + 32 > raw_len || offset + 32 < offset) return NULL;
     len = abi_decode_uint64(raw + offset);
-    if (len > raw_len - offset - 32) { free(raw); return NULL; }
+    if (len > raw_len - offset - 32) return NULL;
     data = malloc((size_t)len + 1);
-    if (!data) { free(raw); return NULL; }
+    if (!data) return NULL;
     memcpy(data, raw + offset + 32, (size_t)len);
     data[len] = 0;
-    free(raw);
-    if (data_len_out) *data_len_out = (size_t)len;
+    if (pLen) *pLen = (size_t)len;
     return data;
+}
+
+static uint8_t *eth_get_batch_from_log(HppliteL1 *l1, uint64_t height, size_t *data_len_out, uint8_t hash_out[32]) {
+    size_t raw_len = 0;
+    uint8_t *raw = eth_height_log(l1, height, TOPIC_BATCH_SUBMITTED, &raw_len, hash_out);
+    uint8_t *data;
+    if (!raw) return NULL;
+    data = abi_dynamic_bytes(raw, raw_len, 0, data_len_out);
+    free(raw);
+    return data;
+}
+
+/* DA v2 commitBatch(bytes32 instanceId, uint256 height, bytes32 hash, bytes ref, bytes receipt) (#11) */
+static char *eth_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32],
+                              const char *zRef, const uint8_t *receipt, size_t nReceipt) {
+    size_t refLen, rcptLen, refPad, rcptPad, n;
+    uint8_t *calldata, *p, *tx_hash;
+    uint64_t gas;
+    if (!l1 || !self->has_privkey || !instanceId || !hash || !zRef || !zRef[0]) return NULL;
+    if (!ensure_da_contract(l1) || self->version < 8) return NULL;
+    refLen = strlen(zRef);
+    rcptLen = receipt ? nReceipt : 0;
+    refPad = (refLen + 31) / 32 * 32;
+    rcptPad = (rcptLen + 31) / 32 * 32;
+    n = 4 + 5 * 32 + 32 + refPad + 32 + rcptPad;
+    calldata = calloc(1, n);
+    if (!calldata) return NULL;
+    p = calldata;
+    memcpy(p, SEL_COMMIT_BATCH, 4); p += 4;
+    memcpy(p, instanceId, 32); p += 32;
+    abi_encode_uint64(height, p); p += 32;
+    memcpy(p, hash, 32); p += 32;
+    abi_encode_uint64(5 * 32, p); p += 32;                         /* ref's offset from the start of the arguments */
+    abi_encode_uint64(5 * 32 + 32 + refPad, p); p += 32;           /* receipt's */
+    abi_encode_uint64(refLen, p); p += 32;
+    memcpy(p, zRef, refLen); p += refPad;
+    abi_encode_uint64(rcptLen, p); p += 32;
+    if (rcptLen) memcpy(p, receipt, rcptLen);
+    gas = eth_client_estimate_gas(self->eth, self->da_contract, calldata, n);
+    if (gas == (uint64_t)-1) gas = 300000 + (refLen + rcptLen) * 100;
+    else gas += gas / 4;
+    if (gas < 200000) gas = 200000;
+    if (self->maxTxGas && gas > self->maxTxGas) gas = self->maxTxGas;
+    tx_hash = eth_client_send_tx(self->eth, self->da_contract, calldata, n, gas, 0);
+    free(calldata);
+    return tx_hash ? txHashString(tx_hash) : NULL;
+}
+
+/* BatchCommitted(height, hash, bytes ref, bytes receipt) at `height` (#11) */
+static int eth_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32], char **pzRef, uint8_t **pReceipt, size_t *pnReceipt) {
+    size_t raw_len = 0, refLen = 0, rcptLen = 0;
+    uint8_t h[32], *raw, *ref, *rcpt;
+    if (pzRef) *pzRef = NULL;
+    if (pReceipt) *pReceipt = NULL;
+    if (pnReceipt) *pnReceipt = 0;
+    if (!l1 || !ensure_da_contract(l1) || self->version < 8) return -1;
+    raw = eth_height_log(l1, height, TOPIC_BATCH_COMMITTED, &raw_len, h);
+    if (!raw) return -1;
+    ref = abi_dynamic_bytes(raw, raw_len, 0, &refLen);
+    rcpt = abi_dynamic_bytes(raw, raw_len, 1, &rcptLen);
+    free(raw);
+    if (!ref || !refLen) { free(ref); free(rcpt); return -1; }
+    if (hash) memcpy(hash, h, 32);
+    if (pzRef) *pzRef = sqlite3_mprintf("%.*s", (int)refLen, (const char *)ref);
+    if (pReceipt && rcpt && rcptLen) {
+        *pReceipt = sqlite3_malloc((int)rcptLen);
+        if (*pReceipt) { memcpy(*pReceipt, rcpt, rcptLen); if (pnReceipt) *pnReceipt = rcptLen; }
+    }
+    free(ref);
+    free(rcpt);
+    return 0;
 }
 
 static uint8_t *eth_get_batch(
@@ -1142,4 +1220,6 @@ const HppliteL1Ops hppliteL1EthOps = {
     .submit_was_oversized = eth_submit_was_oversized,
     .set_max_tx_gas = eth_set_max_tx_gas,
     .get_chain_hash = eth_get_chain_hash,
+    .commit_batch = eth_commit_batch,
+    .get_commitment = eth_get_commitment,
 };

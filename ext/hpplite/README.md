@@ -112,6 +112,8 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
+| `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
+| `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
 | `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
@@ -554,7 +556,22 @@ service publishes and commits with the batch (`commitBatch`, #33). One
 Python file, standard library only, with the x402 seller side written out;
 `buyer.py` is the node's side in Python. ctest runs it free
 (`test_pin_service`); anvil scenario 18 runs it paid against a mock USDC
-and a mock facilitator. The node's own adapter is #11.
+and a mock facilitator.
+
+The node's own side is `store=` (`store.c`): with it, a flush puts the
+sealed batch at the service, takes the CID and the receipt, and commits
+`(hash, CID, receipt)` to the rollup with `commitBatch` - no bytes on the
+chain (68k gas for a 1 KB batch on anvil, against 83k with the bytes, and
+the gap grows with size). A replica with the same `store=` reads the
+commitment, fetches by the CID, checks the hash, replays; one without says
+`batch N is in a store (...) and no store= names one` and rebuilds nothing.
+A 402 from the service is paid in x402's exact scheme with the node's key
+up to `storecap=` per call; the receipt goes on chain in a 94-byte form
+(signer, expiry, signature) that `hpplite-verify` prints for the last
+batch. ctest `test_store` runs the client free; anvil scenarios 19 and 20
+run it free and paid. Not here yet: S3 and Kubo adapters, receipt
+signature verification against the provider's published signer, `upto`
+and payment channels.
 
 ## Versions
 

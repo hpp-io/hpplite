@@ -184,3 +184,15 @@ void hpplite_l1_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
 int hpplite_l1_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]) {
     return l1 ? l1->ops->get_chain_hash(l1, pHeight, out) : -1;
 }
+
+char *hpplite_l1_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32],
+                              const char *zRef, const uint8_t *receipt, size_t nReceipt) {
+    return (l1 && l1->ops->commit_batch) ? l1->ops->commit_batch(l1, instanceId, height, hash, zRef, receipt, nReceipt) : NULL;
+}
+
+int hpplite_l1_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32], char **pzRef, uint8_t **pReceipt, size_t *pnReceipt) {
+    if (pzRef) *pzRef = NULL;
+    if (pReceipt) *pReceipt = NULL;
+    if (pnReceipt) *pnReceipt = 0;
+    return (l1 && l1->ops->get_commitment) ? l1->ops->get_commitment(l1, height, hash, pzRef, pReceipt, pnReceipt) : -1;
+}

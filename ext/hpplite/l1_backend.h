@@ -69,6 +69,13 @@ struct HppliteL1Ops {
     /* The store's rolling hash over every batch and the height it covers (#33);
     ** -1 when the backend keeps none (the mock, a directory, DA v1) */
     int (*get_chain_hash)(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]);
+    /* Commitments (#11): a batch whose bytes live in a store. commit_batch
+    ** records hash, reference and receipt at the height (NULL: refused or
+    ** unsupported); get_commitment reads them back (0; -1 when the height
+    ** holds none or the backend keeps none). Strings are sqlite3_malloc'd. */
+    char *(*commit_batch)(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32],
+                          const char *zRef, const uint8_t *receipt, size_t nReceipt);
+    int (*get_commitment)(HppliteL1 *l1, uint64_t height, uint8_t hash[32], char **pzRef, uint8_t **pReceipt, size_t *pnReceipt);
 };
 
 extern const HppliteL1Ops hppliteL1EthOps;    /* l1_eth.c */

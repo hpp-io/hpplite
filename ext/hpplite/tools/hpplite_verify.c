@@ -26,6 +26,8 @@
 #include "l1_interface.h"
 #include "crypto.h"
 #include "config.h"
+#include "store.h"
+#include <time.h>
 #include <ftw.h>
 #include <sys/stat.h>
 #include <stdio.h>
@@ -267,6 +269,30 @@ int main(int argc, char **argv) {
             }
         } else {
             printf("no rolling hash on this contract (DA v1): posted roots and the checkpoint only\n");
+        }
+    }
+    /* where the last batch's bytes are: on the chain, or in a store under a provider's receipt (#11) */
+    if (onChain > 0) {
+        uint8_t h[32], *receipt = NULL;
+        char *zRef = NULL;
+        size_t nReceipt = 0;
+        if (hpplite_l1_get_commitment(node->l1, onChain, h, &zRef, &receipt, &nReceipt) == 0) {
+            unsigned char signer[20];
+            uint64_t expires = 0;
+            printf("batch %llu: bytes in a store, reference %s", (unsigned long long)onChain, zRef);
+            if (hpplite_store_receipt_decode(receipt, nReceipt, signer, &expires, NULL) == 0) {
+                char zs[41];
+                time_t t = (time_t)expires;
+                char when[40];
+                hpplite_bytes_to_hex(signer, 20, zs);
+                strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S UTC", gmtime(&t));
+                printf("; receipt signed by 0x%s, held until %s%s", zs, when, expires > (uint64_t)time(NULL) ? "" : " <- EXPIRED");
+            } else {
+                printf("; no receipt");
+            }
+            printf("\n");
+            sqlite3_free(zRef);
+            sqlite3_free(receipt);
         }
     }
     {

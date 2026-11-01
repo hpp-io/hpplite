@@ -26,6 +26,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <fcntl.h>
+#include "store.h"
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
@@ -1518,6 +1519,180 @@ static void test_pin_service(void) {
     PASS();
 }
 
+/* 19. A store for the bytes (#11): the pin service (free) as store= on the
+** writer: the chain gets commitments (BatchCommitted: hash, CID, receipt)
+** and no bytes, the service the bytes; a replica with the same store=
+** rebuilds equal, one without cannot and says so; the commit transaction
+** costs a fraction of posting the bytes. KEY2, its own named database. */
+static pid_t start_pin_service_free(const char *svc, int port) {
+    pid_t pid;
+    FILE *f = fopen(DIR "/store_signer.key", "w");
+    if (!f) return -1;
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    pid = fork();
+    if (pid == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        snprintf(script, sizeof script, "%s/pin_service.py", svc);
+        int fd = open(DIR "/store_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/store_pins", "--signer-key", DIR "/store_signer.key",
+               "--pay-to", "0x1111111111111111111111111111111111111111", (char *)NULL);
+        _exit(127);
+    }
+    for (int i = 0; i < 50; i++) {
+        char cmd[200], out[400];
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
+        if (run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"")) return pid;
+        usleep(200 * 1000);
+    }
+    kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+    return -1;
+}
+static void test_store_commit(void) {
+    TEST("a store for the bytes (#11): commitments on chain and bytes at the pin service; a replica with the store rebuilds, one without says so; the commit is cheap");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    int port = 8800 + (int)(getpid() % 200);
+    pid_t pid = start_pin_service_free(svc, port);
+    if (pid < 0) FAIL("the pin service did not come up");
+    char extra[200], big[1001], sql[1200], contract[80], want[80];
+    snprintf(extra, sizeof extra, "&dbname=stored&store=http://127.0.0.1:%d", port);
+    sqlite3 *w = open_db("st_writer.db", KEY2, extra);
+    if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open writer"); }
+    sqlite3_exec(w, "CREATE TABLE s(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 1 through the store"); }
+    memset(big, 'y', 1000); big[1000] = 0;
+    snprintf(sql, sizeof sql, "INSERT INTO s(v) VALUES('%s')", big);
+    sqlite3_exec(w, sql, NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 2 through the store"); }
+    long gas = receipt_gas(status_text(w, "last_batch_tx"));
+    printf("(commit of a 1 KB batch: %ld gas) ", gas);
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    snprintf(want, sizeof want, "%s", status_text(w, "chain_hash"));
+    {
+        /* what the chain holds: a commitment with the CID and the receipt, and no bytes */
+        HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
+        uint8_t hash[32], *receipt = NULL;
+        char *zRef = NULL;
+        size_t n = 0, nReceipt = 0;
+        unsigned char signer[20];
+        uint64_t expires = 0;
+        uint8_t *bytes = peek ? hpplite_l1_get_batch(peek, 2, &n) : NULL;
+        int ok = peek && hpplite_l1_get_commitment(peek, 2, hash, &zRef, &receipt, &nReceipt) == 0
+                 && zRef && strncmp(zRef, "bafkrei", 7) == 0 && !bytes
+                 && hpplite_store_receipt_decode(receipt, nReceipt, signer, &expires, NULL) == 0 && expires > (uint64_t)time(NULL);
+        if (!ok) printf("(commitment: ref %s, receipt %zu bytes, bytes on chain %zu) ", zRef ? zRef : "(none)", nReceipt, n);
+        free(bytes);
+        sqlite3_free(zRef); sqlite3_free(receipt);
+        hpplite_l1_disconnect(peek);
+        if (!ok) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the chain should hold a commitment with the CID and the receipt, and no bytes"); }
+    }
+    if (gas <= 0 || gas >= 90000) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("a commitment should cost a fraction of posting 1 KB"); }
+
+    snprintf(extra, sizeof extra, "&dbname=stored&role=verify&store=http://127.0.0.1:%d", port);
+    sqlite3 *r = open_db("st_replica.db", KEY2, extra);
+    if (!r) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open replica"); }
+    if (strcmp(status_text(r, "state"), "verify") != 0 || scalar(r, "SELECT count(*) FROM s") != 1
+        || strcasecmp(strip0x(status_text(r, "chain_hash")), strip0x(want)) != 0) {
+        printf("(replica state %s, last_error '%s', rows %lld) ", status_text(r, "state"), status_text(r, "last_error"), (long long)scalar(r, "SELECT count(*) FROM s"));
+        sqlite3_close(r); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        FAIL("a replica with the store should rebuild equal");
+    }
+    sqlite3_close(r);
+
+    /* without the store the bytes are out of reach: nothing rebuilt, and the reason says so */
+    sqlite3 *r2 = open_db("st_replica2.db", KEY2, "&dbname=stored&role=verify");
+    char err2[300];
+    snprintf(err2, sizeof err2, "%s", r2 ? status_text(r2, "last_error") : "");
+    long long rows2 = r2 ? (long long)scalar(r2, "SELECT count(*) FROM s") : -2;
+    int refused = !r2 || (rows2 != 1 && strstr(err2, "store") != NULL);
+    printf("(without a store: rows %lld, last_error '%.60s') ", rows2, err2);
+    if (r2) sqlite3_close(r2);
+    sqlite3_close(w);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (!refused) FAIL("a replica without a store should rebuild nothing and say why");
+    PASS();
+}
+
+/* 20. The node pays the store (#11): the pin service on the mock facilitator
+** (MockUSDC, KEY1 the pay-to and settle key), store= and storecap= on the
+** writer, KEY0 the payer (it holds the supply). Each batch's put is a 402
+** paid in the exact scheme with the node's key; the pay-to wallet gains
+** what settled; with storecap= below the price the put is refused before
+** signing and the batch stays pending with the reason. */
+static void test_store_paid(void) {
+    TEST("the node pays the store (#11): a 402 per batch paid with the node's key up to storecap=; below the price nothing is signed and the batch waits");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
+    int port = 8900 + (int)(getpid() % 200);
+    char cmd[2400], payTo[80], before[80], after[80], extra[240];
+    FILE *f = fopen(DIR "/paid_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    if (run_cmd(cmd, payTo, sizeof payTo) != 0) FAIL("cast wallet address");
+    payTo[strcspn(payTo, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, payTo, RPC);
+    run_cmd(cmd, before, sizeof before);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        snprintf(script, sizeof script, "%s/pin_service.py", svc);
+        int fd = open(DIR "/paid_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/paid_pins", "--signer-key", DIR "/paid_signer.key",
+               "--pay-to", payTo, "--facilitator", "mock", "--rpc", RPC, "--asset", usdc, "--settle-key", KEY1,
+               "--network", "eip155:31337", "--retention", "60", "--price-per-pin", "1000", "--price-per-byte", "1", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        char out[400];
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
+        up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
+        if (!up) usleep(200 * 1000);
+    }
+    if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the pin service did not come up"); }
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead: see scenario 18 */
+
+    snprintf(extra, sizeof extra, "&dbname=paidstore&store=http://127.0.0.1:%d&storecap=100000", port);
+    sqlite3 *w = open_db("pd_writer.db", KEY0, extra);
+    if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("open writer"); }
+    sqlite3_exec(w, "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    int ok1 = scalar(w, "SELECT hpplite_flush()") > 0;
+    sqlite3_exec(w, "INSERT INTO p(v) VALUES('paid for')", NULL, NULL, NULL);
+    int ok2 = scalar(w, "SELECT hpplite_flush()") > 0;
+    if (!ok1 || !ok2) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("batches through the paid store"); }
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, payTo, RPC);
+    run_cmd(cmd, after, sizeof after);
+    long gained = first_number(after) - first_number(before);
+    printf("(two batches: the store's wallet gained %ld units) ", gained);
+    sqlite3_close(w);
+    if (gained <= 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("the node did not pay the store"); }
+
+    /* the cap below the price: refused before signing, the batch waits and says why */
+    snprintf(extra, sizeof extra, "&dbname=paidstore&store=http://127.0.0.1:%d&storecap=10", port);
+    sqlite3 *w2 = open_db("pd_writer.db", KEY0, extra);
+    if (!w2) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("reopen writer"); }
+    sqlite3_exec(w2, "INSERT INTO p(v) VALUES('over the cap')", NULL, NULL, NULL);
+    long long h = scalar(w2, "SELECT hpplite_flush()");
+    const char *err = status_text(w2, "last_error");
+    int refused = h == 0 && strstr(err, "storecap") != NULL && scalar(w2, "SELECT pending FROM hpplite_status") > 0;
+    printf("(cap 10: flush %lld, '%.50s') ", h, err);
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, payTo, RPC);
+    run_cmd(cmd, before, sizeof before);
+    sqlite3_close(w2);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    unsetenv("HPPLITE_STORE_VALID_FOR");
+    if (!refused) FAIL("a price over storecap should be refused before signing, the batch kept pending");
+    if (first_number(before) != first_number(after)) FAIL("nothing should have been paid over the cap");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -1547,6 +1722,8 @@ int main(void) {
     if (soak_env("HPPLITE_SOAK_SECONDS", 0) > 0) test_soak();   /* 16: only when asked (#120) */
     if (wanted(17)) test_chain_hash();
     if (wanted(18)) test_pin_service();
+    if (wanted(19)) test_store_commit();
+    if (wanted(20)) test_store_paid();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

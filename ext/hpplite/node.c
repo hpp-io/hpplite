@@ -13,9 +13,11 @@
 */
 
 #include "node.h"
+#include "store.h"
 #include "da_uri.h"
 #include "capture_rows.h"
 static void node_cap_batch_limit(HppliteNode *node);
+static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
 static int node_check_rollup(HppliteNode *node);
 #include <string.h>
 #include <strings.h>
@@ -112,6 +114,16 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.chainId = config->chainId;
     node->config.maxTxBytes = config->maxTxBytes;
     node->config.maxTxGas = config->maxTxGas;
+    node->config.storeUrl = node_strdup(config->storeUrl);
+    node->config.storeCap = config->storeCap;
+    if (node->config.storeUrl) {
+        /* the batch bytes' store (#11): the chain will hold commitments only */
+        node->store = hpplite_store_open(node->config.storeUrl, config->hasPrivkey ? config->privkey : NULL, config->storeCap);
+        if (!node->store) {
+            fprintf(stderr, "hpplite: store=%s: not a store HPPLite knows (http://host:port of a pin service)\n", node->config.storeUrl);
+            return -1;
+        }
+    }
     node_cap_batch_limit(node);
     node->config.noEncrypt = config->noEncrypt;
     node->config.determinismWarn = config->determinismWarn;
@@ -354,7 +366,7 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
         l1 = hpplite_l1_connect(config->rpcUrl, hex);
         if (l1) {
             size_t len = 0;
-            uint8_t *data = hpplite_l1_get_batch(l1, 1, &len);
+            uint8_t *data = node_fetch_bytes(node, l1, 1, &len);
             HppliteBatch *b = data ? node_decode_batch(node, 1, data, len) : NULL;
             int match = b && b->zDbName && strcmp(b->zDbName, zName) == 0;
             if (b && b->zDbName && !match) zOthers = sqlite3_mprintf("%z%s\"%s\"", zOthers, zOthers ? ", " : "", b->zDbName);
@@ -664,6 +676,10 @@ void hpplite_node_destroy(HppliteNode *node) {
     if (node->l1 && node->ownsL1) {
         hpplite_l1_disconnect(node->l1);
     }
+    if (node->store) {
+        hpplite_store_close(node->store);
+        node->store = NULL;
+    }
 
     /* Shutdown HPPLite context */
     if (node->ctx) {
@@ -709,6 +725,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     sqlite3_free(node->config.dataDir);
     sqlite3_free(node->config.dbPath);
     sqlite3_free(node->config.dbName);
+    sqlite3_free(node->config.storeUrl);
     sqlite3_free(node->config.rpcUrl);
     sqlite3_free(node->canonicalPath);
     if (node->flushMutex) {
@@ -882,7 +899,7 @@ static int node_skip_foreign_height(HppliteNode *node, uint64_t height) {
         hpplite_error(node->ctx, "batch 1 is not sealed with our key: wrong key or wrong rollup");
         return -1;
     }
-    raw = hpplite_l1_get_batch(node->l1, height, &len);
+    raw = node_fetch_bytes(node, node->l1, height, &len);
     if (!raw) return -1;
     hpplite_sha256(raw, len, h);
     {
@@ -898,12 +915,47 @@ static int node_skip_foreign_height(HppliteNode *node, uint64_t height) {
     return rc == SQLITE_OK ? 0 : -1;
 }
 
+/*
+** The posted bytes of a height: from the chain, or, for a height the chain
+** only commits to (#11), from the store by the committed reference, checked
+** against the committed hash. malloc'd, terminated; NULL with the reason in
+** last_error when the bytes are in a store this node cannot reach.
+*/
+static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen) {
+    uint8_t *data = hpplite_l1_get_batch(l1, height, pLen);
+    unsigned char hash[32], got[32];
+    char *zRef = NULL;
+    uint8_t *receipt = NULL;
+    size_t nReceipt = 0;
+    if (data) return data;
+    if (hpplite_l1_get_commitment(l1, height, hash, &zRef, &receipt, &nReceipt) != 0) return NULL;
+    sqlite3_free(receipt);                        /* verified where it is reported (hpplite-verify); the hash is the check here */
+    if (!node->store) {
+        hpplite_error(node->ctx, "batch %llu is in a store (%s) and no store= names one", (unsigned long long)height, zRef);
+    } else {
+        data = hpplite_store_get(node->store, zRef, pLen);
+        if (!data) {
+            hpplite_error(node->ctx, "batch %llu: the store has no %s: %s", (unsigned long long)height, zRef, hpplite_store_error(node->store));
+        } else {
+            hpplite_keccak256(data, *pLen, got);
+            if (memcmp(got, hash, 32) != 0) {
+                hpplite_error(node->ctx, "batch %llu: the store's bytes for %s are not what the chain committed to", (unsigned long long)height, zRef);
+                free(data);
+                data = NULL;
+                *pLen = 0;
+            }
+        }
+    }
+    sqlite3_free(zRef);
+    return data;
+}
+
 HppliteBatch *hpplite_node_fetch_batch(HppliteNode *node, uint64_t height) {
     size_t dataLen = 0;
     uint8_t *data;
     HppliteBatch *batch;
     if (!node || !node->l1) return NULL;
-    data = hpplite_l1_get_batch(node->l1, height, &dataLen);
+    data = node_fetch_bytes(node, node->l1, height, &dataLen);
     batch = node_decode_batch(node, height, data, dataLen);
     if (batch) {
         /* the sealed bytes stay with the batch: adopted, it is kept as
@@ -1117,8 +1169,10 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     sqlite3_int64 maxId = 0;
     uint64_t height;
     int confirmed = 0;
+    char zStoreWhy[240];               /* why the store did not take the batch (#11): the reason the error keeps */
 
     *pMore = 0;
+    zStoreWhy[0] = 0;
     /* The root is O(database size): compute it only on the batch that
     ** closes a checkpoint interval (the checkpoint is submitted from it) */
     int withRoot = node->batchesSinceCheckpoint + 1 >= node->config.checkpointInterval;
@@ -1199,8 +1253,29 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                 payload = sealed;
             }
             if (payload) {
-                char *txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height,
-                                        payload, payloadLen);
+                char *txHash;
+                if (node->store) {
+                    /* the bytes to the store, the commitment to the chain (#11) */
+                    char *zReceipt = NULL;
+                    char *zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
+                    if (!zRef) {
+                        snprintf(zStoreWhy, sizeof zStoreWhy, "the store did not take it: %s", hpplite_store_error(node->store));
+                        txHash = NULL;
+                    } else {
+                        unsigned char h[32];
+                        uint8_t compact[HPPLITE_RECEIPT_SIZE];
+                        int nCompact = zReceipt ? hpplite_store_receipt_compact(zReceipt, compact) : -1;
+                        hpplite_keccak256(payload, payloadLen, h);
+                        txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef,
+                                                         nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                        if (!txHash) hpplite_error(node->ctx, "the chain did not take the commitment of batch %llu (ref %s)",
+                                                   (unsigned long long)height, zRef);
+                    }
+                    sqlite3_free(zRef);
+                    sqlite3_free(zReceipt);
+                } else {
+                    txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
+                }
                 if (!txHash && hpplite_l1_submit_was_oversized(node->l1) && payloadLen > 1024) {
                     /* The RPC takes less per transaction than the contract per
                     ** batch (an unknown chain's limit): post smaller batches,
@@ -1251,8 +1326,13 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                 wait <<= node->failStreak;                 /* 2x per failure */
                 if (wait > 300000) wait = 300000;          /* ... up to the lease length */
                 node->retryAt = node_current_time_ms() + wait;
-                hpplite_error(node->ctx, "batch %llu not confirmed on L1, kept pending (retry in %llds)",
-                        (unsigned long long)height, (long long)(wait / 1000));
+                if (zStoreWhy[0]) {
+                    hpplite_error(node->ctx, "batch %llu kept pending: %s (retry in %llds)",
+                            (unsigned long long)height, zStoreWhy, (long long)(wait / 1000));
+                } else {
+                    hpplite_error(node->ctx, "batch %llu not confirmed on L1, kept pending (retry in %llds)",
+                            (unsigned long long)height, (long long)(wait / 1000));
+                }
                 *pMore = 0;
             }
             hpplite_batch_free(batch);

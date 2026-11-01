@@ -98,7 +98,7 @@ set(HPPLITE_SOURCES
 # L1 backends: every build has both; the endpoint picks one at run time (#35).
 # HPPLITE_USE_REAL_L1 now only decides whether the tests and examples that
 # need a chain (anvil, HPP Sepolia) are built, and keeps the test hooks out.
-list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c)
+list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c)
 if(HPPLITE_USE_REAL_L1)
     message(STATUS "L1 backends: eth + mock; chain tests and examples on")
 else()
@@ -190,6 +190,9 @@ if(HPPLITE_BUILD_TESTS)
 
     add_executable(test_l1_dir tests/unit/test_l1_dir.c)
     target_link_libraries(test_l1_dir hpplite_testlib)
+
+    add_executable(test_store tests/unit/test_store.c)
+    target_link_libraries(test_store hpplite_testlib)
 
     add_executable(test_simple_open tests/unit/test_simple_open.c)
     target_link_libraries(test_simple_open hpplite)
@@ -303,6 +306,9 @@ if(HPPLITE_BUILD_TESTS)
                                            ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/rpc_proxy.py)
         # The reference pin service in free mode: storage, CIDs, receipts, idempotence (#125); paid on anvil in scenario 18
         add_test(NAME test_pin_service COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service/selftest.sh)
+        # The node's store client against it (#11); paid on anvil in scenario 19
+        add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service)
+        set_tests_properties(test_store PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if(HPPLITE_BUILD_EXTENSION)
         add_test(NAME test_loadable COMMAND test_loadable)

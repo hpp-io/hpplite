@@ -133,6 +133,7 @@ void hpplite_config_free(HppliteConfig *cfg) {
     if (cfg->rpcUrl) free(cfg->rpcUrl);
     if (cfg->dataDir) free(cfg->dataDir);
     if (cfg->dbPath) free(cfg->dbPath);
+    free(cfg->storeUrl);
     free(cfg->dbName);
     free(cfg);
 }
@@ -224,6 +225,10 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val) parse_capture(cfg, val, 1);
     val = getenv(HPPLITE_ENV_DBNAME);
     if (val && val[0]) { free(cfg->dbName); cfg->dbName = strdup(val); }
+    val = getenv(HPPLITE_ENV_STORE);
+    if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
+    val = getenv(HPPLITE_ENV_STORE_CAP);
+    if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
     val = getenv(HPPLITE_ENV_MAX_TX);
     if (val && atol(val) > 0) cfg->maxTxBytes = (size_t)atol(val);
     val = getenv(HPPLITE_ENV_MAX_TX_GAS);
@@ -443,6 +448,13 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_MAX_TX, buf, sizeof(buf)) && atol(buf) > 0) {
         cfg->maxTxBytes = (size_t)atol(buf);
     }
+    if (get_uri_param(uri, HPPLITE_URI_STORE, buf, sizeof(buf)) && buf[0]) {
+        free(cfg->storeUrl);
+        cfg->storeUrl = strdup(buf);
+    }
+    if (get_uri_param(uri, HPPLITE_URI_STORE_CAP, buf, sizeof(buf)) && atoll(buf) > 0) {
+        cfg->storeCap = (uint64_t)atoll(buf);
+    }
     if (get_uri_param(uri, HPPLITE_URI_MAX_TX_GAS, buf, sizeof(buf)) && atoll(buf) > 0) {
         cfg->maxTxGas = (uint64_t)atoll(buf);
     }
@@ -582,6 +594,10 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && val[0]) { free(cfg->dbName); cfg->dbName = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX);
     if (val && atol(val) > 0) cfg->maxTxBytes = (size_t)atol(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE);
+    if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_CAP);
+    if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX_GAS);
     if (val && atoll(val) > 0) cfg->maxTxGas = (uint64_t)atoll(val);
 
