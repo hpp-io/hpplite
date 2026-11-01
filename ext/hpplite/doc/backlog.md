@@ -63,7 +63,8 @@
 ### Crash harness and chain-free mock (issue #26)
 - `l1_mock` can live in a directory (`hpplite_l1_create_mock_dir`): batches,
   lease, checkpoints and clock survive the process (atomic rename); the seed
-  of the `file://` DA backend (#35)
+  of the directory backend `l1=file:///path` (`l1_dir.c`, #35), which the
+  harness also runs against (`crash_hpplite --l1 dir`, ctest `test_crash_dir`)
 - `crash_hpplite` (ctest `test_crash`): the writer dies at
   `HPPLITE_TEST_CRASH_AT=after_submit|after_finalize|mid_series` and at random
   moments under the timer; a fresh process reopens and checks every statement

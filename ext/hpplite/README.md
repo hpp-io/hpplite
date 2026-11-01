@@ -104,7 +104,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `hpplite` | Yes | Set to `on` to enable |
-| `l1` | Yes* | Network alias (`hpp-sepolia`): sets `rpc` and `factory`. `local`: no chain, batches are finalized in the file and the history is kept nowhere (#38) |
+| `l1` | Yes* | Network alias (`hpp-sepolia`): sets `rpc` and `factory`. `file:///path`: a directory instead of a chain - lease, checkpoints and batches as files, no wallet needed (#35, see Stores and commitments). `local`: no chain, batches are finalized in the file and the history is kept nowhere (#38) |
 | `rpc` | Yes* | L1 RPC URL (if no `l1`) |
 | `factory` | Yes* | Factory contract address (if no `l1`) |
 | `contract` | No | Connect to an existing rollup instead of using the factory |
@@ -462,6 +462,61 @@ It needs the wallet key (batches are encrypted); a viewing key is v0.3 (#15).
 There is no fraud proof or challenge period: the chain holds the log and
 the roots, the key holder is the one who checks them.
 
+## Stores and commitments
+
+Three words the rest of this document uses precisely (#35, #11):
+
+- A **store** is where the bytes of a batch live. Today that is the rollup's
+  DA contract on the chain, or a directory. S3 and IPFS stores follow (#11).
+- A **commitment** is what the chain holds per height: HPPLite's own hash
+  of the batch and a reference into the store (on chain, the height itself;
+  later a CID or an object key), and, where a pinning service holds the
+  bytes, its signed receipt (#33). A replica reads the commitment, fetches
+  by the reference, checks the hash, replays. Verification never depends on
+  what the reference means.
+- **Data availability** is a property, not a place: anyone can fetch the
+  bytes needed to rebuild, without the writer, for as long as the chain
+  lives. The on-chain store has it by construction. A pinned store has it
+  only as far as the pinner's receipt and the fallback to posting on chain
+  carry it. A directory has none: it is a store with no availability claim.
+
+Every build carries every backend; the `l1=` value picks one at run time
+(`l1.c`, `l1_backend.h`): a network alias or `rpc=` is the Ethereum client,
+`file:///path` the directory, `mock` the tests' mock.
+
+### A directory instead of a chain: `l1=file:///path`
+
+```
+sqlite> .open 'file:app.db?hpplite=on&l1=file:///var/lib/app/log&encrypt=off'
+```
+
+The directory is the rollup: the lease, the latest checkpoint, the height
+and every batch are files in it (`lease`, `checkpoint`, `height`,
+`batch-N.bin`, `config` with the checkpoint interval and lease duration),
+each written to a temporary name and renamed into place, so a crash leaves
+the old or the new content and never a torn file. Nothing is cached: a
+writer, replicas (`role=verify`, or a second file opened on the same
+directory after the writer's lease ends) and `hpplite-verify` read the same
+files and see one state, as they would see one chain. The lease works as
+on chain - one instance posts, by the wall clock, a crashed writer's lease
+expires after `leaseDuration` (300 s by default; the owner key can expire it
+at once) - and `hpplite-verify` audits a directory the way it audits a
+rollup:
+
+```
+HPPLITE_PARAMS="l1=file:///var/lib/app/log&encrypt=off" hpplite-verify --db /var/lib/app/app.db
+```
+
+No wallet is needed: without a key the batches are plaintext (`encrypt=off`
+must say so), with one they are sealed exactly as on chain, and the key is
+also what makes a connection the directory's owner. There is no factory and
+`dbname=` does not apply: one directory, one database. What it is for: a
+Litestream-like log of a database with a content-hash checkpoint and no
+chain, the offline fixture for `hpplite-verify`, and the crash harness
+(`crash_hpplite --l1 dir`). What it is not: data availability - the
+directory is as available as the disk it is on. The crash harness and the
+directory test (`test_l1_dir`) run against it in every build.
+
 ## Versions
 
 Scope is tied to versions. v0.1.1 is the last of the v0.1 line (end of life:
@@ -627,7 +682,9 @@ until a key arrives. With no L1 configured at all (`hpplite=on` alone) the
 log is kept pending too - the first flush says so once on stderr, and
 `hpplite_status.state` is `unposted` - and posts in full once `l1=` names a
 chain. `l1=local` is the explicit development mode: batches are finalized in
-the file and the history is kept nowhere (#38). `encrypt=off`
+the file and the history is kept nowhere (#38). `l1=file:///path` needs no
+key at all: the directory is the chain, and `encrypt=off` posts plaintext
+there, or a key seals the batches as on chain. `encrypt=off`
 is the only way to post plaintext and must be explicit. A URI with
 `hpplite=on` that cannot be honoured (unreadable key file, malformed key)
 makes `sqlite3_open_v2()` fail rather than open without capture. v0.2 splits the roles (owner / sequencer / data /
