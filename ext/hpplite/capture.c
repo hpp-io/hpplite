@@ -881,25 +881,47 @@ static int seqFingerprint(HppliteCtx *pCtx, sqlite3_int64 out[2]) {
   return 1;
 }
 
+/* The run of pS, if one is being tracked: its index in aRun, else -1 */
+static int runFind(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+  int i;
+  for (i = 0; i < pCtx->nRun; i++) if (pCtx->aRun[i].pS == pS) return i;
+  return -1;
+}
+
+/* A run of pS starts (its STMT trace, or the rerun of a stale statement
+** that has no trace): tracked while there is room, the application counted
+** as busy and holding the gate either way. Returns the index, or -1. */
+static int runStart(HppliteCtx *pCtx, sqlite3_stmt *pS, sqlite3_int64 logId, unsigned clockSeen) {
+  int slot = -1;
+  if (pCtx->nRun < HPPLITE_MAX_RUNS) {
+    struct HppliteStmtRun *r = &pCtx->aRun[pCtx->nRun];
+    slot = pCtx->nRun++;
+    r->pS = pS;
+    r->logId = logId;
+    r->now = 0;
+    r->clockSeen = clockSeen;
+    r->vmSteps = sqlite3_stmt_status(pS, SQLITE_STMTSTATUS_VM_STEP, 0);
+  }
+  gateEnterApp(pCtx);
+  pCtx->nAppStmtActive++;
+  return slot;
+}
+
 /* A run of an application statement is over: forget it (PROFILE, or found
 ** reset without finishing). Returns what was recorded for it. */
 typedef struct ActiveRun { sqlite3_int64 log, now; unsigned reads; int found; } ActiveRun;
 static ActiveRun endActiveRun(HppliteCtx *pCtx, int i) {
   ActiveRun r;
-  int last = --pCtx->nActiveStmt;
-  r.log = pCtx->aActiveLog[i]; r.now = pCtx->aActiveNow[i]; r.found = 1;
+  int last = --pCtx->nRun;
+  r.log = pCtx->aRun[i].logId; r.now = pCtx->aRun[i].now; r.found = 1;
   /* clock reads during the run, counted before the pin goes (it resets the
   ** count) and before our own statements below read it */
-  r.reads = hpplite_clock_consulted() - pCtx->aActiveSeen[i];
-  if (pCtx->aActiveStmt[i] == pCtx->pPinOwner) {
+  r.reads = hpplite_clock_consulted() - pCtx->aRun[i].clockSeen;
+  if (pCtx->aRun[i].pS == pCtx->pPinOwner) {
     hpplite_clock_pin(0);
     pCtx->pPinOwner = NULL;
   }
-  pCtx->aActiveStmt[i] = pCtx->aActiveStmt[last];
-  pCtx->aActiveLog[i] = pCtx->aActiveLog[last];
-  pCtx->aActiveNow[i] = pCtx->aActiveNow[last];
-  pCtx->aActiveSeen[i] = pCtx->aActiveSeen[last];
-  pCtx->aActiveVm[i] = pCtx->aActiveVm[last];
+  pCtx->aRun[i] = pCtx->aRun[last];
   if (pCtx->nAppStmtActive > 0) pCtx->nAppStmtActive--;
   return r;
 }
@@ -910,8 +932,8 @@ static ActiveRun endActiveRun(HppliteCtx *pCtx, int i) {
 ** thread. */
 static void endResetRuns(HppliteCtx *pCtx, sqlite3_stmt *pExcept) {
   int j;
-  for (j = pCtx->nActiveStmt - 1; j >= 0; j--) {
-    sqlite3_stmt *p = NULL, *q = pCtx->aActiveStmt[j];
+  for (j = pCtx->nRun - 1; j >= 0; j--) {
+    sqlite3_stmt *p = NULL, *q = pCtx->aRun[j].pS;
     if (q == pExcept) continue;
     while ((p = sqlite3_next_stmt(pCtx->db, p)) != NULL) if (p == q) break;
     if (!p || !sqlite3_stmt_busy(q)) endActiveRun(pCtx, j);
@@ -1029,16 +1051,7 @@ static void rerunStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   ** DDL expires every statement, this one too): it ran, no rerun follows */
   if (pCtx->rerunStage == 1 && stmtExpired(pS) && hppliteSchemaVersion(pCtx) == pCtx->rerunSchema) {
     pCtx->rerunStage = 2;
-    if (pCtx->nActiveStmt < (int)(sizeof(pCtx->aActiveStmt) / sizeof(pCtx->aActiveStmt[0]))) {
-      int slot = pCtx->nActiveStmt++;
-      pCtx->aActiveStmt[slot] = pS;
-      pCtx->aActiveLog[slot] = pCtx->lastLogId;
-      pCtx->aActiveNow[slot] = 0;
-      pCtx->aActiveSeen[slot] = hpplite_clock_consulted();
-      pCtx->aActiveVm[slot] = sqlite3_stmt_status(pS, SQLITE_STMTSTATUS_VM_STEP, 0);
-      gateEnterApp(pCtx);
-      pCtx->nAppStmtActive++;
-    }
+    runStart(pCtx, pS, pCtx->lastLogId, hpplite_clock_consulted());
     pCtx->pLastLogged = pS;               /* the effect check applies to the rerun */
     return;
   }
@@ -1098,32 +1111,22 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
     ** does all its writing in its first step (RETURNING included): a
     ** sub-program sees the count its statement started with, a new run a
     ** larger one. */
-    int i, running = -1;
+    int running;
     if (zSql && zSql[0] == '-' && zSql[1] == '-') return 0;
-    if (pCtx->nActiveStmt > 0) endResetRuns(pCtx, pS);
-    for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { running = i; break; }
+    if (pCtx->nRun > 0) endResetRuns(pCtx, pS);
+    running = runFind(pCtx, pS);
     if (running >= 0) {
-      if (sqlite3_stmt_status(pS, SQLITE_STMTSTATUS_VM_STEP, 0) == pCtx->aActiveVm[running]) return 0;
+      if (sqlite3_stmt_status(pS, SQLITE_STMTSTATUS_VM_STEP, 0) == pCtx->aRun[running].vmSteps) return 0;
       endActiveRun(pCtx, running);          /* the last run was reset unfinished: this is a new one */
     }
-    if (pCtx->nActiveStmt < (int)(sizeof(pCtx->aActiveStmt) / sizeof(pCtx->aActiveStmt[0]))) {
-      slot = pCtx->nActiveStmt++;
-      pCtx->aActiveStmt[slot] = pS;
-      pCtx->aActiveLog[slot] = 0;
-      pCtx->aActiveNow[slot] = 0;
-      pCtx->aActiveSeen[slot] = 0;
-      pCtx->aActiveVm[slot] = sqlite3_stmt_status(pS, SQLITE_STMTSTATUS_VM_STEP, 0);
-    }
-    gateEnterApp(pCtx);
-    pCtx->nAppStmtActive++;
+    slot = runStart(pCtx, pS, 0, 0);
     pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
   } else if (mask == SQLITE_TRACE_PROFILE) {
     int i;
     /* a commit whose hook fired is visible once its statement ends (#37) */
     __atomic_store_n(&pCtx->nCommitDone, __atomic_load_n(&pCtx->nCommitBegun, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
-    for (i = 0; i < pCtx->nActiveStmt; i++) {
-      if (pCtx->aActiveStmt[i] == pS) { done = endActiveRun(pCtx, i); break; }
-    }
+    i = runFind(pCtx, pS);
+    if (i >= 0) done = endActiveRun(pCtx, i);
     if (!done.found && pCtx->nAppStmtActive > 0) pCtx->nAppStmtActive--;
     pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
     gateLeaveAppIfIdle(pCtx);
@@ -1170,7 +1173,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
       ** reruns it now, and triggers rebuilt in between would be the ones it
       ** was rid of (a DROP COLUMN, below). A schema change that ran expires
       ** itself too: that one is the reason to rebuild */
-      if (!sqlite3_stmt_readonly(pS) && !sqlite3_stmt_busy(pS) && pCtx->nActiveStmt == 0
+      if (!sqlite3_stmt_readonly(pS) && !sqlite3_stmt_busy(pS) && pCtx->nRun == 0
           && sqlite3_errcode(pCtx->db) != SQLITE_SCHEMA)
         hpplite_rows_after_statement(pCtx);
     }
@@ -1293,8 +1296,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   ** (#57), and so does a statement - its text is posted in pieces (#59) */
 
   if (pCtx->bClockPin && slot < 0) {
-    int i;
-    for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { slot = i; break; }
+    slot = runFind(pCtx, pS);
   }
   if (pCtx->bClockPin && slot >= 0) {
     /* Pin "now" for the statement (#56): the outermost write pins the real
@@ -1306,7 +1308,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
       hpplite_clock_pin(t);
       pCtx->pPinOwner = pS;
     }
-    pCtx->aActiveNow[slot] = t;
+    pCtx->aRun[slot].now = t;
   }
 
   pCtx->bInternal = 1;
@@ -1323,7 +1325,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
     sqlite3_bind_int64(pCtx->pLogStmt, 1, pCtx->curTxn);
     sqlite3_bind_text(pCtx->pLogStmt, 2, zExpanded, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(pCtx->pLogStmt, 3, currentMode(pCtx));
-    sqlite3_bind_int64(pCtx->pLogStmt, 4, slot >= 0 ? pCtx->aActiveNow[slot] : 0);
+    sqlite3_bind_int64(pCtx->pLogStmt, 4, slot >= 0 ? pCtx->aRun[slot].now : 0);
     {
       /* our row's id is not the application's last_insert_rowid() */
       sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
@@ -1335,11 +1337,8 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
       rerunBegin(pCtx, pS);
       pCtx->pLastLogged = pS;
       pCtx->bLastLoggedKeep = isHeaderPragmaWrite(zSql);
-      if (slot < 0) {
-        int i;
-        for (i = 0; i < pCtx->nActiveStmt; i++) if (pCtx->aActiveStmt[i] == pS) { slot = i; break; }
-      }
-      if (slot >= 0) pCtx->aActiveLog[slot] = pCtx->lastLogId;
+      if (slot < 0) slot = runFind(pCtx, pS);
+      if (slot >= 0) pCtx->aRun[slot].logId = pCtx->lastLogId;
       if (pCtx->curTxn == 0) pCtx->curTxn = pCtx->lastLogId;
       pCtx->changesAtLog = totalChanges(pCtx->db);
       pCtx->schemaAtLog = hppliteSchemaVersion(pCtx);
@@ -1358,7 +1357,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   }
   pCtx->bInternal = 0;
   /* the statement's own clock reads start after our bookkeeping above */
-  if (slot >= 0) pCtx->aActiveSeen[slot] = hpplite_clock_consulted();
+  if (slot >= 0) pCtx->aRun[slot].clockSeen = hpplite_clock_consulted();
   if (rc != SQLITE_DONE) {
     char why[160];
     snprintf(why, sizeof(why), "could not log statement (%s)", sqlite3_errmsg(pCtx->db));

@@ -41,6 +41,7 @@ struct HppliteBatch;
 /*
 ** HPPLite context attached to a database connection
 */
+#define HPPLITE_MAX_RUNS 16     /* application statements running at once that capture keeps track of */
 typedef struct HppliteCtx HppliteCtx;
 struct HppliteCtx {
   sqlite3 *db;                /* Application connection: trace + pending log */
@@ -72,12 +73,15 @@ struct HppliteCtx {
   struct HppliteFnVerdict {   /* Function check of a write, by statement text and schema */
     char *zSql; int schema; char zWhy[160];
   } aFnVerdict[64];
-  sqlite3_stmt *aActiveStmt[16]; /* Application statements between their STMT and PROFILE trace */
-  sqlite3_int64 aActiveLog[16];  /* ...the log row each one wrote (0 = none) */
-  sqlite3_int64 aActiveNow[16];  /* ...the time pinned for it (0 = none; #56) */
-  unsigned aActiveSeen[16];      /* ...clock reads on the thread when it started */
-  int aActiveVm[16];             /* ...its VM step count when this run started (a later trace with
-                                 ** the same count is a sub-program; another count, a new run) */
+  struct HppliteStmtRun {        /* A run of an application statement, between its STMT and PROFILE trace */
+    sqlite3_stmt *pS;
+    sqlite3_int64 logId;         /* the log row it wrote (0 = none) */
+    sqlite3_int64 now;           /* the time pinned for it (0 = none; #56) */
+    unsigned clockSeen;          /* clock reads on the thread when it started */
+    int vmSteps;                 /* its VM step count as it started (a later trace with the same
+                                 ** count is a sub-program; another count, a new run) */
+  } aRun[HPPLITE_MAX_RUNS];
+  int nRun;
   int seenSchema;                /* schema_version this connection last loaded (-1: not yet) */
   sqlite3_stmt *pRerunStmt;      /* a statement prepared on a stale schema, logged in a transaction
                                  ** HPPLite opened for it: SQLite reruns it without a STMT trace */
@@ -106,8 +110,6 @@ struct HppliteCtx {
   int bSeqAtLog;              /* ...taken (an INSERT on a database that has sqlite_sequence) */
   int bClockPin;              /* The connection's VFS is the clock VFS: 'now' can be recorded and replayed */
   sqlite3_stmt *pPinOwner;    /* The statement that pinned the clock (outermost write) */
-
-  int nActiveStmt;
 
   /* Row capture (capture engine v2, #19; capture_rows.c) */
   int bRows;                  /* writes are captured as row records by the connection's TEMP triggers */
