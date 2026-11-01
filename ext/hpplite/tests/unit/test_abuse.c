@@ -389,6 +389,61 @@ static void test_last_refusal(void) {
     PASS();
 }
 
+/* An application function on a connection: its name reaches a replica's
+** function list nowhere */
+static void fn_app_double(sqlite3_context *c, int argc, sqlite3_value **argv) {
+    (void)argc;
+    sqlite3_result_int64(c, 2 * sqlite3_value_int64(argv[0]));
+}
+
+/* The text rules, one place (textVerdict, #104): for a fixed set of
+** statements, the rule each one falls under, as hpplite_status.last_refusal
+** says it; and which of them determinism=warn lets through */
+static void test_text_verdicts(void) {
+    TEST("why a statement logged as text is refused, rule by rule (#104); warn mode lets a value through, never a function");
+    SKIP_IF_ROWS("values are rows");
+    reset_dir();
+    static const struct { const char *sql, *why, *advice; } aCase[] = {
+        { "INSERT INTO t VALUES(random())", "non-deterministic function random()", "compute the value in the application and bind it" },
+        { "INSERT INTO t VALUES(datetime('now', 'localtime'))", "machine's time zone", "bind the value instead" },
+        { "UPDATE t SET x = last_insert_rowid()", "non-deterministic function last_insert_rowid()", "compute the value in the application and bind it" },
+        { "INSERT INTO t VALUES(app_double(2))", "app_double() is defined by the application", "compute the value in the application and bind it" },
+        { "INSERT INTO t SELECT count(*) FROM _hpplite_pending", "may not reference _hpplite_ tables", NULL },
+        { NULL, NULL, NULL } };
+    HppliteNode *n = open_node(DIR "/verdict.db", NULL);
+    if (!n) FAIL("open");
+    sqlite3_create_function(n->db, "app_double", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, fn_app_double, NULL, NULL);
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    for (int i = 0; aCase[i].sql; i++) {
+        char why[512];
+        int rc = sqlite3_exec(n->db, aCase[i].sql, NULL, NULL, NULL);
+        if (rc != SQLITE_INTERRUPT) FAILF("%s: rc %d, want SQLITE_INTERRUPT (refused)", aCase[i].sql, rc);
+        text_of(n->db, "SELECT last_refusal FROM hpplite_status", why, sizeof(why));
+        if (!strstr(why, aCase[i].why)) FAILF("%s: refused for '%s', want the rule '%s'", aCase[i].sql, why, aCase[i].why);
+        if (aCase[i].advice && !strstr(why, aCase[i].advice)) FAILF("%s: no advice '%s' in '%s'", aCase[i].sql, aCase[i].advice, why);
+        if (!aCase[i].advice && strstr(why, "bind")) FAILF("%s: advice where there is nothing to advise: '%s'", aCase[i].sql, why);
+    }
+    if (count_rows(n->db, "t") != 0) FAIL("a refused statement ran");
+    if (n->ctx->nNondeterministic != 4) FAILF("nondeterministic counted %llu, want 4 (the _hpplite_ reference is not a determinism matter)",
+                                              (unsigned long long)n->ctx->nNondeterministic);
+    hpplite_node_destroy(n);
+
+    /* determinism=warn: a value replay cannot reproduce is let through and
+    ** counted; a function the replica does not have is still refused */
+    TestNodeOpts o = { .determinismWarn = 1 };
+    HppliteNode *w = test_open_node(DIR "/verdict_warn.db", NULL, &o);
+    if (!w) FAIL("open warn");
+    sqlite3_create_function(w->db, "app_double", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, fn_app_double, NULL, NULL);
+    hpplite_node_exec(w, "CREATE TABLE t(x)", NULL);
+    if (sqlite3_exec(w->db, "INSERT INTO t VALUES(random())", NULL, NULL, NULL) != SQLITE_OK) FAIL("warn: random() refused");
+    if (sqlite3_exec(w->db, "UPDATE t SET x = last_insert_rowid()", NULL, NULL, NULL) != SQLITE_OK) FAIL("warn: last_insert_rowid() refused");
+    if (sqlite3_exec(w->db, "INSERT INTO t VALUES(app_double(2))", NULL, NULL, NULL) != SQLITE_INTERRUPT) FAIL("warn: an application function let through");
+    if (sqlite3_exec(w->db, "INSERT INTO t SELECT count(*) FROM _hpplite_pending", NULL, NULL, NULL) != SQLITE_INTERRUPT) FAIL("warn: a _hpplite_ reference let through");
+    if (count_rows(w->db, "t") != 1 || w->ctx->nNondeterministic != 3) FAILF("warn: %d rows, counted %llu; want 1 and 3", count_rows(w->db, "t"), (unsigned long long)w->ctx->nNondeterministic);
+    hpplite_node_destroy(w);
+    PASS();
+}
+
 /* Migration tools keep their version in the header (PRAGMA user_version):
 ** a replica that becomes the writer reads it to decide what to migrate */
 static void test_header_pragmas_replicate(void) {
@@ -1216,6 +1271,7 @@ int main(void) {
     test_guard_spellings();
     test_app_defined_functions();
     test_last_refusal();
+    test_text_verdicts();
     test_header_pragmas_replicate();
     test_changes_are_the_applications();
     test_returning_stepped_once();
