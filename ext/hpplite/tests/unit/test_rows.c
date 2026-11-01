@@ -675,6 +675,37 @@ static void test_refused_after_foreign_alter(void) {
     PASS();
 }
 
+/* HPPLite's own transaction (opened for a stale statement) whose COMMIT had
+** to wait for a statement in progress (a RETURNING stepped once writes) is
+** committed at a later statement's end. Tracking another statement in
+** between (a DROP COLUMN, whose triggers go) must not forget the commit
+** owed (review of #103) */
+static void test_own_txn_commit_pending_then_tracked(void) {
+    TEST("HPPLite's transaction, its commit pending behind a statement in progress, is still committed when another statement is tracked meanwhile");
+    reset_dir();
+    W a, b;
+    sqlite3_stmt *s1 = NULL;
+    if (!open_writer(DIR "/pending.db", &a) || !open_writer(DIR "/pending.db", &b)) FAIL("open");
+    exec(a.db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v); CREATE TABLE u(a, b)");
+    exec(b.db, "ALTER TABLE t ADD COLUMN c DEFAULT 'x'");          /* a's next statement is stale: tracked, in HPPLite's transaction */
+    if (sqlite3_prepare_v2(a.db, "INSERT INTO t(v) VALUES(1) RETURNING id", -1, &s1, NULL) != SQLITE_OK) FAIL("prepare s1");
+    int rc1 = sqlite3_step(s1);                                      /* in progress: HPPLite's transaction cannot be committed yet */
+    int rc2 = exec(a.db, "ALTER TABLE u DROP COLUMN b");             /* tracked too (its capture triggers go) while the commit is owed */
+    sqlite3_finalize(s1);
+    int rc3 = exec(a.db, "INSERT INTO t(v) VALUES(3)");              /* a statement's end with nothing in progress: the commit is due */
+    int autoc = sqlite3_get_autocommit(a.db);
+    sqlite3_int64 seen = scalar(b.db, "SELECT count(*) FROM t");
+    int nr, nt;
+    const char *why = replica_differs(&a, DIR "/pending_r.db", &nr, &nt);
+    close_writer(&b);
+    close_writer(&a);
+    if (rc1 != SQLITE_ROW || !rc2 || !rc3) FAILF("premise: s1 %d (want ROW), drop column %d, insert %d", rc1, rc2, rc3);
+    if (!autoc) FAIL("HPPLite's transaction is still open after a later statement ended (the commit owed was forgotten when the DROP COLUMN was tracked)");
+    if (seen != 2) FAILF("the other connection sees %lld rows, want 2", (long long)seen);
+    if (why) FAIL(why);
+    PASS();
+}
+
 /* A statement HPPLite tracks for a rerun (prepared on a schema another
 ** connection changed) runs in a transaction of HPPLite's. One that changes
 ** the schema itself (a CREATE VIRTUAL TABLE: FTS5's nested DDL expires it)
@@ -746,6 +777,7 @@ int main(void) {
     test_refused_then_expired();
     test_refused_after_foreign_alter();
     test_tracked_schema_change_commits();
+    test_own_txn_commit_pending_then_tracked();
     test_groups();
     return test_report();
 }

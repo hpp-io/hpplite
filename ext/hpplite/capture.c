@@ -975,7 +975,10 @@ static int rerunTrack(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   if (sqlite3_get_autocommit(pCtx->db)) {
     if (hppliteInternalExec(pCtx, pCtx->db, "BEGIN") != SQLITE_OK) return 0;
     pCtx->ownTxn = HPPLITE_OWN_OPEN;
-  } else {
+  } else if (pCtx->ownTxn != HPPLITE_OWN_COMMIT_PENDING) {
+    /* the application's transaction, left alone - or ours, its commit still
+    ** owed behind a statement in progress: this statement runs inside it and
+    ** the commit stays due at the next end */
     pCtx->ownTxn = HPPLITE_OWN_NONE;
   }
   pCtx->pRerunStmt = pS;
