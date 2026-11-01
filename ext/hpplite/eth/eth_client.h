@@ -77,6 +77,15 @@ int eth_client_get_receipt(EthClient *client,
                            const uint8_t tx_hash[32],
                            int *status);
 
+/* eth_getLogs for one block: the first log of `address` in `block` whose
+** topic 0 is topic0 and topic 1 is topic1 (#33: a batch's bytes are in its
+** log). On success its ABI-encoded data is returned (malloc, *data_len set)
+** and, when topic2 is given, its third topic. NULL when there is no such
+** log or the call failed (eth_client_error() says which). */
+uint8_t *eth_client_get_log(EthClient *client, const uint8_t address[20], uint64_t block,
+                            const uint8_t topic0[32], const uint8_t topic1[32],
+                            size_t *data_len, uint8_t topic2[32]);
+
 /* === Utility === */
 
 /* Get last error message */

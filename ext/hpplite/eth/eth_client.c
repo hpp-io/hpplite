@@ -648,6 +648,57 @@ int eth_client_receipt_topic(EthClient *client, const uint8_t tx_hash[32],
     return found ? 1 : -1;
 }
 
+uint8_t *eth_client_get_log(EthClient *client, const uint8_t address[20], uint64_t block,
+                            const uint8_t topic0[32], const uint8_t topic1[32],
+                            size_t *data_len, uint8_t topic2[32]) {
+    cJSON *params = cJSON_CreateArray(), *filter = cJSON_CreateObject(), *topics = cJSON_CreateArray();
+    cJSON *response, *result, *log;
+    char *addr_hex = eth_hex_encode(address, 20), *t0 = eth_hex_encode(topic0, 32), *t1 = eth_hex_encode(topic1, 32);
+    char block_hex[32];
+    uint8_t *out = NULL;
+    if (data_len) *data_len = 0;
+    snprintf(block_hex, sizeof block_hex, "0x%llx", (unsigned long long)block);
+    cJSON_AddStringToObject(filter, "address", addr_hex);
+    cJSON_AddStringToObject(filter, "fromBlock", block_hex);
+    cJSON_AddStringToObject(filter, "toBlock", block_hex);
+    cJSON_AddItemToArray(topics, cJSON_CreateString(t0));
+    cJSON_AddItemToArray(topics, cJSON_CreateString(t1));
+    cJSON_AddItemToObject(filter, "topics", topics);
+    cJSON_AddItemToArray(params, filter);
+    free(addr_hex); free(t0); free(t1);
+    response = rpc_call(client, "eth_getLogs", params);
+    if (!response) return NULL;
+    result = cJSON_GetObjectItem(response, "result");
+    if (!result || !cJSON_IsArray(result)) {
+        snprintf(client->error, sizeof(client->error), "no result in response");
+        cJSON_Delete(response);
+        return NULL;
+    }
+    cJSON_ArrayForEach(log, result) {
+        cJSON *data = cJSON_GetObjectItem(log, "data");
+        cJSON *tp = cJSON_GetObjectItem(log, "topics");
+        cJSON *t2 = tp ? cJSON_GetArrayItem(tp, 2) : NULL;
+        const char *hex;
+        size_t len;
+        if (!data || !cJSON_IsString(data)) continue;
+        hex = data->valuestring;
+        if (hex[0] == '0' && hex[1] == 'x') hex += 2;
+        len = strlen(hex) / 2;
+        out = malloc(len + 1);
+        if (!out) break;
+        if (eth_hex_decode(data->valuestring, out, len) != 0 && len > 0) { free(out); out = NULL; break; }
+        out[len] = 0;
+        if (data_len) *data_len = len;
+        if (topic2) {
+            if (!t2 || !cJSON_IsString(t2) || eth_hex_decode(t2->valuestring, topic2, 32) != 0) memset(topic2, 0, 32);
+        }
+        break;
+    }
+    if (!out) snprintf(client->error, sizeof(client->error), "no such log in block %llu", (unsigned long long)block);
+    cJSON_Delete(response);
+    return out;
+}
+
 int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address[20]) {
     eth_client_global_init();
     if (!g_addr_ctx) return -1;

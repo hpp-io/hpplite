@@ -373,6 +373,15 @@ int hpplite_l1_get_da_state(
     uint8_t latest_batch_hash[32]
 );
 
+/*
+** The store's rolling hash over every batch (#33): DA v2 keeps
+** keccak256(abi.encode(prev, height, keccak256(bytes))) from bytes32(0),
+** and a reader recomputes it (hpplite_chain_hash_next) to compare at the
+** tip. 0 with the hash and the height it covers; -1 when the backend keeps
+** none (the mock, a directory, DA v1).
+*/
+int hpplite_l1_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]);
+
 /* === Mock-specific functions for testing === */
 
 /*

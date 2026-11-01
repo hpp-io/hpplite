@@ -15,7 +15,7 @@
 ** one file killed and restarted in both orders; a misbehaving RPC endpoint
 ** (tests/l1/rpc_proxy.py in front of anvil); a power loss mid-transaction,
 ** the file and its -wal reopened as they lie. HPPLITE_ANVIL_TESTS=12,15
-** runs a selection. 16 is the soak (#120): hours of a demo-like workload
+** runs a selection. 17 is the DA v2 chain hash (#33). 16 is the soak (#120): hours of a demo-like workload
 ** with a rebuild and hpplite-verify every N batches, run only when
 ** HPPLITE_SOAK_SECONDS is set (the nightly soak workflow).
 */
@@ -1353,6 +1353,91 @@ static int wanted(int number) {
     return strstr(all, tag) != NULL;
 }
 
+/* 17. DA v2 (#33): a batch's bytes are in its log and the contract keeps a
+** rolling hash. A batch of about 1 KB costs under 100k gas (storage took
+** ~700k); the writer's and a replica's chain hash equal the contract's; a
+** commitment altered on the chain (anvil_setStorageAt on chainHash, slot 3)
+** makes a fresh rebuild stop in the error state, and the chain restored, a
+** rebuild passes again. KEY2, its own named database. */
+static long receipt_gas(const char *tx) {
+    char cmd[300], out[64] = "";
+    FILE *f;
+    if (!tx || !tx[0]) return -1;
+    snprintf(cmd, sizeof cmd, "cast receipt %s gasUsed --rpc-url %s 2>/dev/null", tx, RPC);
+    if ((f = popen(cmd, "r")) != NULL) { if (!fgets(out, sizeof out, f)) out[0] = 0; pclose(f); }
+    return atol(out);
+}
+static const char *strip0x(const char *z) { return (z[0] == '0' && (z[1] == 'x' || z[1] == 'X')) ? z + 2 : z; }
+static void test_chain_hash(void) {
+    TEST("DA v2 (#33): a 1 KB batch far below storage cost; writer and replica chain hash equal the contract's; a commitment altered on chain is refused");
+    sqlite3 *w = open_db("ch_writer.db", KEY2, "&dbname=chainhash");
+    if (!w) FAIL("open writer");
+    sqlite3_exec(w, "CREATE TABLE c(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("batch 1"); }
+    char big[1001], sql[1200];
+    memset(big, 'x', 1000); big[1000] = 0;
+    snprintf(sql, sizeof sql, "INSERT INTO c(v) VALUES('%s')", big);
+    sqlite3_exec(w, sql, NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("batch 2"); }
+    long gas = receipt_gas(status_text(w, "last_batch_tx"));
+    printf("(1 KB batch: %ld gas) ", gas);
+    /* measured 97k: 21k base, the sealed row's ~1.2 KB as calldata and log data, three slots; storage took ~700k */
+    if (gas <= 0 || gas >= 120000) { sqlite3_close(w); FAIL("a 1 KB batch should cost well under the storage DA's ~700k gas"); }
+    sqlite3_exec(w, "INSERT INTO c(v) VALUES('three')", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("batch 3"); }
+
+    char contract[80], da[80], mine[80], want[80];
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    snprintf(da, sizeof da, "%s", status_text(w, "da_contract"));
+    snprintf(mine, sizeof mine, "%s", status_text(w, "chain_hash"));
+    {
+        HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
+        uint64_t h = 0;
+        uint8_t chain[32];
+        if (!peek || hpplite_l1_get_chain_hash(peek, &h, chain) != 0) { hpplite_l1_disconnect(peek); sqlite3_close(w); FAIL("the contract reports no chain hash"); }
+        hpplite_l1_disconnect(peek);
+        snprintf(want, sizeof want, "0x");
+        for (int i = 0; i < 32; i++) snprintf(want + 2 + 2 * i, 3, "%02x", chain[i]);
+        if (h != 3 || strcasecmp(strip0x(mine), strip0x(want)) != 0) {
+            printf("(contract %s at %llu, writer '%s') ", want, (unsigned long long)h, mine);
+            sqlite3_close(w);
+            FAIL("the writer's chain hash differs from the contract's");
+        }
+    }
+
+    sqlite3 *r = open_db("ch_replica.db", KEY2, "&dbname=chainhash&role=verify");
+    if (!r) { sqlite3_close(w); FAIL("open replica"); }
+    if (strcmp(status_text(r, "state"), "verify") != 0 || scalar(r, "SELECT count(*) FROM c") != 2
+        || strcasecmp(strip0x(status_text(r, "chain_hash")), strip0x(want)) != 0) {
+        printf("(replica state %s, chain_hash '%s', rows %lld) ", status_text(r, "state"), status_text(r, "chain_hash"), (long long)scalar(r, "SELECT count(*) FROM c"));
+        sqlite3_close(r); sqlite3_close(w);
+        FAIL("the replica's chain hash differs from the contract's");
+    }
+    sqlite3_close(r);
+
+    /* the chain's commitment altered: slot 3 of the DA contract is chainHash */
+    char arg[300], out[200];
+    snprintf(arg, sizeof arg, "%s 0x3 0x1111111111111111111111111111111111111111111111111111111111111111", da);
+    cast_rpc("anvil_setStorageAt", arg, out, sizeof out);
+    sqlite3 *r2 = open_db("ch_replica2.db", KEY2, "&dbname=chainhash&role=verify");
+    const char *st = r2 ? status_text(r2, "state") : "(no open)";
+    char err[300];
+    snprintf(err, sizeof err, "%s", r2 ? status_text(r2, "last_error") : "");
+    int refused = r2 && strcmp(st, "error") == 0 && strstr(err, "chain hash") != NULL;
+    printf("(tampered: state %s) ", st);
+    snprintf(arg, sizeof arg, "%s 0x3 %s", da, want);
+    cast_rpc("anvil_setStorageAt", arg, out, sizeof out);   /* the chain restored */
+    if (r2) sqlite3_close(r2);
+    if (!refused) { printf("(last_error '%s') ", err); sqlite3_close(w); FAIL("a commitment altered on the chain was not refused"); }
+
+    sqlite3 *r3 = open_db("ch_replica3.db", KEY2, "&dbname=chainhash&role=verify");
+    if (!r3) { sqlite3_close(w); FAIL("open replica after restore"); }
+    if (strcmp(status_text(r3, "state"), "verify") != 0) { printf("(state %s) ", status_text(r3, "state")); sqlite3_close(r3); sqlite3_close(w); FAIL("the restored chain should rebuild"); }
+    sqlite3_close(r3);
+    sqlite3_close(w);
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -1380,6 +1465,7 @@ int main(void) {
     if (wanted(14)) test_rpc_faults();
     if (wanted(15)) test_power_loss();
     if (soak_env("HPPLITE_SOAK_SECONDS", 0) > 0) test_soak();   /* 16: only when asked (#120) */
+    if (wanted(17)) test_chain_hash();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

@@ -499,20 +499,25 @@ int hpplite_adopt_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch) {
 /* Step past a height whose batch fails authentication (posted under a lease we do
 ** not hold): every key holder skips it the same way, prev_block_hash becoming the
 ** hash of the raw bytes; and persist checkpoint progress (hpplite.h) */
-int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRawHash) {
+int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRawHash, const unsigned char *pRawKeccak) {
   sqlite3_stmt *pStmt;
+  unsigned char chainHash[HPPLITE_HASH_SIZE];
   int rc;
   if (!pCtx || !pRawHash) return SQLITE_MISUSE;
   if (height != pCtx->blockHeight) return SQLITE_MISMATCH;
+  /* the contract committed to those bytes too: the rolling hash steps over them (#33) */
+  if (pRawKeccak) hpplite_chain_hash_next(pCtx->chainHash, height, pRawKeccak, chainHash);
+  else memcpy(chainHash, pCtx->chainHash, HPPLITE_HASH_SIZE);
   rc = hppliteBkBegin(pCtx, 1);
   if (rc != SQLITE_OK) return rc;
   {
     int saved = hppliteBkEnter(pCtx);
     rc = sqlite3_prepare_v2(pCtx->bkDb,
-      "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2 WHERE id=1", -1, &pStmt, NULL);
+      "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, chain_hash=?3 WHERE id=1", -1, &pStmt, NULL);
     if (rc == SQLITE_OK) {
       sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(height + 1));
       sqlite3_bind_blob(pStmt, 2, pRawHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+      sqlite3_bind_blob(pStmt, 3, chainHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
       rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
       sqlite3_finalize(pStmt);
     }
@@ -522,6 +527,7 @@ int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *
   if (rc == SQLITE_OK) {
     pCtx->blockHeight = height + 1;
     memcpy(pCtx->prevBlockHash, pRawHash, HPPLITE_HASH_SIZE);
+    memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
     pCtx->nForeignBatches++;
   }
   return rc;

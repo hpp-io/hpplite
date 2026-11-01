@@ -66,6 +66,9 @@ struct HppliteL1Ops {
     int (*get_da_state)(HppliteL1 *l1, uint64_t *last_batch_height, uint64_t *total_batches, uint8_t latest_batch_hash[32]);
     int (*submit_was_oversized)(HppliteL1 *l1);
     void (*set_max_tx_gas)(HppliteL1 *l1, uint64_t gas);
+    /* The store's rolling hash over every batch and the height it covers (#33);
+    ** -1 when the backend keeps none (the mock, a directory, DA v1) */
+    int (*get_chain_hash)(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]);
 };
 
 extern const HppliteL1Ops hppliteL1EthOps;    /* l1_eth.c */

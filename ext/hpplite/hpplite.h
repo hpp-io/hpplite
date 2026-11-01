@@ -156,6 +156,7 @@ struct HppliteCtx {
   /* Mirror of _hpplite_meta (the row in the database is authoritative) */
   uint64_t blockHeight;       /* Next batch height to produce */
   unsigned char prevBlockHash[HPPLITE_HASH_SIZE];
+  unsigned char chainHash[HPPLITE_HASH_SIZE];  /* the rollup's rolling hash over batches 1..blockHeight-1, as the DA contract keeps it (#33); zero = not known */
   unsigned char stateRoot[HPPLITE_HASH_SIZE];  /* Root after last confirmed batch */
   uint64_t lastCheckpointHeight;
   unsigned char lastCheckpointRoot[HPPLITE_HASH_SIZE];
@@ -396,7 +397,17 @@ int hpplite_set_checkpoint(HppliteCtx *pCtx, uint64_t height, const unsigned cha
 ** holder skips it the same way. prev_block_hash becomes the hash of the
 ** raw bytes, which keeps the chain of hashes deterministic for all of them.
 */
-int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRawHash);
+int hpplite_skip_height(HppliteCtx *pCtx, uint64_t height, const unsigned char *pRawHash, const unsigned char *pRawKeccak);
+
+/*
+** The DA contract's rolling hash (#33): chainHash = keccak256(abi.encode(prev,
+** height, keccak256(bytes))) over every batch from bytes32(0). A node keeps
+** it in _hpplite_meta.chain_hash as it finalizes, replays or skips batches,
+** and a rebuild compares it with the contract's at the tip: a batch the
+** contract never committed to, or one it did that the reader did not get,
+** shows there.
+*/
+void hpplite_chain_hash_next(const unsigned char *pPrev, uint64_t height, const unsigned char *pBatchKeccak, unsigned char *pOut);
 
 /*
 ** sqlite3_trace_v2 / commit_hook / rollback_hook are one slot per connection:

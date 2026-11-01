@@ -38,7 +38,8 @@ static const char *HPPLITE_SCHEMA =
   "  open_txn INTEGER NOT NULL DEFAULT 0,"  /* writer: group left open by the last posted batch (#57) */
   "  frag_id INTEGER NOT NULL DEFAULT 0,"   /* writer: log row whose text is posted in part (#59) */
   "  frag_off INTEGER NOT NULL DEFAULT 0,"  /* ...bytes of it posted */
-  "  rollup TEXT NOT NULL DEFAULT ''"       /* "<chain id>:<contract>" its history is on */
+  "  rollup TEXT NOT NULL DEFAULT '',"      /* "<chain id>:<contract>" its history is on */
+  "  chain_hash BLOB"                       /* the rollup's rolling hash over every batch so far (#33); NULL/zero: not known */
   ");"
   "INSERT OR IGNORE INTO _hpplite_meta(id, next_height, prev_block_hash, state_root)"
   "  VALUES(1, 1, zeroblob(32), zeroblob(32));"
@@ -131,12 +132,13 @@ int hppliteLoadMeta(HppliteCtx *pCtx) {
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT next_height, prev_block_hash, state_root,"
     "       last_checkpoint_height, last_checkpoint_root, open_txn,"
-    "       (SELECT count(*) FROM _hpplite_carry), frag_id, frag_off, rollup"
+    "       (SELECT count(*) FROM _hpplite_carry), frag_id, frag_off, rollup, chain_hash"
     "  FROM _hpplite_meta WHERE id=1", -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     if (sqlite3_step(pStmt) == SQLITE_ROW) {
       pCtx->blockHeight = (uint64_t)sqlite3_column_int64(pStmt, 0);
       columnHash(pStmt, 1, pCtx->prevBlockHash);
+      columnHash(pStmt, 10, pCtx->chainHash);
       columnHash(pStmt, 2, pCtx->stateRoot);
       pCtx->lastCheckpointHeight = (uint64_t)sqlite3_column_int64(pStmt, 3);
       columnHash(pStmt, 4, pCtx->lastCheckpointRoot);
@@ -187,7 +189,7 @@ int hpplite_internal_open_active(void) { return tlInternalOpen > 0; }
 static int bookkeepingIsCurrent(sqlite3 *db) {
   static const char zSql[] =
     "SELECT (SELECT count(*) FROM pragma_table_info('_hpplite_meta')"
-    "          WHERE name IN ('open_txn','frag_id','frag_off','rollup')) = 4"
+    "          WHERE name IN ('open_txn','frag_id','frag_off','rollup','chain_hash')) = 5"
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_pending') WHERE name IN ('mode','now')) = 2"
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_carry') WHERE name IN ('now','frag')) = 2"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_posted'))"
@@ -301,6 +303,15 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
     /* #59: statements posted in pieces */
     if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_id");
     if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_off");
+    if (rc == SQLITE_OK) {
+      /* #33: the rollup's rolling hash; a file from before has none (NULL), which no check reads */
+      sqlite3_stmt *q = NULL;
+      int has = 0;
+      if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_meta') WHERE name = 'chain_hash'", -1, &q, NULL) == SQLITE_OK)
+        has = (sqlite3_step(q) == SQLITE_ROW);
+      sqlite3_finalize(q);
+      if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_meta ADD COLUMN chain_hash BLOB");
+    }
     if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "frag");
     if (rc == SQLITE_OK) {
       /* the rollup the history is on */

@@ -999,6 +999,11 @@ static int mock_get_da_state(
     return 0;
 }
 
+static int mock_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]) {
+    (void)l1; (void)pHeight; (void)out;
+    return -1;                                    /* the mock keeps no rolling hash (#33) */
+}
+
 const HppliteL1Ops hppliteL1MockOps = {
     .name = "mock",
     .connect = mock_connect,
@@ -1033,4 +1038,5 @@ const HppliteL1Ops hppliteL1MockOps = {
     .get_da_state = mock_get_da_state,
     .submit_was_oversized = mock_submit_was_oversized,
     .set_max_tx_gas = mock_set_max_tx_gas,
+    .get_chain_hash = mock_get_chain_hash,
 };

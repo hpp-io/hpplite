@@ -56,9 +56,11 @@ static uint8_t SEL_GET_SYSTEM_CONFIG[4];
 
 /* Function selectors - HPPLiteDA contract (data availability) */
 static uint8_t SEL_SUBMIT_BATCH[4];
-static uint8_t SEL_GET_BATCH[4];
-static uint8_t SEL_GET_BATCH_HASH[4];
+static uint8_t SEL_GET_BATCH[4];        /* DA v1 (coordinator VERSION < 8): the bytes in storage */
+static uint8_t SEL_GET_BATCH_HASH[4];   /* DA v1 */
 static uint8_t SEL_GET_DA_STATE[4];
+static uint8_t SEL_BLOCK_OF[4];         /* DA v2 (#33): the block whose log carries a height */
+static uint8_t TOPIC_BATCH_SUBMITTED[32];   /* DA v2: BatchSubmitted(uint256 indexed height, bytes32 indexed hash, bytes data) */
 
 /* Function selectors - HPPLiteFactory contract */
 static uint8_t SEL_GET_ROLLUP[4];
@@ -98,6 +100,11 @@ static void init_selectors(void) {
     abi_function_selector("getBatch(uint256)", SEL_GET_BATCH);
     abi_function_selector("getBatchHash(uint256)", SEL_GET_BATCH_HASH);
     abi_function_selector("getDAState()", SEL_GET_DA_STATE);
+    abi_function_selector("blockOf(uint256)", SEL_BLOCK_OF);
+    {
+        static const char zSig[] = "BatchSubmitted(uint256,bytes32,bytes)";
+        keccak256((const uint8_t *)zSig, sizeof(zSig) - 1, TOPIC_BATCH_SUBMITTED);
+    }
 
     /* HPPLiteFactory selectors */
     abi_function_selector("getRollup(address)", SEL_GET_ROLLUP);
@@ -907,6 +914,44 @@ static char *eth_submit_batch(
     return hash_hex;
 }
 
+/*
+** DA v2 (#33): the batch's bytes are in the log of the block blockOf(height)
+** names, as the ABI-encoded `bytes data` of BatchSubmitted; its hash is the
+** log's third topic. A height recorded by commitBatch (bytes elsewhere, #11)
+** has no such log: NULL, as a missing batch.
+*/
+static uint8_t *eth_get_batch_from_log(HppliteL1 *l1, uint64_t height, size_t *data_len_out, uint8_t hash_out[32]) {
+    uint8_t calldata[4 + 32], topic1[32];
+    size_t result_len = 0, raw_len = 0;
+    uint64_t block;
+    uint8_t *result, *raw, *data;
+    uint64_t offset, len;
+
+    memcpy(calldata, SEL_BLOCK_OF, 4);
+    abi_encode_uint64(height, calldata + 4);
+    result = eth_client_call(self->eth, self->da_contract, calldata, sizeof(calldata), &result_len);
+    if (!result || result_len < 32) { free(result); return NULL; }   /* "No such batch" reverts */
+    block = abi_decode_uint64(result);
+    free(result);
+
+    abi_encode_uint64(height, topic1);
+    raw = eth_client_get_log(self->eth, self->da_contract, block, TOPIC_BATCH_SUBMITTED, topic1, &raw_len, hash_out);
+    if (!raw) return NULL;
+    /* ABI: offset (32) + length (32) + bytes */
+    if (raw_len < 64) { free(raw); return NULL; }
+    offset = abi_decode_uint64(raw);
+    if (offset + 32 > raw_len || offset + 32 < offset) { free(raw); return NULL; }
+    len = abi_decode_uint64(raw + offset);
+    if (len > raw_len - offset - 32) { free(raw); return NULL; }
+    data = malloc((size_t)len + 1);
+    if (!data) { free(raw); return NULL; }
+    memcpy(data, raw + offset + 32, (size_t)len);
+    data[len] = 0;
+    free(raw);
+    if (data_len_out) *data_len_out = (size_t)len;
+    return data;
+}
+
 static uint8_t *eth_get_batch(
     HppliteL1 *l1,
     uint64_t height,
@@ -916,6 +961,11 @@ static uint8_t *eth_get_batch(
     if (!ensure_da_contract(l1)) {
         *data_len_out = 0;
         return NULL;
+    }
+    if (self->version >= 8) {
+        uint8_t *data = eth_get_batch_from_log(l1, height, data_len_out, NULL);
+        if (!data) *data_len_out = 0;
+        return data;
     }
 
     /* Build calldata: getBatch(uint256 height) */
@@ -972,6 +1022,13 @@ static int eth_get_batch_hash(
 ) {
     if (!l1) return -1;
     if (!ensure_da_contract(l1)) return -1;
+    if (self->version >= 8) {
+        size_t n = 0;
+        uint8_t *data = eth_get_batch_from_log(l1, height, &n, hash_out);
+        if (!data) { memset(hash_out, 0, 32); return 0; }
+        free(data);
+        return 1;
+    }
 
     /* Build calldata: getBatchHash(uint256 height) */
     uint8_t calldata[4 + 32];
@@ -1037,6 +1094,15 @@ static int eth_submit_was_oversized(HppliteL1 *l1) {
     return l1 ? self->lastOversized : 0;
 }
 
+/* DA v2: getDAState()'s third word is the rolling hash (#33); v1 kept the latest batch's hash there */
+static int eth_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]) {
+    uint64_t last = 0, total = 0;
+    if (!l1 || !ensure_da_contract(l1) || self->version < 8) return -1;
+    if (eth_get_da_state(l1, &last, &total, out) != 0) return -1;
+    if (pHeight) *pHeight = last;
+    return 0;
+}
+
 static void eth_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
     if (l1) self->maxTxGas = gas;
 }
@@ -1075,4 +1141,5 @@ const HppliteL1Ops hppliteL1EthOps = {
     .get_da_state = eth_get_da_state,
     .submit_was_oversized = eth_submit_was_oversized,
     .set_max_tx_gas = eth_set_max_tx_gas,
+    .get_chain_hash = eth_get_chain_hash,
 };

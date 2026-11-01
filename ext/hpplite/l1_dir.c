@@ -546,6 +546,10 @@ static int dir_get_da_state(HppliteL1 *l1, uint64_t *last_batch_height, uint64_t
 
 static int dir_submit_was_oversized(HppliteL1 *l1) { (void)l1; return 0; }
 static void dir_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) { (void)l1; (void)gas; }
+static int dir_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]) {
+    (void)l1; (void)pHeight; (void)out;
+    return -1;                                    /* a directory keeps no rolling hash yet (#33) */
+}
 
 const HppliteL1Ops hppliteL1DirOps = {
     .name = "dir",
@@ -581,4 +585,5 @@ const HppliteL1Ops hppliteL1DirOps = {
     .get_da_state = dir_get_da_state,
     .submit_was_oversized = dir_submit_was_oversized,
     .set_max_tx_gas = dir_set_max_tx_gas,
+    .get_chain_hash = dir_get_chain_hash,
 };

@@ -885,8 +885,12 @@ static int node_skip_foreign_height(HppliteNode *node, uint64_t height) {
     raw = hpplite_l1_get_batch(node->l1, height, &len);
     if (!raw) return -1;
     hpplite_sha256(raw, len, h);
-    free(raw);
-    rc = hpplite_skip_height(node->ctx, height, h);
+    {
+        unsigned char k[32];
+        hpplite_keccak256(raw, len, k);          /* what the contract hashed into its chain (#33) */
+        free(raw);
+        rc = hpplite_skip_height(node->ctx, height, h, k);
+    }
     if (rc == SQLITE_OK) {
         fprintf(stderr, "hpplite: batch %llu was posted by another sequencer; skipped (%llu so far)\n",
                 (unsigned long long)height, (unsigned long long)node->ctx->nForeignBatches);
@@ -1412,6 +1416,23 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
         hpplite_batch_free(batch);
         synced++;
+    }
+    /* Caught up: what we rebuilt must be what the contract committed to.
+    ** The DA contract keeps a rolling hash over every batch (#33); ours
+    ** advanced with every batch finalized, replayed or skipped. A file from
+    ** before the hash was kept has none (zero) and is not compared. */
+    if (lastBatch > 0 && node->ctx->blockHeight == lastBatch + 1) {
+        static const unsigned char zero[32];
+        unsigned char chain[32];
+        uint64_t covered = 0;
+        if (memcmp(node->ctx->chainHash, zero, 32) != 0
+            && hpplite_l1_get_chain_hash(node->l1, &covered, chain) == 0 && covered == lastBatch
+            && memcmp(chain, node->ctx->chainHash, 32) != 0) {
+            hpplite_error(node->ctx, "chain hash mismatch after batch %llu: the batches read are not the ones the contract committed to",
+                          (unsigned long long)lastBatch);
+            node->state = HPPLITE_STATE_ERROR;
+            return -1;
+        }
     }
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
     return synced;

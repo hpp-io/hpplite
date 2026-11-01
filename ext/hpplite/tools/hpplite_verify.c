@@ -248,6 +248,27 @@ int main(int argc, char **argv) {
         }
         hpplite_l1_state_free(st);
     }
+    /* the contract's rolling hash over every batch (#33) against the one the rebuild computed */
+    {
+        uint64_t h = 0;
+        uint8_t chain[32];
+        if (hpplite_l1_get_chain_hash(node->l1, &h, chain) == 0) {
+            const char *mine = status_text(db, "chain_hash");
+            char want[65];
+            hex(chain, want);
+            if (mine[0] == '0' && (mine[1] == 'x' || mine[1] == 'X')) mine += 2;
+            if (rebuilt < h) {
+                printf("chain hash: the contract's covers %llu batches, the rebuild %llu: not compared\n", (unsigned long long)h, (unsigned long long)rebuilt);
+            } else if (strcasecmp(mine, want) == 0) {
+                printf("chain hash over %llu batches: matches the contract's\n", (unsigned long long)h);
+            } else {
+                printf("chain hash over %llu batches: contract %s, rebuilt %s <- MISMATCH\n", (unsigned long long)h, want, mine[0] ? mine : "(none)");
+                rc = 1;
+            }
+        } else {
+            printf("no rolling hash on this contract (DA v1): posted roots and the checkpoint only\n");
+        }
+    }
     {
         unsigned char root[32]; char z[65];
         if (hpplite_db_hash(db, root) == SQLITE_OK) { hex(root, z); printf("rebuilt state root: 0x%s\n", z); }

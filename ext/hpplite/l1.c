@@ -180,3 +180,7 @@ int hpplite_l1_submit_was_oversized(HppliteL1 *l1) {
 void hpplite_l1_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
     if (l1) l1->ops->set_max_tx_gas(l1, gas);
 }
+
+int hpplite_l1_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]) {
+    return l1 ? l1->ops->get_chain_hash(l1, pHeight, out) : -1;
+}

@@ -70,6 +70,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_FOREIGN_WRITES   22
 #define STATUS_COL_STATE            23
 #define STATUS_COL_LAST_ERROR       24
+#define STATUS_COL_CHAIN_HASH       25
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -83,7 +84,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
         " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
         " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
-        " state TEXT, last_error TEXT)");
+        " state TEXT, last_error TEXT, chain_hash TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -192,6 +193,12 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_PREV_BLOCK_HASH:
             statusResultHex(ctx, node->ctx->prevBlockHash);
             break;
+        case STATUS_COL_CHAIN_HASH: {            /* the DA contract's rolling hash as this node tracks it (#33); NULL until known */
+            static const unsigned char zero[32];
+            if (memcmp(node->ctx->chainHash, zero, 32) == 0) sqlite3_result_null(ctx);
+            else statusResultHex(ctx, node->ctx->chainHash);
+            break;
+        }
         case STATUS_COL_LAST_CHECKPOINT:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->lastCheckpointHeight);
             break;

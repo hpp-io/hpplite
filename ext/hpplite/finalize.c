@@ -9,6 +9,7 @@
 */
 
 #include "hpplite_int.h"
+#include "crypto.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -393,15 +394,27 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     pCtx->nCarry = 0;
   }
 
+  /* the contract's rolling hash advances by the posted bytes (#33); a batch
+  ** with none (l1=local) leaves it where it was */
+  unsigned char chainHash[HPPLITE_HASH_SIZE];
+  if (pBatch->pPosted && pBatch->nPosted > 0) {
+    unsigned char k[HPPLITE_HASH_SIZE];
+    hpplite_keccak256(pBatch->pPosted, pBatch->nPosted, k);
+    hpplite_chain_hash_next(pCtx->chainHash, pBatch->height, k, chainHash);
+  } else {
+    memcpy(chainHash, pCtx->chainHash, HPPLITE_HASH_SIZE);
+  }
+
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     pBatch->hasRoot
-      ? "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6,"
+      ? "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6, chain_hash=?7,"
         " state_root=?3 WHERE id=1"
-      : "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6 WHERE id=1",
+      : "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6, chain_hash=?7 WHERE id=1",
     -1, &pStmt, NULL);
   if (rc != SQLITE_OK) return rc;
   sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(pBatch->height + 1));
   sqlite3_bind_blob(pStmt, 2, blockHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+  sqlite3_bind_blob(pStmt, 7, chainHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
   if (pBatch->hasRoot) {
     sqlite3_bind_blob(pStmt, 3, pBatch->postStateRoot, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
   }
@@ -419,6 +432,7 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
   pCtx->fragId = bWriter ? pBatch->fragRow : 0;
   pCtx->fragOff = bWriter ? pBatch->fragOff : 0;
   memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
+  memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
   if (pBatch->hasRoot) {
     memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
   }
@@ -466,6 +480,17 @@ uint8_t *hpplite_posted_batch(HppliteCtx *pCtx, uint64_t height, size_t *pLen) {
   }
   hppliteBkLeave(pCtx, saved);
   return out;
+}
+
+void hpplite_chain_hash_next(const unsigned char *pPrev, uint64_t height, const unsigned char *pBatchKeccak, unsigned char *pOut) {
+  /* abi.encode(bytes32 prev, uint256 height, bytes32 batchHash): three 32-byte words */
+  unsigned char buf[96];
+  int i;
+  memcpy(buf, pPrev, 32);
+  memset(buf + 32, 0, 32);
+  for (i = 0; i < 8; i++) buf[63 - i] = (unsigned char)(height >> (8 * i));
+  memcpy(buf + 64, pBatchKeccak, 32);
+  hpplite_keccak256(buf, sizeof(buf), pOut);
 }
 
 int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId) {
