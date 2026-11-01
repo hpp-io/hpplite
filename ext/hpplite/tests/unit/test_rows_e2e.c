@@ -13,7 +13,7 @@
 ** the pipeline.
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "batch.h"
 #include "cipher.h"
 #include "capture_rows.h"
@@ -24,12 +24,6 @@
 #include <pthread.h>
 #include <sys/time.h>
 
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
-
 static const unsigned char PRIVKEY[32] = {
     0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f,0x70,
     0x71,0x72,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x7b,0x7c,0x7d,0x7e,0x7f,0x80
@@ -37,124 +31,21 @@ static const unsigned char PRIVKEY[32] = {
 
 #define DIR "/tmp/hpplite_test_rows_e2e"
 
-static void reset_dir(void) {
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
-}
-
-static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
-    sqlite3_stmt *s;
-    sqlite3_int64 v = -1;
-    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
-    return v;
-}
-
 static HppliteNode *open_node_ex(const char *dbPath, HppliteL1 *l1, size_t maxBatch, int noEncrypt) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "rows";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.checkpointInterval = 1000;
-    config.maxBatchBytes = maxBatch;
-    config.noEncrypt = noEncrypt;
-    node = hpplite_node_create(&config);
-    if (node && l1) {
-        /* the DA limit is the contract's; the mock stands in for it */
-        if (maxBatch) hpplite_l1_mock_set_batch_size_limit(l1, maxBatch);
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_sync_from_l1(node, 1);
-        hpplite_node_start(node);
-    }
-    return node;
+    TestNodeOpts o = { .maxBatchBytes = maxBatch, .noEncrypt = noEncrypt };
+    return test_open_node(dbPath, l1, &o);
 }
 static int g_plain;                     /* replicas of an encrypt=off history read plaintext */
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_ex(dbPath, l1, 0, g_plain); }
 
-static int run(HppliteNode *n, const char **aSql) {
-    for (int i = 0; aSql[i]; i++) {
-        char *err = NULL;
-        if (sqlite3_exec(n->db, aSql[i], NULL, NULL, &err) != SQLITE_OK) {
-            printf("[%s: %s] ", aSql[i], err ? err : "?");
-            sqlite3_free(err);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/* Every row of every table (sqlite_sequence included), quoted, in order */
-static char *dump(sqlite3 *db) {
-    sqlite3_str *out = sqlite3_str_new(NULL);
-    sqlite3_stmt *t;
-    if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\' "
-                               "AND name NOT LIKE '%\\_data' ESCAPE '\\' AND name NOT LIKE '%\\_idx' ESCAPE '\\' "
-                               "AND name NOT LIKE '%\\_docsize' ESCAPE '\\' AND name NOT LIKE '%\\_config' ESCAPE '\\' "
-                               "AND name NOT LIKE '%\\_content' ESCAPE '\\' AND sql NOT LIKE 'CREATE VIRTUAL%' ORDER BY name",
-                           -1, &t, NULL) == SQLITE_OK) {
-        while (sqlite3_step(t) == SQLITE_ROW) {
-            const char *zTab = (const char *)sqlite3_column_text(t, 0);
-            char *q = sqlite3_mprintf("SELECT * FROM \"%w\" ORDER BY 1, 2", zTab);
-            sqlite3_stmt *r;
-            sqlite3_str_appendf(out, "[%s]", zTab);
-            if (sqlite3_prepare_v2(db, q, -1, &r, NULL) == SQLITE_OK) {
-                while (sqlite3_step(r) == SQLITE_ROW) {
-                    for (int i = 0; i < sqlite3_column_count(r); i++) {
-                        sqlite3_value *v = sqlite3_column_value(r, i);
-                        switch (sqlite3_value_type(v)) {
-                        case SQLITE_INTEGER: sqlite3_str_appendf(out, "%lld,", sqlite3_value_int64(v)); break;
-                        case SQLITE_FLOAT: sqlite3_str_appendf(out, "%!.17g,", sqlite3_value_double(v)); break;
-                        case SQLITE_TEXT: sqlite3_str_appendf(out, "'%q',", sqlite3_value_text(v)); break;
-                        case SQLITE_BLOB: sqlite3_str_appendf(out, "x%d:%d,", sqlite3_value_bytes(v),
-                                                              sqlite3_value_bytes(v) ? ((const unsigned char *)sqlite3_value_blob(v))[0] : 0); break;
-                        default: sqlite3_str_appendall(out, "NULL,");
-                        }
-                    }
-                    sqlite3_str_appendall(out, ";");
-                }
-                sqlite3_finalize(r);
-            }
-            sqlite3_free(q);
-        }
-        sqlite3_finalize(t);
-    }
-    return sqlite3_str_finish(out);
-}
+/* Every row of every table (sqlite_sequence included), the FTS5 shadow tables left out */
+#define DUMP_FLAGS TEST_DUMP_SKIP_FTS_SHADOW
 
 /* Flush everything, rebuild a replica from L1, compare all rows and the
 ** root. Destroys the writer. */
 static const char *replica_matches(HppliteNode *w, HppliteL1 *l1, const char *replicaFile) {
-    static char why[400];
-    unsigned char rootW[32], rootR[32];
-    char *a, *b;
-    for (int i = 0; i < 50 && hpplite_node_pending_count(w) > 0; i++) hpplite_node_flush_batch(w);
-    if (hpplite_node_pending_count(w) != 0) return "writer still has pending rows after flushing";
-    a = dump(w->db);
-    hpplite_state_root(w->db, rootW);
-    hpplite_node_destroy(w);
-
-    char path[256];
-    snprintf(path, sizeof(path), DIR "/%s", replicaFile);
-    HppliteNode *r = open_node(path, l1);
-    if (!r) { sqlite3_free(a); return "replica open"; }
-    if (r->state == HPPLITE_STATE_ERROR) { sqlite3_free(a); hpplite_node_destroy(r); return "replica sync failed"; }
-    b = dump(r->db);
-    hpplite_state_root(r->db, rootR);
-    hpplite_node_destroy(r);
-    int rows = strcmp(a, b) != 0, root = memcmp(rootW, rootR, 32) != 0;
-    if (rows) {
-        size_t i = 0; while (a[i] && a[i] == b[i]) i++;
-        while (i > 0 && a[i - 1] != ';' && a[i - 1] != ']') i--;
-        snprintf(why, sizeof(why), "replica rows differ: writer [%.70s] replica [%.70s]", a + i, b + i);
-    } else if (root) {
-        snprintf(why, sizeof(why), "replica rows equal but its state root differs");
-    }
-    sqlite3_free(a); sqlite3_free(b);
-    return rows || root ? why : NULL;
+    TestNodeOpts o = { .noEncrypt = g_plain };
+    return test_replica_check(w, l1, tpath(replicaFile), &o, DUMP_FLAGS, 50, 1);
 }
 
 static void app_fn(sqlite3_context *c, int n, sqlite3_value **v) {
@@ -412,19 +303,8 @@ static void test_reopen(void) {
     hpplite_node_destroy(w);
     hpplite_l1_mock_set_fail_submit(l1, 0);
     /* reopened without row capture: the records already logged still post */
-    HppliteNodeConfig config;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "rows";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = DIR "/re.db";
-    config.checkpointInterval = 1000;
-    w = hpplite_node_create(&config);
+    w = open_node(DIR "/re.db", l1);
     if (!w) FAIL("reopen");
-    hpplite_node_set_l1(w, l1);
-    hpplite_node_sync_from_l1(w, 1);
-    hpplite_node_start(w);
     hpplite_node_exec(w, "INSERT INTO t(v) VALUES('text')", NULL);
     const char *why = replica_matches(w, l1, "re_r.db");
     hpplite_l1_disconnect(l1);
@@ -515,20 +395,9 @@ static void test_text_history_then_rows(void) {
     TEST("a database with statement history (posted and pending) continues with records: replica equal");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    HppliteNodeConfig config;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "rows";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = DIR "/hist.db";
-    config.checkpointInterval = 1000;
-    config.captureText = 1;
-    HppliteNode *w = hpplite_node_create(&config);
+    TestNodeOpts text = { .captureText = 1 };
+    HppliteNode *w = test_open_node(DIR "/hist.db", l1, &text);
     if (!w) FAIL("open text");
-    hpplite_node_set_l1(w, l1);
-    hpplite_node_sync_from_l1(w, 1);
-    hpplite_node_start(w);
     hpplite_node_exec(w, "CREATE TABLE e(id INTEGER PRIMARY KEY, body, at)", NULL);
     hpplite_node_exec(w, "INSERT INTO e(body, at) VALUES('one', '2026-01-01'), ('two', '2026-01-02')", NULL);
     hpplite_node_flush_batch(w);
@@ -720,20 +589,9 @@ static void test_connection_pragmas(void) {
 
     /* text capture: LIKE's case sensitivity decides which rows a write touches */
     l1 = hpplite_l1_create_mock();
-    HppliteNodeConfig config;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "rows";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = DIR "/like.db";
-    config.checkpointInterval = 1000;
-    config.captureText = 1;
-    w = hpplite_node_create(&config);
+    TestNodeOpts text = { .captureText = 1 };
+    w = test_open_node(DIR "/like.db", l1, &text);
     if (!w) FAIL("open text");
-    hpplite_node_set_l1(w, l1);
-    hpplite_node_sync_from_l1(w, 1);
-    hpplite_node_start(w);
     const char *sql2[] = {
         "CREATE TABLE s(x)",
         "INSERT INTO s VALUES('Abc'), ('abc')",
@@ -787,26 +645,6 @@ static void test_foreign_writes_detected(void) {
 
 /* Why height stopped advancing, from SQL (#32): hpplite_status.state and
 ** last_error, the latter cleared by the next success */
-static char *status_text(sqlite3 *db, const char *col) {
-    static char buf[2][512];
-    static int which;
-    char *out = buf[which ^= 1];
-    char sql[128];
-    sqlite3_stmt *st;
-    snprintf(sql, sizeof sql, "SELECT %s FROM hpplite_status", col);
-    out[0] = 0;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return out;
-    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL)
-        snprintf(out, 512, "%s", (const char *)sqlite3_column_text(st, 0));
-    sqlite3_finalize(st);
-    return out;
-}
-#define WANT_STATUS(db, col, want, when) do { \
-    const char *got_ = status_text(db, col); \
-    if (strcmp(got_, want) != 0) { if (l1) hpplite_l1_disconnect(l1); FAILF("%s: %s is '%s', want '%s'", when, col, got_, want); } } while (0)
-#define WANT_STATUS_PREFIX(db, col, want, when) do { \
-    const char *got_ = status_text(db, col); \
-    if (strncmp(got_, want, strlen(want)) != 0) { if (l1) hpplite_l1_disconnect(l1); FAILF("%s: %s is '%s', want '%s...'", when, col, got_, want); } } while (0)
 static void test_state_and_last_error(void) {
     TEST("hpplite_status.state and last_error: a failed post is named and cleared by the next success; a lease held elsewhere; an undecodable batch puts the replica in error");
     reset_dir();
@@ -863,18 +701,8 @@ static void test_state_and_last_error(void) {
 /* No chain configured (#38): the log is the product, so it is kept pending
 ** until one is; l1=local is the explicit throw-away mode */
 static HppliteNode *open_chainless(const char *dbPath, int localOnly) {
-    HppliteNodeConfig config;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "rows";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.checkpointInterval = 1000;
-    config.localOnly = localOnly;
-    HppliteNode *n = hpplite_node_create(&config);
-    if (n) hpplite_node_start(n);
-    return n;
+    TestNodeOpts o = { .localOnly = localOnly ? 1 : -1, .start = 1 };
+    return test_open_node(dbPath, NULL, &o);
 }
 static void test_no_chain_keeps_the_log(void) {
     TEST("hpplite=on with no chain keeps the log pending (state 'unposted'); l1=local finalizes batches locally");
@@ -1075,6 +903,7 @@ static void test_lock_contention(void) {
 
 int main(void) {
     printf("=== HPPLite row capture end to end (#19) ===\n");
+    test_suite_init("rows", PRIVKEY, DIR);
     srand(1);
     test_nondeterministic_values();
     test_sequence();
@@ -1098,6 +927,5 @@ int main(void) {
     test_no_chain_keeps_the_log();
     test_verify_role();
     test_lock_contention();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

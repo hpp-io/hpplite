@@ -164,6 +164,13 @@ if(HPPLITE_BUILD_TESTS)
     # Include tests directory for test_env.h
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
+    # The test library (#106): the TEST macros, the scratch directory, the node
+    # open helper, the row dump and the replica check every suite used to carry
+    # a copy of - tests/unit/test_lib.h
+    add_library(hpplite_testlib STATIC tests/unit/test_lib.c)
+    target_link_libraries(hpplite_testlib hpplite)
+    target_include_directories(hpplite_testlib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
+
     # === Unit Tests (no network required) ===
     add_executable(test_hpplite tests/unit/test_hpplite.c)
     target_link_libraries(test_hpplite hpplite)
@@ -215,7 +222,7 @@ if(HPPLITE_BUILD_TESTS)
         add_executable(test_rows tests/unit/test_rows.c)
         target_link_libraries(test_rows hpplite)
         add_executable(test_rows_e2e tests/unit/test_rows_e2e.c)
-        target_link_libraries(test_rows_e2e hpplite)
+        target_link_libraries(test_rows_e2e hpplite_testlib)
 
         # Microbenchmark (not a test): `make bench` or ./bench_hpplite [--rows N] [--mb 1,10,50]
         add_executable(bench_hpplite tests/bench/bench_hpplite.c)
