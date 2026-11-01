@@ -59,6 +59,7 @@ typedef struct HppliteNodeConfig {
     uint64_t chainId;               /* L1 chain id for signing (0 = library default, HPP Sepolia) */
     size_t maxBatchBytes;           /* DA size limit (0 = from L1 / default 128 KB) */
     int noEncrypt;                  /* Post plaintext batches (default: sealed when a key exists) */
+    int noCompress;                 /* compress=off: post the batch JSON as is (#12); default: deflate when it shrinks */
     int determinismWarn;            /* Warn about non-deterministic SQL instead of refusing it */
     int captureText;                /* Capture statements, as v0.1 (default 0: rows, #19) */
     int captureSource;              /* ...2 when a URI said so: HPPLITE_CAPTURE does not override it (#80) */

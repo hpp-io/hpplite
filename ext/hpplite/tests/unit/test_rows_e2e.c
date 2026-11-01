@@ -36,6 +36,8 @@ static HppliteNode *open_node_ex(const char *dbPath, HppliteL1 *l1, size_t maxBa
     return test_open_node(dbPath, l1, &o);
 }
 static int g_plain;                     /* replicas of an encrypt=off history read plaintext */
+/* a failure inside the plaintext case must not leave the rest of the suite in plaintext mode */
+#define FAIL_PLAIN(msg) do { g_plain = 0; FAIL(msg); } while (0)
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_ex(dbPath, l1, 0, g_plain); }
 
 /* Every row of every table (sqlite_sequence included), the FTS5 shadow tables left out */
@@ -221,19 +223,19 @@ static void test_plaintext_entries(void) {
     HppliteL1 *l1 = hpplite_l1_create_mock();
     g_plain = 1;
     HppliteNode *w = open_node_ex(DIR "/plain.db", l1, 0, 1);
-    if (!w) FAIL("open");
+    if (!w) FAIL_PLAIN("open");
     hpplite_node_exec(w, "CREATE TABLE t(x)", NULL);
     hpplite_node_exec(w, "INSERT INTO t VALUES(random())", NULL);
     if (hpplite_node_flush_batch(w) != 1) FAIL("flush");
     size_t len = 0;
     uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
-    if (!raw || hpplite_envelope_is_sealed(raw, len)) { free(raw); FAIL("expected plaintext on L1"); }
-    char *json = malloc(len + 1);
-    memcpy(json, raw, len); json[len] = 0;
+    if (!raw || hpplite_envelope_is_sealed(raw, len)) { free(raw); FAIL_PLAIN("expected plaintext on L1"); }
+    char *json = (char *)test_readable_bytes(raw, len, NULL);   /* the HPZ1 frame around deflated JSON since #12: still anyone's to read */
     free(raw);
+    if (!json) FAIL_PLAIN("plaintext batch does not inflate");
     HppliteBatch *b = hpplite_batch_from_json(strchr(json, '{'));
     free(json);
-    if (!b || b->nTxns != 2) { if (b) hpplite_batch_free(b); FAIL("two entries: the CREATE TABLE and a record"); }
+    if (!b || b->nTxns != 2) { if (b) hpplite_batch_free(b); FAIL_PLAIN("two entries: the CREATE TABLE and a record"); }
     int op = 0; char *zTab = NULL;
     int ok = !(b->aTxns[0].mode & HPPLITE_MODE_ROW) && strncmp(b->aTxns[0].zSql, "CREATE TABLE", 12) == 0
           && (b->aTxns[1].mode & HPPLITE_MODE_ROW)
@@ -241,7 +243,7 @@ static void test_plaintext_entries(void) {
           && op == HPPLITE_ROW_INSERT && strcmp(zTab, "t") == 0;
     sqlite3_free(zTab);
     hpplite_batch_free(b);
-    if (!ok) FAIL("entries are not what was written");
+    if (!ok) FAIL_PLAIN("entries are not what was written");
     const char *why = replica_matches(w, l1, "plain_r.db");
     g_plain = 0;
     hpplite_l1_disconnect(l1);

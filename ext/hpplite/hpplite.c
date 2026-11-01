@@ -692,6 +692,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->chainId = cfg->chainId;
     nc->batchIntervalMs = cfg->batchIntervalMs;
     nc->noEncrypt = !cfg->encrypt;
+    nc->noCompress = !cfg->compress;
     nc->determinismWarn = cfg->determinismWarn;
     nc->captureText = cfg->captureText;
     nc->captureSource = cfg->captureSource;

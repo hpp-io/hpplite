@@ -335,7 +335,9 @@ static char *sized_insert(size_t target) {
 
 static void test_edge_sql_end_to_end(void) {
     TEST("edge-case SQL and full-size batches: posted on the real contract, replica root matches");
-    sqlite3 *w = open_db("e_writer.db", KEY2, NULL);
+    /* compress=off: this is about batches cut at the DA limit, and the filler
+    ** here deflates a thousandfold (#12 would post 200-byte batches) */
+    sqlite3 *w = open_db("e_writer.db", KEY2, "&compress=off");
     if (!w) FAIL("open writer");
     HppliteNode *nw = hpplite_get_node(w);
     if (!nw || !nw->l1 || !nw->ctx) FAIL("writer has no L1");

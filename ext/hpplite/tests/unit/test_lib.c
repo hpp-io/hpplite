@@ -3,6 +3,7 @@
 */
 #include "test_lib.h"
 #include "l1_interface.h"
+#include "compress.h"
 #include <strings.h>
 #include <unistd.h>
 
@@ -28,6 +29,17 @@ static const unsigned char DEFAULT_PRIVKEY[32] = {
 static const char *g_nodeId = "test";
 static const unsigned char *g_privkey = DEFAULT_PRIVKEY;
 static char g_dir[256] = "/tmp/hpplite_test";
+
+uint8_t *test_readable_bytes(const uint8_t *raw, size_t len, size_t *pLen) {
+    uint8_t *out;
+    if (hpplite_is_plain_compressed(raw, len)) return hpplite_inflate(raw + HPPLITE_PLAIN_MAGIC_LEN, len - HPPLITE_PLAIN_MAGIC_LEN, pLen);
+    out = malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, raw, len);
+    out[len] = 0;
+    if (pLen) *pLen = len;
+    return out;
+}
 
 void test_suite_init(const char *nodeId, const unsigned char privkey[32], const char *dir) {
     if (nodeId) g_nodeId = nodeId;
@@ -136,6 +148,7 @@ HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpt
     config.checkpointInterval = o->checkpointInterval;                   /* 0: the node's default, as in the config (#114) */
     config.maxBatchBytes = o->maxBatchBytes;
     config.noEncrypt = o->noEncrypt;
+    config.noCompress = o->noCompress;
     config.verifyOnly = o->verifyOnly;
     config.determinismWarn = o->determinismWarn;
     config.captureText = o->captureText;

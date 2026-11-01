@@ -12,6 +12,7 @@
 #define KEY_B "0x2020202020202020202020202020202020202020202020202020202020202020"
 
 /* a fresh directory, and no key from the environment */
+
 static void reset_keys(void) { reset_dir(); unsetenv("HPPLITE_PRIVATE_KEY"); unsetenv("HPPLITE_PRIVATE_KEY_FILE"); }
 
 static void write_file(const char *path, const char *content, mode_t mode) {
@@ -172,7 +173,13 @@ static void test_encrypt_off_is_explicit(void) {
     if (hpplite_flush(db) != 1) FAIL("flush plaintext");
     size_t len = 0;
     uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
-    if (!raw || !memmem(raw, len, "visible", 7)) FAIL("encrypt=off should post plaintext");
+    {
+        size_t n = 0;
+        uint8_t *readable = raw ? test_readable_bytes(raw, len, &n) : NULL;   /* deflated since #12, still anyone's to read */
+        int ok = readable && memmem(readable, n, "visible", 7) != NULL;
+        free(readable);
+        if (!ok) FAIL("encrypt=off should post plaintext");
+    }
     free(raw);
     sqlite3_close(db);
 

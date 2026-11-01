@@ -118,6 +118,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
 | `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
+| `compress` | No | `on` (default): the batch JSON is deflated before it is sealed or posted when that shrinks it, five to twelve times for SQL and row records (#12); `off`: posted as is. Every reader takes both forms, and batches from before stay readable. Also `HPPLITE_COMPRESS` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
 | `capture` | No | `rows` (default): log what each write changed (#19, below); `text`: log each write statement, as v0.1. Also `HPPLITE_CAPTURE` |
@@ -367,8 +368,10 @@ took 658k, eight times less, and the gap widens with size. A reader fetches
 one block's log by the height topic (the chain's own block number: on an
 Arbitrum-style chain such as HPP the contract asks ArbSys for it, #128),
 which any archive node serves; pruned nodes cannot serve a rebuild.
-Compression (#12) still applies, and the timer only flushes when something
-is pending, so an idle database costs nothing.
+Since #12 the batch is deflated before it is sealed (`compress=on`, the
+default), which cuts the bytes five to twelve times again on SQL and row
+records, on the chain and at a store alike; the timer only flushes when
+something is pending, so an idle database costs nothing.
 
 ## Components
 

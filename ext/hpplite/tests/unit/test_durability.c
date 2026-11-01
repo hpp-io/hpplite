@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 
 #define PRIVKEY_HEX "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+
 static const unsigned char PRIVKEY[32] = {
     0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
     0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20
@@ -749,7 +750,14 @@ static void test_encryption_off_and_legacy(void) {
     if (hpplite_flush(db) != 1) FAIL("flush");
     size_t len = 0;
     uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
-    if (!raw || hpplite_envelope_is_sealed(raw, len) || !memmem(raw, len, "INSERT INTO t", 13)) FAIL("expected plaintext JSON on L1");
+    if (!raw || hpplite_envelope_is_sealed(raw, len)) FAIL("expected plaintext (not sealed) on L1");
+    {
+        size_t n = 0;
+        uint8_t *readable = test_readable_bytes(raw, len, &n);      /* deflated since #12, still anyone's to read */
+        int ok = readable && memmem(readable, n, "INSERT INTO t", 13) != NULL;
+        free(readable);
+        if (!ok) FAIL("expected plaintext JSON on L1");
+    }
     free(raw);
     sqlite3_close(db);
 

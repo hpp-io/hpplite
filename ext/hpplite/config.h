@@ -49,6 +49,7 @@ extern "C" {
 #define HPPLITE_ENV_NODE_ID       "HPPLITE_NODE_ID"
 #define HPPLITE_ENV_BATCH_INTERVAL "HPPLITE_BATCH_INTERVAL"
 #define HPPLITE_ENV_ENCRYPT       "HPPLITE_ENCRYPT"
+#define HPPLITE_ENV_COMPRESS      "HPPLITE_COMPRESS"       /* off: the batch JSON as is (#12) */
 #define HPPLITE_ENV_CHECKPOINT    "HPPLITE_CHECKPOINT_INTERVAL"
 #define HPPLITE_ENV_DETERMINISM   "HPPLITE_DETERMINISM"
 #define HPPLITE_ENV_CAPTURE       "HPPLITE_CAPTURE"
@@ -71,6 +72,7 @@ extern "C" {
 #define HPPLITE_URI_PRIVKEY_FILE  "keyfile"
 #define HPPLITE_URI_DATA_DIR      "datadir"
 #define HPPLITE_URI_ENCRYPT       "encrypt"
+#define HPPLITE_URI_COMPRESS      "compress"    /* on (default): deflate the batch when it shrinks; off: as is (#12) */
 #define HPPLITE_URI_CHECKPOINT    "checkpoint"
 #define HPPLITE_URI_DETERMINISM   "determinism"
 #define HPPLITE_URI_CAPTURE       "capture"
@@ -125,6 +127,7 @@ typedef struct HppliteConfig {
     /* Batching */
     int batchIntervalMs;             /* Batch interval in milliseconds */
     int encrypt;                     /* Seal batches before posting (default 1) */
+    int compress;                    /* Deflate batches before sealing or posting when it shrinks them (default 1, #12) */
     int checkpointInterval;          /* Batches per checkpoint (0 = node default, 100) */
     int determinismWarn;             /* 1: only warn about non-deterministic SQL (default 0: refuse it) */
     int captureText;                 /* 1: capture statements, as v0.1 (default 0: rows, #19) */

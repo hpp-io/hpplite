@@ -14,6 +14,7 @@
 
 #include "node.h"
 #include "store.h"
+#include "compress.h"
 #include "da_uri.h"
 #include "capture_rows.h"
 static void node_cap_batch_limit(HppliteNode *node);
@@ -127,6 +128,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     }
     node_cap_batch_limit(node);
     node->config.noEncrypt = config->noEncrypt;
+    node->config.noCompress = config->noCompress;
     node->config.determinismWarn = config->determinismWarn;
     node->config.captureText = config->captureText;
     node->config.localOnly = config->localOnly;
@@ -846,7 +848,8 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
                     (unsigned long long)height);
             return NULL;
         }
-        plain = hpplite_envelope_open(node->encKey, height, data, dataLen, NULL, &scheme);
+        size_t plainLen = 0;
+        plain = hpplite_envelope_open(node->encKey, height, data, dataLen, &plainLen, &scheme);
         if (!plain) {
             /* A known scheme that fails our tag was sealed with another key:
             ** posted under a lease we did not hold. Provably not ours. */
@@ -854,6 +857,23 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
             hpplite_error(node->ctx, "batch %llu: %s", (unsigned long long)height,
                     scheme ? "not sealed with our key (posted by another sequencer)" : "unknown encryption scheme");
             return NULL;
+        }
+        {
+            /* what the envelope's encoding byte says is inside (#12) */
+            int encoding = hpplite_envelope_encoding(data, dataLen);
+            if (encoding == HPPLITE_ENCODING_DEFLATE) {
+                uint8_t *inflated = hpplite_inflate(plain, plainLen, NULL);
+                free(plain);
+                if (!inflated) {
+                    hpplite_error(node->ctx, "batch %llu: sealed and compressed, but the compressed bytes do not inflate", (unsigned long long)height);
+                    return NULL;
+                }
+                plain = inflated;
+            } else if (encoding != HPPLITE_ENCODING_NONE) {
+                free(plain);
+                hpplite_error(node->ctx, "batch %llu uses encoding %d, which this version does not know", (unsigned long long)height, encoding);
+                return NULL;
+            }
         }
         batch = hpplite_batch_from_json((const char *)plain);
         free(plain);
@@ -865,6 +885,14 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         node->lastFetchForeign = 1;
         hpplite_error(node->ctx, "batch %llu is plaintext on an encrypting rollup: not ours", (unsigned long long)height);
         return NULL;
+    } else if (hpplite_is_plain_compressed(data, dataLen)) {
+        uint8_t *inflated = hpplite_inflate(data + HPPLITE_PLAIN_MAGIC_LEN, dataLen - HPPLITE_PLAIN_MAGIC_LEN, NULL);
+        if (!inflated) {
+            hpplite_error(node->ctx, "batch %llu: compressed plaintext that does not inflate", (unsigned long long)height);
+            return NULL;
+        }
+        batch = hpplite_batch_from_json((const char *)inflated);
+        free(inflated);
     } else {
         batch = hpplite_batch_from_json((const char *)data);
     }
@@ -1247,11 +1275,37 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         if (json) {
             const uint8_t *payload = (const uint8_t *)json;
             size_t payloadLen = strlen(json);
-            uint8_t *sealed = NULL;
+            uint8_t *sealed = NULL, *packed = NULL;
+            uint8_t encoding = HPPLITE_ENCODING_NONE;
+            if (!node->config.noCompress) {
+                /* deflate the JSON before it is sealed (#12): ciphertext does not
+                ** compress. Only when it shrinks; a tiny batch stays as it was. */
+                size_t n = 0;
+                uint8_t *c = hpplite_deflate(payload, payloadLen, &n);
+                if (c && n + HPPLITE_PLAIN_MAGIC_LEN < payloadLen) {
+                    packed = c;
+                    payload = c;
+                    payloadLen = n;
+                    encoding = HPPLITE_ENCODING_DEFLATE;
+                } else {
+                    free(c);
+                }
+            }
             if (node->cipher) {
                 sealed = hpplite_envelope_seal(node->cipher, node->encKey, height,
-                                               HPPLITE_ENCODING_NONE, payload, payloadLen, &payloadLen);
+                                               encoding, payload, payloadLen, &payloadLen);
                 payload = sealed;
+            } else if (encoding == HPPLITE_ENCODING_DEFLATE) {
+                /* plaintext: the HPZ1 frame says what follows */
+                uint8_t *framed = malloc(HPPLITE_PLAIN_MAGIC_LEN + payloadLen);
+                if (framed) {
+                    memcpy(framed, HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN);
+                    memcpy(framed + HPPLITE_PLAIN_MAGIC_LEN, payload, payloadLen);
+                    free(packed);
+                    packed = framed;
+                    payload = framed;
+                    payloadLen += HPPLITE_PLAIN_MAGIC_LEN;
+                }
             }
             if (payload) {
                 char *txHash;
@@ -1321,6 +1375,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                 }
             }
             free(sealed);
+            free(packed);
             sqlite3_free(json);
         }
         batch->pPosted = postedCopy;

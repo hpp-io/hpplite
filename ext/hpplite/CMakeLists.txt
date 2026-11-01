@@ -25,6 +25,9 @@ pkg_check_modules(SECP256K1 REQUIRED libsecp256k1)
 # libcurl (for Web3 integration)
 pkg_check_modules(CURL REQUIRED libcurl)
 
+# zlib: batch compression (#12)
+find_package(ZLIB REQUIRED)
+
 # Find threads
 find_package(Threads REQUIRED)
 
@@ -98,7 +101,7 @@ set(HPPLITE_SOURCES
 # L1 backends: every build has both; the endpoint picks one at run time (#35).
 # HPPLITE_USE_REAL_L1 now only decides whether the tests and examples that
 # need a chain (anvil, HPP Sepolia) are built, and keeps the test hooks out.
-list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c)
+list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c compress.c)
 if(HPPLITE_USE_REAL_L1)
     message(STATUS "L1 backends: eth + mock; chain tests and examples on")
 else()
@@ -119,6 +122,7 @@ target_link_libraries(hpplite PUBLIC
     sqlite3
     ${SECP256K1_LIBRARIES}
     ${CURL_LIBRARIES}
+    ZLIB::ZLIB
 )
 
 target_link_directories(hpplite PUBLIC
@@ -147,6 +151,7 @@ if(HPPLITE_BUILD_EXTENSION)
         Threads::Threads
         ${SECP256K1_LIBRARIES}
         ${CURL_LIBRARIES}
+        ZLIB::ZLIB
     )
     target_link_directories(hpplite_ext PRIVATE
         ${SECP256K1_LIBRARY_DIRS}
@@ -209,6 +214,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_checkpoint_flow hpplite_testlib)
         add_executable(test_durability tests/unit/test_durability.c)
         target_link_libraries(test_durability hpplite_testlib)
+        add_executable(test_compress tests/unit/test_compress.c)
+        target_link_libraries(test_compress hpplite_testlib)
         add_executable(test_faults tests/unit/test_faults.c)
         target_link_libraries(test_faults hpplite_testlib)
         add_executable(test_keys tests/unit/test_keys.c)
@@ -331,6 +338,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_l1_mock COMMAND test_l1_mock)
         add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
         add_test(NAME test_durability COMMAND test_durability)
+        add_test(NAME test_compress COMMAND test_compress)
         add_test(NAME test_faults COMMAND test_faults)
         add_test(NAME test_keys COMMAND test_keys)
         add_test(NAME test_abuse COMMAND test_abuse)
@@ -347,7 +355,7 @@ if(HPPLITE_BUILD_TESTS)
 
         # Every suite above again with statement capture (capture=text, v0.1's;
         # rows are the default, #19): the cases about statement text run there
-        foreach(t test_checkpoint_flow test_durability test_faults test_keys test_abuse test_foreign_keys
+        foreach(t test_checkpoint_flow test_durability test_compress test_faults test_keys test_abuse test_foreign_keys
                   test_big_txn test_clock test_reorg test_big_stmt test_concurrency)
             add_test(NAME ${t}_text COMMAND ${t})
             # the same scratch directory: never at once (ctest -j)

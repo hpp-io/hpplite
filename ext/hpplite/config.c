@@ -122,6 +122,7 @@ HppliteConfig *hpplite_config_create(void) {
     cfg->role = HPPLITE_CFG_ROLE_OBSERVER;  /* Safe default */
     cfg->batchIntervalMs = 5000;  /* 5 seconds default */
     cfg->encrypt = 1;             /* everything posted is public otherwise */
+    cfg->compress = 1;            /* smaller batches everywhere they go (#12) */
     cfg->storeFallback = 1;       /* a store that does not answer never holds a batch back (#11) */
 
     return cfg;
@@ -218,6 +219,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     /* Encryption */
     val = getenv(HPPLITE_ENV_ENCRYPT);
     if (val) cfg->encrypt = parse_bool(val);
+    val = getenv(HPPLITE_ENV_COMPRESS);
+    if (val) cfg->compress = parse_bool(val);
 
     /* Determinism: strict (default) or warn */
     val = getenv(HPPLITE_ENV_DETERMINISM);
@@ -435,6 +438,9 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     }
 
     /* Encryption */
+    if (get_uri_param(uri, HPPLITE_URI_COMPRESS, buf, sizeof(buf))) {
+        cfg->compress = parse_bool(buf);
+    }
     if (get_uri_param(uri, HPPLITE_URI_ENCRYPT, buf, sizeof(buf))) {
         cfg->encrypt = parse_bool(buf);
     }
@@ -590,6 +596,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     /* Encryption */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_ENCRYPT);
     if (val) cfg->encrypt = parse_bool(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_COMPRESS);
+    if (val) cfg->compress = parse_bool(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DETERMINISM);
     if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_CAPTURE);

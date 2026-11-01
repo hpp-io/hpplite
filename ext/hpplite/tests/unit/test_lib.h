@@ -35,6 +35,10 @@ int test_rows_mode(void);
 /* The end of main: the tally, and the process's exit code */
 int test_report(void);
 
+/* The bytes an encrypt=off node posts, as text: plain JSON, or since #12 the
+** HPZ1 frame around deflated JSON, inflated. NUL-terminated; free() */
+uint8_t *test_readable_bytes(const uint8_t *raw, size_t len, size_t *pLen);
+
 /* The suite: the node id and key its nodes get, and its scratch directory.
 ** dir NULL: /tmp/hpplite_test_<nodeId>.<pid>, this process's own, so two
 ** runs at once (a seed sweep beside ctest) do not share one. privkey NULL:
@@ -64,6 +68,7 @@ typedef struct TestNodeOpts {
     size_t maxBatchBytes;                    /* the node's DA limit; the mock takes it as the contract's */
     size_t daLimit;                          /* the mock's DA limit alone, the node left to find it */
     int noEncrypt;                           /* plaintext batches */
+    int noCompress;                          /* the batch JSON as is (#12) */
     int localOnly;                           /* 0: when there is no L1; 1: always; -1: never (no chain: the log stays pending) */
     int verifyOnly;                          /* role=verify (#5) */
     int determinismWarn;                     /* warn about non-deterministic SQL instead of refusing it */
