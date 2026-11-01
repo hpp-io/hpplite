@@ -254,6 +254,15 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
 ** the root check fails. Spot the usual suspects and count them, so a user
 ** can see why verification would fail (hpplite_status.nondeterministic).
 */
+/* What a text rule finds against a statement (textVerdict) */
+typedef enum {
+  TEXT_REPLAYS = 0,  /* nothing against it */
+  TEXT_VALUE,        /* a value replay cannot reproduce: counted; determinism=warn lets it through */
+  TEXT_FUNCTION,     /* a function the replica does not have: counted, never let through */
+  TEXT_NEVER         /* never, and not a determinism matter: the check failed, our tables named,
+                     ** bound values this SQLite cuts (#62) */
+} TextVerdict;
+
 /*
 ** The things the authorizer cannot see: keywords (CURRENT_*), the zero-
 ** argument time functions, strftime with only a format, and the literal
@@ -411,6 +420,7 @@ static void collectFunction(HppliteCtx *pCtx, const char *zName) {
     if (strcmp(lower, aNondet[i]) == 0) {
       snprintf(pCtx->zCollectWhy, sizeof(pCtx->zCollectWhy),
                "non-deterministic function %s() in a write; replay cannot reproduce it", lower);
+      pCtx->collectKind = TEXT_VALUE;
       return;
     }
   }
@@ -423,6 +433,7 @@ static void collectFunction(HppliteCtx *pCtx, const char *zName) {
     snprintf(pCtx->zCollectWhy, sizeof(pCtx->zCollectWhy),
              "%s() is defined by the application, not SQLite: a replica does not have it, so a write "
              "that calls it cannot replay", lower);
+    pCtx->collectKind = TEXT_FUNCTION;
   }
 }
 /* The statement's shape: string and number literals blanked. Which
@@ -455,8 +466,10 @@ static char *statementShape(const char *z) {
   *o = 0;
   return out;
 }
-/* Returns the reason the write cannot replay, or NULL */
-static const char *functionVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+/* The reason the write cannot replay by its functions, or NULL; *pKind says
+** which: TEXT_NEVER when the check itself failed, TEXT_FUNCTION for a
+** function the replica does not have, TEXT_VALUE for a non-deterministic one */
+static const char *functionVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS, TextVerdict *pKind) {
   const char *zSql = sqlite3_sql(pS);
   struct HppliteFnVerdict *v;
   sqlite3_stmt *p = NULL;
@@ -464,6 +477,7 @@ static const char *functionVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   uint64_t h = 1469598103934665603ULL;
   const char *c;
   char *zShape;
+  *pKind = TEXT_NEVER;
   if (!zSql) return NULL;
   zShape = statementShape(zSql);
   if (!zShape) {
@@ -485,9 +499,11 @@ static const char *functionVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   v = &pCtx->aFnVerdict[h % (sizeof(pCtx->aFnVerdict) / sizeof(pCtx->aFnVerdict[0]))];
   if (v->zSql && v->schema == schema && strcmp(v->zSql, zShape) == 0) {
     sqlite3_free(zShape);
+    *pKind = v->kind;
     return v->zWhy[0] ? v->zWhy : NULL;
   }
   pCtx->zCollectWhy[0] = 0;
+  pCtx->collectKind = TEXT_REPLAYS;
   pCtx->bCollectFns = 1;
   rc = sqlite3_prepare_v2(pCtx->db, zSql, -1, &p, NULL);
   pCtx->bCollectFns = 0;
@@ -501,7 +517,9 @@ static const char *functionVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   sqlite3_free(v->zSql);
   v->zSql = zShape;
   v->schema = schema;
+  v->kind = pCtx->collectKind;
   memcpy(v->zWhy, pCtx->zCollectWhy, sizeof(v->zWhy));
+  *pKind = v->kind;
   return v->zWhy[0] ? v->zWhy : NULL;
 }
 
@@ -724,20 +742,19 @@ static int usesTimeZone(const char *zIn) {
 
 /*
 ** Why a statement logged as text could not replay (#104): the one place the
-** text rules are applied, with no effect on the connection (the function
-** check keeps its cache; see functionVerdict). Writes the reason, with its
-** advice, into zWhy. The caller counts, warns or refuses by the verdict.
-** Only for a tracked statement (isTrackedSql), as the rules presume one.
+** text rules are applied, in order, with no effect on the connection (the
+** function check keeps its cache; see functionVerdict). Writes the reason,
+** with its advice, into zWhy. A value replay cannot reproduce (TEXT_VALUE)
+** is let through when bWarn (determinism=warn), and the later rules still
+** apply; a function the replica lacks or a statement that cannot be logged
+** never is. *pnHits counts the determinism rules hit, let through or not,
+** for hpplite_status.nondeterministic. Only for a tracked statement
+** (isTrackedSql), as the rules presume one. Returns TEXT_REPLAYS when the
+** statement may be logged (zWhy then holds the last let-through reason, or
+** nothing).
 */
-typedef enum {
-  TEXT_REPLAYS = 0,  /* nothing against it */
-  TEXT_VALUE,        /* a value replay cannot reproduce: counted; determinism=warn lets it through */
-  TEXT_FUNCTION,     /* a function the replica does not have: counted, never let through */
-  TEXT_NEVER         /* never, and not a determinism matter: the check failed, our tables named,
-                     ** bound values this SQLite cuts (#62) */
-} TextVerdict;
-
-static TextVerdict textVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *zSql, char *zWhy, size_t nWhy) {
+static TextVerdict textVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *zSql, int bWarn,
+                               char *zWhy, size_t nWhy, int *pnHits) {
   /* the refusal says why this statement is text, so the rule is not taken
   ** for row capture's (#85) */
   const char *zAsText = pCtx->bRows
@@ -745,7 +762,10 @@ static TextVerdict textVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *z
       " connection just created) and replays as written"
     : "";
   const char *zWhat = NULL;
+  TextVerdict kind;
   char *lower = lowercaseDup(zSql);
+  *pnHits = 0;
+  zWhy[0] = 0;
   if (lower) {
     /* the clock replays when the connection is on the clock VFS (#56);
     ** a machine's time zone never does */
@@ -756,8 +776,9 @@ static TextVerdict textVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *z
     sqlite3_free(lower);
   }
   if (zWhat) {
+    (*pnHits)++;
     snprintf(zWhy, nWhy, "%s%s; bind the value instead", zWhat, zAsText);
-    return TEXT_VALUE;
+    if (!bWarn) return TEXT_VALUE;
   }
   if (mentionsHppliteTable(zSql)) {
     /* A write that names our tables where the authorizer could not see it
@@ -766,15 +787,16 @@ static TextVerdict textVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *z
     snprintf(zWhy, nWhy, "application writes may not reference _hpplite_ tables");
     return TEXT_NEVER;
   }
-  zWhat = functionVerdict(pCtx, pS);
-  if (zWhat && strncmp(zWhat, "could not check", 15) == 0) {
+  zWhat = functionVerdict(pCtx, pS, &kind);
+  if (zWhat && kind == TEXT_NEVER) {
     /* the check itself failed (out of memory): nothing to advise */
     snprintf(zWhy, nWhy, "%s", zWhat);
     return TEXT_NEVER;
   }
   if (zWhat) {
+    (*pnHits)++;
     snprintf(zWhy, nWhy, "%s%s; compute the value in the application and bind it", zWhat, zAsText);
-    return strstr(zWhat, "defined by the application") ? TEXT_FUNCTION : TEXT_VALUE;
+    if (kind == TEXT_FUNCTION || !bWarn) return kind;
   }
   /* A SQLite that cuts bound values in the expansion is used with row
   ** capture only (#62): the few statements still logged as text are
@@ -1265,16 +1287,15 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   ** function the replica lacks, or a statement that cannot be logged). */
   {
     char why[512];
-    TextVerdict v = textVerdict(pCtx, pS, zSql, why, sizeof why);
+    int nHits;
+    TextVerdict v = textVerdict(pCtx, pS, zSql, pCtx->bDeterminismWarn, why, sizeof why, &nHits);
+    pCtx->nNondeterministic += (uint64_t)nHits;
     if (v != TEXT_REPLAYS) {
-      if (v != TEXT_NEVER) pCtx->nNondeterministic++;
-      if (v != TEXT_VALUE || !pCtx->bDeterminismWarn) {
-        refuseStatement(pCtx, pS, why, zSql);
-        return 0;
-      }
-      if (pCtx->nNondeterministic == 1) {
-        fprintf(stderr, "hpplite: %s; verification will report a mismatch: %.80s\n", why, zSql);
-      }
+      refuseStatement(pCtx, pS, why, zSql);
+      return 0;
+    }
+    if (nHits && pCtx->nNondeterministic == (uint64_t)nHits) {   /* the first let through: said once */
+      fprintf(stderr, "hpplite: %s; verification will report a mismatch: %.80s\n", why, zSql);
     }
   }
 

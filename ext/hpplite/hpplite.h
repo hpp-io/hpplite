@@ -70,8 +70,9 @@ struct HppliteCtx {
   size_t fragOff;             /* ...bytes of its text posted so far */
   int nCarry;                 /* Replica: statements held back from an open group (_hpplite_carry) */
   uint64_t nTxnsDropped;      /* Replica: transactions dropped because their other part never came */
+  int collectKind;            /* ...what kind of reason (capture.c's TextVerdict) */
   struct HppliteFnVerdict {   /* Function check of a write, by statement text and schema */
-    char *zSql; int schema; char zWhy[160];
+    char *zSql; int schema; int kind; char zWhy[160];
   } aFnVerdict[64];
   struct HppliteStmtRun {        /* A run of an application statement, between its STMT and PROFILE trace */
     sqlite3_stmt *pS;

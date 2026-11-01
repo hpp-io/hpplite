@@ -440,6 +440,12 @@ static void test_text_verdicts(void) {
     if (sqlite3_exec(w->db, "INSERT INTO t VALUES(app_double(2))", NULL, NULL, NULL) != SQLITE_INTERRUPT) FAIL("warn: an application function let through");
     if (sqlite3_exec(w->db, "INSERT INTO t SELECT count(*) FROM _hpplite_pending", NULL, NULL, NULL) != SQLITE_INTERRUPT) FAIL("warn: a _hpplite_ reference let through");
     if (count_rows(w->db, "t") != 1 || w->ctx->nNondeterministic != 3) FAILF("warn: %d rows, counted %llu; want 1 and 3", count_rows(w->db, "t"), (unsigned long long)w->ctx->nNondeterministic);
+    /* a value rule hit first does not hide a later rule (review of #104): every rule is applied */
+    if (sqlite3_exec(w->db, "INSERT INTO t VALUES(datetime('now', 'localtime') || app_double(1))", NULL, NULL, NULL) != SQLITE_INTERRUPT)
+        FAIL("warn: a time zone value let an application function through");
+    if (sqlite3_exec(w->db, "INSERT INTO t SELECT datetime('now', 'localtime') FROM _hpplite_pending", NULL, NULL, NULL) != SQLITE_INTERRUPT)
+        FAIL("warn: a time zone value let a _hpplite_ reference through");
+    if (count_rows(w->db, "t") != 1 || w->ctx->nNondeterministic != 6) FAILF("warn: %d rows, counted %llu; want 1 and 6 (every determinism rule hit counts)", count_rows(w->db, "t"), (unsigned long long)w->ctx->nNondeterministic);
     hpplite_node_destroy(w);
     PASS();
 }
