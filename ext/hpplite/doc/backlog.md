@@ -166,6 +166,17 @@ ext/hpplite/tools/sync_upstream.sh version-3.55.0
 
 Rebase, never merge, so `git log version-X..hpplite` always answers "what did we change".
 
+What the extension relies on in SQLite beyond its documented API - the
+reprepare inside `sqlite3_step()`, the trace callback's transaction, the
+busy handler's silence under a snapshot, the data version - is inventoried
+in [`sqlite-dependencies.md`](sqlite-dependencies.md) (#105): each
+behaviour with its SQLite source location, the HPPLite code that uses it
+and the test that fails if it changes. The `sqlite-trunk` CI job builds
+against upstream `master` and runs the mock suite, advisory
+(`continue-on-error`), so a change upstream is seen there first; its first
+run found trunk's deferred schema reset (2026-10-26/27) breaking the stale
+rerun path (entry 10 there), to be handled before the move to 3.55.
+
 ---
 
 ## Versions (GitHub milestones)

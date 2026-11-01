@@ -428,6 +428,15 @@ Typical latencies: COMMITTED immediately; ON L1 within the batch interval
 (5 s default) plus L1 confirmation; CHECKPOINTED after `checkpoint`
 batches (100 default).
 
+The COMMITTED stage holds because the log row is written from the trace
+callback of the application's statement and joins its transaction, and
+because a statement SQLite reruns after a foreign schema change is caught
+without a second trace. Those are SQLite behaviours outside its documented
+API; [`sqlite-dependencies.md`](sqlite-dependencies.md) lists each one with
+its SQLite source location, the HPPLite code that relies on it and the
+test that fails if it changes, and the `sqlite-trunk` CI job builds against
+upstream `master` so a change there is seen before a release moves to it.
+
 ---
 
 ## Configuration
