@@ -112,7 +112,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
-| `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
+| `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls), or `kubo://host:port` of a Kubo node's RPC: the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (none from Kubo) (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
 | `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
 | `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason |
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
@@ -522,7 +522,8 @@ the roots, the key holder is the one who checks them.
 Three words the rest of this document uses precisely (#35, #11):
 
 - A **store** is where the bytes of a batch live. Today that is the rollup's
-  DA contract on the chain, or a directory. S3 and IPFS stores follow (#11).
+  DA contract on the chain, a directory, a pin service or a Kubo node (#11);
+  S3 follows.
 - A **commitment** is what the chain holds per height: HPPLite's own hash
   of the batch and a reference into the store (on chain, the height itself;
   later a CID or an object key), and, where a pinning service holds the
@@ -602,8 +603,12 @@ alone, and `hpplite-verify` prints it for the last batch, saying whether
 the signature verifies. A store that does not answer never holds a batch
 back: the chain carries the bytes meanwhile (`storefallback=on`, the
 default). ctest `test_store` runs the client free; anvil scenarios 19, 20
-and 21 run it free, paid, and with the store down. Not here yet: S3 and
-Kubo adapters, `upto` and payment channels, top-up.
+and 21 run it free, paid, and with the store down. `store=kubo://host:port`
+is a Kubo node's own RPC (`add` with CIDv1 and raw leaves, pinned; `cat`):
+the same commitments with no receipt, for a node you run yourself; ctest
+runs it against a stand-in (`examples/pin_service/kubo_mock.py`), and
+`HPPLITE_KUBO=kubo://127.0.0.1:5001` runs the same case against a daemon.
+Not here yet: an S3 adapter, `upto` and payment channels, top-up.
 
 ## Versions
 

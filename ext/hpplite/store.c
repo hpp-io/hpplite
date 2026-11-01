@@ -19,8 +19,13 @@
 #include <stdio.h>
 #include <time.h>
 
+#define STORE_PIN  0                /* http(s)://host:port: a pin service (examples/pin_service) */
+#define STORE_KUBO 1                /* kubo://host:port: a Kubo node's own RPC (#11); no receipts, no payment */
+
 struct HppliteStore {
-    char *url;                      /* no trailing slash */
+    char *url;                      /* as given, no trailing slash: what the status row shows */
+    char *base;                     /* http(s)://host:port the requests go to */
+    int kind;                       /* STORE_* */
     int hasKey;
     HppliteKeypair kp;
     unsigned char address[20];
@@ -66,7 +71,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
     char url[1200];
     long status = 0;
     if (!c) return 0;
-    snprintf(url, sizeof url, "%s%s", s->url, path);
+    snprintf(url, sizeof url, "%s%s", s->base, path);
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, bufWrite);
@@ -297,12 +302,19 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
 HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64_t cap) {
     HppliteStore *s;
     size_t n;
-    if (!url || (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)) return NULL;
+    int kind;
+    if (!url) return NULL;
+    if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) kind = STORE_PIN;
+    else if (strncmp(url, "kubo://", 7) == 0) kind = STORE_KUBO;
+    else return NULL;
     s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->url = strdup(url);
     n = strlen(s->url);
     while (n > 0 && s->url[n - 1] == '/') s->url[--n] = 0;
+    s->kind = kind;
+    s->base = kind == STORE_KUBO ? sqlite3_mprintf("http://%s", s->url + 7) : sqlite3_mprintf("%s", s->url);
+    if (!s->base) { free(s->url); free(s); return NULL; }
     s->cap = cap;
     s->validFor = 120;
     {
@@ -318,7 +330,7 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
         }
     }
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    {
+    if (kind == STORE_PIN) {
         /* the provider's /status: which key signs its receipts, in which domain */
         Buf out = {0};
         if (storeRequest(s, "GET", "/status", NULL, 0, NULL, &out, NULL, NULL) == 200 && out.p) {
@@ -377,6 +389,7 @@ void hpplite_store_close(HppliteStore *s) {
     if (s->crypto) hpplite_crypto_free(s->crypto);
     memset(&s->kp, 0, sizeof s->kp);
     free(s->url);
+    sqlite3_free(s->base);
     free(s);
 }
 
@@ -427,6 +440,55 @@ int hpplite_store_payment(HppliteStore *s, unsigned char asset[20], uint64_t *pC
     return 0;
 }
 
+/* Kubo's add (#11): the bytes as one multipart file, CIDv1 with raw leaves
+** so a batch under the chunk size is one raw block whose CID is its
+** sha-256, pinned. The answer is one JSON line per file; the last names it. */
+static char *kuboAdd(HppliteStore *s, const uint8_t *data, size_t len) {
+    CURL *c = curl_easy_init();
+    curl_mime *mime;
+    curl_mimepart *part;
+    Buf out = {0};
+    char url[1200];
+    char *zRef = NULL;
+    long status = 0;
+    if (!c) return NULL;
+    snprintf(url, sizeof url, "%s/api/v0/add?cid-version=1&raw-leaves=true&pin=true", s->base);
+    mime = curl_mime_init(c);
+    part = curl_mime_addpart(mime);
+    curl_mime_name(part, "file");
+    curl_mime_filename(part, "batch");
+    curl_mime_type(part, "application/octet-stream");
+    curl_mime_data(part, (const char *)data, len);
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(c, CURLOPT_MIMEPOST, mime);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, bufWrite);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+    if (curl_easy_perform(c) != CURLE_OK) {
+        snprintf(s->error, sizeof s->error, "store unreachable: %s", url);
+        s->lastFailure = HPPLITE_STORE_FAIL_UNREACHABLE;
+    } else {
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+        if (status != 200) {
+            snprintf(s->error, sizeof s->error, "Kubo answered %ld to add: %.120s", status, out.p ? out.p : "");
+            s->lastFailure = HPPLITE_STORE_FAIL_OTHER;
+        } else {
+            /* the last line */
+            char *line = out.p ? out.p : "", *nl;
+            while ((nl = strchr(line, '\n')) != NULL && nl[1]) line = nl + 1;
+            cJSON *r = cJSON_Parse(line);
+            cJSON *hash = r ? cJSON_GetObjectItem(r, "Hash") : NULL;
+            if (hash && cJSON_IsString(hash) && hash->valuestring[0]) zRef = sqlite3_mprintf("%s", hash->valuestring);
+            else { snprintf(s->error, sizeof s->error, "Kubo's answer to add names no Hash"); s->lastFailure = HPPLITE_STORE_FAIL_OTHER; }
+            cJSON_Delete(r);
+        }
+    }
+    curl_mime_free(mime);
+    curl_easy_cleanup(c);
+    free(out.p);
+    return zRef;
+}
+
 char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char **pzReceipt) {
     Buf out = {0};
     char *zRequired = NULL, *zResponse = NULL, *zRef = NULL;
@@ -436,6 +498,11 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
     s->error[0] = 0;
     s->lastFailure = HPPLITE_STORE_FAIL_NONE;
     s->lastBytes = len;
+    if (s->kind == STORE_KUBO) {
+        zRef = kuboAdd(s, data, len);
+        if (zRef) s->nOk++;
+        return zRef;                              /* no receipt: a Kubo node promises nothing */
+    }
     status = storeRequest(s, "POST", "/put", data, len, NULL, &out, &zRequired, NULL);
     if (status == 402 && zRequired) {
         uint64_t amount = 0;
@@ -539,8 +606,13 @@ uint8_t *hpplite_store_get(HppliteStore *s, const char *zRef, size_t *pLen) {
     if (pLen) *pLen = 0;
     if (!s || !zRef || !zRef[0] || strlen(zRef) > 500 || strchr(zRef, '/')) return NULL;
     s->error[0] = 0;
-    snprintf(path, sizeof path, "/get/%s", zRef);
-    status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+    if (s->kind == STORE_KUBO) {
+        snprintf(path, sizeof path, "/api/v0/cat?arg=%s", zRef);
+        status = storeRequest(s, "POST", path, NULL, 0, NULL, &out, NULL, NULL);
+    } else {
+        snprintf(path, sizeof path, "/get/%s", zRef);
+        status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+    }
     if (status != 200) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to get %s", status, zRef);
         free(out.p);

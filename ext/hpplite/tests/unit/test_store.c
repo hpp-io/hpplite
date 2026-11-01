@@ -42,6 +42,31 @@ static int start_service(const char *dir, int port) {
     return -1;
 }
 
+/* a Kubo stand-in (examples/pin_service/kubo_mock.py), for the kubo:// store */
+static pid_t g_kubo;
+static int start_kubo(const char *dir, int port) {
+    char portStr[16], script[600];
+    snprintf(portStr, sizeof portStr, "%d", port);
+    snprintf(script, sizeof script, "%s/kubo_mock.py", dir);
+    g_kubo = fork();
+    if (g_kubo == 0) {
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, (char *)NULL);
+        _exit(127);
+    }
+    for (int i = 0; i < 50; i++) {
+        char cmd[200];
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 -X POST 'http://127.0.0.1:%d/api/v0/cat?arg=x' 2>/dev/null | grep -q Message", port);
+        if (system(cmd) == 0) return 0;
+        usleep(200 * 1000);
+    }
+    return -1;
+}
+static void stop_kubo(void) {
+    if (g_kubo > 0) { kill(g_kubo, SIGTERM); waitpid(g_kubo, NULL, 0); g_kubo = 0; }
+}
+
 static void stop_service(void) {
     if (g_pid > 0) { kill(g_pid, SIGTERM); waitpid(g_pid, NULL, 0); g_pid = 0; }
 }
@@ -170,6 +195,58 @@ static void test_node_status(const char *url) {
     PASS();
 }
 
+/* 5. A Kubo node as the store (#11): kubo://host:port speaks Kubo's own RPC
+** (add with cid-version 1 and raw leaves, cat). No receipts, no payment:
+** the chain commits (hash, CID) and nothing else. */
+static void test_kubo(const char *url) {
+    TEST("kubo://: put pins the bytes and names their CIDv1, get reads them back, no receipt; a node on it posts and a replica rebuilds from the commitment");
+    HppliteStore *s = hpplite_store_open(url, NULL, 0);
+    if (!s) FAIL("kubo:// did not open");
+    const uint8_t data[] = "bytes on a Kubo node";
+    char *zReceipt = (char *)"unset";
+    char *zRef = hpplite_store_put(s, data, sizeof(data) - 1, &zReceipt);
+    if (!zRef) { printf("(%s) ", hpplite_store_error(s)); hpplite_store_close(s); FAIL("put"); }
+    if (strcmp(zRef, "bafkreihvqzvroh57j7qeruusyaoawj62ny72bxluzpmjzatjhtklrlwtte") != 0) {   /* CIDv1 raw sha-256 of the bytes */
+        printf("(ref %s) ", zRef); sqlite3_free(zRef); hpplite_store_close(s); FAIL("the reference is not the bytes' CIDv1");
+    }
+    if (zReceipt) { sqlite3_free(zRef); hpplite_store_close(s); FAIL("a Kubo node signs nothing: the receipt must be NULL"); }
+    {
+        size_t n = 0;
+        uint8_t *back = hpplite_store_get(s, zRef, &n);
+        int ok = back && n == sizeof(data) - 1 && memcmp(back, data, n) == 0;
+        free(back);
+        if (!ok) { sqlite3_free(zRef); hpplite_store_close(s); FAIL("get"); }
+        back = hpplite_store_get(s, "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy", &n);
+        if (back) { free(back); sqlite3_free(zRef); hpplite_store_close(s); FAIL("an unknown CID should be NULL"); }
+    }
+    sqlite3_free(zRef);
+    if (hpplite_store_signer(s, NULL) != -1 || hpplite_store_calls(s) != 2 || hpplite_store_spent(s, NULL) != 0)
+        { hpplite_store_close(s); FAIL("no signer, two calls, nothing paid"); }
+    hpplite_store_close(s);
+
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "kubo_w" };
+    HppliteNode *w = test_open_node(tpath("kubo_w.db"), l1, &o);
+    if (!w) FAIL("open node");
+    hpplite_node_exec(w, "CREATE TABLE k(x); INSERT INTO k VALUES('pinned')", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("flush through Kubo"); }
+    if (strcmp(status_text(w->db, "store_state"), "ok") != 0 || scalar(w->db, "SELECT store_price IS NULL FROM hpplite_status") != 1
+        || strcmp(status_text(w->db, "store"), url) != 0) {
+        printf("(state '%s', store '%s') ", status_text(w->db, "store_state"), status_text(w->db, "store"));
+        hpplite_node_destroy(w);
+        FAIL("the status row should name the Kubo store, ok, with no price");
+    }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "kubo_r" };
+        HppliteNode *r = test_open_node(tpath("kubo_r.db"), l1, &ro);
+        int rows = r ? count_rows(r->db, "k") : -1;
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); }
+        if (rows != 1) { printf("(replica rows %d) ", rows); hpplite_node_destroy(w); FAIL("a replica on the Kubo node should rebuild the committed batch"); }
+    }
+    hpplite_node_destroy(w);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = 8470 + (int)(getpid() % 200);
@@ -187,6 +264,15 @@ int main(int argc, char **argv) {
     test_errors(s);
     hpplite_store_close(s);
     test_node_status(url);
+    {
+        int kport = 8670 + (int)(getpid() % 200);
+        char kurl[64];
+        snprintf(kurl, sizeof kurl, "kubo://127.0.0.1:%d", kport);
+        if (start_kubo(dir, kport) != 0) { stop_kubo(); stop_service(); printf("FAIL: the Kubo stand-in did not start\n"); return 1; }
+        test_kubo(kurl);
+        stop_kubo();
+        if (getenv("HPPLITE_KUBO")) test_kubo(getenv("HPPLITE_KUBO"));    /* a real daemon, when one is named (kubo://127.0.0.1:5001) */
+    }
     stop_service();
     remove_dir();
     return test_report();

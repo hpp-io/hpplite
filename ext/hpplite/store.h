@@ -7,6 +7,9 @@
 ** store=http://host:port is the pin service of examples/pin_service (or any
 ** provider speaking its four calls): POST /put, GET /get/<ref>. A 402 is
 ** paid in x402's exact scheme with the node's key, up to storecap= per call.
+** store=kubo://host:port is a Kubo node's own RPC (add, cat): the node pins
+** what it is given and signs nothing, so the chain commits (hash, CID) with
+** no receipt.
 */
 #ifndef HPPLITE_STORE_H
 #define HPPLITE_STORE_H
