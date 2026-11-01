@@ -32,7 +32,14 @@ for t in "$@"; do
             "$work/testfixture" "$here/wrap.tcl" "$root/test/$t.test" > log 2>&1 || true
         fi
         grep -E "errors out of" log | tail -1 | sed -E 's/ on .*//' > summary || true
-        grep -E "^! " log | sed -E 's/^! ([^ ]+).*/\1/' | sort -u > failed || true
+        # every failed test: the closing list has those that threw as well
+        # as those that compared unequal ("! name"); a run that stopped part
+        # way has no closing list, only the latter
+        if grep -q "^!Failures on these tests:" log; then
+            grep "^!Failures on these tests:" log | tail -1 | sed -E 's/^!Failures on these tests: *//' | tr ' ' '\n' | grep . | sort -u > failed
+        else
+            grep -E "^! " log | sed -E 's/^! ([^ ]+).*/\1/' | sort -u > failed || true
+        fi
     done
     s=$(cat "$work/out/stock/$t/summary"); h=$(cat "$work/out/hp/$t/summary")
     new=$(comm -13 "$work/out/stock/$t/failed" "$work/out/hp/$t/failed" | tr '\n' ' ')
