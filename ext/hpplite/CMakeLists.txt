@@ -72,6 +72,7 @@ endif()
 # HPPLite core library
 set(HPPLITE_SOURCES
     hpplite.c
+    sha256.c
     capture_rows.c
     batch.c
     crypto.c
