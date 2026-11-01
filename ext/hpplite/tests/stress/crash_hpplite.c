@@ -10,7 +10,9 @@
 **     reader rebuilt from L1 alone has the same content root as the writer.
 **
 ** Runs as `test_crash` in ctest (a few seconds). ./crash_hpplite --rounds N
-** for more random rounds.
+** for more random rounds. --l1 dir runs the same against the directory
+** backend (l1=file://, #35) instead of the directory-backed mock: there the
+** dead writer's lease is expired by the owner's right, not by a mock clock.
 */
 #include "hpplite.h"
 #include "node.h"
@@ -32,7 +34,25 @@ static const unsigned char PRIVKEY[32] = {
     0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20
 };
 static int failures = 0;
+static int useDir = 0;                           /* --l1 dir: the directory backend instead of the mock */
 #define CHECK(cond, ...) do { if (!(cond)) { printf("    FAIL: " __VA_ARGS__); printf("\n"); failures++; } } while (0)
+
+/* The persistent L1 every process of a round shares */
+static HppliteL1 *open_l1(void) {
+    return useDir ? hpplite_l1_connect("file://" L1DIR, NULL) : hpplite_l1_create_mock_dir(L1DIR);
+}
+
+/* The dead writer's lease: the mock's clock jumps past it; on the directory
+** backend the owner (the same key) expires it, as the contract lets the owner */
+static void expire_dead_lease(HppliteL1 *l1) {
+    if (useDir) {
+        hpplite_l1_set_privkey(l1, PRIVKEY);
+        char *tx = hpplite_l1_release_lease(l1, NULL);
+        sqlite3_free(tx);
+    } else {
+        hpplite_l1_mock_advance_time(l1, 600);
+    }
+}
 
 static void reset_dir(void) {
     (void)!system("rm -rf " DIR);
@@ -70,8 +90,8 @@ static HppliteNode *open_node(const char *path, HppliteL1 *l1, int intervalMs, s
 
 /* The writer: CREATE once, then rows with unique ids; never closes. */
 static void writer(const char *mode, int rows, int intervalMs, size_t limit) {
-    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
-    hpplite_l1_mock_set_batch_size_limit(l1, limit);
+    HppliteL1 *l1 = open_l1();
+    hpplite_l1_mock_set_batch_size_limit(l1, limit);   /* the mock's DA limit; nothing on the directory (the node's own limit splits) */
     HppliteNode *n = open_node(DIR "/w.db", l1, intervalMs, limit);
     if (!n) _exit(2);
     sqlite3_exec(n->db, "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v)", NULL, NULL, NULL);
@@ -107,8 +127,8 @@ static sqlite3_int64 rows_of_t(sqlite3 *db) {
 
 /* The checker: reopen, sync, count, flush, rebuild, compare. */
 static void check(const char *what) {
-    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
-    hpplite_l1_mock_advance_time(l1, 600);           /* the dead writer's lease expires */
+    HppliteL1 *l1 = open_l1();
+    expire_dead_lease(l1);
     HppliteNode *n = open_node(DIR "/w.db", l1, 0, 0);
     CHECK(n != NULL, "%s: reopen after crash failed", what);
     if (!n) { hpplite_l1_disconnect(l1); return; }
@@ -153,7 +173,7 @@ static void check(const char *what) {
     height = hpplite_node_get_height(n);
     hpplite_node_destroy(n);
 
-    HppliteL1 *l1r = hpplite_l1_create_mock_dir(L1DIR);
+    HppliteL1 *l1r = open_l1();
     unlink(DIR "/r.db"); unlink(DIR "/r.db-wal"); unlink(DIR "/r.db-shm");
     HppliteNode *r = open_node(DIR "/r.db", l1r, 0, 0);
     CHECK(r != NULL, "%s: reader open", what);
@@ -192,8 +212,10 @@ int main(int argc, char **argv) {
     int rounds = 6;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--l1") && i + 1 < argc) useDir = !strcmp(argv[++i], "dir");
     }
     srand((unsigned)getpid());
+    printf("L1: %s\n", useDir ? "directory backend (l1=file://)" : "directory-backed mock");
 
     /* --- deterministic crash points --- */
     static const struct { const char *at; size_t limit; } points[] = {
