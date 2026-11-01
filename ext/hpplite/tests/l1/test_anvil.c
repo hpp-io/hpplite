@@ -1465,7 +1465,7 @@ static void test_pin_service(void) {
     TEST("reference pin service (#125): x402 exact payments on a MockUSDC through the mock facilitator; receipts; idempotent put; the cap");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
     if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
-    int port = 8600 + (int)(getpid() % 200);
+    int port = 9100 + (int)(getpid() % 200);   /* off the harness's anvil range, 8600 + its pid % 200 (#130) */
     char cmd[2400], out[8192], payTo[80], before[80], after[80];
     FILE *f = fopen(DIR "/pin_signer.key", "w");
     if (!f) FAIL("signer key file");
