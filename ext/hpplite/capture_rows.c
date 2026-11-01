@@ -21,6 +21,7 @@
 #include "hpplite_sqlite.h"
 #include "hpplite_int.h"
 #include "batch.h"
+#include "sha256.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -172,15 +173,7 @@ static void fnNote(sqlite3_context *c, int n, sqlite3_value **v) {
 
 /* ---------------------------------------------------------------- triggers */
 
-/* A table as capture sees it: its stored columns and its key */
-typedef struct Tab {
-  char *zName;
-  int nCol; char **azCol;       /* stored columns, in order */
-  int nKey; char **azKey;       /* key columns (WITHOUT ROWID); 0 = rowid */
-  int ipk;                      /* rowid table whose INTEGER PRIMARY KEY is the rowid: its index, else -1 */
-  const char *zRowid;           /* the rowid's name that no column takes: rowid, _rowid_ or oid; NULL when
-                                ** all three are columns (the table cannot be addressed by row, #72) */
-} Tab;
+typedef HppliteRowsTab Tab;     /* a table as capture sees it: capture_rows.h */
 
 static void tabFree(Tab *t) {
   int i;
@@ -263,6 +256,8 @@ static int tabLoad(sqlite3 *db, const char *zName, Tab *t) {
   }
   return SQLITE_OK;
 }
+int hpplite_rows_tab_load(sqlite3 *db, const char *zName, HppliteRowsTab *t) { return tabLoad(db, zName, t); }
+void hpplite_rows_tab_free(HppliteRowsTab *t) { tabFree(t); }
 
 /* "new.k1, new.k2" / "new.rowid" */
 static char *keyList(const Tab *t, const char *zRow) {
@@ -911,6 +906,202 @@ static char *whereKey(const Tab *t, int firstParam) {
   return z;
 }
 
+/* ------------------------------------------------ the state root's leaves (#9) */
+
+static unsigned char *bytesCopy(const unsigned char *a, int n) {
+  unsigned char *p = sqlite3_malloc(n > 0 ? n : 1);
+  if (p && n > 0) memcpy(p, a, (size_t)n);
+  return p;
+}
+
+int hpplite_rows_rec_keys(const HppliteRowsTab *t, int op, const unsigned char *aRec, int nRec,
+                          unsigned char **pa1, int *pn1, unsigned char **pa2, int *pn2) {
+  Dec d = { aRec, nRec, 0, 0 };
+  int n, i, nKey = t->nKey ? t->nKey : 1;
+  *pa1 = *pa2 = NULL; *pn1 = *pn2 = 0;
+  n = (int)decVarint(&d);
+  if (d.bad) return SQLITE_CORRUPT;
+  if (op == HPPLITE_ROW_DELETE) {
+    int at = d.i;
+    if (n != nKey) return SQLITE_CORRUPT;
+    for (i = 0; i < nKey; i++) decSkip(&d);
+    if (d.bad) return SQLITE_CORRUPT;
+    *pa1 = bytesCopy(aRec + at, d.i - at); *pn1 = d.i - at;
+    return *pa1 ? SQLITE_OK : SQLITE_NOMEM;
+  }
+  if (op == HPPLITE_ROW_UPDATE) {
+    int at = d.i, keyChanged;
+    if (n != nKey) return SQLITE_CORRUPT;
+    for (i = 0; i < nKey; i++) decSkip(&d);
+    if (d.bad) return SQLITE_CORRUPT;
+    *pa1 = bytesCopy(aRec + at, d.i - at); *pn1 = d.i - at;
+    if (!*pa1) return SQLITE_NOMEM;
+    keyChanged = d.i < d.n ? d.a[d.i++] : (d.bad = 1, 0);
+    if (keyChanged) {
+      at = d.i;
+      for (i = 0; i < nKey; i++) decSkip(&d);
+      if (d.bad) { sqlite3_free(*pa1); *pa1 = NULL; *pn1 = 0; return SQLITE_CORRUPT; }
+      *pa2 = bytesCopy(aRec + at, d.i - at); *pn2 = d.i - at;
+      if (!*pa2) { sqlite3_free(*pa1); *pa1 = NULL; *pn1 = 0; return SQLITE_NOMEM; }
+    }
+    return SQLITE_OK;
+  }
+  if (op == HPPLITE_ROW_INSERT) {
+    if (!t->nKey) {
+      /* a rowid table's record starts with the rowid */
+      int at = d.i;
+      if (n != 1 + t->nCol) return SQLITE_CORRUPT;
+      decSkip(&d);
+      if (d.bad) return SQLITE_CORRUPT;
+      *pa1 = bytesCopy(aRec + at, d.i - at); *pn1 = d.i - at;
+      return *pa1 ? SQLITE_OK : SQLITE_NOMEM;
+    } else {
+      /* the key columns, in key order, from among the stored columns */
+      int *aStart = sqlite3_malloc((t->nCol + 1) * (int)sizeof(int));
+      int k, total = 0;
+      unsigned char *out;
+      if (!aStart) return SQLITE_NOMEM;
+      if (n != t->nCol) { sqlite3_free(aStart); return SQLITE_CORRUPT; }
+      for (i = 0; i < t->nCol; i++) { aStart[i] = d.i; decSkip(&d); }
+      aStart[t->nCol] = d.i;
+      if (d.bad) { sqlite3_free(aStart); return SQLITE_CORRUPT; }
+      for (k = 0; k < t->nKey; k++) {
+        for (i = 0; i < t->nCol && sqlite3_stricmp(t->azCol[i], t->azKey[k]) != 0; i++) {}
+        if (i == t->nCol) { sqlite3_free(aStart); return SQLITE_CORRUPT; }
+        total += aStart[i + 1] - aStart[i];
+      }
+      out = sqlite3_malloc(total > 0 ? total : 1);
+      if (!out) { sqlite3_free(aStart); return SQLITE_NOMEM; }
+      total = 0;
+      for (k = 0; k < t->nKey; k++) {
+        for (i = 0; i < t->nCol && sqlite3_stricmp(t->azCol[i], t->azKey[k]) != 0; i++) {}
+        memcpy(out + total, aRec + aStart[i], (size_t)(aStart[i + 1] - aStart[i]));
+        total += aStart[i + 1] - aStart[i];
+      }
+      sqlite3_free(aStart);
+      *pa1 = out; *pn1 = total;
+      return SQLITE_OK;
+    }
+  }
+  return SQLITE_CORRUPT;
+}
+
+void hpplite_rows_key_hash(const unsigned char *aKey, int nKey, unsigned char *out) {
+  SHA256_CTX h;
+  hpplite_sha256_init(&h);
+  hpplite_sha256_update(&h, aKey, (size_t)nKey);
+  hpplite_sha256_final(&h, out);
+}
+
+/* SHA256(hpplite_rec(columns iFirst.. of the row)) */
+static void rowValueHash(sqlite3_stmt *st, int iFirst, int nCol, unsigned char *out) {
+  Rec r = {0};
+  SHA256_CTX h;
+  int i;
+  recVarint(&r, (sqlite3_uint64)nCol);
+  for (i = 0; i < nCol; i++) recValue(&r, sqlite3_column_value(st, iFirst + i));
+  hpplite_sha256_init(&h);
+  if (!r.oom) hpplite_sha256_update(&h, r.a, (size_t)r.n);
+  hpplite_sha256_final(&h, out);
+  sqlite3_free(r.a);
+}
+
+static char *colList(const HppliteRowsTab *t) {
+  char *z = NULL;
+  int i;
+  for (i = 0; i < t->nCol; i++) z = sqlite3_mprintf("%z%s\"%w\"", z, i ? ", " : "", t->azCol[i]);
+  return z;
+}
+
+int hpplite_rows_leaf(sqlite3 *db, const HppliteRowsTab *t, const unsigned char *aKey, int nKey, unsigned char *valueHash) {
+  Dec d = { aKey, nKey, 0, 0 };
+  sqlite3_stmt *st = NULL;
+  char *zCols = colList(t), *zWhere = whereKey(t, 1), *zSql;
+  int rc, i, n = t->nKey ? t->nKey : 1, found = 0;
+  if (!t->nKey && !t->zRowid) { sqlite3_free(zCols); sqlite3_free(zWhere); return -1; }
+  zSql = sqlite3_mprintf("SELECT %s FROM main.\"%w\" WHERE %s", zCols, t->zName, zWhere);
+  sqlite3_free(zCols); sqlite3_free(zWhere);
+  rc = zSql ? sqlite3_prepare_v2(db, zSql, -1, &st, NULL) : SQLITE_NOMEM;
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) return -1;
+  for (i = 0; i < n && !d.bad; i++) decBind(&d, st, 1 + i);
+  if (d.bad) { sqlite3_finalize(st); return -1; }
+  rc = sqlite3_step(st);
+  if (rc == SQLITE_ROW) { rowValueHash(st, 0, t->nCol, valueHash); found = 1; rc = SQLITE_OK; }
+  else rc = (rc == SQLITE_DONE) ? SQLITE_OK : rc;
+  sqlite3_finalize(st);
+  return rc == SQLITE_OK ? found : -1;
+}
+
+int hpplite_rows_table_leaves(sqlite3 *db, const HppliteRowsTab *t, HppliteSmtLeaf **paLeaf, size_t *pn) {
+  sqlite3_stmt *st = NULL;
+  char *zCols = colList(t), *zSql;
+  HppliteSmtLeaf *a = NULL;
+  size_t n = 0, cap = 0;
+  int rc, byRowid = !t->nKey && t->zRowid != NULL, nameless = !t->nKey && !t->zRowid;
+  *paLeaf = NULL; *pn = 0;
+  if (nameless) {
+    /* no name for the rowid (#72): the rows cannot be told apart by key; one leaf over all of them */
+    SHA256_CTX h;
+    unsigned char vh[32];
+    zSql = sqlite3_mprintf("SELECT %s FROM main.\"%w\" ORDER BY rowid", zCols, t->zName);
+    sqlite3_free(zCols);
+    rc = zSql ? sqlite3_prepare_v2(db, zSql, -1, &st, NULL) : SQLITE_NOMEM;
+    sqlite3_free(zSql);
+    if (rc != SQLITE_OK) return rc;
+    hpplite_sha256_init(&h);
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+      rowValueHash(st, 0, t->nCol, vh);
+      hpplite_sha256_update(&h, vh, 32);
+      n++;
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return rc;
+    if (n == 0) return SQLITE_OK;
+    a = sqlite3_malloc(sizeof(HppliteSmtLeaf));
+    if (!a) return SQLITE_NOMEM;
+    hpplite_rows_key_hash((const unsigned char *)"rows", 4, a[0].key);
+    hpplite_sha256_final(&h, a[0].hash);
+    *paLeaf = a; *pn = 1;
+    return SQLITE_OK;
+  }
+  zSql = byRowid ? sqlite3_mprintf("SELECT %s, %s FROM main.\"%w\"", t->zRowid, zCols, t->zName)
+                 : sqlite3_mprintf("SELECT %s FROM main.\"%w\"", zCols, t->zName);
+  sqlite3_free(zCols);
+  rc = zSql ? sqlite3_prepare_v2(db, zSql, -1, &st, NULL) : SQLITE_NOMEM;
+  sqlite3_free(zSql);
+  if (rc != SQLITE_OK) return rc;
+  while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+    Rec k = {0};
+    if (n == cap) {
+      HppliteSmtLeaf *p;
+      cap = cap ? cap * 2 : 256;
+      p = sqlite3_realloc64(a, cap * sizeof(HppliteSmtLeaf));
+      if (!p) { sqlite3_free(a); sqlite3_finalize(st); return SQLITE_NOMEM; }
+      a = p;
+    }
+    if (byRowid) {
+      recValue(&k, sqlite3_column_value(st, 0));
+    } else {
+      int kk, i;
+      for (kk = 0; kk < t->nKey; kk++) {
+        for (i = 0; i < t->nCol && sqlite3_stricmp(t->azCol[i], t->azKey[kk]) != 0; i++) {}
+        if (i < t->nCol) recValue(&k, sqlite3_column_value(st, i));
+      }
+    }
+    if (k.oom) { sqlite3_free(k.a); sqlite3_free(a); sqlite3_finalize(st); return SQLITE_NOMEM; }
+    hpplite_rows_key_hash(k.a, k.n, a[n].key);
+    sqlite3_free(k.a);
+    rowValueHash(st, byRowid ? 1 : 0, t->nCol, a[n].hash);
+    n++;
+  }
+  sqlite3_finalize(st);
+  if (rc != SQLITE_DONE) { sqlite3_free(a); return rc; }
+  if (n > 1) qsort(a, n, sizeof *a, hpplite_smt_leaf_cmp);
+  *paLeaf = a; *pn = n;
+  return SQLITE_OK;
+}
+
 int hpplite_rows_apply(sqlite3 *db, const char *zTab, int op, const unsigned char *aRec, int nRec, char **pzErr) {
   Tab t;
   Dec d = { aRec, nRec, 0, 0 };
@@ -1122,6 +1313,12 @@ int hpplite_rows_entry_info(const char *zEntry, int *pOp, char **pzTab) {
   unsigned char *a = NULL;
   int n, iRec, rc = entryDecode(zEntry, &a, &n, pOp, pzTab, &iRec);
   sqlite3_free(a);
+  return rc;
+}
+
+int hpplite_rows_entry_rec(const char *zEntry, unsigned char **paBuf, int *piRec, int *pnRec, int *pOp, char **pzTab) {
+  int n = 0, rc = entryDecode(zEntry, paBuf, &n, pOp, pzTab, piRec);
+  if (rc == SQLITE_OK) *pnRec = n - *piRec;
   return rc;
 }
 

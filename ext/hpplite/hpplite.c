@@ -18,6 +18,7 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include "state_tree.h"
 
 #include <time.h>
 
@@ -322,6 +323,8 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
       sqlite3_finalize(q);
       if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_meta ADD COLUMN rollup TEXT NOT NULL DEFAULT ''");
     }
+    /* #9: the maintained state trees */
+    if (rc == SQLITE_OK) rc = hppliteTreeSchema(pCtx, db);
   }
   if (rc != SQLITE_OK) {
     sqlite3_free(pCtx);
@@ -415,6 +418,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
     finalizeOwnStatements(pCtx);
   }
   hppliteFreeFunctionChecks(pCtx);
+  hppliteTreeFree(pCtx);
   sqlite3_free(pCtx->aNoClock);
   sqlite3_free(pCtx->zRowsTextOnly);
   sqlite3_free(pCtx->zRowsSeq);
@@ -436,11 +440,17 @@ void hpplite_enable(HppliteCtx *pCtx, int bEnable) {
 void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut) {
   if (!pCtx || !pOut) return;
   if (pCtx->bRootDirty) {
+    /* the trees take the log in; a write transaction keeps what they took,
+    ** a read one computes the root and keeps the work in memory for the
+    ** next flush; on the shared connection inside the application's
+    ** transaction, neither: the statements run as they can */
+    int txn = hppliteBkBegin(pCtx, 1) == SQLITE_OK ? 1 : (hppliteBkBegin(pCtx, 0) == SQLITE_OK ? 0 : -1);
     int saved = hppliteBkEnter(pCtx);
-    if (hpplite_db_hash(pCtx->bkDb, pCtx->curRoot) == SQLITE_OK) {
-      pCtx->bRootDirty = 0;
-    }
+    int rc = hppliteTreeRoot(pCtx, pCtx->curRoot);
+    if (rc == SQLITE_OK && txn == 1) rc = hppliteTreeFlush(pCtx);
     hppliteBkLeave(pCtx, saved);
+    if (txn >= 0) rc = hppliteBkEnd(pCtx, rc);
+    if (rc == SQLITE_OK) pCtx->bRootDirty = 0;
   }
   memcpy(pOut, pCtx->curRoot, HPPLITE_HASH_SIZE);
 }

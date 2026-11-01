@@ -197,8 +197,8 @@ size_t hpplite_batch_stmt_json_size(const char *zSql, int64_t nRowsAffected, int
 }
 
 size_t hpplite_batch_json_overhead(void) {
-  /* height, timestamp, state_root, partial, open, cont, "transactions": [ ] and braces */
-  return 288;
+  /* height, timestamp, state_root, root_v, partial, open, cont, "transactions": [ ] and braces */
+  return 300;
 }
 
 /*
@@ -223,6 +223,7 @@ char *hpplite_batch_to_json(const HppliteBatch *pBatch) {
     ** checkpoint interval (computing it is O(database size)) */
     hpplite_to_hex(pBatch->postStateRoot, HPPLITE_HASH_SIZE, hexBuf);
     sqlite3_str_appendf(pStr, "\"state_root\":\"%s\",", hexBuf);
+    if (pBatch->rootVersion >= 2) sqlite3_str_appendf(pStr, "\"root_v\":%d,", pBatch->rootVersion);   /* absent: version 1 */
   }
   if (pBatch->partial) {
     sqlite3_str_appendf(pStr, "\"partial\":1,");
@@ -410,6 +411,8 @@ HppliteBatch *hpplite_batch_from_json(const char *zJson) {
         hpplite_from_hex(zVal, pBatch->preStateRoot, HPPLITE_HASH_SIZE);
         sqlite3_free(zVal);
       }
+    } else if (strcmp(zKey, "root_v") == 0) {
+      pBatch->rootVersion = (int)json_parse_number(&p);
     } else if (strcmp(zKey, "state_root") == 0 || strcmp(zKey, "post_state_root") == 0) {
       /* post_state_root: batches written before roots moved to checkpoint cadence */
       zVal = json_parse_string(&p);

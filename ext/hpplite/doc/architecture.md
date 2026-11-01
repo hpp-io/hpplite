@@ -124,7 +124,8 @@ needs no special recovery:
 | Table | Holds | Written |
 |-------|-------|---------|
 | `_hpplite_pending` | SQL of every committed write, in order, grouped by transaction | From inside the user's own statement, so the row commits or rolls back **with** the user's transaction |
-| `_hpplite_meta` | Next batch height, previous block hash, state root after the last confirmed batch, checkpoint progress | When a batch is confirmed on L1 |
+| `_hpplite_meta` | Next batch height, previous block hash, state root after the last confirmed batch, checkpoint progress, `tree_seq`/`tree_stale` (how far the state trees reflect the log) | When a batch is confirmed on L1 |
+| `_hpplite_tree` | The per-table Merkle trees of the state root (#9): one row per tree node, keyed by table and path | With the batch that took the rows in (writer: at finalize; replica: at apply), or at a root read |
 
 How a statement gets logged: SQLite's statement trace fires at the start of
 every statement on the connection. HPPLite inserts the statement text (with
@@ -156,11 +157,15 @@ Flushing a batch:
 1. If L1 already holds a batch at our next height, it was produced from our
    pending rows by an earlier attempt (crash after submit, lost RPC reply):
    adopt it - delete those rows, advance meta.
-2. Read pending rows in one snapshot; if this batch closes a checkpoint
-   interval, compute the state root in the same snapshot.
+2. Read pending rows in one snapshot; the state trees take the rows' keys
+   in (each touched row re-read as it is, its leaf set or cleared; a
+   statement entry marks every tree stale, to be rebuilt from a scan);
+   if this batch closes a checkpoint interval, the root is the schema
+   plus the table roots, in the same snapshot.
 3. Submit to L1 and wait for the transaction.
 4. Confirmed  -> delete the rows, advance height / prev hash (and the root,
-   when the batch carries one) in one transaction.
+   when the batch carries one), and write the trees' changes, in one
+   transaction.
    Not confirmed -> leave everything; retry next interval at the same height.
 5. If an interval of batches is now complete, submit the checkpoint
    (previous root -> this root) to the coordinator contract.

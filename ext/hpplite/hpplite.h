@@ -164,6 +164,7 @@ struct HppliteCtx {
   /* Cached content hash of the committed state */
   unsigned char curRoot[HPPLITE_HASH_SIZE];
   int bRootDirty;
+  struct HppliteTree *pTree;  /* the maintained state trees of the version 2 root (#9) */
 
   size_t maxStmtBytes;        /* Longest statement the DA can carry (0 = unlimited) */
   int bDeterminismWarn;       /* Non-deterministic SQL: 1 = warn and count, 0 = refuse (default) */
@@ -264,6 +265,14 @@ void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut);
 ** state root. Excludes sqlite_* and _hpplite_* tables.
 */
 int hpplite_db_hash(sqlite3 *db, unsigned char *pOut);
+/* Root version 1 (histories from before #9): one hash over every row in order */
+int hpplite_db_hash_v1(sqlite3 *db, unsigned char *pOut);
+/* Root version 2 with the table roots from xTableRoot (the maintained trees, or a scan) */
+typedef int (*HppliteTableRootFn)(void *pArg, sqlite3 *db, const char *zTab, unsigned char out[HPPLITE_HASH_SIZE]);
+int hpplite_db_hash_v2(sqlite3 *db, HppliteTableRootFn xTableRoot, void *pArg, unsigned char *pOut);
+#define HPPLITE_ROOT_VERSION 2
+/* test hooks: rows read for a root (a no-op in other builds) */
+void hpplite_test_rows_hashed_add(long n);
 
 /*
 ** SHA-256 helper (used for state roots, block hashes, batch identity).
@@ -426,6 +435,7 @@ void hpplite_error_clear(HppliteCtx *pCtx);
 void hpplite_refresh_meta(HppliteCtx *pCtx);
 #ifdef HPPLITE_TEST_HOOKS
 extern int hpplite_test_fail_commits;   /* mock builds: the next n bookkeeping COMMITs fail as SQLITE_FULL */
+extern long hpplite_test_rows_hashed;   /* rows read for a state root since the counter was last zeroed (#9) */
 #endif
 
 /*

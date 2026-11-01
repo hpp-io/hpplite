@@ -9,6 +9,7 @@
 */
 
 #include "hpplite_int.h"
+#include "state_tree.h"
 #include "crypto.h"
 #include <string.h>
 #include <stdio.h>
@@ -223,8 +224,9 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
     ** the O(database) hash on chunks that will drop it anyway. */
     if (withRoot && !pBatch->partial) {
       unsigned char root[HPPLITE_HASH_SIZE];
-      if (hpplite_db_hash(pCtx->bkDb, root) == SQLITE_OK) {
+      if (hppliteTreeRoot(pCtx, root) == SQLITE_OK) {
         hpplite_batch_set_post_state(pBatch, root);
+        pBatch->rootVersion = HPPLITE_ROOT_VERSION;
       } else {
         pCtx->nLogErrors++;
         hpplite_error(pCtx, "cannot hash the database for the state root (%s); batch %llu not built",
@@ -351,6 +353,12 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
 
   hpplite_block_hash(pBatch, pCtx->prevBlockHash, blockHash);
 
+  /* the state trees take the log in before it is pruned, and are kept (#9) */
+  rc = hppliteTreeSync(pCtx);
+  if (rc != SQLITE_OK) {
+    hpplite_error(pCtx, "the state trees could not take the log in (rc=%d: %s)", rc, sqlite3_errmsg(pCtx->bkDb));
+    return rc;
+  }
   if (maxId > 0) {
     rc = sqlite3_prepare_v2(pCtx->bkDb,
       "DELETE FROM _hpplite_pending WHERE id <= ?1", -1, &pStmt, NULL);
@@ -359,6 +367,11 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     rc = sqlite3_step(pStmt);
     sqlite3_finalize(pStmt);
     if (rc != SQLITE_DONE) return rc;
+  }
+  rc = hppliteTreeFlush(pCtx);
+  if (rc != SQLITE_OK) {
+    hpplite_error(pCtx, "the state trees could not be kept (rc=%d: %s)", rc, sqlite3_errmsg(pCtx->bkDb));
+    return rc;
   }
 
   if (bWriter && pBatch->pPosted && pBatch->nPosted) {

@@ -10,6 +10,7 @@
 */
 
 #include "hpplite_int.h"
+#include "state_tree.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +78,10 @@ static int connectionMode(sqlite3 *db) {
 ** before posting it.
 */
 typedef struct ReplayStmt { const char *zSql; int mode; sqlite3_int64 group; sqlite3_int64 now; int frag; } ReplayStmt;
+static void runEntry(void *pArg, int i, const char **pzSql, int *pMode) {
+  const ReplayStmt *a = (const ReplayStmt *)pArg;
+  *pzSql = a[i].zSql; *pMode = a[i].mode;
+}
 
 static int loadCarry(HppliteCtx *pCtx, char ***pazSql, int **paMode, sqlite3_int64 **paNow, int **paFrag) {
   sqlite3_stmt *q = NULL;
@@ -398,6 +403,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
       int saved = hppliteBkEnter(pCtx);
       /* the held part moves with the height, in one transaction */
       if (carryChanged) rc = storeCarry(pCtx, aRun + holdFrom, nHold);
+      if (rc == SQLITE_OK) rc = hppliteTreeTouchEntries(pCtx, holdFrom, runEntry, aRun);   /* what ran, into the state trees (#9) */
       if (rc == SQLITE_OK) rc = hppliteAdvanceMeta(pCtx, pBatch, 0, 0);
       hppliteBkLeave(pCtx, saved);
       rc = hppliteBkEnd(pCtx, rc);
@@ -415,7 +421,14 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   /* The seed of `hpplite verify`: does the content match what was posted?
   ** Only batches that carry a root (checkpoint boundaries) can be checked. */
   if (!pBatch->hasRoot) return SQLITE_OK;
-  hpplite_get_state_root(pCtx, root);
+  if (pBatch->rootVersion < 2) {
+    /* a history from before #9: its roots are one hash over every row */
+    int saved = hppliteBkEnter(pCtx);
+    if (hpplite_db_hash_v1(pCtx->bkDb, root) != SQLITE_OK) memset(root, 0, sizeof root);
+    hppliteBkLeave(pCtx, saved);
+  } else {
+    hpplite_get_state_root(pCtx, root);
+  }
   pCtx->nRootsCompared++;
   pCtx->rootCmpHeight = pBatch->height;        /* for the verifier: compared with the on-chain checkpoint (#5) */
   memcpy(pCtx->rootCmp, root, HPPLITE_HASH_SIZE);

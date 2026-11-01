@@ -68,6 +68,7 @@ struct HppliteBatch {
   int64_t fragRow;                           /* Writer only: log id of the statement it ends a piece of */
   size_t fragOff;                            /* ...and how many bytes of its text are posted after it */
   int hasRoot;                               /* postStateRoot is set (batch closes a checkpoint interval) */
+  int rootVersion;                           /* how postStateRoot was computed: 0/1 one hash over every row, 2 per-table trees (#9) */
   char *zDbName;                             /* Batch 1 of a named database: the name (#61), else NULL */
 };
 

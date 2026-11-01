@@ -383,7 +383,9 @@ something is pending, so an idle database costs nothing.
 | `bookkeeping.c` | The bookkeeping transaction and the foreign-write check |
 | `finalize.c` | Batch build, size cut, finalize; the posted batches kept for a reorg |
 | `replay.c` | Applying batches from the chain; adopt, skipped heights, checkpoints |
-| `state_hash.c` | Content-hash state root and block hash (`sha256.c`) |
+| `state_hash.c` | The state root (version 2: schema plus per-table tree roots; version 1 kept for old histories) and the block hash (`sha256.c`) |
+| `smt.c` | The sparse Merkle tree of a table's rows (#9): a store interface, set/clear/root, build from a sorted list |
+| `state_tree.c` | The maintained trees: `_hpplite_tree`, the log taken in by key, the overlay flushed with the batch, stale trees rebuilt from a scan |
 | `status.c` | `hpplite_status` table and the close sentinel |
 | `capture_rows.c` | Row capture (#19): the TEMP triggers, the record format, what stays text, `sqlite_sequence`, applying records on a replica |
 | `cipher.c` | Batch encryption: ChaCha20-Poly1305, HKDF-SHA256 key derivation, envelope format, pluggable schemes |
@@ -440,6 +442,7 @@ the rebuilt file yourself, or use a smaller `checkpoint` in development.
 records or statements - not yet posted), `state_root`, `prev_block_hash`,
 `last_checkpoint_height`, `lease` (1 = this instance may post), `log_errors`,
 `replay_skipped`, `encryption`, `keyed`, `nondeterministic`, `contract`,
+`root_version` (2: per-table Merkle trees, #9),
 `da_contract`, `last_batch_tx`, `foreign_batches`, `hooks_replaced`,
 `roots_compared`, `root_mismatches`, `txns_dropped`, `last_refusal`,
 `sequencer` (1 = this connection posts the file's batches; 0 = another
@@ -467,6 +470,18 @@ rebuilt database is compared with the posted one (`hpplite: state root
 mismatch after replaying batch N` on stderr when they differ). The live root
 of any database is `SELECT state_root FROM hpplite_status` (or
 `hpplite_db_hash()` from C).
+
+**What the root is** (version 2, #9): a hash over the schema and, for each
+table, the root of a Merkle tree of its rows (a leaf per row, keyed by its
+rowid or primary key, its value the row's columns as a row record carries
+them). It is a pure function of the file's content, which is why anyone can
+recompute it from a rebuilt file, and the node keeps the trees in
+`_hpplite_tree`, taking each batch's touched rows in from the log, so a
+checkpoint costs what changed and not a scan of the database. A checkpoint
+batch says which version its root is (`root_v`); histories written before
+carry version 1 roots (one hash over every row) and are compared with
+version 1 still, `hpplite_status.root_version` says what a live node
+computes. The tree is also the structure a row proof needs (#5).
 
 ```bash
 sqlite3> .load ./hpplite

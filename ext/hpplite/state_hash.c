@@ -7,6 +7,8 @@
 */
 
 #include "hpplite_int.h"
+#include "capture_rows.h"
+#include "smt.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -15,6 +17,14 @@
 ** Content hash (state root)
 ** ============================================================================
 */
+
+#ifdef HPPLITE_TEST_HOOKS
+long hpplite_test_rows_hashed = 0;
+#define ROWS_HASHED(n) (hpplite_test_rows_hashed += (n))
+#else
+#define ROWS_HASHED(n) ((void)0)
+#endif
+void hpplite_test_rows_hashed_add(long n) { ROWS_HASHED(n); }
 
 static void hashU64(SHA256_CTX *pH, uint64_t v) {
   uint8_t b[8];
@@ -109,6 +119,7 @@ static int hashTableRows(sqlite3 *db, SHA256_CTX *pH, const char *zName, const c
 
   nCol = sqlite3_column_count(pStmt);
   while ((rc = sqlite3_step(pStmt)) == SQLITE_ROW) {
+    ROWS_HASHED(1);
     hpplite_sha256_update(pH, (const uint8_t*)"R", 1);
     for (i = 0; i < nCol; i++) hashValue(pH, pStmt, i);
   }
@@ -116,7 +127,7 @@ static int hashTableRows(sqlite3 *db, SHA256_CTX *pH, const char *zName, const c
   return rc == SQLITE_DONE ? SQLITE_OK : rc;
 }
 
-int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
+int hpplite_db_hash_v1(sqlite3 *db, unsigned char *pOut) {
   SHA256_CTX h;
   sqlite3_stmt *pStmt;
   int rc, nEntries = 0;
@@ -174,6 +185,91 @@ int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
     hpplite_sha256_final(&h, pOut);
   }
   return SQLITE_OK;
+}
+
+/*
+** ============================================================================
+** Root version 2 (#9): per-table Merkle trees
+** ============================================================================
+** SHA256("HPR2" || for each schema entry in order: "S" type name tbl_name sql,
+** and for a table (not virtual) "T" || its tree root || the header fields
+** as in version 1). A table's tree: capture_rows.h, smt.h.
+*/
+int hpplite_db_hash_v2(sqlite3 *db, HppliteTableRootFn xTableRoot, void *pArg, unsigned char *pOut) {
+  SHA256_CTX h;
+  sqlite3_stmt *pStmt;
+  int rc, nEntries = 0;
+
+  hpplite_sha256_init(&h);
+  hpplite_sha256_update(&h, (const uint8_t*)"HPR2", 4);
+  rc = sqlite3_prepare_v2(db,
+    "SELECT type, name, tbl_name, sql FROM sqlite_master"
+    " WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+    "   AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\'"
+    " ORDER BY type, name", -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) return rc;
+  while ((rc = sqlite3_step(pStmt)) == SQLITE_ROW) {
+    const unsigned char *zType = sqlite3_column_text(pStmt, 0);
+    const unsigned char *zName = sqlite3_column_text(pStmt, 1);
+    const unsigned char *zSql = sqlite3_column_text(pStmt, 3);
+    nEntries++;
+    hpplite_sha256_update(&h, (const uint8_t*)"S", 1);
+    hashText(&h, zType);
+    hashText(&h, zName);
+    hashText(&h, sqlite3_column_text(pStmt, 2));
+    hashText(&h, zSql);
+    if (zType && strcmp((const char*)zType, "table") == 0
+        && zSql && sqlite3_strnicmp((const char*)zSql, "CREATE VIRTUAL", 14) != 0) {
+      unsigned char root[HPPLITE_HASH_SIZE];
+      rc = xTableRoot(pArg, db, (const char*)zName, root);
+      if (rc != SQLITE_OK) break;
+      hpplite_sha256_update(&h, (const uint8_t*)"T", 1);
+      hpplite_sha256_update(&h, root, HPPLITE_HASH_SIZE);
+    }
+  }
+  sqlite3_finalize(pStmt);
+  if (rc != SQLITE_DONE && rc != SQLITE_OK) return rc;
+  {
+    static const char *aHdr[] = { "SELECT user_version FROM pragma_user_version", "U",
+                                  "SELECT application_id FROM pragma_application_id", "A", NULL };
+    int k;
+    for (k = 0; aHdr[k]; k += 2) {
+      sqlite3_int64 v = 0;
+      if (sqlite3_prepare_v2(db, aHdr[k], -1, &pStmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(pStmt) == SQLITE_ROW) v = sqlite3_column_int64(pStmt, 0);
+        sqlite3_finalize(pStmt);
+      }
+      if (v) {
+        hpplite_sha256_update(&h, (const uint8_t*)aHdr[k + 1], 1);
+        hashU64(&h, (uint64_t)v);
+        nEntries++;
+      }
+    }
+  }
+  if (nEntries == 0) memset(pOut, 0, HPPLITE_HASH_SIZE);   /* genesis: no user schema */
+  else hpplite_sha256_final(&h, pOut);
+  return SQLITE_OK;
+}
+
+/* a table's tree root from a scan of its rows: what a plain file gives */
+static int tableRootByScan(void *pArg, sqlite3 *db, const char *zTab, unsigned char *out) {
+  HppliteRowsTab t;
+  HppliteSmtLeaf *a = NULL;
+  size_t n = 0;
+  int rc = hpplite_rows_tab_load(db, zTab, &t);
+  (void)pArg;
+  if (rc == SQLITE_OK) rc = hpplite_rows_table_leaves(db, &t, &a, &n);
+  hpplite_rows_tab_free(&t);
+  if (rc != SQLITE_OK) return rc;
+  ROWS_HASHED((long)n);
+  hpplite_smt_build_root(a, n, out);
+  sqlite3_free(a);
+  return SQLITE_OK;
+}
+
+/* The state root of a file as it is: version 2, every tree from a scan */
+int hpplite_db_hash(sqlite3 *db, unsigned char *pOut) {
+  return hpplite_db_hash_v2(db, tableRootByScan, NULL, pOut);
 }
 
 /* Block hash: sha256(height || prevHash || [stateRoot] || tags || sql...) - the

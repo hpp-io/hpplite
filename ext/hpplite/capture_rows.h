@@ -12,6 +12,35 @@
 #include "hpplite_sqlite.h"
 
 struct HppliteCtx;
+#include "smt.h"
+/* A table as capture sees it: its stored columns and its key */
+typedef struct HppliteRowsTab {
+  char *zName;
+  int nCol; char **azCol;       /* stored columns, in order */
+  int nKey; char **azKey;       /* key columns (WITHOUT ROWID); 0 = rowid */
+  int ipk;                      /* rowid table whose INTEGER PRIMARY KEY is the rowid: its index, else -1 */
+  const char *zRowid;           /* the rowid's name that no column takes: rowid, _rowid_ or oid; NULL when
+                                ** all three are columns (the table cannot be addressed by row, #72) */
+} HppliteRowsTab;
+int hpplite_rows_tab_load(sqlite3 *db, const char *zName, HppliteRowsTab *t);
+void hpplite_rows_tab_free(HppliteRowsTab *t);
+/* The state root's view of a table's rows (#9): a leaf per row, its key
+** SHA256(the key values in key order, record-encoded) and its value
+** SHA256(hpplite_rec(the stored columns)). */
+/* The keys a record names (sqlite3_free each): one for an insert or a
+** delete; for an update the old and, when it moved, the new (*pn2 = 0
+** otherwise). SQLITE_OK, or SQLITE_CORRUPT for a record that does not parse */
+int hpplite_rows_rec_keys(const HppliteRowsTab *t, int op, const unsigned char *aRec, int nRec,
+                          unsigned char **pa1, int *pn1, unsigned char **pa2, int *pn2);
+void hpplite_rows_key_hash(const unsigned char *aKey, int nKey, unsigned char out[32]);
+/* The row with this key as it is now: 1 and its value hash, 0 when there is none, <0 on error */
+int hpplite_rows_leaf(sqlite3 *db, const HppliteRowsTab *t, const unsigned char *aKey, int nKey, unsigned char valueHash[32]);
+/* Every row of the table as a leaf, sorted by key hash (sqlite3_free *paLeaf). A
+** table whose rowid has no name (#72) is one leaf over all its rows in order. */
+int hpplite_rows_table_leaves(sqlite3 *db, const HppliteRowsTab *t, HppliteSmtLeaf **paLeaf, size_t *pn);
+/* A batch entry's record (sqlite3_free *paBuf and *pzTab): the record is
+** *paBuf + *piRec, *pnRec bytes; its op and table. SQLITE_OK or SQLITE_CORRUPT */
+int hpplite_rows_entry_rec(const char *zEntry, unsigned char **paBuf, int *piRec, int *pnRec, int *pOp, char **pzTab);
 
 #define HPPLITE_ROW_INSERT 1
 #define HPPLITE_ROW_UPDATE 2
