@@ -331,6 +331,7 @@ the bytes went into contract storage at ~0.7k gas per byte.
 | Factory deploy (VERSION 8, optimizer on) | 3.40M | 0.000034 |
 | Rollup creation (`getOrCreateRollup`, `createRollup` for a named database) | 2.83M | 0.000028 |
 | Batch submit (932 B sealed, the demo's; ~24 gas per further byte) | 82.7k | 0.0000008 |
+| Batch submit, deflated (#12): the demo's three timeline writes, 419 B sealed, measured 2026-11-01 | 73.9k | 0.0000007 |
 | Batch submit (40 KB sealed, as cut on HPP Sepolia; from the per-byte cost) | ~1.0M | 0.00001 |
 | Checkpoint | 50k | 0.0000005 |
 | Lease claim / renew / release | 28-37k | 0.0000003 |
