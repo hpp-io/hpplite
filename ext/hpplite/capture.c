@@ -981,9 +981,9 @@ static int rerunTrack(HppliteCtx *pCtx, sqlite3_stmt *pS) {
             pCtx->seenSchema, sqlite3_get_autocommit(pCtx->db), sqlite3_sql(pS) ? sqlite3_sql(pS) : "?");
   if (sqlite3_get_autocommit(pCtx->db)) {
     if (hppliteInternalExec(pCtx, pCtx->db, "BEGIN") != SQLITE_OK) return 0;
-    pCtx->rerunOwnTxn = 1;
+    pCtx->ownTxn = HPPLITE_OWN_OPEN;
   } else {
-    pCtx->rerunOwnTxn = 0;
+    pCtx->ownTxn = HPPLITE_OWN_NONE;
   }
   pCtx->pRerunStmt = pS;
   pCtx->rerunStage = 1;
@@ -997,38 +997,35 @@ static void rerunBegin(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   if (v >= 0 && pCtx->seenSchema >= 0 && v != pCtx->seenSchema) rerunTrack(pCtx, pS);
   pCtx->seenSchema = v;
 }
+/* HPPLite's own transaction ends: COMMIT, and what the commit hook does for
+** an application commit (ours it skips). The one place it is committed.
+** Returns 1 when it is over (committed, or already ended by the application),
+** 0 when the COMMIT failed - a statement in progress (this is its trace):
+** ours stays open with the application's statement inside, and is committed
+** at that statement's end - never left open past it. */
+static int ownTxnEnd(HppliteCtx *pCtx) {
+  if (pCtx->ownTxn == HPPLITE_OWN_NONE) return 1;
+  if (sqlite3_get_autocommit(pCtx->db)) { pCtx->ownTxn = HPPLITE_OWN_NONE; return 1; }   /* ended by the application */
+  if (hppliteInternalExec(pCtx, pCtx->db, "COMMIT") != SQLITE_OK) return 0;
+  pCtx->ownTxn = HPPLITE_OWN_NONE;
+  pCtx->curTxn = 0;
+  pCtx->bRootDirty = 1;
+  if (pCtx->xOnCommit) pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
+  pCtx->bAppTxnOpen = 0;
+  gateLeaveAppIfIdle(pCtx);
+  return 1;
+}
+/* The tracked statement is over: forget it, end our transaction if it is ours */
 static void rerunCommit(HppliteCtx *pCtx) {
-  int own = pCtx->rerunOwnTxn;
   pCtx->pRerunStmt = NULL;
   pCtx->rerunStage = 0;
-  pCtx->rerunOwnTxn = 0;
-  if (own && !sqlite3_get_autocommit(pCtx->db)) {
-    if (hppliteInternalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
-      /* what the commit hook does for an application commit (ours it skips) */
-      pCtx->curTxn = 0;
-      pCtx->bRootDirty = 1;
-      if (pCtx->xOnCommit) pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
-    } else {
-      /* a statement in progress (this is its trace): ours stays open with
-      ** the application's statement inside, and is committed at that
-      ** statement's end - never left open past it */
-      pCtx->rerunCommitPending = 1;
-    }
-  }
+  if (!ownTxnEnd(pCtx)) pCtx->ownTxn = HPPLITE_OWN_COMMIT_PENDING;
   pCtx->bAppTxnOpen = !sqlite3_get_autocommit(pCtx->db);
   gateLeaveAppIfIdle(pCtx);
 }
 /* ...that end: the application's statement over, nothing is in progress */
 static void rerunCommitRetry(HppliteCtx *pCtx) {
-  if (sqlite3_get_autocommit(pCtx->db)) { pCtx->rerunCommitPending = 0; return; }   /* ended by the application */
-  if (hppliteInternalExec(pCtx, pCtx->db, "COMMIT") == SQLITE_OK) {
-    pCtx->rerunCommitPending = 0;
-    pCtx->curTxn = 0;
-    pCtx->bRootDirty = 1;
-    if (pCtx->xOnCommit) pCtx->xOnCommit(pCtx->pCallbackArg, NULL, 0);
-    pCtx->bAppTxnOpen = 0;
-    gateLeaveAppIfIdle(pCtx);
-  } else {
+  if (!ownTxnEnd(pCtx)) {
     hpplite_error(pCtx, "could not commit the transaction opened for a stale statement's rerun (%s)",
             sqlite3_errmsg(pCtx->db));
     pCtx->nLogErrors++;
@@ -1140,7 +1137,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   }
   if (mask == SQLITE_TRACE_PROFILE) {
     int bWasLogged = pS == pCtx->pLastLogged;
-    if (pCtx->rerunCommitPending) rerunCommitRetry(pCtx);
+    if (pCtx->ownTxn == HPPLITE_OWN_COMMIT_PENDING) rerunCommitRetry(pCtx);
     /* a refused statement done - unless this is its first run failing stale
     ** (expired: SQLite reprepares and reruns it inside this step): the rerun
     ** must be refused too (#89) */

@@ -672,7 +672,7 @@ static void test_refused_stale_statement(void) {
     int ok1 = exec(a.db, "CREATE VIRTUAL TABLE ft USING fts5(body)");
     int ok2 = exec(a.db, "CREATE TABLE c(id INTEGER PRIMARY KEY, v)");
     int ok3 = exec(a.db, "CREATE TRIGGER c_ai AFTER INSERT ON c BEGIN INSERT INTO ft(rowid, body) VALUES(new.id, new.v); END");
-    int aAuto = sqlite3_get_autocommit(a.db), aStage = a.ctx->rerunStage, aOwn = a.ctx->rerunOwnTxn;
+    int aAuto = sqlite3_get_autocommit(a.db), aStage = a.ctx->rerunStage, aOwn = a.ctx->ownTxn;
     int ok4 = exec(b.db, "SELECT count(*) FROM c");                   /* b sees the schema */
     const char *e4 = sqlite3_errmsg(b.db);
     sqlite3_stmt *st = NULL;
