@@ -1068,7 +1068,13 @@ static void test_close_during_timer_flush(void) {
     reset_dir();
     const char *uri = "file:" DIR "/tclose.db?hpplite=on&privkey=0x" PRIVKEY_HEX "&datadir=" DIR
                       "&interval=1ms&checkpoint=1";
-    alarm(60);                                   /* a hang fails the whole suite loudly */
+    {
+        /* a hang fails the whole suite loudly; a watchdog, not a performance bound:
+        ** the macOS CI runner took 62 s for an honest run (#129). HPPLITE_TEST_ALARM
+        ** sets it; 0 disables it (a debugger session) */
+        const char *z = getenv("HPPLITE_TEST_ALARM");
+        alarm(z ? (unsigned)atoi(z) : 300);
+    }
     for (int cycle = 0; cycle < 12; cycle++) {
         sqlite3 *db = NULL;
         if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FAIL("open");
