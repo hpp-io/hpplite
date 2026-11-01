@@ -254,6 +254,51 @@ static void test_table_from_another_connection(void) {
     PASS();
 }
 
+/* #93: a cursor the application keeps open across another connection's
+** schema change. SQLite itself refuses the write meanwhile (the cursor's
+** read snapshot cannot be upgraded past a foreign commit: SQLITE_BUSY, as
+** on stock SQLite); what HPPLite owes is that the first write after the
+** cursor closes is rows again, not text, and the replica is equal. */
+static void test_cursor_open_across_foreign_schema_change(void) {
+    TEST("a cursor open across another connection's CREATE TABLE: the write meanwhile is SQLite's BUSY, the first write after the cursor closes is rows, replica equal (#93)");
+    reset_dir();
+    W w, w2;
+    if (!open_writer(DIR "/cursor.db", &w) || !open_writer(DIR "/cursor.db", &w2)) FAIL("open");
+    exec(w.db, "CREATE TABLE a(x); INSERT INTO a VALUES(1); INSERT INTO a VALUES(2)");
+    sqlite3_stmt *cur = NULL;
+    if (sqlite3_prepare_v2(w.db, "SELECT x FROM a", -1, &cur, NULL) != SQLITE_OK || sqlite3_step(cur) != SQLITE_ROW) FAIL("cursor");
+    exec(w2.db, "CREATE TABLE b(id INTEGER PRIMARY KEY, y)");        /* the foreign schema change, w's cursor still open */
+    sqlite3_stmt *ins = NULL;
+    int rcOpen = SQLITE_ERROR, rcClosed = SQLITE_ERROR;
+    if (sqlite3_prepare_v2(w.db, "INSERT INTO a VALUES(?)", -1, &ins, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(ins, 1, 3);
+        rcOpen = sqlite3_step(ins);                                  /* SQLite: the snapshot cannot be upgraded */
+        sqlite3_reset(ins);
+        sqlite3_finalize(cur);                                       /* the cursor closes: the schema can be reset */
+        cur = NULL;
+        sqlite3_bind_int(ins, 1, 3);
+        rcClosed = sqlite3_step(ins);                                /* the first write after: text on a SQLite that resets the
+                                                                     ** schema under it (the v1 way, then rows), rows on 3.55 */
+    }
+    sqlite3_finalize(ins);
+    sqlite3_finalize(cur);
+    sqlite3_int64 textsFirst = scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE op = 0 AND sql LIKE 'INSERT INTO a%'");
+    int ok2 = exec(w.db, "INSERT INTO a VALUES(4)");                 /* the next one must be rows: nothing stays pinned */
+    sqlite3_int64 texts = scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE op = 0 AND sql LIKE 'INSERT INTO a%'");
+    sqlite3_int64 recs = scalar(w.db, "SELECT count(*) FROM _hpplite_pending WHERE op = 1 AND tbl = 'a'");
+    printf("(with the cursor open: %d; after: %d, logged as %s; then: %lld text, %lld records in all) ", rcOpen, rcClosed,
+           textsFirst ? "text" : "rows", (long long)texts, (long long)recs);
+    int nr, nt;
+    const char *why = replica_differs(&w, DIR "/cursor_r.db", &nr, &nt);
+    close_writer(&w2);
+    close_writer(&w);
+    if ((rcOpen & 0xff) != SQLITE_BUSY) FAIL("with the cursor open SQLite should refuse the write (BUSY), as stock SQLite does");
+    if (rcClosed != SQLITE_DONE || !ok2) FAIL("the writes after the cursor closed were not accepted");
+    if (texts != textsFirst || recs != 4 - textsFirst) FAILF("the write after the first one should be rows, nothing pinned: %lld text, %lld records", (long long)texts, (long long)recs);
+    if (why) FAIL(why);
+    PASS();
+}
+
 static void test_autoincrement_and_fts5(void) {
     TEST("AUTOINCREMENT (sqlite_sequence) and an FTS5 table (its internal tables): replica equal and searchable");
     reset_dir();
@@ -819,6 +864,7 @@ int main(void) {
     test_without_rowid_and_generated();
     test_table_rebuild_migration();
     test_table_from_another_connection();
+    test_cursor_open_across_foreign_schema_change();
     test_autoincrement_and_fts5();
     test_failures_and_rollbacks();
     test_write_beside_open_text_statement();
