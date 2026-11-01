@@ -7,34 +7,12 @@
 ** rowid, sqlite_sequence included.
 */
 
-#include "hpplite.h"
+#include "test_lib.h"
 #include "capture_rows.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 #define DIR "/tmp/hpplite_test_rows"
 
-static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); }
-static int exec(sqlite3 *db, const char *sql) {
-    char *e = NULL;
-    int rc = sqlite3_exec(db, sql, NULL, NULL, &e);
-    if (rc != SQLITE_OK && getenv("ROWS_VERBOSE")) fprintf(stderr, "  [%s]: %s\n", sql, e);
-    sqlite3_free(e);
-    return rc == SQLITE_OK;
-}
-static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
-    sqlite3_stmt *st; sqlite3_int64 v = -1;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    return v;
-}
+static int exec(sqlite3 *db, const char *sql) { return exec_sql(db, sql) == SQLITE_OK; }   /* ROWS_VERBOSE=1 shows what failed */
 
 typedef struct { sqlite3 *db; HppliteCtx *ctx; } W;
 static int open_writer_ex(const char *path, W *w, int fnArgLimit) {
@@ -85,53 +63,7 @@ static const char *apply_log(sqlite3 *writer, sqlite3 *replica, int *pRecords, i
 }
 
 /* Every table, every row (rowid tables with their rowid), typed */
-static void dump_value(sqlite3_stmt *st, int i, char **out, size_t *len, size_t *cap) {
-    char buf[64]; const char *p = buf; int n;
-    switch (sqlite3_column_type(st, i)) {
-        case SQLITE_INTEGER: n = snprintf(buf, sizeof buf, "i%lld", (long long)sqlite3_column_int64(st, i)); break;
-        case SQLITE_FLOAT: { double d = sqlite3_column_double(st, i); unsigned long long u; memcpy(&u, &d, 8); n = snprintf(buf, sizeof buf, "f%llx", u); break; }
-        case SQLITE_NULL: n = snprintf(buf, sizeof buf, "n"); break;
-        default: {
-            n = sqlite3_column_bytes(st, i);
-            const unsigned char *b = sqlite3_column_blob(st, i);
-            size_t need = (size_t)n * 2 + 4;
-            while (*len + need + 2 > *cap) { *cap *= 2; *out = realloc(*out, *cap); }
-            (*out)[(*len)++] = sqlite3_column_type(st, i) == SQLITE_TEXT ? 't' : 'b';
-            for (int k = 0; k < n; k++) *len += (size_t)sprintf(*out + *len, "%02x", b[k]);
-            (*out)[(*len)++] = ','; (*out)[*len] = 0;
-            return;
-        }
-    }
-    while (*len + (size_t)n + 2 > *cap) { *cap *= 2; *out = realloc(*out, *cap); }
-    memcpy(*out + *len, p, (size_t)n); *len += (size_t)n; (*out)[(*len)++] = ','; (*out)[*len] = 0;
-}
-static char *dump(sqlite3 *db) {
-    size_t cap = 1 << 16, len = 0; char *out = malloc(cap); out[0] = 0;
-    sqlite3_stmt *tabs;
-    sqlite3_prepare_v2(db, "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\'"
-                           " AND sql NOT LIKE 'CREATE VIRTUAL%' ORDER BY name", -1, &tabs, NULL);
-    while (sqlite3_step(tabs) == SQLITE_ROW) {
-        const char *t = (const char *)sqlite3_column_text(tabs, 0);
-        char sql[512];
-        sqlite3_stmt *probe, *st;
-        snprintf(sql, sizeof sql, "SELECT rowid FROM main.\"%s\" LIMIT 0", t);
-        int hasRowid = sqlite3_prepare_v2(db, sql, -1, &probe, NULL) == SQLITE_OK;
-        sqlite3_finalize(probe);
-        if (hasRowid) snprintf(sql, sizeof sql, "SELECT rowid, * FROM main.\"%s\" ORDER BY rowid", t);
-        else snprintf(sql, sizeof sql, "SELECT * FROM main.\"%s\" ORDER BY 1, 2", t);
-        while (len + strlen(t) + 8 > cap) { cap *= 2; out = realloc(out, cap); }
-        len += (size_t)sprintf(out + len, "[%s]", t);
-        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) continue;
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            for (int i = 0; i < sqlite3_column_count(st); i++) dump_value(st, i, &out, &len, &cap);
-            while (len + 2 > cap) { cap *= 2; out = realloc(out, cap); }
-            out[len++] = ';'; out[len] = 0;
-        }
-        sqlite3_finalize(st);
-    }
-    sqlite3_finalize(tabs);
-    return out;
-}
+#define dump(db) test_dump(db, 0)
 
 /* The check every test ends with */
 static const char *replica_differs(W *w, const char *replicaPath, int *pRecords, int *pTexts) {
@@ -147,7 +79,7 @@ static const char *replica_differs(W *w, const char *replicaPath, int *pRecords,
         size_t s = i > 60 ? i - 60 : 0;
         snprintf(why, sizeof why, "replica differs near\n      writer  ...%.140s\n      replica ...%.140s", a + s, b + s);
     }
-    free(a); free(b);
+    sqlite3_free(a); sqlite3_free(b);
     sqlite3_close(r);
     return same ? NULL : why;
 }
@@ -789,6 +721,8 @@ static void test_groups(void) {
 
 int main(void) {
     printf("HPPLite row capture\n");
+    test_suite_init("rows", NULL, DIR);
+    test_verbose = getenv("ROWS_VERBOSE") != NULL;
     test_basic_types();
     test_effects_not_text();
     test_cascades_and_app_triggers();
@@ -813,6 +747,5 @@ int main(void) {
     test_refused_after_foreign_alter();
     test_tracked_schema_change_commits();
     test_groups();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

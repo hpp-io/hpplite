@@ -5,16 +5,7 @@
 ** interval, and the flush loop submits the checkpoint right after it.
 */
 
-#include "node.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
+#include "test_lib.h"
 
 static const unsigned char SEQ_PRIVKEY[32] = {
     0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
@@ -23,24 +14,12 @@ static const unsigned char SEQ_PRIVKEY[32] = {
 
 #define DIR "/tmp/hpplite_test_checkpoint"
 
+/* a fresh file each time, in the local throw-away mode (#38) with the mock
+** attached but not synced from; checkpointInterval 0: none given */
 static HppliteNode *open_node(HppliteL1 *l1, int checkpointInterval) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "test-seq";
-    memcpy(config.privkey, SEQ_PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = DIR "/test.db";
-    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
-    config.checkpointInterval = checkpointInterval;
-    node = hpplite_node_create(&config);
-    if (node) {
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_start(node);
-    }
-    return node;
+    TestNodeOpts o = { .checkpointInterval = checkpointInterval ? checkpointInterval : TEST_INTERVAL_NODE, .localOnly = 1, .noSync = 1 };
+    reset_dir();
+    return test_open_node(DIR "/test.db", l1, &o);
 }
 
 static HppliteBatch *l1_batch(HppliteNode *node, uint64_t h) {
@@ -133,15 +112,11 @@ static void test_checkpoint_every_batch(void) {
 
 /* No L1: the interval is tracked, nothing is submitted, roots still land on closing batches */
 static void test_checkpoint_without_l1(void) {
-    HppliteNodeConfig config;
+    TestNodeOpts local = { .nodeId = "local", .checkpointInterval = 2, .localOnly = 1 };
     HppliteNode *node;
     TEST("without L1 the interval is tracked and manual checkpoint is a no-op");
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "local"; memcpy(config.privkey, SEQ_PRIVKEY, 32); config.hasPrivkey = 1;
-    config.dataDir = DIR; config.dbPath = DIR "/local.db"; config.checkpointInterval = 2;
-    config.localOnly = 1;   /* no chain here: the local throw-away mode (#38) */
-    node = hpplite_node_create(&config);
+    reset_dir();
+    node = test_open_node(DIR "/local.db", NULL, &local);
     if (!node) FAIL("open");
     hpplite_node_exec(node, "CREATE TABLE t (x)", NULL); hpplite_node_flush_batch(node);
     hpplite_node_exec(node, "INSERT INTO t VALUES (1)", NULL); hpplite_node_flush_batch(node);
@@ -192,13 +167,13 @@ static void test_interval_written_back(void) {
 
 int main(void) {
     printf("=== Checkpoint Flow Tests ===\n");
+    test_suite_init("test-seq", SEQ_PRIVKEY, DIR);
     test_checkpoint_auto();
     test_checkpoint_chain();
     test_checkpoint_every_batch();
     test_checkpoint_without_l1();
     test_interval_from_contract();
     test_interval_written_back();
-    (void)!system("rm -rf " DIR);
-    printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    remove_dir();
+    return test_report();
 }

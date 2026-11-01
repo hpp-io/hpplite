@@ -11,25 +11,11 @@
 **   - the state root is a function of content, not of history
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "cipher.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <strings.h>
 #include <unistd.h>
 #include <sys/wait.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-
-/* Row capture (#19) is the default; cases about statement capture run with
-** HPPLITE_CAPTURE=text (the _text tests) and skip otherwise */
-static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return !(v && strcasecmp(v, "text") == 0); }
-#define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 #define PRIVKEY_HEX "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 static const unsigned char PRIVKEY[32] = {
@@ -39,42 +25,12 @@ static const unsigned char PRIVKEY[32] = {
 
 #define DIR "/tmp/hpplite_test_durability"
 
-static void reset_dir(void) {
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
-}
-
-static int count_rows(sqlite3 *db, const char *table) {
-    char sql[128];
-    sqlite3_stmt *stmt;
-    int n = -1;
-    snprintf(sql, sizeof(sql), "SELECT count(*) FROM %s", table);
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(stmt) == SQLITE_ROW) n = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
-    return n;
-}
-
-static HppliteNode *open_node_mode(const char *dbPath, HppliteL1 *l1, int determinismWarn);
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_mode(dbPath, l1, 0); }
+/* no checkpoint interval given: the node's own default */
 static HppliteNode *open_node_mode(const char *dbPath, HppliteL1 *l1, int determinismWarn) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.determinismWarn = determinismWarn;
-    config.nodeId = "durability";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.localOnly = (l1 == NULL);   /* no chain in these tests: the local throw-away mode (#38) */
-    node = hpplite_node_create(&config);
-    if (node && l1) {
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_sync_from_l1(node, 1);
-        hpplite_node_start(node);
-    }
-    return node;
+    TestNodeOpts o = { .checkpointInterval = TEST_INTERVAL_NODE, .determinismWarn = determinismWarn };
+    return test_open_node(dbPath, l1, &o);
 }
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_mode(dbPath, l1, 0); }
 
 /* 1. Reopening an existing file continues where it left off */
 static void test_reopen_continues(void) {
@@ -1457,6 +1413,7 @@ static void test_unsupported_sql_refused(void) {
 
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
+    test_suite_init("durability", PRIVKEY, DIR);
     test_reopen_continues();
     test_crash_recovers_pending();
     test_submit_failure_retries();
@@ -1494,7 +1451,6 @@ int main(void) {
     test_claim_reverted_on_chain();
     test_finalize_commit_fails();
     test_adopted_batch_kept_for_reorg();
-    (void)!system("rm -rf " DIR);
-    printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    remove_dir();
+    return test_report();
 }
