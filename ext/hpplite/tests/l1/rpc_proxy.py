@@ -17,6 +17,11 @@ each line is key=value, missing keys are 0:
     hold_ms=4000     how long a timed-out response is held
     seed=1           the random stream (one per proxy start)
 
+When the mode changes, the first requests take each fault kind the mode
+lists once, in order (error, drop, timeout); the rolls decide after that.
+A phase of a few requests then always shows its kind (#127: on CI the 503
+phase saw no 503 and the test failed on its own coverage check).
+
 What happened is counted in <mode_file>.stats (requests, forwarded,
 delayed, dropped, timed_out, errored), rewritten after every request, so
 the test can tell the faults were exercised. Only the standard library.
@@ -41,6 +46,8 @@ stats_lock = threading.Lock()
 stats = {"requests": 0, "forwarded": 0, "delayed": 0, "dropped": 0, "timed_out": 0, "errored": 0}
 rng = None
 rng_seed = None
+mode_seen = None       # the mode the last request saw
+forced = []            # fault kinds still owed at the start of this mode
 
 
 def read_mode():
@@ -96,7 +103,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
     def do_POST(self):
-        global rng, rng_seed
+        global rng, rng_seed, mode_seen, forced
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
         mode = read_mode()
@@ -105,7 +112,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if rng is None or seed != rng_seed:
                 rng = random.Random(seed)
                 rng_seed = seed
+            sig = tuple(sorted(mode.items()))
+            if sig != mode_seen:
+                mode_seen = sig
+                forced = [k for k in ("error", "drop", "timeout") if mode.get(k, 0) > 0]
             roll = rng.random()
+            if forced:
+                # the roll that lands in this kind's band, below
+                kind = forced.pop(0)
+                roll = {"error": 0.0, "drop": mode.get("error", 0),
+                        "timeout": mode.get("error", 0) + mode.get("drop", 0)}[kind]
         count("requests")
         if roll < mode.get("error", 0):
             count("errored")
