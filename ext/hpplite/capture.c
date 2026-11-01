@@ -51,8 +51,7 @@ static void pragmaModeSet(HppliteCtx *pCtx, const char *zName, const char *zValu
 }
 void hpplitePragmaModeRead(HppliteCtx *pCtx) {
   static const char *aRead[] = { "legacy_alter_table", "writable_schema", "ignore_check_constraints", NULL };
-  int i, saved = pCtx->bInternal;
-  pCtx->bInternal = 1;
+  int i, saved = hppliteInternalBegin(pCtx);
   for (i = 0; aRead[i]; i++) {
     sqlite3_stmt *q = NULL;
     char *zSql = sqlite3_mprintf("PRAGMA %s", aRead[i]);
@@ -63,7 +62,7 @@ void hpplitePragmaModeRead(HppliteCtx *pCtx) {
     sqlite3_finalize(q);
     sqlite3_free(zSql);
   }
-  pCtx->bInternal = saved;
+  hppliteInternalEnd(pCtx, saved);
 }
 
 /* PRAGMA [schema.]user_version / application_id = N (or (N)): the two header
@@ -161,19 +160,18 @@ static sqlite3_int64 totalChanges(sqlite3 *db) {
 }
 
 int hppliteSchemaVersion(HppliteCtx *pCtx) {
-  int v = -1, savedInternal = pCtx->bInternal;
-  pCtx->bInternal = 1;                   /* ours: its trace must not pass for the application's next statement */
+  int v = -1, saved = hppliteInternalBegin(pCtx);   /* ours: its trace must not pass for the application's next statement */
   if (!pCtx->pSchemaStmt) {
     if (sqlite3_prepare_v3(pCtx->db, "PRAGMA schema_version", -1, SQLITE_PREPARE_PERSISTENT,
                            &pCtx->pSchemaStmt, NULL) != SQLITE_OK) {
       pCtx->pSchemaStmt = NULL;
-      pCtx->bInternal = savedInternal;
+      hppliteInternalEnd(pCtx, saved);
       return -1;
     }
   }
   if (sqlite3_step(pCtx->pSchemaStmt) == SQLITE_ROW) v = sqlite3_column_int(pCtx->pSchemaStmt, 0);
   sqlite3_reset(pCtx->pSchemaStmt);
-  pCtx->bInternal = savedInternal;
+  hppliteInternalEnd(pCtx, saved);
   return v;
 }
 
@@ -194,7 +192,40 @@ int hppliteSchemaVersion(HppliteCtx *pCtx) {
 ** transaction.
 */
 static int seqFingerprint(HppliteCtx *pCtx, sqlite3_int64 out[2]);
+/* Did the logged statement do anything: changes(), the schema version or
+** sqlite_sequence moved since its row was written. Under bInternal. */
+static int loggedHadEffect(HppliteCtx *pCtx) {
+  sqlite3_int64 now[2];
+  if (totalChanges(pCtx->db) != pCtx->logged.changes || hppliteSchemaVersion(pCtx) != pCtx->logged.schema) return 1;
+  /* no row changed, but sqlite_sequence may have */
+  return pCtx->logged.bSeq && seqFingerprint(pCtx, now) && (now[0] != pCtx->logged.seq[0] || now[1] != pCtx->logged.seq[1]);
+}
+/* The last logged row goes, inside the application's transaction. Under bInternal. */
+static void unlogLast(HppliteCtx *pCtx) {
+  if (!pCtx->pUnlogStmt) {
+    if (sqlite3_prepare_v3(pCtx->db, "DELETE FROM _hpplite_pending WHERE id = ?1",
+                           -1, SQLITE_PREPARE_PERSISTENT, &pCtx->pUnlogStmt, NULL) != SQLITE_OK) {
+      pCtx->pUnlogStmt = NULL;
+    }
+  }
+  if (!pCtx->pUnlogStmt) return;
+  sqlite3_bind_int64(pCtx->pUnlogStmt, 1, pCtx->logged.id);
+  hpplite_step_write(pCtx->pUnlogStmt);
+  sqlite3_reset(pCtx->pUnlogStmt);
+  /* changes() now says 1 (our DELETE); the application's statement changed
+  ** nothing - that is why its row went. A zero-row UPDATE says 0 again. */
+  if (!pCtx->pZeroStmt
+      && sqlite3_prepare_v3(pCtx->db, "UPDATE _hpplite_pending SET txn = txn WHERE 0", -1,
+                            SQLITE_PREPARE_PERSISTENT, &pCtx->pZeroStmt, NULL) != SQLITE_OK) {
+    pCtx->pZeroStmt = NULL;
+  }
+  if (pCtx->pZeroStmt) {
+    hpplite_step_write(pCtx->pZeroStmt);
+    sqlite3_reset(pCtx->pZeroStmt);
+  }
+}
 static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
+  int saved;
   if (pS != pCtx->logged.pS) return;
   pCtx->logged.pS = NULL;
   if (pCtx->logged.keep) return;   /* a header pragma changes neither rows nor schema: keep */
@@ -203,55 +234,17 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   ** is still busy, before it counts the changes it made. Its writes are done
   ** (they all happen in the first step), the count says nothing: keep. */
   if (sqlite3_stmt_busy(pS)) return;
-
-  pCtx->bInternal = 1;
-  if (totalChanges(pCtx->db) != pCtx->logged.changes
-      || hppliteSchemaVersion(pCtx) != pCtx->logged.schema) {
-    pCtx->bInternal = 0;
-    return;   /* had an effect: keep */
-  }
-  if (pCtx->logged.bSeq) {
-    sqlite3_int64 now[2];
-    if (seqFingerprint(pCtx, now) && (now[0] != pCtx->logged.seq[0] || now[1] != pCtx->logged.seq[1])) {
-      pCtx->bInternal = 0;
-      return;   /* no row changed, but sqlite_sequence did: keep */
-    }
-  }
-  /* No effect. Inside a transaction its row goes before anyone can see it:
-  ** a statement that failed there must not reach the chain (in autocommit a
-  ** failed statement's rollback took the row already), and a no-op need not.
-  ** In autocommit the row committed with the statement and may already be in
-  ** a snapshot - a batch being built in this process or another; removing it
-  ** now would leave that batch carrying a row the log no longer has. It stays:
-  ** a statement that changed nothing on the writer changes nothing on a
-  ** replica with the same state. */
-  if (sqlite3_get_autocommit(pCtx->db)) {
-    pCtx->bInternal = 0;
-    return;
-  }
-  if (!pCtx->pUnlogStmt) {
-    if (sqlite3_prepare_v3(pCtx->db, "DELETE FROM _hpplite_pending WHERE id = ?1",
-                           -1, SQLITE_PREPARE_PERSISTENT, &pCtx->pUnlogStmt, NULL) != SQLITE_OK) {
-      pCtx->pUnlogStmt = NULL;
-    }
-  }
-  if (pCtx->pUnlogStmt) {
-    sqlite3_bind_int64(pCtx->pUnlogStmt, 1, pCtx->logged.id);
-    hpplite_step_write(pCtx->pUnlogStmt);
-    sqlite3_reset(pCtx->pUnlogStmt);
-    /* changes() now says 1 (our DELETE); the application's statement changed
-    ** nothing - that is why its row went. A zero-row UPDATE says 0 again. */
-    if (!pCtx->pZeroStmt
-        && sqlite3_prepare_v3(pCtx->db, "UPDATE _hpplite_pending SET txn = txn WHERE 0", -1,
-                              SQLITE_PREPARE_PERSISTENT, &pCtx->pZeroStmt, NULL) != SQLITE_OK) {
-      pCtx->pZeroStmt = NULL;
-    }
-    if (pCtx->pZeroStmt) {
-      hpplite_step_write(pCtx->pZeroStmt);
-      sqlite3_reset(pCtx->pZeroStmt);
-    }
-  }
-  pCtx->bInternal = 0;
+  saved = hppliteInternalBegin(pCtx);
+  /* Had an effect: keep. No effect: inside a transaction its row goes
+  ** before anyone can see it - a statement that failed there must not reach
+  ** the chain (in autocommit a failed statement's rollback took the row
+  ** already), and a no-op need not. In autocommit the row committed with the
+  ** statement and may already be in a snapshot - a batch being built in this
+  ** process or another; removing it now would leave that batch carrying a
+  ** row the log no longer has. It stays: a statement that changed nothing on
+  ** the writer changes nothing on a replica with the same state. */
+  if (!loggedHadEffect(pCtx) && !sqlite3_get_autocommit(pCtx->db)) unlogLast(pCtx);
+  hppliteInternalEnd(pCtx, saved);
 }
 
 /*
@@ -1062,8 +1055,7 @@ static void rerunStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
 static void logVacuum(HppliteCtx *pCtx) {
   sqlite3_stmt *q = NULL;
   sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
-  int saved = pCtx->bInternal;
-  pCtx->bInternal = 1;
+  int saved = hppliteInternalBegin(pCtx);
   if (sqlite3_prepare_v2(pCtx->db, "INSERT INTO _hpplite_pending(txn, sql, mode, now) VALUES(0, 'VACUUM', 0, 0)",
                          -1, &q, NULL) == SQLITE_OK) {
     if (hpplite_step_write(q) != SQLITE_DONE) pCtx->nLogErrors++;
@@ -1072,7 +1064,7 @@ static void logVacuum(HppliteCtx *pCtx) {
   }
   sqlite3_finalize(q);
   sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
-  pCtx->bInternal = saved;
+  hppliteInternalEnd(pCtx, saved);
 }
 
 int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
@@ -1080,7 +1072,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   sqlite3_stmt *pS = (sqlite3_stmt*)pStmt;
   const char *zSql = (const char*)pX;
   char *zExpanded;
-  int rc, slot = -1;
+  int rc, slot = -1, saved;
   ActiveRun done = { 0, 0, 0, 0 };
 
   if (!pCtx || pCtx->bInternal) return 0;
@@ -1308,7 +1300,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
     pCtx->aRun[slot].now = t;
   }
 
-  pCtx->bInternal = 1;
+  saved = hppliteInternalBegin(pCtx);
   if (!pCtx->pLogStmt) {
     rc = sqlite3_prepare_v3(pCtx->db,
       "INSERT INTO _hpplite_pending(txn, sql, mode, now) VALUES(?1, ?2, ?3, ?4)",
@@ -1352,7 +1344,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   } else {
     rc = SQLITE_ERROR;
   }
-  pCtx->bInternal = 0;
+  hppliteInternalEnd(pCtx, saved);
   /* the statement's own clock reads start after our bookkeeping above */
   if (slot >= 0) pCtx->aRun[slot].clockSeen = hpplite_clock_consulted();
   if (rc != SQLITE_DONE) {

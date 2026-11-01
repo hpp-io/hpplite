@@ -34,6 +34,14 @@
 #define TEST_FAIL_COMMIT(rc) ((void)0)
 #endif
 
+/* HPPLite's own statements on the application connection: the hooks ignore
+** them while bInternal is set. Scoped: what hppliteInternalBegin() returns
+** goes to hppliteInternalEnd() on every way out of the scope, so no path
+** leaves the flag set (which silently drops captures, #20) or clears one a
+** caller holds. */
+static inline int hppliteInternalBegin(HppliteCtx *pCtx) { int saved = pCtx->bInternal; pCtx->bInternal = 1; return saved; }
+static inline void hppliteInternalEnd(HppliteCtx *pCtx, int saved) { pCtx->bInternal = saved; }
+
 /* hpplite.c */
 int hppliteInternalExec(HppliteCtx *pCtx, sqlite3 *db, const char *zSql);  /* SQL of HPPLite's own on the application connection, hooks silent */
 int hppliteBkEnter(HppliteCtx *pCtx);          /* bInternal around HPPLite's own statements when bookkeeping shares the */
