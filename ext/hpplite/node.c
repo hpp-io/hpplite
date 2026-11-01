@@ -1248,7 +1248,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
 
     if (hpplite_finalize_batch(ctx, batch, maxId) != SQLITE_OK) {
         /* Typically: an application statement is mid-step, so bookkeeping
-        ** must not commit now (see bkBegin). The batch is on L1 (when there
+        ** must not commit now (see hppliteBkBegin). The batch is on L1 (when there
         ** is one) and the next flush adopts it; locally nothing changed. */
         node->retryAt = 0;        /* not an L1 failure: try again next tick */
         if (ctx->nAppStmtActive == 0 && !ctx->bAppTxnOpen && ctx->txnGate != 1) {

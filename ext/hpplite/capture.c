@@ -480,7 +480,7 @@ static const char *functionVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   for (c = zShape; *c; c++) h = (h ^ (unsigned char)*c) * 1099511628211ULL;
   /* The key must not read the file: a read of our own here, while the
   ** application statement is starting, races a bookkeeping commit (WAL
-  ** snapshot, see bkBegin). The data version is in memory and moves when
+  ** snapshot, see hppliteBkBegin). The data version is in memory and moves when
   ** another connection commits; our own DDL is counted as it is captured.
   ** Left open: another connection adding a trigger that calls an
   ** application function, between our last lock and this statement. */
@@ -1007,7 +1007,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   ActiveRun done = { 0, 0, 0, 0 };
 
   if (!pCtx || pCtx->bInternal) return 0;
-  /* Mid-step bookkeeping for bkBegin(): the timer thread must not ask the
+  /* Mid-step bookkeeping for hppliteBkBegin(): the timer thread must not ask the
   ** connection itself (sqlite3_next_stmt takes the connection mutex, which
   ** sqlite3_close holds while it joins the timer thread - a deadlock). */
   if (mask == SQLITE_TRACE_STMT && pCtx->rerunStage == 2 && pS != pCtx->pRerunStmt

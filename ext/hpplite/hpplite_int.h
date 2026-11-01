@@ -15,6 +15,13 @@
 #include "clock.h"
 #include "batch.h"
 
+/* mock builds: a test makes the next n bookkeeping COMMITs fail as SQLITE_FULL (a full disk) */
+#ifdef HPPLITE_TEST_HOOKS
+#define TEST_FAIL_COMMIT(rc) do { if ((rc) == SQLITE_OK && hpplite_test_fail_commits > 0) { hpplite_test_fail_commits--; (rc) = SQLITE_FULL; } } while (0)
+#else
+#define TEST_FAIL_COMMIT(rc) ((void)0)
+#endif
+
 /* hpplite.c: run SQL of HPPLite's own on the application connection, hooks silent */
 int hppliteInternalExec(HppliteCtx *pCtx, sqlite3 *db, const char *zSql);
 
@@ -38,5 +45,10 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX);
 
 /* capture.c: the hooks hpplite_init installs and rearmHooks re-installs */
 int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const char *z3, const char *z4);
+
+/* bookkeeping.c: a bookkeeping transaction, read or write; bkEnd commits or rolls back and notices foreign writes */
+int hppliteBkBegin(HppliteCtx *pCtx, int bWrite);
+
+int hppliteBkEnd(HppliteCtx *pCtx, int rc);
 
 #endif /* HPPLITE_INT_H */
