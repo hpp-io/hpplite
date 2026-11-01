@@ -343,8 +343,9 @@ static void finalizeOwnStatements(HppliteCtx *pCtx) {
   if (pCtx->pRowsSchemaStmt) sqlite3_finalize(pCtx->pRowsSchemaStmt);
   if (pCtx->pRowsTempSchemaStmt) sqlite3_finalize(pCtx->pRowsTempSchemaStmt);
   if (pCtx->pRowsLockStmt) sqlite3_finalize(pCtx->pRowsLockStmt);
+  if (pCtx->pProbeStmt) sqlite3_finalize(pCtx->pProbeStmt);
   pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = pCtx->pZeroStmt = NULL;
-  pCtx->pSeqStmt = pCtx->pRowsSchemaStmt = pCtx->pRowsTempSchemaStmt = pCtx->pRowsLockStmt = NULL;
+  pCtx->pSeqStmt = pCtx->pRowsSchemaStmt = pCtx->pRowsTempSchemaStmt = pCtx->pRowsLockStmt = pCtx->pProbeStmt = NULL;
   pCtx->logged.pS = NULL;
 }
 
@@ -355,7 +356,8 @@ static int applicationStatementsOpen(HppliteCtx *pCtx) {
   while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
     if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt
         || pStmt == pCtx->pRecTrigStmt || pStmt == pCtx->pZeroStmt || pStmt == pCtx->pSeqStmt
-        || pStmt == pCtx->pRowsSchemaStmt || pStmt == pCtx->pRowsTempSchemaStmt || pStmt == pCtx->pRowsLockStmt) continue;
+        || pStmt == pCtx->pRowsSchemaStmt || pStmt == pCtx->pRowsTempSchemaStmt || pStmt == pCtx->pRowsLockStmt
+        || pStmt == pCtx->pProbeStmt) continue;
     return 1;
   }
   return 0;

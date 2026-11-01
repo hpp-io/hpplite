@@ -175,7 +175,8 @@ and the test that fails if it changes. The `sqlite-trunk` CI job builds
 against upstream `master` and runs the mock suite, advisory
 (`continue-on-error`), so a change upstream is seen there first; its first
 run found trunk's deferred schema reset (2026-10-26/27) breaking the stale
-rerun path (entry 10 there), to be handled before the move to 3.55.
+rerun path (entry 10 there), handled in #108: the capture is deferred to
+the statement's first run's end when its start finds the schema pinned.
 
 ---
 

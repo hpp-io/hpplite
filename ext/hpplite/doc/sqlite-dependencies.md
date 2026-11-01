@@ -32,10 +32,12 @@ the same binary with `HPPLITE_CAPTURE=text`.
 | 7 | `SQLITE_FCNTL_DATA_VERSION` moves per own commit and per detected change, not per foreign commit | test_rows_e2e | ok |
 | 8 | The rollback hook fires for the implicit rollback of a failed autocommit statement | test_hpplite | ok |
 | 9 | `sqlite3_expanded_sql()` truncates bound values in some builds | test_env_enable | ok |
-| 10 | A schema reset is immediate even while another statement of the connection is running | test_rows, test_concurrency(+_text), test_faults(+_text), test_rows_e2e | **broken** |
+| 10 | A schema reset is immediate even while another statement of the connection is running | test_rows, test_concurrency(+_text), test_faults(+_text), test_rows_e2e | handled (#108) |
 
 Entry 10 was not on the list in #105: it is the one trunk broke, found by the
-first run of the trunk build (2026-11-01; details under 10).
+first run of the trunk build (2026-11-01; details under 10). HPPLite no
+longer relies on it (#108): the capture of a statement whose start finds the
+schema stale and pinned is deferred to its first run's end.
 
 ## 1. A stale statement is reprepared and rerun inside the same `sqlite3_step()`
 
@@ -366,13 +368,26 @@ pass against 3.54.1): test_concurrency and test_concurrency_text
 test_rows "a table created by another connection: the first write to it is
 logged as text, then rows" and `test_tracked_schema_change_commits`;
 test_rows_e2e `test_lock_contention`; test_faults and test_faults_text (the
-two-connection seeds: "could not log statement" refusals diverge the
-replica). What HPPLite should do about it is not decided here: it may
-reprepare its own statements itself when a step returns SQLITE_SCHEMA
-(SQLite's reprepare of the application's statement then happens at its
-own retry, with the schema reset once the first run halts), or read the
-schema with a fresh prepare; that is a change to `capture.c`, outside this
-inventory (#108).
+two-connection seeds).
+
+**No longer relied on (#108).** When a statement of HPPLite's fails
+SQLITE_SCHEMA at an application statement's start (the lock no-op or the
+log INSERT: `HPPLITE_ROWS_STALE`, `deferCapture()` in `capture.c`), the
+application's statement is stale too: HPPLite opens its transaction
+(`rerunTrack()`), lets the first run fail at its own cookie check - which
+resets the schema, this statement being the only one running - and does the
+capture at that run's end (`rerunStatementDone()` → `captureStart()`,
+triggers rebuilt there for a write), before SQLite reprepares and reruns it
+in the same step. Under a held lock (#92) a probe (`hppliteSchemaProbe()`)
+tells "stale and pinned" from "lock held"; a statement that then fails
+SQLITE_BUSY leaves the rebuild owed, done under the retry's own lock with
+the schema cookie moved on so the retry reruns with the new triggers rather
+than aborting (a running statement expired by trigger DDL aborts at its
+first cursor, SQLITE_ABORT_ROLLBACK, on every SQLite). The text rules are
+judged at the start when the statement is text in any case, so a refusal
+opens no transaction. On 3.54.1 the deferred paths are never taken (the
+nested reprepare works and the lock no-op never fails SQLITE_SCHEMA); the
+trunk CI job exercises them.
 
 ## Adding an entry
 

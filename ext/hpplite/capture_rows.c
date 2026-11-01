@@ -498,6 +498,7 @@ static int rebuild(HppliteCtx *pCtx) {
   sqlite3_free(zSkip);
   pCtx->rowsBuiltFor = rc == SQLITE_OK ? v : -1;
   pCtx->rowsTempBuiltFor = tempSchemaVersionOf(pCtx);
+  if (rc == SQLITE_OK) pCtx->bRebuildOwed = 0;
   hppliteInternalEnd(pCtx, saved);
   return rc;
 }
@@ -649,6 +650,7 @@ int hpplite_rows_covered_for_write(HppliteCtx *pCtx) {
     if (pCtx->pRowsLockStmt) sqlite3_reset(pCtx->pRowsLockStmt);
     hppliteInternalEnd(pCtx, saved);
     if ((rc & 0xff) == SQLITE_BUSY) return HPPLITE_ROWS_BUSY;   /* held elsewhere past the timeout (#92) */
+    if ((rc & 0xff) == SQLITE_SCHEMA) return HPPLITE_ROWS_STALE; /* the schema stale past every reprepare (#108) */
     if (rc != SQLITE_DONE) return 0;      /* no lock for another reason: text, as v1 - its own insert says why */
   }
   return schemaVersionOf(pCtx) == pCtx->rowsBuiltFor && tempSchemaVersionOf(pCtx) == pCtx->rowsTempBuiltFor;

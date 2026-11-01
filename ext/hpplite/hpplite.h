@@ -87,7 +87,15 @@ struct HppliteCtx {
   sqlite3_stmt *pRerunStmt;      /* a statement prepared on a stale schema, logged in a transaction
                                  ** HPPLite opened for it: SQLite reruns it without a STMT trace */
   int rerunStage;                /* 1 logged, 2 its first run failed (SQLITE_SCHEMA) and the rerun runs */
-  int rerunSchema;               /* schema_version when it was tracked: one it changed itself expired itself */
+  int rerunSchema;               /* schema_version when it was tracked: one it changed itself expired itself
+                                 ** (-1: unknown, the read failed with the capture, #108) */
+  int bCaptureDeferred;          /* its capture waits for its first run's end: HPPLite's statements could
+                                 ** not run at its start, the stale schema not reset while it runs (#108) */
+  int bDeferredJudged;           /* ...the text rules were applied at its start already */
+  int bDenyReprepare;            /* the next prepare is the refused statement's reprepare: deny it (#89), known
+                                 ** without the error code (HPPLite's own statements ran since, #108) */
+  int bRebuildOwed;              /* a write found the schema stale and pinned under a held lock and failed
+                                 ** SQLITE_BUSY: the triggers are rebuilt under the next write's lock (#108) */
   sqlite3_stmt *pRefusedStmt;    /* refused at its trace (sqlite3_interrupt); a first run failing stale
                                  ** (SQLITE_SCHEMA) reruns untraced with the interrupt cleared, so its
                                  ** reprepare is denied by the authorizer instead (#89) */
@@ -120,6 +128,8 @@ struct HppliteCtx {
   sqlite3_stmt *pRowsSchemaStmt; /* Cached PRAGMA main.schema_version */
   sqlite3_stmt *pRowsTempSchemaStmt; /* Cached PRAGMA temp.schema_version */
   sqlite3_stmt *pRowsLockStmt; /* Cached no-op write: the write lock before that read */
+  sqlite3_stmt *pProbeStmt;   /* Cached read of _hpplite_meta: can HPPLite's statements run, or is the
+                              ** schema stale and pinned by a running statement (#108)? */
   char *zRowsSeq;             /* sqlite_sequence when last looked at: name '\0' seq '\0' ... '\0' */
   sqlite3_stmt *pVacuumStmt;  /* A VACUUM running: the ATTACH inside it is its own */
   int vacuumSchema;           /* ...schema_version as it started (VACUUM bumps it when done) */

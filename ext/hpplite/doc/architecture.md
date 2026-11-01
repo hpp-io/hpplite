@@ -436,6 +436,10 @@ API; [`sqlite-dependencies.md`](sqlite-dependencies.md) lists each one with
 its SQLite source location, the HPPLite code that relies on it and the
 test that fails if it changes, and the `sqlite-trunk` CI job builds against
 upstream `master` so a change there is seen before a release moves to it.
+Its first run found one (SQLite 3.55 defers the schema reset while a
+statement runs), and the capture now has a path for a stale, pinned schema:
+the capture of such a statement is done at its first run's end, when the
+statement's own schema check has reset the schema (#108, entry 10 there).
 
 ---
 

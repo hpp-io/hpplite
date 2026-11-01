@@ -31,6 +31,9 @@ int hpplite_rows_covered(struct HppliteCtx *pCtx);
 ** busy_timeout): 1 covered, 0 not (text), HPPLITE_ROWS_BUSY the lock is held
 ** elsewhere past the timeout - nothing was read, the caller decides (#92) */
 #define HPPLITE_ROWS_BUSY (-1)
+/* ...HPPLITE_ROWS_STALE: the lock no-op failed SQLITE_SCHEMA - the schema is stale and
+** stays so while the statement runs (#108); the statement is stale too */
+#define HPPLITE_ROWS_STALE (-2)
 int hpplite_rows_covered_for_write(struct HppliteCtx *pCtx);
 
 /* Must this write be logged as text? (it names a virtual table, or a table
