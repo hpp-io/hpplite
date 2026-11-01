@@ -988,6 +988,14 @@ static int node_adopt_existing(HppliteNode *node) {
     ** Told apart from "nothing at our height": the batch is on L1, and
     ** posting another at this height would only be refused (#90) */
     if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) return 2;
+    /* The batch matched too, but its finalize could not be written (a full
+    ** disk, an I/O error): a local failure, retried at the next flush - not
+    ** a fork, which only a mismatch is (#119) */
+    if (rc != SQLITE_MISMATCH) {
+        hpplite_error(node->ctx, "could not finalize L1 batch %llu (%s): retried",
+                (unsigned long long)node->ctx->blockHeight, sqlite3_errstr(rc));
+        return 2;
+    }
     hpplite_error(node->ctx, "L1 batch %llu does not match local pending SQL",
             (unsigned long long)node->ctx->blockHeight);
     return -1;
