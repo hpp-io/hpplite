@@ -1329,6 +1329,62 @@ static void test_finalize_commit_fails(void) {
     PASS();
 }
 
+/* A full disk in the middle of a series of batches (#49): a backlog that
+** splits into several batches posts its first, whose finalize cannot
+** commit; the next flush finds it on L1 and adopts it, and that commit
+** fails too (the disk is still full); then there is room again. The node
+** must carry on where the chain is - nothing posted twice, no gap - and
+** not stay in error over a disk that was full for a while. */
+static void test_full_disk_mid_series(void) {
+    TEST("full disk mid-series: the finalize and the adopt after it both fail to commit; with room again the series completes, nothing posted twice, no stuck error");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .checkpointInterval = TEST_INTERVAL_1000, .maxBatchBytes = 2048 };
+    HppliteNode *n = test_open_node(DIR "/full_series.db", l1, &o);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", NULL);
+    if (hpplite_node_flush_batch(n) != 1) FAIL("batch 1");
+    for (int i = 0; i < 60; i++) {
+        char sql[200];
+        snprintf(sql, sizeof sql, "INSERT INTO t VALUES(%d, '%0100d')", i, i);
+        hpplite_node_exec(n, sql, NULL);
+    }
+    uint64_t last = 0, total = 0;
+    hpplite_test_fail_commits = 2;                       /* batch 2's finalize, then its adopt */
+    uint64_t h1 = hpplite_node_flush_batch(n);
+    uint64_t h2 = hpplite_node_flush_batch(n);
+    hpplite_test_fail_commits = 0;
+    int errAfterFull = n->state == HPPLITE_STATE_ERROR;
+    char *afterFull = sqlite3_mprintf("%s", n->ctx->zLastError);
+    hpplite_l1_get_da_state(l1, &last, &total, NULL);
+    if (h1 != 0 || h2 != 0) FAILF("flushes %llu, %llu with the disk full: want 0, 0", (unsigned long long)h1, (unsigned long long)h2);
+    if (last != 2) FAILF("the chain holds %llu batches after two failed commits: want 2 (batch 2 posted once)", (unsigned long long)last);
+    if (hpplite_node_get_height(n) != 2) FAILF("height %llu in memory, the file says 2", (unsigned long long)hpplite_node_get_height(n));
+    /* room again: the series completes from batch 2 on */
+    uint64_t h3 = 0;
+    for (int k = 0; k < 10 && hpplite_node_pending_count(n) > 0; k++) h3 = hpplite_node_flush_batch(n);
+    hpplite_l1_get_da_state(l1, &last, &total, NULL);
+    int pending = hpplite_node_pending_count(n);
+    uint64_t height = hpplite_node_get_height(n);
+    printf("(after the full disk: state %s, last_error \"%s\"; then %llu batches on chain, height %llu) ",
+           errAfterFull ? "error" : "ok", afterFull, (unsigned long long)last, (unsigned long long)height);
+    sqlite3_free(afterFull);
+    if (pending != 0 || h3 < 4) FAILF("the series did not complete: %d pending, last flush %llu", pending, (unsigned long long)h3);
+    if (last + 1 != height) FAILF("the chain holds %llu batches, the file finalized %llu", (unsigned long long)last, (unsigned long long)(height - 1));
+    for (uint64_t h = 1; h <= last; h++) {
+        HppliteBatch *b = hpplite_node_fetch_batch(n, h);
+        if (!b) FAILF("batch %llu is missing on the chain", (unsigned long long)h);
+        hpplite_batch_free(b);
+    }
+    hpplite_node_exec(n, "INSERT INTO t VALUES(100, 'after')", NULL);
+    if (hpplite_node_flush_batch(n) != height) FAIL("the node does not go on");
+    if (n->state == HPPLITE_STATE_ERROR) FAIL("the node stays in error after the disk had room again (a full disk is not a fork)");
+    const char *why = test_replica_check(n, l1, DIR "/full_series_r.db", &o, 0, 1, 1);
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+    PASS();
+}
+
 /* A batch the node adopted from L1 (posted, confirmation lost, found there
 ** at the next flush) must be kept like one it finalized itself, or a reorg
 ** that drops it cannot be repaired: "no longer kept to post again" (#99,
@@ -1449,6 +1505,7 @@ int main(void) {
     test_unsupported_sql_refused();
     test_claim_reverted_on_chain();
     test_finalize_commit_fails();
+    test_full_disk_mid_series();
     test_adopted_batch_kept_for_reorg();
     remove_dir();
     return test_report();
