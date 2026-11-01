@@ -13,7 +13,6 @@
 
 #include "test_lib.h"
 #include "cipher.h"
-#include <strings.h>
 #include <unistd.h>
 #include <sys/wait.h>
 

@@ -18,7 +18,6 @@
 #include "test_lib.h"
 #include "l1_interface.h"
 #include <strings.h>
-#include <unistd.h>
 
 /* in a scratch directory of this process's own (test_suite_init): two
 ** harness runs at once (a long seed sweep beside ctest) must not share one */

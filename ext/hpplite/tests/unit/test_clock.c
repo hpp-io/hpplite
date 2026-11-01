@@ -12,7 +12,6 @@
 #include "test_lib.h"
 #include "batch.h"
 #include "clock.h"
-#include <strings.h>
 #include <unistd.h>
 
 static const unsigned char PRIVKEY[32] = {

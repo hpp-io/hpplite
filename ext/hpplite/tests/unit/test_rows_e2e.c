@@ -707,7 +707,6 @@ static HppliteNode *open_chainless(const char *dbPath, int localOnly) {
 static void test_no_chain_keeps_the_log(void) {
     TEST("hpplite=on with no chain keeps the log pending (state 'unposted'); l1=local finalizes batches locally");
     reset_dir();
-    HppliteL1 *l1 = NULL;
     HppliteNode *n = open_chainless(DIR "/nochain.db", 0);
     if (!n) FAIL("open");
     hpplite_node_exec(n, "CREATE TABLE t(a)", NULL);

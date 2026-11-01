@@ -5,8 +5,6 @@
 
 #include "test_lib.h"
 #include "config.h"
-#include <strings.h>
-#include <unistd.h>
 #include <sys/stat.h>
 
 #define DIR "/tmp/hpplite_test_keys"
