@@ -140,8 +140,22 @@ contract HPPLiteDA {
     function _record(uint256 height, bytes32 batchHash) internal {
         require(height == lastBatchHeight + 1, "Non-sequential batch");
         chainHash = keccak256(abi.encode(chainHash, height, batchHash));
-        batchBlock.push(uint64(block.number));
+        batchBlock.push(_blockNumber());
         lastBatchHeight = height;
+    }
+
+    /**
+     * @dev The block a reader asks eth_getLogs for. On an Arbitrum-style
+     *      chain (HPP is one) block.number is the parent chain's block, and
+     *      the chain's own is ArbSys(0x64).arbBlockNumber(); where there is
+     *      no ArbSys (anvil, Ethereum itself) the staticcall returns nothing
+     *      and block.number is right. Found on HPP Sepolia: the first v2
+     *      factory recorded L1 blocks and no replica could fetch a log.
+     */
+    function _blockNumber() internal view returns (uint64) {
+        (bool ok, bytes memory r) = address(100).staticcall(abi.encodeWithSignature("arbBlockNumber()"));
+        if (ok && r.length == 32) return uint64(abi.decode(r, (uint256)));
+        return uint64(block.number);
     }
 
     // ============ View Functions ============

@@ -360,6 +360,18 @@ contract HPPLiteDATest is Test {
         da.blockOf(2);
     }
 
+    /* On an Arbitrum-style chain block.number is the parent chain's block; the
+    ** block a reader can fetch a log from is ArbSys(0x64).arbBlockNumber() */
+    function test_BatchBlock_IsTheChainsOwnBlockUnderArbSys() public {
+        // a stand-in ArbSys: any call returns 7654321
+        bytes memory code = abi.encodePacked(hex"7f", bytes32(uint256(7654321)), hex"60005260206000f3");
+        vm.etch(address(100), code);
+        vm.roll(99);                                      // what block.number says: the parent chain's
+        vm.prank(sequencer);
+        da.submitBatch(instanceId, 1, "on an L2");
+        assertEq(da.blockOf(1), 7654321);
+    }
+
     /* The cost cut this issue is for: a 1 KB batch below 100 k gas (storage took ~700 k) */
     function test_SubmitBatch_Gas() public {
         bytes memory batchData = new bytes(1024);
