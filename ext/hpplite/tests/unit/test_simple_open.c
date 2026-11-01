@@ -423,6 +423,36 @@ int main(void) {
         passed++;
     }
 
+    /* #123: a connection of a set-up file opens with HPPLite while another
+    ** connection is inside a write transaction (PHP's one-per-request) */
+    tests++;
+    TEST("hpplite_open: starts beside another connection's write transaction");
+    {
+        unlink("/tmp/test_simple_open.db"); unlink("/tmp/test_simple_open.db-wal"); unlink("/tmp/test_simple_open.db-shm");
+        sqlite3 *first = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&l1=local&interval=0&datadir=/tmp/hpplite_test_simple");
+        if (!first) FAIL("first open");
+        sqlite3_exec(first, "CREATE TABLE t(x)", NULL, NULL, NULL);
+        hpplite_close(first);
+        sqlite3 *other = NULL;
+        if (sqlite3_open("/tmp/test_simple_open.db", &other) != SQLITE_OK) FAIL("plain connection");
+        if (sqlite3_exec(other, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) FAIL("the other connection's write transaction");
+        sqlite3 *db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&l1=local&interval=0&datadir=/tmp/hpplite_test_simple");
+        HppliteCtx *ctx = db ? hpplite_context(db) : NULL;
+        sqlite3_exec(other, "COMMIT", NULL, NULL, NULL);
+        sqlite3_close(other);
+        if (!db) FAIL("hpplite_open failed while another connection held the write lock");
+        if (!ctx) { hpplite_close(db); FAIL("opened without HPPLite"); }
+        sqlite3_exec(db, "INSERT INTO t VALUES(1)", NULL, NULL, NULL);
+        sqlite3_stmt *q = NULL; int pending = -1;
+        if (sqlite3_prepare_v2(db, "SELECT count(*) FROM _hpplite_pending", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
+            pending = sqlite3_column_int(q, 0);
+        sqlite3_finalize(q);
+        hpplite_close(db);
+        if (pending != 1) FAIL("the write after the open was not captured");
+        PASS();
+        passed++;
+    }
+
     printf("\n=== Results: %d/%d tests passed ===\n", passed, tests);
 
     /* Cleanup */

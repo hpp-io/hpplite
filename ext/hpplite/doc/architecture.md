@@ -192,7 +192,12 @@ never do.
 Bookkeeping (steps 1, 2, 4) runs on a second connection to the same file,
 so the background flush never touches the application's transaction state.
 File databases are switched to WAL and both connections get a 5 s busy
-timeout; readers and the writer then never block each other.
+timeout; readers and the writer then never block each other. Opening a
+file whose bookkeeping tables exist and are current reads only, so a
+connection opened while another is inside a write transaction (one
+connection per request) starts at once; the first open of a file, and the
+upgrade of an older file, create or alter the tables and take the write
+lock (#123).
 
 The hooks are one slot per connection, so another library installing its
 own trace or commit hook would silently end capture. Every HPPLite entry

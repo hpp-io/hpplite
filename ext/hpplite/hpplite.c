@@ -181,6 +181,25 @@ void hpplite_internal_open_begin(void) { tlInternalOpen++; }
 void hpplite_internal_open_end(void) { tlInternalOpen--; }
 int hpplite_internal_open_active(void) { return tlInternalOpen > 0; }
 
+/* Every table of HPPLITE_SCHEMA, every column added since (#52, #56, #57,
+** #59, the rollup column) and the meta row: nothing of the schema would
+** write. A missing table makes the query fail to prepare, which is "no". */
+static int bookkeepingIsCurrent(sqlite3 *db) {
+  static const char zSql[] =
+    "SELECT (SELECT count(*) FROM pragma_table_info('_hpplite_meta')"
+    "          WHERE name IN ('open_txn','frag_id','frag_off','rollup')) = 4"
+    "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_pending') WHERE name IN ('mode','now')) = 2"
+    "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_carry') WHERE name IN ('now','frag')) = 2"
+    "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_posted'))"
+    "   AND EXISTS(SELECT 1 FROM _hpplite_meta WHERE id = 1)";
+  sqlite3_stmt *q = NULL;
+  int ok = 0;
+  if (sqlite3_prepare_v2(db, zSql, -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
+    ok = sqlite3_column_int(q, 0);
+  sqlite3_finalize(q);
+  return ok;
+}
+
 static int addColumnIfMissing(HppliteCtx *pCtx, sqlite3 *db, const char *zTable, const char *zCol) {
   sqlite3_stmt *q = NULL;
   int has = 0, rc = SQLITE_OK;
@@ -252,36 +271,46 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
   pCtx->bkDb = db;
   pCtx->bEnabled = 1;
 
-  rc = hppliteInternalExec(pCtx, db, HPPLITE_SCHEMA);
-  if (rc == SQLITE_OK) {
-    /* files from before #52: the log has no mode column yet (rows already
-    ** in it ran with the default state, which DEFAULT 0 records) */
-    sqlite3_stmt *q = NULL;
-    int has = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_pending') WHERE name = 'mode'",
-                           -1, &q, NULL) == SQLITE_OK) {
-      has = (sqlite3_step(q) == SQLITE_ROW);
+  /* A file whose bookkeeping exists and is current is opened with reads
+  ** alone (#123): CREATE IF NOT EXISTS of a table that exists reads, but the
+  ** INSERT OR IGNORE of the meta row takes the write lock even when the row
+  ** is there, and a connection opened while another holds a write
+  ** transaction (one connection per request) waited out the busy timeout
+  ** and started without HPPLite. The first open of a file, and an upgrade
+  ** of an older file, still write. */
+  rc = SQLITE_OK;
+  if (!bookkeepingIsCurrent(db)) {
+    rc = hppliteInternalExec(pCtx, db, HPPLITE_SCHEMA);
+    if (rc == SQLITE_OK) {
+      /* files from before #52: the log has no mode column yet (rows already
+      ** in it ran with the default state, which DEFAULT 0 records) */
+      sqlite3_stmt *q = NULL;
+      int has = 0;
+      if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_pending') WHERE name = 'mode'",
+                             -1, &q, NULL) == SQLITE_OK) {
+        has = (sqlite3_step(q) == SQLITE_ROW);
+      }
+      sqlite3_finalize(q);
+      if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_pending ADD COLUMN mode INTEGER NOT NULL DEFAULT 0");
     }
-    sqlite3_finalize(q);
-    if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_pending ADD COLUMN mode INTEGER NOT NULL DEFAULT 0");
-  }
-  /* files from before #57 (no batch was ever left open) and #56 (no
-  ** statement recorded a time) */
-  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "open_txn");
-  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_pending", "now");
-  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "now");
-  /* #59: statements posted in pieces */
-  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_id");
-  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_off");
-  if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "frag");
-  if (rc == SQLITE_OK) {
-    /* the rollup the history is on */
-    sqlite3_stmt *q = NULL;
-    int has = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_meta') WHERE name = 'rollup'", -1, &q, NULL) == SQLITE_OK)
-      has = (sqlite3_step(q) == SQLITE_ROW);
-    sqlite3_finalize(q);
-    if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_meta ADD COLUMN rollup TEXT NOT NULL DEFAULT ''");
+    /* files from before #57 (no batch was ever left open) and #56 (no
+    ** statement recorded a time) */
+    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "open_txn");
+    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_pending", "now");
+    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "now");
+    /* #59: statements posted in pieces */
+    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_id");
+    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_off");
+    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "frag");
+    if (rc == SQLITE_OK) {
+      /* the rollup the history is on */
+      sqlite3_stmt *q = NULL;
+      int has = 0;
+      if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_meta') WHERE name = 'rollup'", -1, &q, NULL) == SQLITE_OK)
+        has = (sqlite3_step(q) == SQLITE_ROW);
+      sqlite3_finalize(q);
+      if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_meta ADD COLUMN rollup TEXT NOT NULL DEFAULT ''");
+    }
   }
   if (rc != SQLITE_OK) {
     sqlite3_free(pCtx);

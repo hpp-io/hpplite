@@ -10,6 +10,7 @@
 
 #include "test_lib.h"
 #include "batch.h"
+#include <unistd.h>
 
 static int commits = 0, rollbacks = 0;
 static void on_commit(void *arg, unsigned char *root, int n) { (void)arg; (void)root; (void)n; commits++; }
@@ -323,6 +324,41 @@ static void test_rollback_hook_failed_autocommit(void) {
     PASS();
 }
 
+/* A file whose bookkeeping already exists and is current is opened with a
+** read alone: another connection inside a write transaction must not make
+** HPPLite's start wait out the busy timeout and fail (#123). The first open
+** of a file creates the tables and does take the lock. */
+static void test_open_reads_when_bookkeeping_exists(void) {
+    const char *zPath = "/tmp/hpplite_core_open_123.db";
+    sqlite3 *a, *b, *c; HppliteCtx *ca, *cc;
+    int rc;
+    TEST("open of a set-up file needs no write lock: it starts beside another connection's write transaction (#123)");
+    unlink(zPath);
+    if (sqlite3_open(zPath, &a) != SQLITE_OK || hpplite_init(a, &ca) != SQLITE_OK) FAIL("first open");
+    exec(a, "CREATE TABLE t(x)");
+    close_ctx(a, ca);
+    if (sqlite3_open(zPath, &b) != SQLITE_OK) FAIL("plain connection");
+    if (!exec(b, "BEGIN IMMEDIATE")) FAIL("the other connection's write transaction");
+    if (sqlite3_open(zPath, &c) != SQLITE_OK) FAIL("third connection");
+    sqlite3_busy_timeout(c, 300);
+    rc = hpplite_init(c, &cc);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(c); sqlite3_close(b); unlink(zPath);
+        FAILF("hpplite_init rc=%d while another connection holds the write lock: open wrote", rc);
+    }
+    exec(b, "COMMIT");
+    sqlite3_close(b);
+    {
+        int before = count_rows(c, "_hpplite_pending");   /* the first connection's CREATE TABLE */
+        exec(c, "INSERT INTO t VALUES(1)");
+        if (count_rows(c, "_hpplite_pending") != before + 1)
+            FAILF("%d pending rows after the write, want %d: not captured", count_rows(c, "_hpplite_pending"), before + 1);
+    }
+    close_ctx(c, cc);
+    unlink(zPath);
+    PASS();
+}
+
 static void test_txn_groups(void) {
     sqlite3 *db; HppliteCtx *ctx;
     HppliteBatch *b;
@@ -353,6 +389,7 @@ int main(void) {
     test_nondeterminism_detected();
     test_callbacks();
     test_rollback_hook_failed_autocommit();
+    test_open_reads_when_bookkeeping_exists();
     test_txn_groups();
     return test_report();
 }
