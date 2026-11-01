@@ -301,6 +301,8 @@ if(HPPLITE_BUILD_TESTS)
     if(HPPLITE_PYTHON3)
         add_test(NAME test_rpc_proxy COMMAND ${HPPLITE_PYTHON3} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/test_rpc_proxy.py
                                            ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/rpc_proxy.py)
+        # The reference pin service in free mode: storage, CIDs, receipts, idempotence (#125); paid on anvil in scenario 18
+        add_test(NAME test_pin_service COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service/selftest.sh)
     endif()
     if(HPPLITE_BUILD_EXTENSION)
         add_test(NAME test_loadable COMMAND test_loadable)

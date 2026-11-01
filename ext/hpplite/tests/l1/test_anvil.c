@@ -25,6 +25,7 @@
 #include "batch.h"
 #include <sys/wait.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
@@ -1438,6 +1439,85 @@ static void test_chain_hash(void) {
     PASS();
 }
 
+/* 18. The reference pin service (#125) paid over x402 on anvil: a MockUSDC
+** with EIP-3009 (anvil_test.sh deploys it, KEY0 holds the supply), the
+** service's mock facilitator verifying each payment by eth_call and
+** settling it with cast send from KEY1, which is also the pay-to wallet.
+** The buyer drives put (402, pay, 200 with a receipt the signer signed),
+** re-put (held, nothing paid), get, pin (paid, a new receipt), a tampered
+** receipt, an unknown CID, a price over its cap (refused before signing);
+** the pay-to wallet ends richer by what was settled. */
+static long first_number(const char *z) { return atol(z); }
+static int run_cmd(const char *cmd, char *out, size_t n) {
+    FILE *p = popen(cmd, "r");
+    size_t got = 0;
+    int status;
+    out[0] = 0;
+    if (!p) return -1;
+    while (got + 1 < n && fgets(out + got, (int)(n - got), p)) got = strlen(out);
+    status = pclose(p);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+static void test_pin_service(void) {
+    TEST("reference pin service (#125): x402 exact payments on a MockUSDC through the mock facilitator; receipts; idempotent put; the cap");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
+    int port = 8600 + (int)(getpid() % 200);
+    char cmd[2400], out[8192], payTo[80], before[80], after[80];
+    FILE *f = fopen(DIR "/pin_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY2);
+    fclose(f);
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    if (run_cmd(cmd, payTo, sizeof payTo) != 0) FAIL("cast wallet address");
+    payTo[strcspn(payTo, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, payTo, RPC);
+    run_cmd(cmd, before, sizeof before);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        char portStr[16], dirArg[300], keyArg[300];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        snprintf(dirArg, sizeof dirArg, DIR "/pin_store");
+        snprintf(keyArg, sizeof keyArg, DIR "/pin_signer.key");
+        char script[600];
+        snprintf(script, sizeof script, "%s/pin_service.py", svc);
+        int devnull = open(DIR "/pin_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", dirArg, "--signer-key", keyArg,
+               "--pay-to", payTo, "--facilitator", "mock", "--rpc", RPC, "--asset", usdc, "--settle-key", KEY1,
+               "--network", "eip155:31337", "--retention", "60", "--price-per-pin", "1000", "--price-per-byte", "1", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
+        up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
+        if (!up) usleep(200 * 1000);
+    }
+    if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the pin service did not come up (see pin_service.log)"); }
+
+    /* anvil's clock is days ahead after the lease scenarios (evm_increaseTime), and the token
+    ** checks validBefore against chain time: an authorization window of ten years here;
+    ** a real chain's clock is the wall clock and the default is two minutes */
+    snprintf(cmd, sizeof cmd, "python3 -I %s/buyer.py --service http://127.0.0.1:%d --key %s --cap 100000 --valid-for 315360000 --selftest --expect-paid 2>&1",
+             svc, port, KEY0);
+    int rc = run_cmd(cmd, out, sizeof out);
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+    if (rc != 0) { printf("\n%s", out); FAIL("the buyer's selftest failed"); }
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, payTo, RPC);
+    run_cmd(cmd, after, sizeof after);
+    long gained = first_number(after) - first_number(before);
+    {
+        const char *paid = strstr(out, "PASS (");
+        int nPaid = paid ? atoi(paid + 6) : -1;
+        printf("(pay-to wallet gained %ld units over %d paid calls) ", gained, nPaid);
+    }
+    if (gained <= 0) FAIL("the pay-to wallet did not receive the settlements");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -1466,6 +1546,7 @@ int main(void) {
     if (wanted(15)) test_power_loss();
     if (soak_env("HPPLITE_SOAK_SECONDS", 0) > 0) test_soak();   /* 16: only when asked (#120) */
     if (wanted(17)) test_chain_hash();
+    if (wanted(18)) test_pin_service();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

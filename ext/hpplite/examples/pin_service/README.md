@@ -1,0 +1,88 @@
+# A reference pin service for HPPLite (#125)
+
+What a storage provider for HPPLite nodes looks like, in one Python file
+with no dependencies beyond the standard library (`eth.py` beside it does
+keccak-256, secp256k1 and EIP-712 in pure Python; slow, and far faster than
+a pin service needs). An HPP operator reads it before running the real
+service; HPPLite's IPFS store adapter (#11) is tested against it.
+
+```
+pin_service.py --port 8420 --dir /var/lib/pins --signer-key /etc/pins/key \
+    --pay-to 0xYourWallet --facilitator https://facilitator-sepolia.hpp.io \
+    --network eip155:181228 --asset 0x401eCb1D350407f13ba348573E5630B83638E30D
+```
+
+Without `--facilitator` every call is free: the storage and receipt logic
+alone, which is what `selftest.sh` and ctest's `test_pin_service` exercise.
+
+## The contract with a node
+
+Four calls. The node (or `buyer.py`, the same thing in Python) does them in
+this order and verifies every receipt before it believes it.
+
+| Call | Paid | Answer |
+|---|---|---|
+| `POST /put` with the bytes | yes: `pricePerPin + pricePerByte × size` buys `retentionSeconds` | `{cid, bytes, expires, receipt, held}` |
+| `POST /pin/<cid>` | yes, the same price | retention extended, a new `receipt` |
+| `GET /get/<cid>` | no (`--paid-get` to charge) | the bytes |
+| `GET /status` | no | prices, retention, the **signer** and the receipt's typed-data layout |
+
+- **Idempotent by CID.** A `put` of bytes already held answers 200 with the
+  existing receipt and no 402. A node whose payment settled while the
+  upload failed retries and pays nothing twice.
+- **The CID is CIDv1, raw codec, sha-256, base32** (`bafkrei…`). The same
+  bytes give the same CID at every IPFS provider, so one commitment on
+  chain can be pinned at several (`--kubo http://127.0.0.1:5001` pins on a
+  Kubo node too and refuses to answer a CID Kubo would compute differently).
+- **The receipt is the provider's promise:** an EIP-712 signature by
+  `--signer-key` over `Receipt(bytes32 hash, string cid, uint256 expires)`
+  in the domain `("HPPLitePinService", "1", chainId, payTo)`. `/status`
+  publishes the signer, as HPP's facilitator publishes its signers. A node
+  verifies the receipt (`buyer.receipt_ok`), keeps it, and commits it with
+  the batch (`commitBatch`, #33), so anyone can later show what the provider
+  undertook to hold until when.
+
+## The x402 seller side, written out
+
+`Handler.paid()` is the whole protocol from the seller's side, which is
+why it is not behind a library:
+
+1. no `PAYMENT-SIGNATURE` header: answer `402` with `PAYMENT-REQUIRED`, a
+   base64 `PaymentRequired` naming the price (`amount`, atomic units of
+   `asset`), `payTo`, the network and the token's EIP-712 domain (`extra`);
+2. with one: decode the `PaymentPayload`, `POST /verify` it to the
+   facilitator with the requirements;
+3. valid: do the work; if the work fails nothing is settled;
+4. `POST /settle`; on success answer 200 with `PAYMENT-RESPONSE`.
+
+No signing happens in the seller. The buyer signs an EIP-3009
+`TransferWithAuthorization` for exactly the quoted amount with a random
+nonce; the facilitator submits it and pays the gas. `hpp-x402 serve
+--handler <url>` wraps a plain endpoint in the same dance with no code.
+
+`--facilitator mock` stands in for the facilitator on anvil: verify is an
+`eth_call` of `transferWithAuthorization` (the token itself checks the
+signature), settle is `cast send` of the same call from `--settle-key`.
+`contracts/src/test/MockUSDC.sol` is the token, EIP-3009 with the domain
+`("USDC.e", "2")`. That is anvil scenario 18 (`tests/l1/test_anvil.c`):
+the buyer pays a put and a pin, is refused over its cap before signing,
+and the pay-to wallet ends richer by what settled.
+
+## Against HPP Sepolia
+
+The real facilitator is `https://facilitator-sepolia.hpp.io`, the asset
+USDC.e (six decimals) at the address above, the network `eip155:181228`.
+The buyer needs USDC.e; `hpp-x402 fund` shows where to send it. Then:
+
+```
+buyer.py --service http://host:8420 --key <hex> --cap 50000 put batch.bin
+buyer.py --service http://host:8420 --key <hex> status
+```
+
+## Not here, on purpose
+
+Per-byte settlement with the `upto` scheme and batch-settlement channels
+for per-flush volume (HPP's facilitator supports both); a `/commit` relay
+endpoint that submits a signed commitment to the rollup for a node that
+holds no ETH (#126); a bond and a challenge contract that turn the receipt
+into an enforceable promise. Each is a later layer on the four calls above.

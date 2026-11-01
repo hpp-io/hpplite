@@ -543,6 +543,19 @@ chain, the offline fixture for `hpplite-verify`, and the crash harness
 directory is as available as the disk it is on. The crash harness and the
 directory test (`test_l1_dir`) run against it in every build.
 
+### A storage provider: `examples/pin_service/`
+
+The reference pin service (#125) is what an IPFS store behind the chain's
+commitments looks like from the node's side: four HTTP calls (put bytes
+for a CID, pin a CID longer, get by CID, status), paid per call over
+[x402](https://x402.org) in USDC.e through HPP's facilitator, each put
+answered with a signed receipt the node verifies against the signer the
+service publishes and commits with the batch (`commitBatch`, #33). One
+Python file, standard library only, with the x402 seller side written out;
+`buyer.py` is the node's side in Python. ctest runs it free
+(`test_pin_service`); anvil scenario 18 runs it paid against a mock USDC
+and a mock facilitator. The node's own adapter is #11.
+
 ## Versions
 
 Scope is tied to versions. v0.1.1 is the last of the v0.1 line (end of life:

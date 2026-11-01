@@ -1,0 +1,508 @@
+#!/usr/bin/env python3 -I
+"""A reference storage provider for HPPLite nodes (#125): stores batches
+content-addressed, charges per call over x402, signs a receipt for every
+batch it holds. What an HPP operator reads before running the real thing,
+and what HPPLite's IPFS adapter (#11) is tested against. Standard library
+only; eth.py beside it does keccak, secp256k1 and EIP-712.
+
+    pin_service.py --port 8420 --dir ./store --signer-key /path/to/hexkey \
+        --pay-to 0x... --facilitator https://facilitator-sepolia.hpp.io \
+        --network eip155:181228 --asset 0x401eCb1D350407f13ba348573E5630B83638E30D
+
+    pin_service.py ... --facilitator mock --rpc http://127.0.0.1:8545 \
+        --asset <MockUSDC> --settle-key <hex>          # anvil: verify by eth_call, settle with cast send
+
+Endpoints
+  POST /put            bytes in; {cid, bytes, expires, receipt} out. Paid: the 402 quotes
+                       price-per-byte * size + price-per-pin for `retention` seconds. A CID already
+                       held answers 200 with its receipt and no 402 (idempotent by CID).
+  POST /pin/<cid>      extend retention by `retention`; paid; a new receipt.
+  GET  /get/<cid>      the bytes; free unless --paid-get.
+  GET  /status         prices, retention, pinned count, the signer address and the receipt's
+                       typed-data layout: where a node learns which key signs receipts.
+
+The receipt is the provider's promise: EIP-712 over Receipt(bytes32 hash,
+string cid, uint256 expires) in the domain ("HPPLitePinService", "1",
+chainId, pay-to address), signed by --signer-key. HPPLite verifies it
+against /status's signer and commits it with the batch (#33).
+
+The x402 seller side is written out here on purpose: build the 402 with the
+price, decode PAYMENT-SIGNATURE, POST it to the facilitator's /verify, do the
+work, POST to /settle, answer with PAYMENT-RESPONSE. No signing happens in
+the seller. `hpp-x402 serve --handler <url>` wraps a plain endpoint the same
+way with no code; this file is for reading what it does.
+
+The CID is CIDv1, raw codec, sha-256, base32 ("bafkrei..."): the same bytes
+give the same CID at any IPFS provider, so one commitment can be pinned at
+several. --kubo http://127.0.0.1:5001 forwards put and pin to a Kubo node
+(its `add` with raw-leaves and CIDv1 gives that CID too) instead of the
+directory.
+"""
+import argparse
+import base64
+import hashlib
+import http.client
+import http.server
+import json
+import os
+import secrets
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import eth  # noqa: E402
+
+# ============ CID ============
+
+_B32 = "abcdefghijklmnopqrstuvwxyz234567"
+
+
+def _base32_lower(b: bytes) -> str:
+    out, bits, acc = [], 0, 0
+    for byte in b:
+        acc = (acc << 8) | byte
+        bits += 8
+        while bits >= 5:
+            out.append(_B32[(acc >> (bits - 5)) & 31])
+            bits -= 5
+    if bits:
+        out.append(_B32[(acc << (5 - bits)) & 31])
+    return "".join(out)
+
+
+def cid_of(data: bytes) -> str:
+    """CIDv1, raw (0x55), sha2-256 multihash (0x12, 0x20), multibase 'b' (base32 lower)."""
+    mh = b"\x12\x20" + hashlib.sha256(data).digest()
+    return "b" + _base32_lower(b"\x01\x55" + mh)
+
+
+# ============ The store ============
+
+class Store:
+    """A directory: <cid> holds the bytes, index.json the expiry and receipt per CID."""
+
+    def __init__(self, directory):
+        self.dir = directory
+        os.makedirs(directory, exist_ok=True)
+        self.lock = threading.Lock()
+        self.index_path = os.path.join(directory, "index.json")
+        try:
+            with open(self.index_path) as f:
+                self.index = json.load(f)
+        except (OSError, ValueError):
+            self.index = {}
+
+    def _save(self):
+        tmp = self.index_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.index, f)
+        os.replace(tmp, self.index_path)
+
+    def has(self, cid):
+        with self.lock:
+            return cid in self.index and os.path.exists(os.path.join(self.dir, cid))
+
+    def get(self, cid):
+        try:
+            with open(os.path.join(self.dir, cid), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def put(self, cid, data, expires, receipt):
+        with self.lock:
+            path = os.path.join(self.dir, cid)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            self.index[cid] = {"bytes": len(data), "expires": expires, "receipt": receipt}
+            self._save()
+
+    def extend(self, cid, expires, receipt):
+        with self.lock:
+            self.index[cid]["expires"] = expires
+            self.index[cid]["receipt"] = receipt
+            self._save()
+
+    def entry(self, cid):
+        with self.lock:
+            return dict(self.index.get(cid) or {})
+
+    def count(self):
+        with self.lock:
+            return len(self.index)
+
+
+class KuboStore(Store):
+    """The same, with the bytes pinned on a Kubo node (its HTTP RPC API, port 5001)."""
+
+    def __init__(self, directory, api):
+        super().__init__(directory)
+        self.api = api.rstrip("/")
+
+    def _rpc(self, path, data=None, query=""):
+        url = "%s/api/v0/%s%s" % (self.api, path, query)
+        if data is None:
+            req = urllib.request.Request(url, method="POST")
+        else:
+            boundary = "----hpplite" + secrets.token_hex(8)
+            body = (("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"batch\"\r\n"
+                     "Content-Type: application/octet-stream\r\n\r\n") % boundary).encode() + data + ("\r\n--%s--\r\n" % boundary).encode()
+            req = urllib.request.Request(url, data=body, method="POST",
+                                         headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read()
+
+    def put(self, cid, data, expires, receipt):
+        out = json.loads(self._rpc("add", data, "?cid-version=1&raw-leaves=true&pin=true").splitlines()[-1])
+        if out.get("Hash") != cid:
+            raise ValueError("Kubo computed %s, this service %s: chunking differs" % (out.get("Hash"), cid))
+        super().put(cid, data, expires, receipt)
+
+    def get(self, cid):
+        try:
+            return self._rpc("cat", None, "?arg=" + cid)
+        except (OSError, ValueError):
+            return super().get(cid)
+
+
+# ============ Receipts ============
+
+RECEIPT_TYPE = "Receipt(bytes32 hash,string cid,uint256 expires)"
+
+
+class Signer:
+    def __init__(self, key: bytes, chain_id: int, pay_to: str):
+        self.key = key
+        self.address = eth.address(key)
+        self.domain = eth.domain_separator("HPPLitePinService", "1", chain_id, pay_to)
+        self.chain_id = chain_id
+        self.pay_to = pay_to
+
+    def receipt(self, data_hash: bytes, cid: str, expires: int) -> dict:
+        digest = eth.typed_digest(self.domain, RECEIPT_TYPE, data_hash, eth.keccak256(cid.encode()), expires)
+        sig = eth.sign(self.key, digest)
+        return {"hash": "0x" + data_hash.hex(), "cid": cid, "expires": expires,
+                "signer": self.address, "signature": "0x" + sig.hex()}
+
+
+# ============ x402: the seller's side ============
+
+class Payments:
+    """Quote a price in a 402, verify and settle a payment through the facilitator."""
+
+    def __init__(self, facilitator, network, asset, pay_to, asset_name, asset_version, rpc=None, settle_key=None):
+        self.facilitator = facilitator.rstrip("/") if facilitator else None
+        self.network = network
+        self.asset = asset
+        self.pay_to = pay_to
+        self.extra = {"name": asset_name, "version": asset_version}
+        self.rpc = rpc
+        self.settle_key = settle_key
+        self.settled = 0
+        self.spent_nonces = set()
+
+    @property
+    def enabled(self):
+        return self.facilitator is not None
+
+    def requirements(self, amount: int, resource_url: str, description: str):
+        return {
+            "x402Version": 2,
+            "error": "PAYMENT-SIGNATURE header is required",
+            "resource": {"url": resource_url, "description": description, "mimeType": "application/json"},
+            "accepts": [{
+                "scheme": "exact", "network": self.network, "amount": str(amount), "asset": self.asset,
+                "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": self.extra,
+            }],
+        }
+
+    def decode(self, header: str):
+        try:
+            return json.loads(base64.b64decode(header))
+        except (ValueError, TypeError):
+            return None
+
+    def _facilitator_post(self, path, body):
+        req = urllib.request.Request(self.facilitator + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())
+
+    # --- the mock facilitator: anvil, the token itself checks the signature ---
+    def _mock_calldata(self, auth, sig_hex):
+        sig = bytes.fromhex(sig_hex[2:])
+        if len(sig) != 65:
+            raise ValueError("bad signature length")
+        words = [eth.word(auth["from"]), eth.word(auth["to"]), eth.word(int(auth["value"])),
+                 eth.word(int(auth["validAfter"])), eth.word(int(auth["validBefore"])),
+                 bytes.fromhex(auth["nonce"][2:]), eth.word(sig[64]), sig[:32], sig[32:64]]
+        selector = eth.keccak256(b"transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)")[:4]
+        return "0x" + (selector + b"".join(words)).hex()
+
+    def _eth_call(self, data):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                           "params": [{"to": self.asset, "data": data}, "latest"]}).encode()
+        req = urllib.request.Request(self.rpc, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def _mock_verify(self, payload, requirements):
+        auth = payload["payload"]["authorization"]
+        acc = payload.get("accepted", {})
+        if acc.get("scheme") != "exact" or acc.get("network") != self.network or acc.get("asset", "").lower() != self.asset.lower():
+            return {"isValid": False, "invalidReason": "unsupported_scheme"}
+        if auth["to"].lower() != self.pay_to.lower() or int(auth["value"]) < int(requirements["amount"]):
+            return {"isValid": False, "invalidReason": "invalid_exact_evm_payload_recipient_mismatch"}
+        now = int(time.time())
+        if not (int(auth["validAfter"]) < now < int(auth["validBefore"])):
+            return {"isValid": False, "invalidReason": "invalid_exact_evm_payload_authorization_valid_before"}
+        if auth["nonce"].lower() in self.spent_nonces:
+            return {"isValid": False, "invalidReason": "invalid_exact_evm_payload_authorization_nonce"}
+        try:
+            r = self._eth_call(self._mock_calldata(auth, payload["payload"]["signature"]))
+        except (OSError, ValueError, KeyError) as e:
+            return {"isValid": False, "invalidReason": "rpc_error", "invalidMessage": str(e)}
+        if "error" in r:
+            msg = r["error"].get("message", "")
+            data = r["error"].get("data")
+            if isinstance(data, str) and data.startswith("0x08c379a0") and len(data) >= 10 + 128:
+                try:                                       # Error(string): the token's require() message
+                    n = int(data[10 + 64:10 + 128], 16)
+                    msg = bytes.fromhex(data[10 + 128:10 + 128 + 2 * n]).decode("utf-8", "replace")
+                except ValueError:
+                    pass
+            return {"isValid": False, "invalidReason": "invalid_exact_evm_payload_signature", "invalidMessage": msg}
+        return {"isValid": True, "payer": auth["from"]}
+
+    def _mock_settle(self, payload, requirements):
+        auth = payload["payload"]["authorization"]
+        data = self._mock_calldata(auth, payload["payload"]["signature"])
+        cmd = ["cast", "send", "--rpc-url", self.rpc, "--private-key", self.settle_key, "--json", self.asset, data]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True).stdout
+            tx = json.loads(out).get("transactionHash", "")
+        except (subprocess.SubprocessError, ValueError, OSError) as e:
+            return {"success": False, "errorReason": "settle_failed", "errorMessage": str(e), "transaction": "", "network": self.network}
+        self.spent_nonces.add(auth["nonce"].lower())
+        return {"success": True, "payer": auth["from"], "transaction": tx, "network": self.network}
+
+    def verify(self, payload, requirements):
+        if self.facilitator == "mock":
+            return self._mock_verify(payload, requirements)
+        return self._facilitator_post("/verify", {"x402Version": 2, "paymentPayload": payload, "paymentRequirements": requirements})
+
+    def settle(self, payload, requirements):
+        if self.facilitator == "mock":
+            r = self._mock_settle(payload, requirements)
+        else:
+            r = self._facilitator_post("/settle", {"x402Version": 2, "paymentPayload": payload, "paymentRequirements": requirements})
+        if r.get("success"):
+            self.settled += 1
+        return r
+
+
+# ============ The HTTP service ============
+
+class Service:
+    def __init__(self, args):
+        self.args = args
+        self.store = KuboStore(args.dir, args.kubo) if args.kubo else Store(args.dir)
+        with open(args.signer_key) as f:
+            key = bytes.fromhex(f.read().strip().replace("0x", ""))
+        chain_id = int(args.network.split(":")[1])
+        self.signer = Signer(key, chain_id, args.pay_to)
+        self.payments = Payments(args.facilitator, args.network, args.asset, args.pay_to,
+                                 args.asset_name, args.asset_version, args.rpc, args.settle_key)
+        self.started = int(time.time())
+
+    def price_put(self, nbytes):
+        return self.args.price_per_pin + self.args.price_per_byte * nbytes
+
+    def status(self):
+        return {
+            "service": "hpplite-pin-service", "version": 1,
+            "signer": self.signer.address, "receipt": {"domain": {"name": "HPPLitePinService", "version": "1",
+                                                                   "chainId": self.signer.chain_id, "verifyingContract": self.signer.pay_to},
+                                                        "type": RECEIPT_TYPE},
+            "payment": {"scheme": "exact", "network": self.args.network, "asset": self.args.asset, "payTo": self.args.pay_to,
+                        "pricePerByte": self.args.price_per_byte, "pricePerPin": self.args.price_per_pin,
+                        "retentionSeconds": self.args.retention, "paidGet": bool(self.args.paid_get),
+                        "facilitator": self.args.facilitator or "none (free)"} if self.payments.enabled else None,
+            "pinned": self.store.count(), "settled": self.payments.settled, "uptime": int(time.time()) - self.started,
+        }
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    service = None  # type: Service
+
+    def log_message(self, fmt, *args):
+        if self.service.args.verbose:
+            sys.stderr.write("pin_service: " + fmt % args + "\n")
+
+    # --- replies ---
+    def reply(self, status, obj, headers=None):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def reply_bytes(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    # --- x402, around one piece of work ---
+    def paid(self, amount, description, work):
+        """402 until a payment for `amount` verifies; then the work, then settle, then the answer."""
+        p = self.service.payments
+        url = "http://%s%s" % (self.headers.get("Host", "localhost"), self.path)
+        if not p.enabled or amount <= 0:
+            status, obj = work()
+            return self.reply(status, obj)
+        requirements = p.requirements(amount, url, description)
+        header = self.headers.get("PAYMENT-SIGNATURE")
+        if not header:
+            return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
+        payload = p.decode(header)
+        if not payload or "payload" not in payload:
+            return self.reply(400, {"error": "PAYMENT-SIGNATURE is not a payment payload"})
+        v = p.verify(payload, requirements["accepts"][0])
+        if not v.get("isValid"):
+            requirements["error"] = v.get("invalidReason", "invalid payment")
+            if v.get("invalidMessage"):
+                requirements["error"] += ": " + str(v["invalidMessage"])[:200]
+            return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
+        status, obj = work()
+        if status != 200:
+            return self.reply(status, obj)          # nothing done, nothing charged
+        s = p.settle(payload, requirements["accepts"][0])
+        if not s.get("success"):
+            return self.reply(402, {"error": "settlement failed: " + s.get("errorReason", "?"), "settlement": s})
+        return self.reply(200, obj, {"PAYMENT-RESPONSE": base64.b64encode(json.dumps(s).encode()).decode()})
+
+    # --- the endpoints ---
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/status":
+            return self.reply(200, self.service.status())
+        if path.startswith("/get/"):
+            cid = path[5:]
+            if not self.service.store.has(cid):
+                return self.reply(404, {"error": "not pinned here", "cid": cid})
+
+            def work():
+                data = self.service.store.get(cid)
+                return (200, data) if data is not None else (404, {"error": "gone"})
+            if self.service.args.paid_get and self.service.payments.enabled:
+                # a paid read: the same dance, the body being bytes
+                entry = self.service.store.entry(cid)
+                return self.paid(self.service.price_put(entry.get("bytes", 0)), "read " + cid, lambda: self._bytes_as_json(cid))
+            data = self.service.store.get(cid)
+            if data is None:
+                return self.reply(404, {"error": "gone"})
+            return self.reply_bytes(data)
+        return self.reply(404, {"error": "no such endpoint"})
+
+    def _bytes_as_json(self, cid):
+        data = self.service.store.get(cid)
+        if data is None:
+            return 404, {"error": "gone"}
+        return 200, {"cid": cid, "data": base64.b64encode(data).decode()}
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        if path == "/put":
+            if not body:
+                return self.reply(400, {"error": "empty body"})
+            if len(body) > self.service.args.max_bytes:
+                return self.reply(413, {"error": "too large", "max": self.service.args.max_bytes})
+            cid = cid_of(body)
+            if self.service.store.has(cid):
+                e = self.service.store.entry(cid)              # idempotent: held already, nothing to pay
+                return self.reply(200, {"cid": cid, "bytes": e["bytes"], "expires": e["expires"], "receipt": e["receipt"], "held": True})
+
+            def work():
+                expires = int(time.time()) + self.service.args.retention
+                receipt = self.service.signer.receipt(eth.keccak256(body), cid, expires)
+                try:
+                    self.service.store.put(cid, body, expires, receipt)
+                except (OSError, ValueError) as e:
+                    return 500, {"error": str(e)}
+                return 200, {"cid": cid, "bytes": len(body), "expires": expires, "receipt": receipt, "held": False}
+            return self.paid(self.service.price_put(len(body)), "pin %d bytes for %d s" % (len(body), self.service.args.retention), work)
+        if path.startswith("/pin/"):
+            cid = path[5:]
+            if not self.service.store.has(cid):
+                return self.reply(404, {"error": "not pinned here: put it first", "cid": cid})
+            entry = self.service.store.entry(cid)
+
+            def work():
+                base = max(int(time.time()), int(entry.get("expires", 0)))
+                expires = base + self.service.args.retention
+                data = self.service.store.get(cid)
+                if data is None:
+                    return 404, {"error": "gone"}
+                receipt = self.service.signer.receipt(eth.keccak256(data), cid, expires)
+                self.service.store.extend(cid, expires, receipt)
+                return 200, {"cid": cid, "bytes": len(data), "expires": expires, "receipt": receipt}
+            return self.paid(self.service.price_put(entry.get("bytes", 0)), "extend " + cid, work)
+        return self.reply(404, {"error": "no such endpoint"})
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    ap = argparse.ArgumentParser(description="HPPLite reference pin service (#125)")
+    ap.add_argument("--port", type=int, default=8420)
+    ap.add_argument("--dir", default="./pin_store")
+    ap.add_argument("--signer-key", required=True, help="file with the hex key that signs receipts")
+    ap.add_argument("--pay-to", required=True, help="where payments land; also the receipt domain's verifyingContract")
+    ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, 'mock' (anvil), or none: free")
+    ap.add_argument("--network", default="eip155:181228")
+    ap.add_argument("--asset", default="0x401eCb1D350407f13ba348573E5630B83638E30D", help="the EIP-3009 token (USDC.e on HPP)")
+    ap.add_argument("--asset-name", default="USDC.e", help="the token's EIP-712 domain name")
+    ap.add_argument("--asset-version", default="2")
+    ap.add_argument("--rpc", default=None, help="mock facilitator: the chain to verify and settle on")
+    ap.add_argument("--settle-key", default=None, help="mock facilitator: the key that submits transferWithAuthorization")
+    ap.add_argument("--price-per-byte", type=int, default=1, help="atomic units (USDC.e: 1e-6)")
+    ap.add_argument("--price-per-pin", type=int, default=1000)
+    ap.add_argument("--retention", type=int, default=30 * 24 * 3600, help="seconds a put or a pin buys")
+    ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
+    ap.add_argument("--paid-get", action="store_true")
+    ap.add_argument("--kubo", default=None, help="a Kubo node's RPC API (http://127.0.0.1:5001): pin there too")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+    if args.facilitator == "mock" and not (args.rpc and args.settle_key):
+        ap.error("--facilitator mock needs --rpc and --settle-key")
+    Handler.service = Service(args)
+    srv = Server(("127.0.0.1", args.port), Handler)
+    print("pin_service: listening on 127.0.0.1:%d, signer %s, %s" % (
+        args.port, Handler.service.signer.address, ("paid via " + args.facilitator) if args.facilitator else "free"), flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
