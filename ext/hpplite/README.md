@@ -15,8 +15,9 @@ keeps the history; whoever holds the key can rebuild and check it.
 
 What v0.1 is **not**: not a multi-writer database, not a public verifier
 (batches are encrypted, so only key holders can replay; viewing keys are
-v0.2), not cheap DA (batches live in contract storage on a testnet today),
-and not for databases much beyond 100 MB. See [Versions](#versions).
+v0.2), not cheap DA (every batch is posted on a testnet chain; since #33 as
+log data rather than contract storage, eight times cheaper, but still on
+chain), and not for databases much beyond 100 MB. See [Versions](#versions).
 
 ## Quick Start
 
@@ -350,11 +351,19 @@ data costs ~0.008 ETH per MB of SQL at 0.01 gwei.
 On a chain priced like Ethereum mainnet (10 gwei) every figure is 1000x,
 which is why on-chain storage DA is a testnet design: see #11/#33.
 
-**Cost driver**: `HPPLiteDA` keeps batch bytes in contract storage
-(`batchData[height]`), the most expensive place to put them. Posting them as
-calldata or blobs behind an event, plus compression (#12), is the v0.2/v0.3
-cost work; the timer only flushes when something is pending, so an idle
-database costs nothing.
+**Cost driver, and what #33 changed**: until version 8 `HPPLiteDA` kept
+batch bytes in contract storage (`batchData[height]`), the most expensive
+place to put them: ~0.7k gas per byte, the figures in the table above.
+Since version 8 the bytes go into the transaction's log and storage keeps
+only the commitment - the height, a rolling hash over every batch and the
+block the log is in - so a batch costs about 21k gas for the transaction,
+24 gas per byte (calldata and log data), and some 25k for the three slots:
+a sealed 1 KB batch measured 97.5k gas on anvil where storage took ~765k,
+eight times less, and the gap widens with size. A reader fetches one block's
+log by the height topic, which any archive node serves; pruned nodes cannot
+serve a rebuild. The table above is re-measured on HPP Sepolia with the
+version 8 factory below. Compression (#12) still applies, and the timer only
+flushes when something is pending, so an idle database costs nothing.
 
 ## Components
 
@@ -388,13 +397,27 @@ function getRollup(address owner) external view returns (address);
 function createRollup(uint256 checkpointInterval) external returns (address);   // one more, for a named database (#61)
 function getRollupsByOwner(address owner) external view returns (address[] memory);
 
-// HPPLiteDA (per-rollup)
+// HPPLite (per-rollup coordinator, VERSION 8)
 function claimSequencer(bytes32 instanceId) external;
 function renewLease(bytes32 instanceId) external;
-function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;
-function getBatch(uint256 height) external view returns (bytes);
+function releaseLease(bytes32 instanceId) external;
 function submitCheckpoint(bytes32 instanceId, uint256 from, uint256 to, bytes32 root) external;
+// the same with the sequencer wallet's EIP-712 signature, submitted by anyone (#33, #126):
+function claimSequencerFor(bytes32 instanceId, uint256 nonce, bytes sig) external;   // renewLeaseFor, releaseLeaseFor alike; leaseNonce() is spent
+function submitCheckpointFor(bytes32 instanceId, uint256 from, uint256 to, bytes32 root, bytes sig) external;
+
+// HPPLiteDA (per-rollup store, version 2): the bytes go into the log, storage keeps the commitment
+function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;   // emits BatchSubmitted(height, keccak256(data), data)
+function submitBatchFor(bytes32 instanceId, uint256 height, bytes data, bytes sig) external;
+function commitBatch(bytes32 instanceId, uint256 height, bytes32 hash, bytes ref, bytes receipt) external;   // bytes held elsewhere (#11)
+function chainHash() external view returns (bytes32);        // keccak256(abi.encode(prev, height, hash)) over every batch
+function blockOf(uint256 height) external view returns (uint64);   // the block whose log carries the batch
+function getDAState() external view returns (uint256 lastBatchHeight, uint256, bytes32 chainHash);
 ```
+
+A rollup created before version 8 keeps its batches in the DA contract's
+storage (`getBatch(height)`); HPPLite reads the coordinator's `VERSION`
+and uses whichever it finds, so older rollups stay readable and verifiable.
 
 ## Verification
 
@@ -414,7 +437,8 @@ records or statements - not yet posted), `state_root`, `prev_block_hash`,
 connection, in this process or another, does), `capture` (`rows` or `text`:
 what this connection logs), `foreign_writes` (looks that found the file
 changed by something that is not HPPLite, #37), `state` and `last_error`
-(#32). `state` says what this node is doing about posting: `sequencing`,
+(#32), `chain_hash` (the DA contract's rolling hash over every batch as this
+node tracks it, #33; NULL in a file from before it was kept). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:

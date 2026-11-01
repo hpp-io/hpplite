@@ -168,9 +168,16 @@ Flushing a batch:
 
 The DA contract caps a batch at `batchSizeLimit` (128 KB by default, read
 from the contract's system config on connect); the chain may cap it lower
-(HPP Sepolia: 32M gas per transaction, ~44 KB of contract storage; HPPLite
-cuts at 40 KB there, `maxtx=`/`maxtxgas=` elsewhere, and shrinks batches
-the RPC refuses as oversized). Pending SQL beyond that is
+(HPP Sepolia's RPC takes ~84.9 KB of calldata per transaction; with the
+storage DA of rollups before version 8, 32M gas per transaction meant ~44 KB;
+HPPLite cuts at 40 KB there, `maxtx=`/`maxtxgas=` elsewhere, and shrinks
+batches the RPC refuses as oversized). Since version 8 (#33) the DA contract
+keeps the bytes in the transaction's log, not in storage: storage holds the
+height, a rolling hash over every batch (`chainHash`) and the block each
+batch's log is in; a reader fetches one block's log by the height topic and
+recomputes the rolling hash as it rebuilds (`_hpplite_meta.chain_hash`,
+`hpplite_status.chain_hash`), and a mismatch at the tip stops the rebuild
+in the error state. Pending SQL beyond that is
 submitted as a series of batches, each cut at a transaction boundary when
 possible and marked `"partial": 1` except the last. Only the last batch of
 a series carries a state root, so verification compares roots at non-partial
@@ -356,12 +363,17 @@ The L1 contract stores:
 - **Configuration** - sequencer address, parameters
 
 ```solidity
-interface IHPPLite {
+interface IHPPLite {                       // coordinator, VERSION 8
     function claimSequencer(bytes32 instanceId) external;
     function renewLease(bytes32 instanceId) external;
-    function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;
     function submitCheckpoint(bytes32 instanceId, uint256 from, uint256 to, bytes32 root) external;
-    function getBatch(uint256 height) external view returns (bytes);
+    function claimSequencerFor(bytes32 instanceId, uint256 nonce, bytes sig) external;   // the sequencer's EIP-712 signature, anyone's gas (#126)
+}
+interface IHPPLiteDA {                     // store, version 2 (#33)
+    function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;        // bytes in the log, hash in chainHash
+    function commitBatch(bytes32 instanceId, uint256 height, bytes32 hash, bytes ref, bytes receipt) external;   // bytes elsewhere (#11)
+    function chainHash() external view returns (bytes32);
+    function blockOf(uint256 height) external view returns (uint64);
 }
 ```
 
