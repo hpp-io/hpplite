@@ -5,7 +5,7 @@
 ** Implements lease-based sequencer coordination.
 */
 
-#include "l1_interface.h"
+#include "l1_backend.h"
 #include "crypto.h"
 #include "hpplite_sqlite.h"
 #include <string.h>
@@ -20,7 +20,8 @@
 /*
 ** Internal L1 mock structure
 */
-struct HppliteL1 {
+typedef struct MockL1 {
+    HppliteL1 base;               /* the function table first: l1.c dispatches through it */
     /* Owner */
     unsigned char owner[20];
     unsigned char sequencer[20];     /* The one wallet allowed to claim (the owner by default) */
@@ -75,7 +76,10 @@ struct HppliteL1 {
 
     char *dir;                   /* Directory-backed: every change is written here */
     unsigned char address[20];   /* the rollup's identity (from the directory when backed by one) */
-};
+} MockL1;
+
+/* The backend's view of the l1 parameter */
+#define self ((MockL1 *)l1)
 
 /*
 ** Directory persistence. A mock that survives the process is what the crash
@@ -128,30 +132,30 @@ static void mockUnhex(const char *in, unsigned char *out, int n) {
 }
 static void mockSaveState(HppliteL1 *l1) {
     char path[1024], inst[65], wallet[41], root[65], buf[640];
-    if (!l1->dir) return;
-    mockHex(l1->sequencerInstance, 32, inst);
-    mockHex(l1->sequencerWallet, 20, wallet);
-    mockHex(l1->lastStateRoot, 32, root);
+    if (!self->dir) return;
+    mockHex(self->sequencerInstance, 32, inst);
+    mockHex(self->sequencerWallet, 20, wallet);
+    mockHex(self->lastStateRoot, 32, root);
     snprintf(buf, sizeof(buf), "block %llu\ntime %llu\nbatches %llu\nsequencer %d %s %s %llu\n"
              "checkpoints %d %llu %llu %s\n",
-             (unsigned long long)l1->currentBlock, (unsigned long long)l1->currentTimestamp,
-             (unsigned long long)l1->nBatches, l1->hasSequencer, wallet, inst,
-             (unsigned long long)l1->leaseExpiry, l1->nCheckpoints,
-             (unsigned long long)l1->lastCheckpointHeight, (unsigned long long)l1->lastCheckpointTime, root);
-    snprintf(path, sizeof(path), "%s/state", l1->dir);
+             (unsigned long long)self->currentBlock, (unsigned long long)self->currentTimestamp,
+             (unsigned long long)self->nBatches, self->hasSequencer, wallet, inst,
+             (unsigned long long)self->leaseExpiry, self->nCheckpoints,
+             (unsigned long long)self->lastCheckpointHeight, (unsigned long long)self->lastCheckpointTime, root);
+    snprintf(path, sizeof(path), "%s/state", self->dir);
     mockWriteFile(path, buf, strlen(buf));
 }
 static void mockSaveBatch(HppliteL1 *l1, uint64_t height) {
     char path[1024];
-    if (!l1->dir) return;
-    snprintf(path, sizeof(path), "%s/batch-%llu.bin", l1->dir, (unsigned long long)height);
-    mockWriteFile(path, l1->batchData[height - 1], l1->batchLen[height - 1]);
+    if (!self->dir) return;
+    snprintf(path, sizeof(path), "%s/batch-%llu.bin", self->dir, (unsigned long long)height);
+    mockWriteFile(path, self->batchData[height - 1], self->batchLen[height - 1]);
 }
 static void mockSaveCheckpoint(HppliteL1 *l1, int i) {
     char path[1024];
-    if (!l1->dir) return;
-    snprintf(path, sizeof(path), "%s/cp-%d.bin", l1->dir, i);
-    mockWriteFile(path, l1->checkpoints[i], sizeof(HppliteCheckpoint));
+    if (!self->dir) return;
+    snprintf(path, sizeof(path), "%s/cp-%d.bin", self->dir, i);
+    mockWriteFile(path, self->checkpoints[i], sizeof(HppliteCheckpoint));
 }
 static void mockLoad(HppliteL1 *l1) {
     char path[1024], inst[65] = {0}, wallet[41] = {0}, root[65] = {0};
@@ -159,37 +163,37 @@ static void mockLoad(HppliteL1 *l1) {
     unsigned long long block = 0, tm = 0, nb = 0, exp = 0, cph = 0, cpt = 0;
     int hasSeq = 0, ncp = 0;
     uint8_t *txt;
-    snprintf(path, sizeof(path), "%s/state", l1->dir);
+    snprintf(path, sizeof(path), "%s/state", self->dir);
     txt = mockReadFile(path, &len);
     if (!txt) return;                                   /* fresh directory */
     if (sscanf((char *)txt, "block %llu\ntime %llu\nbatches %llu\nsequencer %d %40s %64s %llu\n"
                "checkpoints %d %llu %llu %64s",
                &block, &tm, &nb, &hasSeq, wallet, inst, &exp, &ncp, &cph, &cpt, root) >= 10) {
-        l1->currentBlock = block;
-        l1->currentTimestamp = tm;
-        l1->hasSequencer = hasSeq;
-        mockUnhex(wallet, l1->sequencerWallet, 20);
-        mockUnhex(inst, l1->sequencerInstance, 32);
-        l1->leaseExpiry = exp;
-        l1->lastCheckpointHeight = cph;
-        l1->lastCheckpointTime = cpt;
-        mockUnhex(root, l1->lastStateRoot, 32);
+        self->currentBlock = block;
+        self->currentTimestamp = tm;
+        self->hasSequencer = hasSeq;
+        mockUnhex(wallet, self->sequencerWallet, 20);
+        mockUnhex(inst, self->sequencerInstance, 32);
+        self->leaseExpiry = exp;
+        self->lastCheckpointHeight = cph;
+        self->lastCheckpointTime = cpt;
+        mockUnhex(root, self->lastStateRoot, 32);
         for (unsigned long long h = 1; h <= nb && h <= MAX_BATCHES; h++) {
-            snprintf(path, sizeof(path), "%s/batch-%llu.bin", l1->dir, h);
-            l1->batchData[h - 1] = mockReadFile(path, &l1->batchLen[h - 1]);
-            if (!l1->batchData[h - 1]) break;           /* announced but missing: history ends here */
-            l1->nBatches = h;
+            snprintf(path, sizeof(path), "%s/batch-%llu.bin", self->dir, h);
+            self->batchData[h - 1] = mockReadFile(path, &self->batchLen[h - 1]);
+            if (!self->batchData[h - 1]) break;           /* announced but missing: history ends here */
+            self->nBatches = h;
         }
         for (int i = 0; i < ncp && i < MAX_CHECKPOINTS; i++) {
             size_t n = 0;
-            snprintf(path, sizeof(path), "%s/cp-%d.bin", l1->dir, i);
+            snprintf(path, sizeof(path), "%s/cp-%d.bin", self->dir, i);
             uint8_t *raw = mockReadFile(path, &n);
             if (!raw || n != sizeof(HppliteCheckpoint)) { free(raw); break; }
             HppliteCheckpoint *cp = hpplite_checkpoint_new(0, 0);
             if (!cp) { free(raw); break; }
             memcpy(cp, raw, sizeof(HppliteCheckpoint));
             free(raw);
-            l1->checkpoints[l1->nCheckpoints++] = cp;
+            self->checkpoints[self->nCheckpoints++] = cp;
         }
     }
     free(txt);
@@ -201,30 +205,31 @@ static void mockLoad(HppliteL1 *l1) {
 static void mockSetAddress(HppliteL1 *l1, const char *seed, uint64_t salt);
 
 HppliteL1 *hpplite_l1_create_mock(void) {
-    HppliteL1 *l1 = sqlite3_malloc(sizeof(HppliteL1));
+    HppliteL1 *l1 = sqlite3_malloc(sizeof(MockL1));
     if (!l1) return NULL;
 
-    memset(l1, 0, sizeof(HppliteL1));
+    memset(l1, 0, sizeof(MockL1));
+    self->base.ops = &hppliteL1MockOps;
 
     /* Initialize crypto for signature verification */
-    l1->crypto = hpplite_crypto_init();
-    if (!l1->crypto) {
+    self->crypto = hpplite_crypto_init();
+    if (!self->crypto) {
         sqlite3_free(l1);
         return NULL;
     }
 
     /* Default configuration */
-    l1->checkpointInterval = 100;
-    l1->leaseDuration = DEFAULT_LEASE_DURATION;
+    self->checkpointInterval = 100;
+    self->leaseDuration = DEFAULT_LEASE_DURATION;
 
     {
         static uint64_t created;
         mockSetAddress(l1, NULL, (uint64_t)time(NULL) * 1000003u + (uint64_t)(uintptr_t)l1 + ++created);
     }
     /* Initialize mock block state */
-    l1->currentBlock = 1;
-    l1->currentTimestamp = (uint64_t)time(NULL);
-    l1->lastCheckpointTime = l1->currentTimestamp;
+    self->currentBlock = 1;
+    self->currentTimestamp = (uint64_t)time(NULL);
+    self->lastCheckpointTime = self->currentTimestamp;
 
     return l1;
 }
@@ -232,7 +237,7 @@ HppliteL1 *hpplite_l1_create_mock(void) {
 HppliteL1 *hpplite_l1_create_mock_dir(const char *dir) {
     HppliteL1 *l1 = hpplite_l1_create_mock();
     if (!l1 || !dir) return l1;
-    l1->dir = strdup(dir);
+    self->dir = strdup(dir);
     mockSetAddress(l1, dir, 0);
     mockLoad(l1);
     return l1;
@@ -241,7 +246,7 @@ HppliteL1 *hpplite_l1_create_mock_dir(const char *dir) {
 /*
 ** Connect to L1 (for mock, just creates a new instance)
 */
-HppliteL1 *hpplite_l1_connect(const char *endpoint, const char *contractAddress) {
+static HppliteL1 *mock_connect(const char *endpoint, const char *contractAddress) {
     (void)endpoint;
     (void)contractAddress;
     return hpplite_l1_create_mock();
@@ -250,7 +255,7 @@ HppliteL1 *hpplite_l1_connect(const char *endpoint, const char *contractAddress)
 /*
 ** Connect from network config
 */
-HppliteL1 *hpplite_l1_connect_config(const HppliteNetworkConfig *config) {
+static HppliteL1 *mock_connect_config(const HppliteNetworkConfig *config) {
     (void)config;
     return hpplite_l1_create_mock();
 }
@@ -258,21 +263,21 @@ HppliteL1 *hpplite_l1_connect_config(const HppliteNetworkConfig *config) {
 /*
 ** Set private key for transactions
 */
-int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
+static int mock_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
     if (!l1 || !privkey) return -1;
 
-    memcpy(l1->privkey, privkey, 32);
-    l1->hasPrivkey = 1;
+    memcpy(self->privkey, privkey, 32);
+    self->hasPrivkey = 1;
 
     /* Derive address from private key */
     HppliteKeypair kp;
-    int rc = hpplite_crypto_keypair_from_privkey(l1->crypto, &kp, privkey);
+    int rc = hpplite_crypto_keypair_from_privkey(self->crypto, &kp, privkey);
     if (rc == 0) {
-        memcpy(l1->myAddress, kp.address, 20);
+        memcpy(self->myAddress, kp.address, 20);
         /* the factory hands the rollup to the wallet that created it */
         unsigned char zero[20] = {0};
-        if (memcmp(l1->owner, zero, 20) == 0) memcpy(l1->owner, kp.address, 20);
-        if (memcmp(l1->sequencer, zero, 20) == 0) memcpy(l1->sequencer, kp.address, 20);
+        if (memcmp(self->owner, zero, 20) == 0) memcpy(self->owner, kp.address, 20);
+        if (memcmp(self->sequencer, zero, 20) == 0) memcpy(self->sequencer, kp.address, 20);
     }
 
     return 0;
@@ -281,35 +286,35 @@ int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
 /*
 ** Disconnect from L1
 */
-void hpplite_l1_disconnect(HppliteL1 *l1) {
+static void mock_disconnect(HppliteL1 *l1) {
     if (!l1) return;
 
     /* Free checkpoints */
-    for (int i = 0; i < l1->nCheckpoints; i++) {
-        hpplite_checkpoint_free(l1->checkpoints[i]);
+    for (int i = 0; i < self->nCheckpoints; i++) {
+        hpplite_checkpoint_free(self->checkpoints[i]);
     }
 
     /* Free batch data */
-    for (uint64_t i = 0; i < l1->nBatches; i++) {
-        if (l1->batchData[i]) {
-            free(l1->batchData[i]);
+    for (uint64_t i = 0; i < self->nBatches; i++) {
+        if (self->batchData[i]) {
+            free(self->batchData[i]);
         }
     }
 
     /* Free crypto */
-    if (l1->crypto) {
-        hpplite_crypto_free(l1->crypto);
+    if (self->crypto) {
+        hpplite_crypto_free(self->crypto);
     }
 
-    free(l1->dir);
+    free(self->dir);
     sqlite3_free(l1);
 }
 
 /*
 ** Get system configuration
 */
-HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
-    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
+static HppliteSystemConfig *mock_get_system_config(HppliteL1 *l1) {
+    if (l1 && self->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1) return NULL;
 
     HppliteSystemConfig *config = sqlite3_malloc(sizeof(HppliteSystemConfig));
@@ -318,9 +323,9 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
     memset(config, 0, sizeof(HppliteSystemConfig));
     config->daScheme = sqlite3_mprintf("hppda");
     config->version = 4;
-    config->checkpointInterval = l1->checkpointInterval;
-    config->leaseDuration = l1->leaseDuration;
-    config->batchSizeLimit = l1->batchSizeLimit ? l1->batchSizeLimit : 128 * 1024;
+    config->checkpointInterval = self->checkpointInterval;
+    config->leaseDuration = self->leaseDuration;
+    config->batchSizeLimit = self->batchSizeLimit ? self->batchSizeLimit : 128 * 1024;
 
     return config;
 }
@@ -328,17 +333,12 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
 /*
 ** Free system config
 */
-void hpplite_l1_system_config_free(HppliteSystemConfig *config) {
-    if (!config) return;
-    sqlite3_free(config->daScheme);
-    sqlite3_free(config);
-}
 
 /*
 ** Get current L1 state
 */
-HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
-    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
+static HppliteL1State *mock_get_state(HppliteL1 *l1) {
+    if (l1 && self->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1) return NULL;
 
     HppliteL1State *state = sqlite3_malloc(sizeof(HppliteL1State));
@@ -347,26 +347,26 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
     memset(state, 0, sizeof(HppliteL1State));
 
     /* Copy owner */
-    memcpy(state->owner, l1->owner, 20);
+    memcpy(state->owner, self->owner, 20);
 
     /* Copy sequencer info */
-    if (l1->hasSequencer) {
-        memcpy(state->sequencerWallet, l1->sequencerWallet, 20);
-        memcpy(state->sequencerInstance, l1->sequencerInstance, 32);
-        state->leaseExpiry = l1->leaseExpiry;
+    if (self->hasSequencer) {
+        memcpy(state->sequencerWallet, self->sequencerWallet, 20);
+        memcpy(state->sequencerInstance, self->sequencerInstance, 32);
+        state->leaseExpiry = self->leaseExpiry;
     }
 
     /* Copy config */
-    state->checkpointInterval = l1->checkpointInterval;
-    state->leaseDuration = l1->leaseDuration;
+    state->checkpointInterval = self->checkpointInterval;
+    state->leaseDuration = self->leaseDuration;
 
     /* Copy checkpoint info */
-    state->lastCheckpointHeight = l1->lastCheckpointHeight;
-    memcpy(state->lastStateRoot, l1->lastStateRoot, 32);
-    state->lastCheckpointTime = l1->lastCheckpointTime;
+    state->lastCheckpointHeight = self->lastCheckpointHeight;
+    memcpy(state->lastStateRoot, self->lastStateRoot, 32);
+    state->lastCheckpointTime = self->lastCheckpointTime;
 
-    state->currentBlock = l1->currentBlock;
-    state->currentTimestamp = l1->currentTimestamp;
+    state->currentBlock = self->currentBlock;
+    state->currentTimestamp = self->currentTimestamp;
 
     return state;
 }
@@ -374,28 +374,21 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
 /*
 ** Free L1 state
 */
-void hpplite_l1_state_free(HppliteL1State *state) {
-    if (!state) return;
-    sqlite3_free(state);
-}
 
 /* === Lease Management === */
 
 /*
 ** Check if lease is currently active
 */
-static uint64_t g_defaultChainId = 181228;
-void hpplite_l1_set_default_chain_id(uint64_t chainId) { if (chainId) g_defaultChainId = chainId; }
-uint64_t hpplite_l1_default_chain_id(void) { return g_defaultChainId; }
 
-int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]) {
+static int mock_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]) {
     static const char *h = "0123456789abcdef";
     int i;
     if (!l1) return -1;
     contractHex[0] = '0'; contractHex[1] = 'x';
     for (i = 0; i < 20; i++) {
-        contractHex[2 + 2*i] = h[l1->address[i] >> 4];
-        contractHex[3 + 2*i] = h[l1->address[i] & 15];
+        contractHex[2 + 2*i] = h[self->address[i] >> 4];
+        contractHex[3 + 2*i] = h[self->address[i] & 15];
     }
     contractHex[42] = 0;
     daHex[0] = 0;
@@ -408,111 +401,112 @@ static void mockSetAddress(HppliteL1 *l1, const char *seed, uint64_t salt) {
     uint64_t x = 1469598103934665603ULL ^ salt;
     int i;
     for (; seed && *seed; seed++) x = (x ^ (unsigned char)*seed) * 1099511628211ULL;
-    for (i = 0; i < 20; i++) { x = (x ^ (uint64_t)i) * 1099511628211ULL; l1->address[i] = (unsigned char)(x >> 32); }
+    for (i = 0; i < 20; i++) { x = (x ^ (uint64_t)i) * 1099511628211ULL; self->address[i] = (unsigned char)(x >> 32); }
 }
 
-int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
-    if (!l1 || !l1->hasPrivkey) return -1;
-    memcpy(out, l1->myAddress, 20);
+static int mock_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
+    if (!l1 || !self->hasPrivkey) return -1;
+    memcpy(out, self->myAddress, 20);
     return 0;
 }
 
 void hpplite_l1_mock_claim_foreign(HppliteL1 *l1, const unsigned char *wallet,
                                    const unsigned char instanceId[32], uint64_t seconds) {
-    if (!l1) return;
-    l1->hasSequencer = 1;
-    if (wallet) memcpy(l1->sequencerWallet, wallet, 20);
-    else memset(l1->sequencerWallet, 0x55, 20);          /* nobody we know */
-    memcpy(l1->sequencerInstance, instanceId, 32);
-    l1->leaseExpiry = l1->currentTimestamp + seconds;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    self->hasSequencer = 1;
+    if (wallet) memcpy(self->sequencerWallet, wallet, 20);
+    else memset(self->sequencerWallet, 0x55, 20);          /* nobody we know */
+    memcpy(self->sequencerInstance, instanceId, 32);
+    self->leaseExpiry = self->currentTimestamp + seconds;
     mockSaveState(l1);
 }
 
 void hpplite_l1_mock_inject_batch(HppliteL1 *l1, const uint8_t *data, size_t len) {
-    if (!l1 || !data || l1->nBatches >= MAX_BATCHES) return;
-    size_t idx = l1->nBatches;
-    l1->batchData[idx] = malloc(len);
-    if (!l1->batchData[idx]) return;
-    memcpy(l1->batchData[idx], data, len);
-    l1->batchLen[idx] = len;
-    l1->nBatches++;
-    mockSaveBatch(l1, l1->nBatches);
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (!l1 || !data || self->nBatches >= MAX_BATCHES) return;
+    size_t idx = self->nBatches;
+    self->batchData[idx] = malloc(len);
+    if (!self->batchData[idx]) return;
+    memcpy(self->batchData[idx], data, len);
+    self->batchLen[idx] = len;
+    self->nBatches++;
+    mockSaveBatch(l1, self->nBatches);
     mockSaveState(l1);
 }
 
-int hpplite_l1_is_lease_active(HppliteL1 *l1) {
-    if (!l1 || !l1->hasSequencer) return 0;
-    return l1->currentTimestamp < l1->leaseExpiry;
+static int mock_is_lease_active(HppliteL1 *l1) {
+    if (!l1 || !self->hasSequencer) return 0;
+    return self->currentTimestamp < self->leaseExpiry;
 }
 
 /*
 ** Release the lease (owner expires it)
 */
-char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
-    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
-    if (!l1 || !l1->hasPrivkey || !l1->hasSequencer) return NULL;
+static char *mock_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    if (l1 && self->rpcDown) return NULL;   /* the endpoint is down */
+    if (!l1 || !self->hasPrivkey || !self->hasSequencer) return NULL;
     if (!instanceId) {
         /* forceExpireLease(): onlyOwner */
-        if (memcmp(l1->owner, l1->myAddress, 20) != 0) return NULL;
+        if (memcmp(self->owner, self->myAddress, 20) != 0) return NULL;
     } else {
         /* releaseLease(instanceId): the holder's wallet and instance, while active */
-        if (memcmp(l1->sequencerWallet, l1->myAddress, 20) != 0) return NULL;   /* "Not sequencer wallet" */
-        if (memcmp(l1->sequencerInstance, instanceId, 32) != 0) return NULL;   /* "Wrong instance" */
-        if (!hpplite_l1_is_lease_active(l1)) return NULL;                       /* "Lease expired" */
+        if (memcmp(self->sequencerWallet, self->myAddress, 20) != 0) return NULL;   /* "Not sequencer wallet" */
+        if (memcmp(self->sequencerInstance, instanceId, 32) != 0) return NULL;   /* "Wrong instance" */
+        if (!mock_is_lease_active(l1)) return NULL;                       /* "Lease expired" */
     }
-    l1->leaseExpiry = l1->currentTimestamp;
+    self->leaseExpiry = self->currentTimestamp;
     mockSaveState(l1);
     return sqlite3_mprintf("0x%08x%08x",
-        (unsigned int)(l1->currentBlock),
-        (unsigned int)(l1->currentTimestamp));
+        (unsigned int)(self->currentBlock),
+        (unsigned int)(self->currentTimestamp));
 }
 
 /*
 ** Get remaining lease time
 */
-uint64_t hpplite_l1_get_lease_time_remaining(HppliteL1 *l1) {
-    if (!l1 || !l1->hasSequencer) return 0;
-    if (l1->currentTimestamp >= l1->leaseExpiry) return 0;
-    return l1->leaseExpiry - l1->currentTimestamp;
+static uint64_t mock_get_lease_time_remaining(HppliteL1 *l1) {
+    if (!l1 || !self->hasSequencer) return 0;
+    if (self->currentTimestamp >= self->leaseExpiry) return 0;
+    return self->leaseExpiry - self->currentTimestamp;
 }
 
 
 /*
 ** Claim sequencer lease with instance ID
 */
-char *hpplite_l1_claim_sequencer(
+static char *mock_claim_sequencer(
     HppliteL1 *l1,
     const unsigned char instanceId[32]
 ) {
-    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
+    if (l1 && self->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !instanceId) return NULL;
-    if (!l1->hasPrivkey) return NULL;
-    if (memcmp(l1->sequencer, l1->myAddress, 20) != 0) return NULL;   /* "Not the sequencer" */
+    if (!self->hasPrivkey) return NULL;
+    if (memcmp(self->sequencer, self->myAddress, 20) != 0) return NULL;   /* "Not the sequencer" */
 
     /* Check if lease is available */
-    if (l1->hasSequencer && hpplite_l1_is_lease_active(l1)) {
+    if (self->hasSequencer && mock_is_lease_active(l1)) {
         return NULL;  /* Lease still active */
     }
-    if (l1->claimReverts) {
+    if (self->claimReverts) {
         /* mined, then reverted: the caller gets a hash, the chain no lease */
-        return sqlite3_mprintf("0xreverted%08x", (unsigned int)(l1->currentTimestamp));
+        return sqlite3_mprintf("0xreverted%08x", (unsigned int)(self->currentTimestamp));
     }
 
     /* Claim the lease */
-    l1->hasSequencer = 1;
-    memcpy(l1->sequencerWallet, l1->myAddress, 20);
-    memcpy(l1->sequencerInstance, instanceId, 32);
-    l1->leaseExpiry = l1->currentTimestamp + l1->leaseDuration;
+    self->hasSequencer = 1;
+    memcpy(self->sequencerWallet, self->myAddress, 20);
+    memcpy(self->sequencerInstance, instanceId, 32);
+    self->leaseExpiry = self->currentTimestamp + self->leaseDuration;
     mockSaveState(l1);
 
     /* Generate mock transaction hash */
     char *txHash = sqlite3_mprintf("0x%08x%08x",
-        (unsigned int)(l1->currentBlock),
-        (unsigned int)(l1->currentTimestamp));
+        (unsigned int)(self->currentBlock),
+        (unsigned int)(self->currentTimestamp));
 
     /* Emit event */
-    if (l1->callback) {
-        l1->callback(l1->callbackArg, "SequencerClaimed", (void *)instanceId);
+    if (self->callback) {
+        self->callback(self->callbackArg, "SequencerClaimed", (void *)instanceId);
     }
 
     return txHash;
@@ -521,30 +515,30 @@ char *hpplite_l1_claim_sequencer(
 /*
 ** Renew sequencer lease
 */
-char *hpplite_l1_renew_lease(
+static char *mock_renew_lease(
     HppliteL1 *l1,
     const unsigned char instanceId[32]
 ) {
-    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
+    if (l1 && self->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !instanceId) return NULL;
-    if (!l1->hasPrivkey) return NULL;
+    if (!self->hasPrivkey) return NULL;
 
     /* Must be current sequencer */
-    if (!l1->hasSequencer) return NULL;
-    if (memcmp(l1->sequencerWallet, l1->myAddress, 20) != 0) return NULL;
-    if (memcmp(l1->sequencerInstance, instanceId, 32) != 0) return NULL;
+    if (!self->hasSequencer) return NULL;
+    if (memcmp(self->sequencerWallet, self->myAddress, 20) != 0) return NULL;
+    if (memcmp(self->sequencerInstance, instanceId, 32) != 0) return NULL;
 
     /* Lease must not be expired */
-    if (!hpplite_l1_is_lease_active(l1)) return NULL;
+    if (!mock_is_lease_active(l1)) return NULL;
 
     /* Renew */
-    l1->leaseExpiry = l1->currentTimestamp + l1->leaseDuration;
+    self->leaseExpiry = self->currentTimestamp + self->leaseDuration;
     mockSaveState(l1);
 
     /* Generate mock transaction hash */
     char *txHash = sqlite3_mprintf("0x%08xrenew%08x",
-        (unsigned int)(l1->currentBlock),
-        (unsigned int)(l1->currentTimestamp));
+        (unsigned int)(self->currentBlock),
+        (unsigned int)(self->currentTimestamp));
 
     return txHash;
 }
@@ -554,27 +548,27 @@ char *hpplite_l1_renew_lease(
 /*
 ** Submit a checkpoint to L1
 */
-char *hpplite_l1_submit_checkpoint(
+static char *mock_submit_checkpoint(
     HppliteL1 *l1,
     const HppliteCheckpoint *checkpoint,
     const unsigned char instanceId[32]
 ) {
-    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
+    if (l1 && self->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !checkpoint || !instanceId) return NULL;
 
     /* onlyActiveSequencer(instanceId): the holder's wallet and instance, while active */
-    if (!l1->hasPrivkey || memcmp(l1->sequencerWallet, l1->myAddress, 20) != 0) {
+    if (!self->hasPrivkey || memcmp(self->sequencerWallet, self->myAddress, 20) != 0) {
         return NULL;  /* "Not sequencer wallet" */
     }
-    if (memcmp(instanceId, l1->sequencerInstance, 32) != 0) {
+    if (memcmp(instanceId, self->sequencerInstance, 32) != 0) {
         return NULL;  /* Wrong instance */
     }
-    if (l1->leaseExpiry <= l1->currentTimestamp) {
+    if (self->leaseExpiry <= self->currentTimestamp) {
         return NULL;  /* Lease expired */
     }
 
     /* Store checkpoint */
-    if (l1->nCheckpoints >= MAX_CHECKPOINTS) {
+    if (self->nCheckpoints >= MAX_CHECKPOINTS) {
         return NULL;
     }
 
@@ -586,27 +580,27 @@ char *hpplite_l1_submit_checkpoint(
     memcpy(cpCopy->batchesHash, checkpoint->batchesHash, 32);
     cpCopy->timestamp = checkpoint->timestamp;
 
-    l1->checkpoints[l1->nCheckpoints++] = cpCopy;
-    l1->lastCheckpointTime = l1->currentTimestamp;
-    l1->lastCheckpointHeight = checkpoint->toHeight;
-    memcpy(l1->lastStateRoot, checkpoint->postStateRoot, 32);
-    mockSaveCheckpoint(l1, l1->nCheckpoints - 1);
+    self->checkpoints[self->nCheckpoints++] = cpCopy;
+    self->lastCheckpointTime = self->currentTimestamp;
+    self->lastCheckpointHeight = checkpoint->toHeight;
+    memcpy(self->lastStateRoot, checkpoint->postStateRoot, 32);
+    mockSaveCheckpoint(l1, self->nCheckpoints - 1);
     mockSaveState(l1);
 
     /* Auto-renew lease on checkpoint */
-    if (l1->hasSequencer && hpplite_l1_is_lease_active(l1)) {
-        l1->leaseExpiry = l1->currentTimestamp + l1->leaseDuration;
+    if (self->hasSequencer && mock_is_lease_active(l1)) {
+        self->leaseExpiry = self->currentTimestamp + self->leaseDuration;
         mockSaveState(l1);
     }
 
     /* Generate mock transaction hash */
     char *txHash = sqlite3_mprintf("0xcp%08x%08x",
-        (unsigned int)(l1->currentBlock),
-        (unsigned int)(l1->nCheckpoints));
+        (unsigned int)(self->currentBlock),
+        (unsigned int)(self->nCheckpoints));
 
     /* Emit event */
-    if (l1->callback) {
-        l1->callback(l1->callbackArg, "CheckpointSubmitted", cpCopy);
+    if (self->callback) {
+        self->callback(self->callbackArg, "CheckpointSubmitted", cpCopy);
     }
 
     return txHash;
@@ -615,119 +609,132 @@ char *hpplite_l1_submit_checkpoint(
 /*
 ** Set callback for L1 events
 */
-void hpplite_l1_set_callback(HppliteL1 *l1, HppliteL1Callback callback, void *arg) {
+static void mock_set_callback(HppliteL1 *l1, HppliteL1Callback callback, void *arg) {
     if (!l1) return;
-    l1->callback = callback;
-    l1->callbackArg = arg;
+    self->callback = callback;
+    self->callbackArg = arg;
 }
 
 /*
 ** Poll for L1 updates (mock: advance block)
 */
-int hpplite_l1_poll(HppliteL1 *l1) {
+static int mock_poll(HppliteL1 *l1) {
     if (!l1) return -1;
 
     /* Simulate block advancement (12 seconds per block) */
-    l1->currentBlock++;
-    l1->currentTimestamp += 12;
+    self->currentBlock++;
+    self->currentTimestamp += 12;
 
     return 0;
 }
 
-int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs) {
+static int mock_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs) {
     (void)timeout_secs;
-    if (l1 && l1->txPending) return -1;   /* still pending after the timeout */
+    if (l1 && self->txPending) return -1;   /* still pending after the timeout */
     if (tx_hash && strncmp(tx_hash, "0xreverted", 10) == 0) return 0;   /* mined, status 0 */
-    if (l1 && l1->submitDelayMs > 0) usleep((useconds_t)l1->submitDelayMs * 1000);
+    if (l1 && self->submitDelayMs > 0) usleep((useconds_t)self->submitDelayMs * 1000);
     return 1;
 }
 
 /* === Mock-specific functions for testing === */
 
 void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms) {
-    if (l1) l1->submitDelayMs = ms;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) self->submitDelayMs = ms;
 }
 
-char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
-    if (!l1 || !l1->hasPrivkey || interval == 0) return NULL;
-    if (memcmp(l1->owner, l1->myAddress, 20) != 0) return NULL;   /* onlyOwner */
-    l1->checkpointInterval = interval;
+static char *mock_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
+    if (!l1 || !self->hasPrivkey || interval == 0) return NULL;
+    if (memcmp(self->owner, self->myAddress, 20) != 0) return NULL;   /* onlyOwner */
+    self->checkpointInterval = interval;
     mockSaveState(l1);
-    return sqlite3_mprintf("0x%08xckpt%08x", (unsigned int)l1->currentBlock, (unsigned int)interval);
+    return sqlite3_mprintf("0x%08xckpt%08x", (unsigned int)self->currentBlock, (unsigned int)interval);
 }
 
 void hpplite_l1_mock_set_rpc_down(HppliteL1 *l1, int down) {
-    if (l1) l1->rpcDown = down;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) self->rpcDown = down;
 }
 
 void hpplite_l1_mock_set_claim_reverts(HppliteL1 *l1, int revert) {
-    if (l1) l1->claimReverts = revert;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) self->claimReverts = revert;
 }
 
 void hpplite_l1_mock_set_fail_submit(HppliteL1 *l1, int fail) {
-    if (l1) { l1->failSubmit = fail; l1->failAfterPlus1 = 0; }
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) { self->failSubmit = fail; self->failAfterPlus1 = 0; }
 }
 
 void hpplite_l1_mock_truncate(HppliteL1 *l1, uint64_t keep) {
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
     if (!l1) return;
-    while (l1->nBatches > keep) {
-        l1->nBatches--;
-        free(l1->batchData[l1->nBatches]);
-        l1->batchData[l1->nBatches] = NULL;
-        l1->batchLen[l1->nBatches] = 0;
+    while (self->nBatches > keep) {
+        self->nBatches--;
+        free(self->batchData[self->nBatches]);
+        self->batchData[self->nBatches] = NULL;
+        self->batchLen[self->nBatches] = 0;
     }
     mockSaveState(l1);
 }
 
 void hpplite_l1_mock_set_max_tx_bytes(HppliteL1 *l1, size_t n) {
-    if (l1) l1->maxTxBytes = n;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) self->maxTxBytes = n;
 }
 
-int hpplite_l1_submit_was_oversized(HppliteL1 *l1) {
-    return l1 ? l1->lastOversized : 0;
+static int mock_submit_was_oversized(HppliteL1 *l1) {
+    return l1 ? self->lastOversized : 0;
 }
 
-void hpplite_l1_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
+static void mock_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
     (void)l1; (void)gas;                 /* the mock charges no gas */
 }
 
 void hpplite_l1_mock_set_fail_submit_after(HppliteL1 *l1, int n) {
-    if (l1) l1->failAfterPlus1 = n + 1;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) self->failAfterPlus1 = n + 1;
 }
 
 void hpplite_l1_mock_set_lose_confirmation(HppliteL1 *l1, int lose) {
-    if (l1) l1->loseConfirmation = lose;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) self->loseConfirmation = lose;
 }
 
 void hpplite_l1_mock_set_tx_pending(HppliteL1 *l1, int pending) {
-    if (l1) l1->txPending = pending;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) self->txPending = pending;
 }
 
 void hpplite_l1_mock_set_batch_size_limit(HppliteL1 *l1, size_t limit) {
-    if (l1) l1->batchSizeLimit = limit;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
+    if (l1) self->batchSizeLimit = limit;
 }
 
 void hpplite_l1_mock_set_sequencer(HppliteL1 *l1, const unsigned char *pubkey) {
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
     if (!l1 || !pubkey) return;
 
-    l1->hasSequencer = 1;
+    self->hasSequencer = 1;
     /* Just use pubkey bytes as address for mock */
-    memcpy(l1->sequencerWallet, pubkey, 20);
-    memset(l1->sequencerInstance, 0, 32);
-    l1->leaseExpiry = l1->currentTimestamp + l1->leaseDuration;
+    memcpy(self->sequencerWallet, pubkey, 20);
+    memset(self->sequencerInstance, 0, 32);
+    self->leaseExpiry = self->currentTimestamp + self->leaseDuration;
     mockSaveState(l1);
 }
 
 void hpplite_l1_mock_advance_blocks(HppliteL1 *l1, uint64_t blocks) {
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
     if (!l1) return;
-    l1->currentBlock += blocks;
-    l1->currentTimestamp += blocks * 12;
+    self->currentBlock += blocks;
+    self->currentTimestamp += blocks * 12;
 }
 
 void hpplite_l1_mock_advance_time(HppliteL1 *l1, uint64_t seconds) {
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
     if (!l1) return;
-    l1->currentTimestamp += seconds;
-    l1->currentBlock += seconds / 12;
+    self->currentTimestamp += seconds;
+    self->currentBlock += seconds / 12;
 }
 
 void hpplite_l1_mock_set_config(
@@ -735,31 +742,36 @@ void hpplite_l1_mock_set_config(
     uint64_t checkpointInterval,
     uint64_t leaseDuration
 ) {
+    if (!l1 || l1->ops != &hppliteL1MockOps) return;
     if (!l1) return;
-    l1->checkpointInterval = checkpointInterval;
-    l1->leaseDuration = leaseDuration;
+    self->checkpointInterval = checkpointInterval;
+    self->leaseDuration = leaseDuration;
 }
 
 uint64_t hpplite_l1_mock_get_timestamp(HppliteL1 *l1) {
-    return l1 ? l1->currentTimestamp : 0;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return 0;
+    return l1 ? self->currentTimestamp : 0;
 }
 
 uint64_t hpplite_l1_mock_get_block(HppliteL1 *l1) {
-    return l1 ? l1->currentBlock : 0;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return 0;
+    return l1 ? self->currentBlock : 0;
 }
 
 const HppliteCheckpoint *hpplite_l1_mock_get_last_checkpoint(HppliteL1 *l1) {
-    if (!l1 || l1->nCheckpoints == 0) return NULL;
-    return l1->checkpoints[l1->nCheckpoints - 1];
+    if (!l1 || l1->ops != &hppliteL1MockOps) return NULL;
+    if (!l1 || self->nCheckpoints == 0) return NULL;
+    return self->checkpoints[self->nCheckpoints - 1];
 }
 
 int hpplite_l1_mock_get_checkpoint_count(HppliteL1 *l1) {
-    return l1 ? l1->nCheckpoints : 0;
+    if (!l1 || l1->ops != &hppliteL1MockOps) return 0;
+    return l1 ? self->nCheckpoints : 0;
 }
 
 /* === Factory Functions (stubs for mock) === */
 
-int hpplite_l1_factory_get_rollup(
+static int mock_factory_get_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t owner_address[20],
@@ -772,7 +784,7 @@ int hpplite_l1_factory_get_rollup(
     return 0;
 }
 
-int hpplite_l1_factory_has_rollup(
+static int mock_factory_has_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t owner_address[20]
@@ -783,7 +795,7 @@ int hpplite_l1_factory_has_rollup(
     return 0;
 }
 
-char *hpplite_l1_factory_get_or_create_rollup(
+static char *mock_factory_get_or_create_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32],
@@ -796,7 +808,7 @@ char *hpplite_l1_factory_get_or_create_rollup(
     return NULL;
 }
 
-int hpplite_l1_factory_get_my_rollup(
+static int mock_factory_get_my_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32],
@@ -809,7 +821,7 @@ int hpplite_l1_factory_get_my_rollup(
     return 0;
 }
 
-int hpplite_l1_factory_list_rollups(
+static int mock_factory_list_rollups(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t owner_address[20],
@@ -820,7 +832,7 @@ int hpplite_l1_factory_list_rollups(
     return 0;
 }
 
-int hpplite_l1_factory_create_rollup(
+static int mock_factory_create_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32],
@@ -831,7 +843,7 @@ int hpplite_l1_factory_create_rollup(
     return 0;
 }
 
-int hpplite_l1_factory_list_my_rollups(
+static int mock_factory_list_my_rollups(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32],
@@ -842,7 +854,7 @@ int hpplite_l1_factory_list_my_rollups(
     return 0;
 }
 
-HppliteL1 *hpplite_l1_connect_factory(
+static HppliteL1 *mock_connect_factory(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32]
@@ -855,92 +867,92 @@ HppliteL1 *hpplite_l1_connect_factory(
 
 /* === Batch DA Functions === */
 
-char *hpplite_l1_submit_batch(
+static char *mock_submit_batch(
     HppliteL1 *l1,
     const uint8_t instanceId[32],
     uint64_t height,
     const uint8_t *data,
     size_t data_len
 ) {
-    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
+    if (l1 && self->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || !instanceId || !data || height == 0) return NULL;
     if (height > MAX_BATCHES) return NULL;
-    l1->lastOversized = 0;
-    if (l1->failSubmit) return NULL;
-    if (l1->failAfterPlus1 == 1) return NULL;
-    if (l1->maxTxBytes && data_len > l1->maxTxBytes) { l1->lastOversized = 1; return NULL; }
-    if (data_len > (l1->batchSizeLimit ? l1->batchSizeLimit : 128 * 1024)) {
+    self->lastOversized = 0;
+    if (self->failSubmit) return NULL;
+    if (self->failAfterPlus1 == 1) return NULL;
+    if (self->maxTxBytes && data_len > self->maxTxBytes) { self->lastOversized = 1; return NULL; }
+    if (data_len > (self->batchSizeLimit ? self->batchSizeLimit : 128 * 1024)) {
         return NULL;  /* "Batch too large" */
     }
-    if (height != l1->nBatches + 1) {
+    if (height != self->nBatches + 1) {
         return NULL;  /* "Non-sequential batch" */
     }
 
     /* onlyActiveSequencer(instanceId): the holder's wallet and instance, while active */
-    if (!l1->hasPrivkey || memcmp(l1->sequencerWallet, l1->myAddress, 20) != 0) {
+    if (!self->hasPrivkey || memcmp(self->sequencerWallet, self->myAddress, 20) != 0) {
         return NULL;  /* "Not sequencer wallet" */
     }
-    if (memcmp(instanceId, l1->sequencerInstance, 32) != 0) {
+    if (memcmp(instanceId, self->sequencerInstance, 32) != 0) {
         return NULL;  /* Wrong instance */
     }
-    if (l1->leaseExpiry <= l1->currentTimestamp) {
+    if (self->leaseExpiry <= self->currentTimestamp) {
         return NULL;  /* Lease expired */
     }
 
     size_t idx = height - 1;
 
     /* Free existing data if overwriting */
-    if (l1->batchData[idx]) {
-        free(l1->batchData[idx]);
+    if (self->batchData[idx]) {
+        free(self->batchData[idx]);
     }
 
-    l1->batchData[idx] = malloc(data_len);
-    if (!l1->batchData[idx]) return NULL;
+    self->batchData[idx] = malloc(data_len);
+    if (!self->batchData[idx]) return NULL;
 
-    memcpy(l1->batchData[idx], data, data_len);
-    l1->batchLen[idx] = data_len;
-    if (l1->failAfterPlus1 > 1) l1->failAfterPlus1--;
+    memcpy(self->batchData[idx], data, data_len);
+    self->batchLen[idx] = data_len;
+    if (self->failAfterPlus1 > 1) self->failAfterPlus1--;
 
-    if (height > l1->nBatches) {
-        l1->nBatches = height;
+    if (height > self->nBatches) {
+        self->nBatches = height;
     }
     mockSaveBatch(l1, height);
     mockSaveState(l1);
 
-    if (l1->loseConfirmation) return NULL;  /* stored, but the caller never hears */
+    if (self->loseConfirmation) return NULL;  /* stored, but the caller never hears */
     return sqlite3_mprintf("0x%016llx", (unsigned long long)height);
 }
 
-uint8_t *hpplite_l1_get_batch(
+static uint8_t *mock_get_batch(
     HppliteL1 *l1,
     uint64_t height,
     size_t *data_len_out
 ) {
-    if (l1 && l1->rpcDown) return NULL;   /* the endpoint is down */
+    if (l1 && self->rpcDown) return NULL;   /* the endpoint is down */
     if (!l1 || height == 0 || height > MAX_BATCHES) {
         if (data_len_out) *data_len_out = 0;
         return NULL;
     }
 
     size_t idx = height - 1;
-    if (!l1->batchData[idx]) {
+    if (!self->batchData[idx]) {
         if (data_len_out) *data_len_out = 0;
         return NULL;
     }
 
-    uint8_t *copy = malloc(l1->batchLen[idx] + 1);     /* terminated, as the chain's copy is (#77) */
+    uint8_t *copy = malloc(self->batchLen[idx] + 1);     /* terminated, as the chain's copy is (#77) */
     if (!copy) {
         if (data_len_out) *data_len_out = 0;
         return NULL;
     }
 
-    memcpy(copy, l1->batchData[idx], l1->batchLen[idx]);
-    copy[l1->batchLen[idx]] = 0;
-    if (data_len_out) *data_len_out = l1->batchLen[idx];
+    memcpy(copy, self->batchData[idx], self->batchLen[idx]);
+    copy[self->batchLen[idx]] = 0;
+    if (data_len_out) *data_len_out = self->batchLen[idx];
     return copy;
 }
 
-int hpplite_l1_get_batch_hash(
+static int mock_get_batch_hash(
     HppliteL1 *l1,
     uint64_t height,
     uint8_t hash_out[32]
@@ -951,22 +963,22 @@ int hpplite_l1_get_batch_hash(
     }
 
     size_t idx = height - 1;
-    if (!l1->batchData[idx]) {
+    if (!self->batchData[idx]) {
         memset(hash_out, 0, 32);
         return 0;
     }
 
-    hpplite_keccak256(l1->batchData[idx], l1->batchLen[idx], hash_out);   /* as HPPLiteDA.submitBatch does */
+    hpplite_keccak256(self->batchData[idx], self->batchLen[idx], hash_out);   /* as HPPLiteDA.submitBatch does */
     return 1;
 }
 
-int hpplite_l1_get_da_state(
+static int mock_get_da_state(
     HppliteL1 *l1,
     uint64_t *last_batch_height,
     uint64_t *total_batches,
     uint8_t latest_batch_hash[32]
 ) {
-    if (l1 && l1->rpcDown) return -1;   /* the endpoint is down */
+    if (l1 && self->rpcDown) return -1;   /* the endpoint is down */
     if (!l1) {
         if (last_batch_height) *last_batch_height = 0;
         if (total_batches) *total_batches = 0;
@@ -974,15 +986,51 @@ int hpplite_l1_get_da_state(
         return -1;
     }
 
-    if (last_batch_height) *last_batch_height = l1->nBatches;
-    if (total_batches) *total_batches = l1->nBatches;
+    if (last_batch_height) *last_batch_height = self->nBatches;
+    if (total_batches) *total_batches = self->nBatches;
 
     if (latest_batch_hash) {
-        if (l1->nBatches > 0) {
-            hpplite_l1_get_batch_hash(l1, l1->nBatches, latest_batch_hash);
+        if (self->nBatches > 0) {
+            mock_get_batch_hash(l1, self->nBatches, latest_batch_hash);
         } else {
             memset(latest_batch_hash, 0, 32);
         }
     }
     return 0;
 }
+
+const HppliteL1Ops hppliteL1MockOps = {
+    .name = "mock",
+    .connect = mock_connect,
+    .connect_config = mock_connect_config,
+    .connect_factory = mock_connect_factory,
+    .disconnect = mock_disconnect,
+    .get_system_config = mock_get_system_config,
+    .set_checkpoint_interval = mock_set_checkpoint_interval,
+    .set_privkey = mock_set_privkey,
+    .get_state = mock_get_state,
+    .claim_sequencer = mock_claim_sequencer,
+    .renew_lease = mock_renew_lease,
+    .release_lease = mock_release_lease,
+    .is_lease_active = mock_is_lease_active,
+    .get_addresses = mock_get_addresses,
+    .get_my_address = mock_get_my_address,
+    .get_lease_time_remaining = mock_get_lease_time_remaining,
+    .submit_checkpoint = mock_submit_checkpoint,
+    .set_callback = mock_set_callback,
+    .poll = mock_poll,
+    .wait_for_tx = mock_wait_for_tx,
+    .factory_get_rollup = mock_factory_get_rollup,
+    .factory_has_rollup = mock_factory_has_rollup,
+    .factory_get_or_create_rollup = mock_factory_get_or_create_rollup,
+    .factory_list_rollups = mock_factory_list_rollups,
+    .factory_create_rollup = mock_factory_create_rollup,
+    .factory_list_my_rollups = mock_factory_list_my_rollups,
+    .factory_get_my_rollup = mock_factory_get_my_rollup,
+    .submit_batch = mock_submit_batch,
+    .get_batch = mock_get_batch,
+    .get_batch_hash = mock_get_batch_hash,
+    .get_da_state = mock_get_da_state,
+    .submit_was_oversized = mock_submit_was_oversized,
+    .set_max_tx_gas = mock_set_max_tx_gas,
+};

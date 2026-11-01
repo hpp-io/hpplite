@@ -374,8 +374,9 @@ database costs nothing.
 | `clock.c` | Pass-through VFS that records and pins SQLite's "now" so clock SQL replays (#56) |
 | `crypto.c` | secp256k1 signing |
 | `config.c` | URI parsing, configuration |
-| `l1_eth.c` | Real Ethereum L1 client |
-| `l1_mock.c` | Mock L1 for testing |
+| `l1.c` | L1 dispatch: every build has every backend, the endpoint picks one (`"mock"` or an RPC URL); `l1_backend.h` is the function table |
+| `l1_eth.c` | Ethereum backend: the rollup contracts over JSON-RPC |
+| `l1_mock.c` | Mock backend: in memory, or in a directory for the crash harness |
 | `eth/` | Web3 primitives (RLP, ABI, keccak256) |
 
 ## Contract Interface

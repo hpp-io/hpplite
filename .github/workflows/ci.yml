@@ -51,7 +51,7 @@ jobs:
       - name: stress (10 MB)
         if: matrix.mode == 'release'
         run: cd ext/hpplite/build && ./stress_hpplite --mb 10
-      - name: real-L1 backend compiles (not run; l1_eth.c is outside the mock suite)
+      - name: real-L1 tree compiles with -Wall -Wextra (chain tests and examples; both backends are in every build, #35)
         if: matrix.mode == 'release'
         run: |
           cmake -S ext/hpplite -B ext/hpplite/build_real -DHPPLITE_SQLITE_SRC=$PWD/build \

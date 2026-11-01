@@ -5,7 +5,7 @@
 ** Implements l1_interface.h for production use with HPP Sepolia.
 */
 
-#include "l1_interface.h"
+#include "l1_backend.h"
 #include "hpplite_sqlite.h"
 #include "eth_client.h"
 #include "abi.h"
@@ -16,7 +16,8 @@
 #include <unistd.h>
 #include <time.h>
 
-struct HppliteL1 {
+typedef struct EthL1 {
+    HppliteL1 base;               /* the function table first: l1.c dispatches through it */
     EthClient *eth;
     uint8_t contract[20];      /* Main HPPLite contract */
     uint8_t da_contract[20];   /* HPPLiteDA contract (for on-chain DA) */
@@ -39,7 +40,10 @@ struct HppliteL1 {
     /* Callback */
     HppliteL1Callback callback;
     void *callback_arg;
-};
+} EthL1;
+
+/* The backend's view of the l1 parameter */
+#define self ((EthL1 *)l1)
 
 /* Function selectors - HPPLite contract (coordination) */
 static uint8_t SEL_GET_STATE[4];
@@ -74,9 +78,6 @@ static const char *DEFAULT_FACTORY_ADDRESS = "0x00000000000000000000000000000000
 /* Chain id for signing: was hard-coded to HPP Sepolia in three places, so
 ** chainid= never reached the client and no other chain (anvil, 31337)
 ** could be used. Found by the anvil harness (#47). */
-static uint64_t g_defaultChainId = 181228;
-void hpplite_l1_set_default_chain_id(uint64_t chainId) { if (chainId) g_defaultChainId = chainId; }
-uint64_t hpplite_l1_default_chain_id(void) { return g_defaultChainId; }
 
 static void init_selectors(void) {
     if (selectors_initialized) return;
@@ -109,26 +110,27 @@ static void init_selectors(void) {
     selectors_initialized = 1;
 }
 
-HppliteL1 *hpplite_l1_connect(const char *endpoint, const char *contractAddress) {
+static HppliteL1 *eth_connect(const char *endpoint, const char *contractAddress) {
     if (!endpoint || !contractAddress) return NULL;
 
     init_selectors();
 
-    HppliteL1 *l1 = calloc(1, sizeof(HppliteL1));
+    HppliteL1 *l1 = calloc(1, sizeof(EthL1));
     if (!l1) return NULL;
+    self->base.ops = &hppliteL1EthOps;
 
     /* Parse contract address */
-    if (eth_hex_decode(contractAddress, l1->contract, 20) != 0) {
+    if (eth_hex_decode(contractAddress, self->contract, 20) != 0) {
         free(l1);
         return NULL;
     }
 
-    l1->chainId = g_defaultChainId;
-    l1->rpcUrl = strdup(endpoint);
+    self->chainId = hpplite_l1_default_chain_id();
+    self->rpcUrl = strdup(endpoint);
 
-    l1->eth = eth_client_create(endpoint, l1->chainId);
-    if (!l1->eth) {
-        free(l1->rpcUrl);
+    self->eth = eth_client_create(endpoint, self->chainId);
+    if (!self->eth) {
+        free(self->rpcUrl);
         free(l1);
         return NULL;
     }
@@ -136,24 +138,25 @@ HppliteL1 *hpplite_l1_connect(const char *endpoint, const char *contractAddress)
     return l1;
 }
 
-HppliteL1 *hpplite_l1_connect_config(const HppliteNetworkConfig *config) {
+static HppliteL1 *eth_connect_config(const HppliteNetworkConfig *config) {
     if (!config || !config->rpcUrl) return NULL;
 
     init_selectors();
 
-    HppliteL1 *l1 = calloc(1, sizeof(HppliteL1));
+    HppliteL1 *l1 = calloc(1, sizeof(EthL1));
     if (!l1) return NULL;
+    self->base.ops = &hppliteL1EthOps;
 
     /* Copy contract address */
-    memcpy(l1->contract, config->contract, 20);
+    memcpy(self->contract, config->contract, 20);
 
     /* Store network info */
-    l1->chainId = config->chainId;
-    l1->rpcUrl = strdup(config->rpcUrl);
+    self->chainId = config->chainId;
+    self->rpcUrl = strdup(config->rpcUrl);
 
-    l1->eth = eth_client_create(config->rpcUrl, config->chainId);
-    if (!l1->eth) {
-        free(l1->rpcUrl);
+    self->eth = eth_client_create(config->rpcUrl, config->chainId);
+    if (!self->eth) {
+        free(self->rpcUrl);
         free(l1);
         return NULL;
     }
@@ -161,20 +164,15 @@ HppliteL1 *hpplite_l1_connect_config(const HppliteNetworkConfig *config) {
     return l1;
 }
 
-void hpplite_l1_disconnect(HppliteL1 *l1) {
+static void eth_disconnect(HppliteL1 *l1) {
     if (!l1) return;
-    if (l1->cached_state) hpplite_l1_state_free(l1->cached_state);
-    if (l1->cached_system_config) hpplite_l1_system_config_free(l1->cached_system_config);
-    if (l1->rpcUrl) free(l1->rpcUrl);
-    if (l1->eth) eth_client_destroy(l1->eth);
+    if (self->cached_state) hpplite_l1_state_free(self->cached_state);
+    if (self->cached_system_config) hpplite_l1_system_config_free(self->cached_system_config);
+    if (self->rpcUrl) free(self->rpcUrl);
+    if (self->eth) eth_client_destroy(self->eth);
     free(l1);
 }
 
-void hpplite_l1_system_config_free(HppliteSystemConfig *config) {
-    if (!config) return;
-    if (config->daScheme) free(config->daScheme);
-    free(config);
-}
 
 
 /*
@@ -190,27 +188,27 @@ static char *txHashString(uint8_t *tx_hash) {
     return out;
 }
 
-char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
+static char *eth_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
     uint8_t calldata[4 + 32];
     uint8_t *tx_hash;
     if (!l1 || interval == 0) return NULL;
     init_selectors();
     memcpy(calldata, SEL_SET_CHECKPOINT_INTERVAL, 4);
     abi_encode_uint64(interval, calldata + 4);
-    tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
+    tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
     if (!tx_hash) return NULL;
     return txHashString(tx_hash);
 }
 
 
 /* Set private key for signing transactions */
-int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
-    memcpy(l1->privkey, privkey, 32);
-    l1->has_privkey = 1;
-    return eth_client_set_privkey(l1->eth, privkey);
+static int eth_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
+    memcpy(self->privkey, privkey, 32);
+    self->has_privkey = 1;
+    return eth_client_set_privkey(self->eth, privkey);
 }
 
-HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
+static HppliteL1State *eth_get_state(HppliteL1 *l1) {
     if (!l1) return NULL;
 
     /* Call getState() on contract */
@@ -218,7 +216,7 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
     memcpy(calldata, SEL_GET_STATE, 4);
 
     size_t result_len;
-    uint8_t *result = eth_client_call(l1->eth, l1->contract, calldata, 4, &result_len);
+    uint8_t *result = eth_client_call(self->eth, self->contract, calldata, 4, &result_len);
     if (!result) return NULL;
 
     /* Parse result: (owner, sequencerWallet, sequencerInstance, leaseExpiry, lastCpHeight, lastStateRoot, lastCpTime) */
@@ -227,11 +225,12 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
         return NULL;
     }
 
-    HppliteL1State *state = calloc(1, sizeof(HppliteL1State));
+    HppliteL1State *state = sqlite3_malloc(sizeof(HppliteL1State));   /* freed by l1.c with sqlite3_free */
     if (!state) {
         free(result);
         return NULL;
     }
+    memset(state, 0, sizeof(*state));
 
     /* Parse each field (32 bytes each) */
     uint8_t *p = result;
@@ -264,7 +263,7 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
     state->lastCheckpointTime = abi_decode_uint64(p);
 
     /* The chain's own clock, for lease arithmetic (never wall-clock time) */
-    if (eth_client_latest_block(l1->eth, &state->currentBlock, &state->currentTimestamp) != 0) {
+    if (eth_client_latest_block(self->eth, &state->currentBlock, &state->currentTimestamp) != 0) {
         state->currentBlock = 0;
         state->currentTimestamp = (uint64_t)time(NULL);   /* callers never see 0; wall clock is the fallback */
     }
@@ -273,12 +272,8 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
     return state;
 }
 
-void hpplite_l1_state_free(HppliteL1State *state) {
-    if (!state) return;
-    free(state);
-}
 
-HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
+static HppliteSystemConfig *eth_get_system_config(HppliteL1 *l1) {
     if (!l1) return NULL;
 
     /* Call getSystemConfig() on contract */
@@ -288,7 +283,7 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
     memcpy(calldata, SEL_GET_SYSTEM_CONFIG, 4);
 
     size_t result_len;
-    uint8_t *result = eth_client_call(l1->eth, l1->contract, calldata, 4, &result_len);
+    uint8_t *result = eth_client_call(self->eth, self->contract, calldata, 4, &result_len);
     if (!result) return NULL;
 
     /* Dynamic string + 3 values
@@ -305,20 +300,23 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
         return NULL;
     }
 
-    HppliteSystemConfig *config = calloc(1, sizeof(HppliteSystemConfig));
+    HppliteSystemConfig *config = sqlite3_malloc(sizeof(HppliteSystemConfig));   /* freed by l1.c with sqlite3_free */
     if (!config) {
         free(result);
         return NULL;
     }
+    memset(config, 0, sizeof(*config));
 
     /* Parse string offset and decode string */
     uint64_t strOffset = abi_decode_uint64(result);
     if (strOffset + 32 <= result_len && strOffset + 32 >= strOffset) {         /* length word in bounds */
         uint64_t strLen = abi_decode_uint64(result + strOffset);
         if (strLen > 0 && strLen <= result_len && strOffset + 32 + strLen <= result_len) {
-            config->daScheme = malloc(strLen + 1);
-            memcpy(config->daScheme, result + strOffset + 32, strLen);
-            config->daScheme[strLen] = '\0';
+            config->daScheme = sqlite3_malloc((int)strLen + 1);
+            if (config->daScheme) {
+                memcpy(config->daScheme, result + strOffset + 32, strLen);
+                config->daScheme[strLen] = '\0';
+            }
         }
     }
 
@@ -327,7 +325,7 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
 
     /* Parse remaining uint256 values */
     config->version = abi_decode_uint64(result + 64);
-    l1->version = config->version;
+    self->version = config->version;
     config->chainId = abi_decode_uint64(result + 96);
     /* words 4 and 5: the checkpoint interval (the configuration of record,
     ** #44) and the lease length; older contracts return four words */
@@ -347,16 +345,16 @@ HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1) {
         }
     }
     if (!is_zero) {
-        memcpy(l1->da_contract, config->daContract, 20);
-        l1->has_da_contract = 1;
+        memcpy(self->da_contract, config->daContract, 20);
+        self->has_da_contract = 1;
     }
 
     free(result);
     return config;
 }
 
-uint64_t hpplite_l1_get_lease_time_remaining(HppliteL1 *l1) {
-    HppliteL1State *st = hpplite_l1_get_state(l1);
+static uint64_t eth_get_lease_time_remaining(HppliteL1 *l1) {
+    HppliteL1State *st = eth_get_state(l1);
     uint64_t left = 0;
     if (!st) return 0;
     if (st->leaseExpiry > st->currentTimestamp) left = st->leaseExpiry - st->currentTimestamp;
@@ -364,12 +362,12 @@ uint64_t hpplite_l1_get_lease_time_remaining(HppliteL1 *l1) {
     return left;
 }
 
-char *hpplite_l1_submit_checkpoint(
+static char *eth_submit_checkpoint(
     HppliteL1 *l1,
     const HppliteCheckpoint *checkpoint,
     const unsigned char instanceId[32]
 ) {
-    if (!l1 || !l1->has_privkey || !checkpoint || !instanceId) return NULL;
+    if (!l1 || !self->has_privkey || !checkpoint || !instanceId) return NULL;
 
     /* Build calldata for submitCheckpoint(bytes32,uint256,uint256,bytes32) */
     size_t calldata_len = 4 + 32 + 32 + 32 + 32;
@@ -399,7 +397,7 @@ char *hpplite_l1_submit_checkpoint(
     abi_encode_bytes32(checkpoint->postStateRoot, p);
 
     /* Send transaction */
-    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, calldata_len,
+    uint8_t *tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, calldata_len,
                                            500000, 0);
     free(calldata);
 
@@ -409,8 +407,8 @@ char *hpplite_l1_submit_checkpoint(
     return hash_hex;
 }
 
-char *hpplite_l1_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[32]) {
-    if (!l1 || !l1->has_privkey || !instanceId) return NULL;
+static char *eth_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    if (!l1 || !self->has_privkey || !instanceId) return NULL;
     init_selectors();
 
     /* Build calldata: claimSequencer(bytes32) */
@@ -419,15 +417,15 @@ char *hpplite_l1_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[3
     memcpy(calldata + 4, instanceId, 32);
 
     /* Send transaction */
-    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 200000, 0);
+    uint8_t *tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 200000, 0);
     if (!tx_hash) return NULL;
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
 }
 
-char *hpplite_l1_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
-    if (!l1 || !l1->has_privkey || !instanceId) return NULL;
+static char *eth_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    if (!l1 || !self->has_privkey || !instanceId) return NULL;
     init_selectors();
 
     /* Build calldata: renewLease(bytes32) */
@@ -436,38 +434,38 @@ char *hpplite_l1_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) 
     memcpy(calldata + 4, instanceId, 32);
 
     /* Send transaction */
-    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 100000, 0);
+    uint8_t *tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 100000, 0);
     if (!tx_hash) return NULL;
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
 }
 
-char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
-    if (!l1 || !l1->has_privkey) return NULL;
+static char *eth_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    if (!l1 || !self->has_privkey) return NULL;
     init_selectors();
 
     /* releaseLease(instanceId): the active instance gives the lease up (VERSION >= 5).
     ** Rollups created by the older factory only have the owner-only
     ** forceExpireLease(); the version is read on connect. */
     uint8_t *tx_hash;
-    if (l1->version == 0) {
+    if (self->version == 0) {
         /* connected without reading the system config: ask before choosing the call */
-        HppliteSystemConfig *cfg = hpplite_l1_get_system_config(l1);
+        HppliteSystemConfig *cfg = eth_get_system_config(l1);
         if (cfg) hpplite_l1_system_config_free(cfg);
     }
-    if (l1->version >= 5 && instanceId) {
+    if (self->version >= 5 && instanceId) {
         uint8_t calldata[36];
         memcpy(calldata, SEL_RELEASE_LEASE, 4);
         memcpy(calldata + 4, instanceId, 32);
-        tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
+        tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
     } else {
         uint8_t calldata[4];
         memcpy(calldata, SEL_FORCE_EXPIRE_LEASE, 4);
-        tx_hash = eth_client_send_tx(l1->eth, l1->contract, calldata, sizeof(calldata), 60000, 0);
+        tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
     }
     if (!tx_hash) {
-        fprintf(stderr, "hpplite: lease release: %s\n", eth_client_error(l1->eth));
+        fprintf(stderr, "hpplite: lease release: %s\n", eth_client_error(self->eth));
         return NULL;
     }
 
@@ -475,33 +473,33 @@ char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]
     return hash_hex;
 }
 
-int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]) {
+static int eth_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]) {
     static const char *h = "0123456789abcdef";
     int i;
     if (!l1) return -1;
     contractHex[0] = daHex[0] = '0'; contractHex[1] = daHex[1] = 'x';
     for (i = 0; i < 20; i++) {
-        contractHex[2 + 2*i] = h[l1->contract[i] >> 4]; contractHex[3 + 2*i] = h[l1->contract[i] & 15];
-        daHex[2 + 2*i] = h[l1->da_contract[i] >> 4];     daHex[3 + 2*i] = h[l1->da_contract[i] & 15];
+        contractHex[2 + 2*i] = h[self->contract[i] >> 4]; contractHex[3 + 2*i] = h[self->contract[i] & 15];
+        daHex[2 + 2*i] = h[self->da_contract[i] >> 4];     daHex[3 + 2*i] = h[self->da_contract[i] & 15];
     }
     contractHex[42] = daHex[42] = 0;
-    if (!l1->has_da_contract) daHex[0] = 0;
+    if (!self->has_da_contract) daHex[0] = 0;
     return 0;
 }
 
-int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
-    if (!l1 || !l1->has_privkey) return -1;
-    return eth_address_from_privkey(l1->privkey, out);
+static int eth_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
+    if (!l1 || !self->has_privkey) return -1;
+    return eth_address_from_privkey(self->privkey, out);
 }
 
-int hpplite_l1_is_lease_active(HppliteL1 *l1) {
+static int eth_is_lease_active(HppliteL1 *l1) {
     if (!l1) return 0;
 
     uint8_t calldata[4];
     memcpy(calldata, SEL_IS_LEASE_ACTIVE, 4);
     
     size_t result_len;
-    uint8_t *result = eth_client_call(l1->eth, l1->contract, calldata, 4, &result_len);
+    uint8_t *result = eth_client_call(self->eth, self->contract, calldata, 4, &result_len);
     if (!result || result_len < 32) {
         free(result);
         return 0;
@@ -512,34 +510,34 @@ int hpplite_l1_is_lease_active(HppliteL1 *l1) {
     return expired;
 }
 
-void hpplite_l1_set_callback(HppliteL1 *l1, HppliteL1Callback callback, void *arg) {
+static void eth_set_callback(HppliteL1 *l1, HppliteL1Callback callback, void *arg) {
     if (!l1) return;
-    l1->callback = callback;
-    l1->callback_arg = arg;
+    self->callback = callback;
+    self->callback_arg = arg;
 }
 
-int hpplite_l1_poll(HppliteL1 *l1) {
+static int eth_poll(HppliteL1 *l1) {
     /* For now, just refresh state - no event monitoring yet */
     if (!l1) return -1;
     
-    HppliteL1State *new_state = hpplite_l1_get_state(l1);
+    HppliteL1State *new_state = eth_get_state(l1);
     if (!new_state) return -1;
     
     /* Check for changes and fire callbacks */
-    if (l1->cached_state && l1->callback) {
+    if (self->cached_state && self->callback) {
         /* Check for new checkpoint */
-        if (new_state->lastCheckpointHeight > l1->cached_state->lastCheckpointHeight) {
-            l1->callback(l1->callback_arg, "checkpoint", new_state);
+        if (new_state->lastCheckpointHeight > self->cached_state->lastCheckpointHeight) {
+            self->callback(self->callback_arg, "checkpoint", new_state);
         }
     }
     
-    if (l1->cached_state) hpplite_l1_state_free(l1->cached_state);
-    l1->cached_state = new_state;
+    if (self->cached_state) hpplite_l1_state_free(self->cached_state);
+    self->cached_state = new_state;
 
     return 0;
 }
 
-int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs) {
+static int eth_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs) {
     if (!l1 || !tx_hash) return -1;
 
     /* Parse tx hash */
@@ -551,7 +549,7 @@ int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs)
     /* Poll for receipt */
     for (int i = 0; i < timeout_secs; i++) {
         int status = 0;
-        int result = eth_client_get_receipt(l1->eth, hash_bytes, &status);
+        int result = eth_client_get_receipt(self->eth, hash_bytes, &status);
 
         if (result == 1) {
             /* Mined */
@@ -570,7 +568,7 @@ int hpplite_l1_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs)
 
 /* ============ Factory Functions ============ */
 
-int hpplite_l1_factory_get_rollup(
+static int eth_factory_get_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t owner_address[20],
@@ -586,7 +584,7 @@ int hpplite_l1_factory_get_rollup(
     }
 
     /* Create temporary eth client */
-    EthClient *eth = eth_client_create(rpc_url, g_defaultChainId);
+    EthClient *eth = eth_client_create(rpc_url, hpplite_l1_default_chain_id());
     if (!eth) return -1;
 
     /* Build calldata: getRollup(address) */
@@ -619,16 +617,16 @@ int hpplite_l1_factory_get_rollup(
     return is_zero ? 0 : 1;  /* 0 = no rollup, 1 = has rollup */
 }
 
-int hpplite_l1_factory_has_rollup(
+static int eth_factory_has_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t owner_address[20]
 ) {
     uint8_t rollup[20];
-    return hpplite_l1_factory_get_rollup(rpc_url, factory_address, owner_address, rollup);
+    return eth_factory_get_rollup(rpc_url, factory_address, owner_address, rollup);
 }
 
-char *hpplite_l1_factory_get_or_create_rollup(
+static char *eth_factory_get_or_create_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32],
@@ -644,7 +642,7 @@ char *hpplite_l1_factory_get_or_create_rollup(
     }
 
     /* Create eth client with private key */
-    EthClient *eth = eth_client_create(rpc_url, g_defaultChainId);
+    EthClient *eth = eth_client_create(rpc_url, hpplite_l1_default_chain_id());
     if (!eth) return NULL;
 
     if (eth_client_set_privkey(eth, privkey) != 0) {
@@ -673,7 +671,7 @@ char *hpplite_l1_factory_get_or_create_rollup(
 
 /* Every rollup the owner created, oldest first (#61). Returns how many were
 ** written to out (at most max), or -1 */
-int hpplite_l1_factory_list_rollups(
+static int eth_factory_list_rollups(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t owner_address[20],
@@ -689,7 +687,7 @@ int hpplite_l1_factory_list_rollups(
     EthClient *eth;
     init_selectors();
     if (eth_hex_decode(factory_addr, factory, 20) != 0) return -1;
-    eth = eth_client_create(rpc_url, g_defaultChainId);
+    eth = eth_client_create(rpc_url, hpplite_l1_default_chain_id());
     if (!eth) return -1;
     memcpy(calldata, SEL_GET_ROLLUPS_BY_OWNER, 4);
     abi_encode_address(owner_address, calldata + 4);
@@ -708,7 +706,7 @@ int hpplite_l1_factory_list_rollups(
 ** transaction and takes the address from its RollupCreated event - not the
 ** last one listed, which another process of the wallet may have created at
 ** the same moment. 1 created (rollup_out set), 0 failed */
-int hpplite_l1_factory_create_rollup(
+static int eth_factory_create_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32],
@@ -722,7 +720,7 @@ int hpplite_l1_factory_create_rollup(
     int i, rc = 0;
     init_selectors();
     if (eth_hex_decode(factory_addr, factory, 20) != 0) return 0;
-    eth = eth_client_create(rpc_url, g_defaultChainId);
+    eth = eth_client_create(rpc_url, hpplite_l1_default_chain_id());
     if (!eth) return 0;
     if (eth_client_set_privkey(eth, privkey) != 0) { eth_client_destroy(eth); return 0; }
     memcpy(calldata, SEL_CREATE_ROLLUP, 4);
@@ -751,7 +749,7 @@ int hpplite_l1_factory_create_rollup(
 }
 
 /* The same lists, for the wallet of a private key */
-int hpplite_l1_factory_list_my_rollups(
+static int eth_factory_list_my_rollups(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32],
@@ -760,11 +758,11 @@ int hpplite_l1_factory_list_my_rollups(
 ) {
     uint8_t me[20];
     if (eth_address_from_privkey(privkey, me) != 0) return -1;
-    return hpplite_l1_factory_list_rollups(rpc_url, factory_address, me, out, max);
+    return eth_factory_list_rollups(rpc_url, factory_address, me, out, max);
 }
 
 /* Helper: Get rollup address from private key (derive address, then lookup) */
-int hpplite_l1_factory_get_my_rollup(
+static int eth_factory_get_my_rollup(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32],
@@ -776,18 +774,18 @@ int hpplite_l1_factory_get_my_rollup(
         return -1;
     }
 
-    return hpplite_l1_factory_get_rollup(rpc_url, factory_address, my_address, rollup_address_out);
+    return eth_factory_get_rollup(rpc_url, factory_address, my_address, rollup_address_out);
 }
 
 /* Connect to L1 using factory - auto-discovers rollup for this wallet */
-HppliteL1 *hpplite_l1_connect_factory(
+static HppliteL1 *eth_connect_factory(
     const char *rpc_url,
     const char *factory_address,
     const uint8_t privkey[32]
 ) {
     /* Get rollup address for this wallet */
     uint8_t rollup[20];
-    int result = hpplite_l1_factory_get_my_rollup(rpc_url, factory_address, privkey, rollup);
+    int result = eth_factory_get_my_rollup(rpc_url, factory_address, privkey, rollup);
 
     if (result != 1) {
         /* No rollup exists for this wallet */
@@ -799,12 +797,12 @@ HppliteL1 *hpplite_l1_connect_factory(
     if (!rollup_hex) return NULL;
 
     /* Connect to the rollup contract */
-    HppliteL1 *l1 = hpplite_l1_connect(rpc_url, rollup_hex);
+    HppliteL1 *l1 = eth_connect(rpc_url, rollup_hex);
     free(rollup_hex);
 
     if (l1) {
         /* Set private key for transactions */
-        hpplite_l1_set_privkey(l1, privkey);
+        eth_set_privkey(l1, privkey);
     }
 
     return l1;
@@ -814,26 +812,26 @@ HppliteL1 *hpplite_l1_connect_factory(
 
 /* Helper to ensure DA contract is cached */
 static int ensure_da_contract(HppliteL1 *l1) {
-    if (l1->has_da_contract) return 1;
+    if (self->has_da_contract) return 1;
 
     /* Try to get system config which caches DA contract */
-    HppliteSystemConfig *config = hpplite_l1_get_system_config(l1);
+    HppliteSystemConfig *config = eth_get_system_config(l1);
     if (config) {
         hpplite_l1_system_config_free(config);
     }
 
-    return l1->has_da_contract;
+    return self->has_da_contract;
 }
 
-char *hpplite_l1_submit_batch(
+static char *eth_submit_batch(
     HppliteL1 *l1,
     const uint8_t instanceId[32],
     uint64_t height,
     const uint8_t *data,
     size_t data_len
 ) {
-    if (l1) l1->lastOversized = 0;
-    if (!l1 || !l1->has_privkey || !instanceId || !data || data_len == 0) return NULL;
+    if (l1) self->lastOversized = 0;
+    if (!l1 || !self->has_privkey || !instanceId || !data || data_len == 0) return NULL;
     if (!ensure_da_contract(l1)) return NULL;  /* Need DA contract */
 
     /* Build calldata: submitBatch(bytes32 instanceId, uint256 height, bytes data) */
@@ -882,26 +880,26 @@ char *hpplite_l1_submit_batch(
     ** formula sat right at the edge (fresh storage is ~707 gas/byte; the
     ** old 700 ran out of gas on larger batches). 25% margin; the formula
     ** is only the fallback when the estimate call fails. */
-    uint64_t gas_estimate = eth_client_estimate_gas(l1->eth, l1->da_contract, calldata, calldata_len);
-    if (gas_estimate != (uint64_t)-1 && l1->maxTxGas && gas_estimate > l1->maxTxGas) {
+    uint64_t gas_estimate = eth_client_estimate_gas(self->eth, self->da_contract, calldata, calldata_len);
+    if (gas_estimate != (uint64_t)-1 && self->maxTxGas && gas_estimate > self->maxTxGas) {
         /* more than a transaction may use (HPP Sepolia: 32M): sent, it would
         ** run out of gas and revert with all of it spent - do not send */
         free(calldata);
-        l1->lastOversized = 1;
+        self->lastOversized = 1;
         return NULL;
     }
     if (gas_estimate == (uint64_t)-1) gas_estimate = 300000 + data_len * 1000;
     else gas_estimate += gas_estimate / 4;
     if (gas_estimate < 3000000) gas_estimate = 3000000;
-    if (l1->maxTxGas && gas_estimate > l1->maxTxGas) gas_estimate = l1->maxTxGas;
-    uint8_t *tx_hash = eth_client_send_tx(l1->eth, l1->da_contract, calldata, calldata_len,
+    if (self->maxTxGas && gas_estimate > self->maxTxGas) gas_estimate = self->maxTxGas;
+    uint8_t *tx_hash = eth_client_send_tx(self->eth, self->da_contract, calldata, calldata_len,
                                            gas_estimate, 0);
     free(calldata);
 
     if (!tx_hash) {
         /* geth's txpool answers "oversized data": never sent, will never be */
-        const char *e = eth_client_error(l1->eth);
-        if (e && strstr(e, "oversized")) l1->lastOversized = 1;
+        const char *e = eth_client_error(self->eth);
+        if (e && strstr(e, "oversized")) self->lastOversized = 1;
         return NULL;
     }
 
@@ -909,7 +907,7 @@ char *hpplite_l1_submit_batch(
     return hash_hex;
 }
 
-uint8_t *hpplite_l1_get_batch(
+static uint8_t *eth_get_batch(
     HppliteL1 *l1,
     uint64_t height,
     size_t *data_len_out
@@ -926,7 +924,7 @@ uint8_t *hpplite_l1_get_batch(
     abi_encode_uint64(height, calldata + 4);
 
     size_t result_len;
-    uint8_t *result = eth_client_call(l1->eth, l1->da_contract, calldata, sizeof(calldata), &result_len);
+    uint8_t *result = eth_client_call(self->eth, self->da_contract, calldata, sizeof(calldata), &result_len);
     if (!result || result_len < 64) {
         free(result);
         *data_len_out = 0;
@@ -967,7 +965,7 @@ uint8_t *hpplite_l1_get_batch(
     return data;
 }
 
-int hpplite_l1_get_batch_hash(
+static int eth_get_batch_hash(
     HppliteL1 *l1,
     uint64_t height,
     uint8_t hash_out[32]
@@ -981,7 +979,7 @@ int hpplite_l1_get_batch_hash(
     abi_encode_uint64(height, calldata + 4);
 
     size_t result_len;
-    uint8_t *result = eth_client_call(l1->eth, l1->da_contract, calldata, sizeof(calldata), &result_len);
+    uint8_t *result = eth_client_call(self->eth, self->da_contract, calldata, sizeof(calldata), &result_len);
     if (!result || result_len < 32) {
         free(result);
         return -1;
@@ -1002,7 +1000,7 @@ int hpplite_l1_get_batch_hash(
     return is_zero ? 0 : 1;  /* 0 = no batch, 1 = has batch */
 }
 
-int hpplite_l1_get_da_state(
+static int eth_get_da_state(
     HppliteL1 *l1,
     uint64_t *last_batch_height,
     uint64_t *total_batches,
@@ -1016,7 +1014,7 @@ int hpplite_l1_get_da_state(
     memcpy(calldata, SEL_GET_DA_STATE, 4);
 
     size_t result_len;
-    uint8_t *result = eth_client_call(l1->eth, l1->da_contract, calldata, 4, &result_len);
+    uint8_t *result = eth_client_call(self->eth, self->da_contract, calldata, 4, &result_len);
     if (!result || result_len < 96) {
         free(result);
         return -1;
@@ -1035,10 +1033,46 @@ int hpplite_l1_get_da_state(
 
 /* Endpoint functions removed in singleton model - no peer discovery needed */
 
-int hpplite_l1_submit_was_oversized(HppliteL1 *l1) {
-    return l1 ? l1->lastOversized : 0;
+static int eth_submit_was_oversized(HppliteL1 *l1) {
+    return l1 ? self->lastOversized : 0;
 }
 
-void hpplite_l1_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
-    if (l1) l1->maxTxGas = gas;
+static void eth_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
+    if (l1) self->maxTxGas = gas;
 }
+
+const HppliteL1Ops hppliteL1EthOps = {
+    .name = "eth",
+    .connect = eth_connect,
+    .connect_config = eth_connect_config,
+    .connect_factory = eth_connect_factory,
+    .disconnect = eth_disconnect,
+    .get_system_config = eth_get_system_config,
+    .set_checkpoint_interval = eth_set_checkpoint_interval,
+    .set_privkey = eth_set_privkey,
+    .get_state = eth_get_state,
+    .claim_sequencer = eth_claim_sequencer,
+    .renew_lease = eth_renew_lease,
+    .release_lease = eth_release_lease,
+    .is_lease_active = eth_is_lease_active,
+    .get_addresses = eth_get_addresses,
+    .get_my_address = eth_get_my_address,
+    .get_lease_time_remaining = eth_get_lease_time_remaining,
+    .submit_checkpoint = eth_submit_checkpoint,
+    .set_callback = eth_set_callback,
+    .poll = eth_poll,
+    .wait_for_tx = eth_wait_for_tx,
+    .factory_get_rollup = eth_factory_get_rollup,
+    .factory_has_rollup = eth_factory_has_rollup,
+    .factory_get_or_create_rollup = eth_factory_get_or_create_rollup,
+    .factory_list_rollups = eth_factory_list_rollups,
+    .factory_create_rollup = eth_factory_create_rollup,
+    .factory_list_my_rollups = eth_factory_list_my_rollups,
+    .factory_get_my_rollup = eth_factory_get_my_rollup,
+    .submit_batch = eth_submit_batch,
+    .get_batch = eth_get_batch,
+    .get_batch_hash = eth_get_batch_hash,
+    .get_da_state = eth_get_da_state,
+    .submit_was_oversized = eth_submit_was_oversized,
+    .set_max_tx_gas = eth_set_max_tx_gas,
+};

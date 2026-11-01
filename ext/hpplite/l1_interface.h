@@ -195,6 +195,13 @@ int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
 /* The wallet this connection signs with (needs a private key). 0 on success. */
 int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]);
 
+/*
+** Which backend a connection is on: "eth" or "mock" (#35). Every build has
+** both; the endpoint given to hpplite_l1_connect() and the factory calls
+** picks one: "mock" is the mock, anything else the Ethereum client.
+*/
+const char *hpplite_l1_backend_name(HppliteL1 *l1);
+
 
 /*
 ** Get remaining lease time in seconds.

@@ -95,14 +95,15 @@ set(HPPLITE_SOURCES
     eth/eth_client.c
 )
 
-# L1 backend selection (mock vs real Ethereum)
+# L1 backends: every build has both; the endpoint picks one at run time (#35).
+# HPPLITE_USE_REAL_L1 now only decides whether the tests and examples that
+# need a chain (anvil, HPP Sepolia) are built, and keeps the test hooks out.
+list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c)
 if(HPPLITE_USE_REAL_L1)
-    list(APPEND HPPLITE_SOURCES l1_eth.c)
-    message(STATUS "L1 backend: Real Ethereum (l1_eth.c)")
+    message(STATUS "L1 backends: eth + mock; chain tests and examples on")
 else()
-    list(APPEND HPPLITE_SOURCES l1_mock.c)
     add_compile_definitions(HPPLITE_TEST_HOOKS)   # HPPLITE_TEST_CRASH_AT crash points
-    message(STATUS "L1 backend: Mock (l1_mock.c)")
+    message(STATUS "L1 backends: eth + mock; test hooks on")
 endif()
 
 add_library(hpplite STATIC ${HPPLITE_SOURCES})
@@ -183,6 +184,9 @@ if(HPPLITE_BUILD_TESTS)
 
     add_executable(test_da_uri tests/unit/test_da_uri.c)
     target_link_libraries(test_da_uri hpplite)
+
+    add_executable(test_l1_dispatch tests/unit/test_l1_dispatch.c)
+    target_link_libraries(test_l1_dispatch hpplite)
 
     add_executable(test_simple_open tests/unit/test_simple_open.c)
     target_link_libraries(test_simple_open hpplite)
@@ -281,6 +285,7 @@ if(HPPLITE_BUILD_TESTS)
     add_test(NAME test_batch COMMAND test_batch)
     add_test(NAME test_node COMMAND test_node)
     add_test(NAME test_da_uri COMMAND test_da_uri)
+    add_test(NAME test_l1_dispatch COMMAND test_l1_dispatch)
     add_test(NAME test_simple_open COMMAND test_simple_open)
     add_test(NAME test_cipher COMMAND test_cipher)
     add_test(NAME test_keccak COMMAND test_keccak)

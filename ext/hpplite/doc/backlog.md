@@ -252,8 +252,9 @@ ext/hpplite/
 ├── node.c/h             # Node lifecycle, timer
 ├── config.c/h           # URI parsing, configuration
 ├── l1_interface.h       # L1 contract interface
-├── l1_mock.c            # L1 mock (testing)
-├── l1_eth.c/h           # Real Ethereum client
+├── l1.c, l1_backend.h   # L1 dispatch: the endpoint picks a backend's function table (#35)
+├── l1_mock.c            # Mock backend (in memory or a directory)
+├── l1_eth.c             # Ethereum backend
 ├── eth/                 # Web3 primitives
 │   ├── eth_client.c/h   # JSON-RPC client
 │   ├── keccak256.c/h
