@@ -174,7 +174,10 @@ HPPLite cuts at 40 KB there, `maxtx=`/`maxtxgas=` elsewhere, and shrinks
 batches the RPC refuses as oversized). Since version 8 (#33) the DA contract
 keeps the bytes in the transaction's log, not in storage: storage holds the
 height, a rolling hash over every batch (`chainHash`) and the block each
-batch's log is in; a reader fetches one block's log by the height topic and
+batch's log is in (the chain's own block: on an Arbitrum-style chain such as
+HPP, `block.number` is the parent chain's, so the contract asks
+`ArbSys(0x64).arbBlockNumber()` where that precompile answers, #128); a
+reader fetches one block's log by the height topic and
 recomputes the rolling hash as it rebuilds (`_hpplite_meta.chain_hash`,
 `hpplite_status.chain_hash`), and a mismatch at the tip stops the rebuild
 in the error state. Pending SQL beyond that is

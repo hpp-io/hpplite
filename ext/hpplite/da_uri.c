@@ -20,7 +20,7 @@ const HppliteNetworkAlias HPPLITE_NETWORKS[] = {
     ** storage cost ~700 gas/byte, so ~44 KB is the most one can carry), and
     ** its RPC answers "oversized data" above 84864 bytes of calldata. Ethereum:
     ** EIP-7825 caps a transaction at 2^24 gas; geth's txpool takes 128 KB. */
-    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xc0fa50eb3076ed0e1ce73639097e40784950b8d8", 40000, 32000000},
+    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xa80365fd5b4e7a22df13de334e3ef0c74032d345", 40000, 32000000},
     {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL, 40000, 32000000},  /* Not deployed yet */
     {"ethereum",    1,      "https://eth.llamarpc.com", NULL, 20000, 16777216},
     {"sepolia",     11155111, "https://sepolia.drpc.org", NULL, 20000, 16777216},

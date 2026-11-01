@@ -94,7 +94,7 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
 | Contract | Address | Description |
 |----------|---------|-------------|
-| HPPLiteFactory | `0xc0fa50eb3076ed0e1ce73639097e40784950b8d8` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 7 (a checkpoint cannot reach past the DA's height, #44; sequencer-only lease claim; rotating the sequencer ends its lease); rollups from earlier factories keep working with the rules they were created with - give their factory with `factory=` (`0xd1aaa8d1…`: VERSION 6, `0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
+| HPPLiteFactory | `0xa80365fd5b4e7a22df13de334e3ef0c74032d345` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 8 with DA version 2 (#33: batch bytes in the log, the rolling chain hash, signed forms of every sequencer call); rollups from earlier factories keep working with the rules they were created with - give their factory with `factory=` (`0xac18df18…`: VERSION 8 too, deployed and superseded the same day, 2026-11-01: its DA recorded Ethereum Sepolia's block numbers (HPP is Arbitrum-style, #128), so no replica can fetch its logs; `0xc0fa50eb…`: VERSION 7, batches in contract storage, a checkpoint cannot reach past the DA's height #44; `0xd1aaa8d1…`: VERSION 6, `0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
 | HPPLite | *(per rollup)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
 | HPPLiteDA | *(per rollup)* | Your rollup's data-availability contract: batch data |
 
@@ -317,39 +317,40 @@ and `HPPLITE_PRIVATE_KEY`).
 
 ## Gas Costs (HPP Sepolia)
 
-Measured on HPP Sepolia on 2026-10-28, where gas is 0.01 gwei (the chain's
-base fee; it is a testnet, so there is no dollar price). The share by
-contract, from the demo wallet's transactions: `submitBatch` 94% of all
-gas, `submitCheckpoint` 3%, lease claim/renew/release 3%.
+Measured on HPP Sepolia on 2026-11-01 with the VERSION 8 factory (DA
+version 2, #33), where gas is 0.01 gwei (the chain's base fee; it is a
+testnet, so there is no dollar price). Before #33 the same batch cost 658k:
+the bytes went into contract storage at ~0.7k gas per byte.
 
 | Operation | Gas | Cost (ETH @ 0.01 gwei) |
 |-----------|-----|------------------------|
-| Factory deploy (VERSION 7, optimizer on) | 2.8M | 0.000028 |
-| Rollup creation (`getOrCreateRollup`, `createRollup` for a named database) | ~2.5M | 0.000025 |
-| Batch submit (~250 B sealed; ~0.7k gas per further byte) | 323k | 0.0000032 |
-| Batch submit (29 KB sealed, as cut on HPP Sepolia) | 20.7M | 0.00023 |
+| Factory deploy (VERSION 8, optimizer on) | 3.40M | 0.000034 |
+| Rollup creation (`getOrCreateRollup`, `createRollup` for a named database) | 2.83M | 0.000028 |
+| Batch submit (932 B sealed, the demo's; ~24 gas per further byte) | 82.7k | 0.0000008 |
+| Batch submit (40 KB sealed, as cut on HPP Sepolia; from the per-byte cost) | ~1.0M | 0.00001 |
 | Checkpoint | 50k | 0.0000005 |
 | Lease claim / renew / release | 28-37k | 0.0000003 |
 
 **Batch size on HPP Sepolia is set by the chain, not the contract.** The
-contract allows 128 KB, but a transaction may use at most 32M gas there
-(measured 2026-10-30; the block gas limit is 2^50, the per-transaction cap
-binds), and contract storage costs ~0.7k gas per byte: ~44 KB is the most a
-batch can carry. Its RPC also refuses more than ~84.9 KB of calldata
-("oversized data"). HPPLite knows both for HPP Sepolia (by chain id) and
-cuts batches at 40 KB; elsewhere set `maxtx=` (bytes) and `maxtxgas=`, or
-let it learn: a batch the RPC refuses as oversized, or whose gas estimate
+contract allows 128 KB; the chain's RPC refuses more than ~84.9 KB of
+calldata per transaction ("oversized data"), and a transaction may use at
+most 32M gas (measured 2026-10-30; the block gas limit is 2^50, the
+per-transaction cap binds), which with the storage DA of rollups before
+version 8 meant ~44 KB. HPPLite knows both for HPP Sepolia (by chain id)
+and cuts batches at 40 KB; elsewhere set `maxtx=` (bytes) and `maxtxgas=`,
+or let it learn: a batch the RPC refuses as oversized, or whose gas estimate
 is over the cap, is never sent, and later batches are cut smaller. Bulk
-data costs ~0.008 ETH per MB of SQL at 0.01 gwei.
+data costs ~0.00025 ETH per MB of sealed SQL at 0.01 gwei (was ~0.008).
 
 | Usage | Batches/day | ETH/day on HPP Sepolia |
 |-------|-------------|------------------------|
-| Light (personal) | 10 | 0.00003 |
-| Medium (small app) | 100 | 0.0003 |
-| Heavy (production) | 1,000 | 0.003 |
+| Light (personal) | 10 | 0.000008 |
+| Medium (small app) | 100 | 0.00008 |
+| Heavy (production) | 1,000 | 0.0008 |
 
 On a chain priced like Ethereum mainnet (10 gwei) every figure is 1000x,
-which is why on-chain storage DA is a testnet design: see #11/#33.
+and the bytes still live on the chain: the off-chain stores of #11 are the
+next step down.
 
 **Cost driver, and what #33 changed**: until version 8 `HPPLiteDA` kept
 batch bytes in contract storage (`batchData[height]`), the most expensive
@@ -358,12 +359,13 @@ Since version 8 the bytes go into the transaction's log and storage keeps
 only the commitment - the height, a rolling hash over every batch and the
 block the log is in - so a batch costs about 21k gas for the transaction,
 24 gas per byte (calldata and log data), and some 25k for the three slots:
-a sealed 1 KB batch measured 97.5k gas on anvil where storage took ~765k,
-eight times less, and the gap widens with size. A reader fetches one block's
-log by the height topic, which any archive node serves; pruned nodes cannot
-serve a rebuild. The table above is re-measured on HPP Sepolia with the
-version 8 factory below. Compression (#12) still applies, and the timer only
-flushes when something is pending, so an idle database costs nothing.
+the demo's 932-byte batch measured 82.7k gas on HPP Sepolia where storage
+took 658k, eight times less, and the gap widens with size. A reader fetches
+one block's log by the height topic (the chain's own block number: on an
+Arbitrum-style chain such as HPP the contract asks ArbSys for it, #128),
+which any archive node serves; pruned nodes cannot serve a rebuild.
+Compression (#12) still applies, and the timer only flushes when something
+is pending, so an idle database costs nothing.
 
 ## Components
 
