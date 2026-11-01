@@ -96,6 +96,15 @@ static void writer(const char *mode, int rows, int intervalMs, size_t limit) {
     _exit(0);   /* deterministic runs die inside a flush above; otherwise plain exit, no close */
 }
 
+/* Rows of t; none when the table is not there: the writer was killed before
+** its CREATE TABLE committed (an early kill on a slow runner), and nothing
+** was captured either (#117). A reader rebuilt from such a log has no table
+** too, and counts the same. */
+static sqlite3_int64 rows_of_t(sqlite3 *db) {
+    if (scalar(db, "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 't'") <= 0) return 0;
+    return scalar(db, "SELECT count(*) FROM t");
+}
+
 /* The checker: reopen, sync, count, flush, rebuild, compare. */
 static void check(const char *what) {
     HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
@@ -106,7 +115,7 @@ static void check(const char *what) {
     CHECK(n->state != HPPLITE_STATE_ERROR, "%s: node in error state after reopen", what);
 
     /* every captured statement exactly once in L1 (after adopt) or pending */
-    sqlite3_int64 rows = scalar(n->db, "SELECT count(*) FROM t");
+    sqlite3_int64 rows = rows_of_t(n->db);
     uint64_t height = hpplite_node_get_height(n);
     sqlite3_int64 onL1 = 0;
     for (uint64_t h = 1; h < height; h++) {
@@ -152,7 +161,7 @@ static void check(const char *what) {
         hpplite_node_get_state_root(r, rootR);
         CHECK(hpplite_node_get_height(r) == height, "%s: reader height %llu != %llu", what,
               (unsigned long long)hpplite_node_get_height(r), (unsigned long long)height);
-        CHECK(scalar(r->db, "SELECT count(*) FROM t") == rows, "%s: reader rows", what);
+        CHECK(rows_of_t(r->db) == rows, "%s: reader rows", what);
         CHECK(memcmp(rootW, rootR, 32) == 0, "%s: content root differs after rebuild from L1", what);
         CHECK(r->ctx->nReplaySkipped == 0, "%s: statements skipped on replay", what);
         hpplite_node_destroy(r);          /* releases the lease it claimed on start */
