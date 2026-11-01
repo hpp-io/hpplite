@@ -1287,6 +1287,9 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     int more;
 
     if (!node->ctx) return 0;
+    /* a node the open hook made and no timer started (interval=0: the
+    ** application flushes) starts at its first flush (#118) */
+    if (node->state == HPPLITE_STATE_INIT) hpplite_node_start(node);
     if (node->config.verifyOnly) return 0;      /* a verifier rebuilds and compares; it posts nothing (#5) */
     /* the sequencer connection posts - unless it is gone: then this one does */
     if (node->follower && !node_try_promote(node)) return 0;
@@ -1441,6 +1444,19 @@ static void *node_timer_thread_func(void *arg) {
         pthread_mutex_unlock(wakeMutex);
 
         if (!node->timerRunning) break;
+
+        /* A node the open hook made starts here, on the first tick, not in
+        ** the hook: opening a connection must not wait on the chain (the
+        ** lease claim). hpplite_open() starts its node itself. Until then the
+        ** state said "init" for the connection's whole life (#118) */
+        if (node->state == HPPLITE_STATE_INIT) {
+            pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
+            if (mutex) {
+                pthread_mutex_lock(mutex);
+                if (node->timerRunning) hpplite_node_start(node);
+                pthread_mutex_unlock(mutex);
+            }
+        }
 
         /* Flush on the interval, or early once pending SQL nears the DA limit */
         int64_t now = node_current_time_ms();
