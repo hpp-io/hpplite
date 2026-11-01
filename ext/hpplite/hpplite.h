@@ -107,8 +107,6 @@ struct HppliteCtx {
   int bBkGate;                /* this bookkeeping transaction took the gate */
   sqlite3_stmt *pSeqStmt;     /* Cached fingerprint of sqlite_sequence (NULL: none yet) */
   int seqTriedGen;            /* nDdlGen + 1 when sqlite_sequence was last found missing */
-  sqlite3_int64 seqAtLog[2];  /* ...its fingerprint when the last statement was logged */
-  int bSeqAtLog;              /* ...taken (an INSERT on a database that has sqlite_sequence) */
   int bClockPin;              /* The connection's VFS is the clock VFS: 'now' can be recorded and replayed */
   sqlite3_stmt *pPinOwner;    /* The statement that pinned the clock (outermost write) */
 
@@ -133,11 +131,15 @@ struct HppliteCtx {
                               ** tables and what reaches them through triggers ('\0'-separated,
                               ** ends with an empty name) */
   sqlite3_stmt *pUnlogStmt;   /* Cached DELETE of a failed statement's row */
-  sqlite3_stmt *pLastLogged;  /* Statement whose row was logged last */
-  int bLastLoggedKeep;        /* ...is kept even without an effect (header pragma) */
-  sqlite3_int64 lastLogId;    /* ...and that row's id */
-  sqlite3_int64 changesAtLog; /* total_changes when it was logged */
-  int schemaAtLog;            /* schema_version when it was logged */
+  struct HppliteLogged {      /* The statement whose row was logged last, and what its effect check compares */
+    sqlite3_stmt *pS;
+    sqlite3_int64 id;         /* its row */
+    int keep;                 /* kept even without an effect (a header pragma) */
+    sqlite3_int64 changes;    /* total_changes when it was logged */
+    int schema;               /* schema_version when it was logged */
+    int bSeq;                 /* seq taken (an INSERT on a database that has sqlite_sequence) */
+    sqlite3_int64 seq[2];     /* sqlite_sequence's fingerprint when it was logged */
+  } logged;
   sqlite3_stmt *pSchemaStmt;  /* Cached PRAGMA schema_version */
 
   /* Mirror of _hpplite_meta (the row in the database is authoritative) */

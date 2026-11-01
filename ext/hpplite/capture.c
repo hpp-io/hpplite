@@ -195,9 +195,9 @@ int hppliteSchemaVersion(HppliteCtx *pCtx) {
 */
 static int seqFingerprint(HppliteCtx *pCtx, sqlite3_int64 out[2]);
 static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
-  if (pS != pCtx->pLastLogged) return;
-  pCtx->pLastLogged = NULL;
-  if (pCtx->bLastLoggedKeep) return;   /* a header pragma changes neither rows nor schema: keep */
+  if (pS != pCtx->logged.pS) return;
+  pCtx->logged.pS = NULL;
+  if (pCtx->logged.keep) return;   /* a header pragma changes neither rows nor schema: keep */
   /* Reset before it finished (a RETURNING write stepped once - node:sqlite's
   ** .get()): SQLite reports the end from sqlite3_reset() while the statement
   ** is still busy, before it counts the changes it made. Its writes are done
@@ -205,14 +205,14 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   if (sqlite3_stmt_busy(pS)) return;
 
   pCtx->bInternal = 1;
-  if (totalChanges(pCtx->db) != pCtx->changesAtLog
-      || hppliteSchemaVersion(pCtx) != pCtx->schemaAtLog) {
+  if (totalChanges(pCtx->db) != pCtx->logged.changes
+      || hppliteSchemaVersion(pCtx) != pCtx->logged.schema) {
     pCtx->bInternal = 0;
     return;   /* had an effect: keep */
   }
-  if (pCtx->bSeqAtLog) {
+  if (pCtx->logged.bSeq) {
     sqlite3_int64 now[2];
-    if (seqFingerprint(pCtx, now) && (now[0] != pCtx->seqAtLog[0] || now[1] != pCtx->seqAtLog[1])) {
+    if (seqFingerprint(pCtx, now) && (now[0] != pCtx->logged.seq[0] || now[1] != pCtx->logged.seq[1])) {
       pCtx->bInternal = 0;
       return;   /* no row changed, but sqlite_sequence did: keep */
     }
@@ -236,7 +236,7 @@ static void hppliteStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
     }
   }
   if (pCtx->pUnlogStmt) {
-    sqlite3_bind_int64(pCtx->pUnlogStmt, 1, pCtx->lastLogId);
+    sqlite3_bind_int64(pCtx->pUnlogStmt, 1, pCtx->logged.id);
     hpplite_step_write(pCtx->pUnlogStmt);
     sqlite3_reset(pCtx->pUnlogStmt);
     /* changes() now says 1 (our DELETE); the application's statement changed
@@ -1048,8 +1048,8 @@ static void rerunStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   ** DDL expires every statement, this one too): it ran, no rerun follows */
   if (pCtx->rerunStage == 1 && stmtExpired(pS) && hppliteSchemaVersion(pCtx) == pCtx->rerunSchema) {
     pCtx->rerunStage = 2;
-    runStart(pCtx, pS, pCtx->lastLogId, hpplite_clock_consulted());
-    pCtx->pLastLogged = pS;               /* the effect check applies to the rerun */
+    runStart(pCtx, pS, pCtx->logged.id, hpplite_clock_consulted());
+    pCtx->logged.pS = pS;               /* the effect check applies to the rerun */
     return;
   }
   rerunCommit(pCtx);
@@ -1136,7 +1136,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
     hppliteInternalExec(pCtx, pCtx->db, "SELECT * FROM hpplite_status LIMIT 0");
   }
   if (mask == SQLITE_TRACE_PROFILE) {
-    int bWasLogged = pS == pCtx->pLastLogged;
+    int bWasLogged = pS == pCtx->logged.pS;
     if (pCtx->ownTxn == HPPLITE_OWN_COMMIT_PENDING) rerunCommitRetry(pCtx);
     /* a refused statement done - unless this is its first run failing stale
     ** (expired: SQLite reprepares and reruns it inside this step): the rerun
@@ -1232,8 +1232,8 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
       ** the statement's end, as after a stale rerun. */
       hpplite_rows_after_statement(pCtx);            /* the rebuild, when the triggers are not the snapshot's */
       if (hpplite_rows_covered(pCtx)) {
-        pCtx->changesAtLog = -1;                     /* no text row: the rerun's effect check keeps nothing */
-        pCtx->bSeqAtLog = 0;
+        pCtx->logged.changes = -1;                     /* no text row: the rerun's effect check keeps nothing */
+        pCtx->logged.bSeq = 0;
         covered = 1;
       }
     }
@@ -1327,24 +1327,24 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
       /* our row's id is not the application's last_insert_rowid() */
       sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
       rc = hpplite_step_write(pCtx->pLogStmt);
-      if (rc == SQLITE_DONE) pCtx->lastLogId = sqlite3_last_insert_rowid(pCtx->db);
+      if (rc == SQLITE_DONE) pCtx->logged.id = sqlite3_last_insert_rowid(pCtx->db);
       sqlite3_set_last_insert_rowid(pCtx->db, appRowid);
     }
     if (rc == SQLITE_DONE) {
       rerunBegin(pCtx, pS);
-      pCtx->pLastLogged = pS;
-      pCtx->bLastLoggedKeep = isHeaderPragmaWrite(zSql);
+      pCtx->logged.pS = pS;
+      pCtx->logged.keep = isHeaderPragmaWrite(zSql);
       if (slot < 0) slot = runFind(pCtx, pS);
-      if (slot >= 0) pCtx->aRun[slot].logId = pCtx->lastLogId;
-      if (pCtx->curTxn == 0) pCtx->curTxn = pCtx->lastLogId;
-      pCtx->changesAtLog = totalChanges(pCtx->db);
-      pCtx->schemaAtLog = hppliteSchemaVersion(pCtx);
+      if (slot >= 0) pCtx->aRun[slot].logId = pCtx->logged.id;
+      if (pCtx->curTxn == 0) pCtx->curTxn = pCtx->logged.id;
+      pCtx->logged.changes = totalChanges(pCtx->db);
+      pCtx->logged.schema = hppliteSchemaVersion(pCtx);
       {
         const char *z = zSql;
         while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
-        pCtx->bSeqAtLog = (sqlite3_strnicmp(z, "INSERT", 6) == 0 || sqlite3_strnicmp(z, "REPLACE", 7) == 0
+        pCtx->logged.bSeq = (sqlite3_strnicmp(z, "INSERT", 6) == 0 || sqlite3_strnicmp(z, "REPLACE", 7) == 0
                            || sqlite3_strnicmp(z, "WITH", 4) == 0)
-                          && seqFingerprint(pCtx, pCtx->seqAtLog);
+                          && seqFingerprint(pCtx, pCtx->logged.seq);
       }
     }
     sqlite3_reset(pCtx->pLogStmt);

@@ -345,7 +345,7 @@ static void finalizeOwnStatements(HppliteCtx *pCtx) {
   if (pCtx->pRowsLockStmt) sqlite3_finalize(pCtx->pRowsLockStmt);
   pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = pCtx->pZeroStmt = NULL;
   pCtx->pSeqStmt = pCtx->pRowsSchemaStmt = pCtx->pRowsTempSchemaStmt = pCtx->pRowsLockStmt = NULL;
-  pCtx->pLastLogged = NULL;
+  pCtx->logged.pS = NULL;
 }
 
 /* Statements of the application that are still open (ours do not count).
