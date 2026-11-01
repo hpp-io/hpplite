@@ -9,19 +9,27 @@
 ** wallet, a stranger's claim after expiry, sleeping for days, and (#51)
 ** that what capture accepts survives the real path: sealed, posted to
 ** contract storage at the size limit, replayed by a fresh replica.
+**
+** The singleton challenged (#49, scenarios 12-15): the database resumed on
+** another machine while the old instance is still alive; two processes on
+** one file killed and restarted in both orders; a misbehaving RPC endpoint
+** (tests/l1/rpc_proxy.py in front of anvil); a power loss mid-transaction,
+** the file and its -wal reopened as they lie. HPPLITE_ANVIL_TESTS=12,15
+** runs a selection.
 */
 #include "test_lib.h"
 #include "l1_interface.h"
 #include "eth/eth_client.h"
 #include "batch.h"
 #include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
 
 #define DIR "/tmp/hpplite_anvil"
 
-static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3, *KEY4, *KEY5, *ANVIL_PID;
+static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3, *KEY4, *KEY5, *KEY6, *KEY7, *KEY8, *KEY9, *ANVIL_PID;
 
 static void chain_sleep(int seconds) {
     char cmd[256];
@@ -29,11 +37,14 @@ static void chain_sleep(int seconds) {
     (void)!system(cmd);
 }
 
-static sqlite3 *open_db(const char *file, const char *key, const char *extra) {
+/* the node on `file` with `key`, through the endpoint `rpc` (anvil's, or a
+** proxy's). No timer unless `extra` names an interval: a URI parameter's
+** first occurrence counts, so the caller's goes first. */
+static sqlite3 *open_db_at(const char *rpc, const char *file, const char *key, const char *extra) {
     char uri[1024];
     sqlite3 *db = NULL;
-    snprintf(uri, sizeof(uri), "file:" DIR "/%s?hpplite=on&rpc=%s&factory=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=0%s",
-             file, RPC, FACTORY, key, extra ? extra : "");
+    snprintf(uri, sizeof(uri), "file:" DIR "/%s?hpplite=on&rpc=%s&factory=%s&chainid=31337&privkey=%s&datadir=" DIR "%s&interval=0",
+             file, rpc, FACTORY, key, extra ? extra : "");
     if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) {
         fprintf(stderr, "open: %s\n", sqlite3_errmsg(db));
         sqlite3_close(db);
@@ -41,6 +52,7 @@ static sqlite3 *open_db(const char *file, const char *key, const char *extra) {
     }
     return db;
 }
+static sqlite3 *open_db(const char *file, const char *key, const char *extra) { return open_db_at(RPC, file, key, extra); }
 
 static void dump_state(HppliteL1 *l1, const unsigned char *mine, const char *why) {
     HppliteL1State *st = hpplite_l1_get_state(l1);
@@ -612,26 +624,573 @@ static void test_named_databases(void) {
     PASS();
 }
 
+/* ---- the singleton challenged (#49): what the chain holds against the file ---- */
+
+/* The chain's batches 1..last are all there and all ours, and the file's
+** height is right behind them. NULL, or why. */
+static const char *chain_contiguous(HppliteNode *n) {
+    static char why[200];
+    uint64_t last = 0, total = 0;
+    if (hpplite_l1_get_da_state(n->l1, &last, &total, NULL) != 0) return "cannot read the chain's state";
+    if (last + 1 != n->ctx->blockHeight) {
+        snprintf(why, sizeof why, "the chain holds %llu batches, the file finalized %llu", (unsigned long long)last, (unsigned long long)(n->ctx->blockHeight - 1));
+        return why;
+    }
+    for (uint64_t h = 1; h <= last; h++) {
+        HppliteBatch *b = hpplite_node_fetch_batch(n, h);
+        if (!b) { snprintf(why, sizeof why, "batch %llu of %llu is missing or not ours", (unsigned long long)h, (unsigned long long)last); return why; }
+        hpplite_batch_free(b);
+    }
+    return NULL;
+}
+
+/* A fresh file with the same key rebuilt from the chain alone has every row
+** of `w` and its root. NULL, or why. */
+static const char *replica_equals(sqlite3 *w, const char *replicaFile, const char *key) {
+    static char why[400];
+    unsigned char rootW[32], rootR[32];
+    char *a = test_dump(w, 0), *b;
+    hpplite_state_root(w, rootW);
+    sqlite3 *r = open_db(replicaFile, key, NULL);
+    if (!r) { sqlite3_free(a); return "replica open"; }
+    b = test_dump(r, 0);
+    hpplite_state_root(r, rootR);
+    sqlite3_close(r);
+    int rows = strcmp(a, b) != 0, root = memcmp(rootW, rootR, 32) != 0;
+    if (rows) {
+        size_t i = test_dump_diff(a, b);
+        snprintf(why, sizeof why, "replica rows differ: writer [%.60s] replica [%.60s]", a + i, b + i);
+    } else if (root) {
+        snprintf(why, sizeof why, "replica rows equal but its state root differs");
+    }
+    sqlite3_free(a); sqlite3_free(b);
+    return rows || root ? why : NULL;
+}
+
+/* 12. The database moves to another machine (#49): an empty file with the
+** same key rebuilds from the chain and sequences once the old lease has run
+** out. The old machine's process is still alive - it fell asleep with a row
+** it never posted - and wakes later: it must not post over the new history,
+** and must say so. A sibling that slept with nothing pending follows the new
+** history and waits for the lease. KEY6's own rollup. */
+static void test_resume_elsewhere(void) {
+    TEST("resume on another machine: the new file rebuilds and sequences; the stale instance wakes and refuses, never posts over the new history");
+    sqlite3 *a = open_db("mig_a.db", KEY6, NULL);
+    if (!a) FAIL("open a");
+    sqlite3_exec(a, "CREATE TABLE m(id INTEGER PRIMARY KEY, who TEXT)", NULL, NULL, NULL);
+    sqlite3_exec(a, "INSERT INTO m VALUES(1, 'old machine')", NULL, NULL, NULL);
+    if (scalar(a, "SELECT hpplite_flush()") <= 0) { sqlite3_close(a); FAIL("a posts"); }
+    sqlite3_int64 hA = scalar(a, "SELECT height FROM hpplite_status");
+    /* a sibling of the same wallet on another directory, idle (a second deployment) */
+    sqlite3 *c = open_db("mig_c.db", KEY6, NULL);
+    if (!c) FAIL("open c");
+    if (scalar(c, "SELECT count(*) FROM m") != 1) FAIL("c did not rebuild from the chain");
+    /* the old machine writes once more, then sleeps before its timer posts it */
+    sqlite3_exec(a, "INSERT INTO m VALUES(2, 'written on the old machine, never posted')", NULL, NULL, NULL);
+    chain_sleep(400);                                       /* its lease runs out while it sleeps */
+
+    /* the new machine: an empty file, the same key */
+    sqlite3 *b = open_db("mig_b.db", KEY6, NULL);
+    if (!b) FAIL("open b");
+    HppliteNode *nb = hpplite_get_node(b);
+    if (scalar(b, "SELECT height FROM hpplite_status") != hA || scalar(b, "SELECT count(*) FROM m") != 1) FAIL("b did not rebuild from the chain");
+    if (scalar(b, "SELECT lease FROM hpplite_status") != 1) { dump_state(nb->l1, nb->instanceId, "b's open"); FAIL("b should hold the lease now"); }
+    sqlite3_exec(b, "INSERT INTO m VALUES(2, 'new machine')", NULL, NULL, NULL);   /* the same rowid as the row a never posted: the histories part here */
+    if (scalar(b, "SELECT hpplite_flush()") <= 0) FAIL("b posts");
+    uint64_t chainB = 0, chainAfterA = 0, total = 0;
+    hpplite_l1_get_da_state(nb->l1, &chainB, &total, NULL);
+
+    /* the old machine wakes: its process continues, with its unposted row and a new one */
+    sqlite3_exec(a, "INSERT INTO m VALUES(3, 'old machine, after waking')", NULL, NULL, NULL);
+    sqlite3_int64 postedA = scalar(a, "SELECT hpplite_flush()");
+    char stateA[64], errA[512];
+    text_of(a, "SELECT state FROM hpplite_status", stateA, sizeof stateA);
+    text_of(a, "SELECT last_error FROM hpplite_status", errA, sizeof errA);
+    sqlite3_int64 pendA = scalar(a, "SELECT pending FROM hpplite_status");
+    sqlite3_close(a);                                       /* tries to post again, and to release "its" lease */
+    hpplite_l1_get_da_state(nb->l1, &chainAfterA, &total, NULL);
+    int leaseB = lease_is(nb->l1, nb->instanceId);
+    printf("(stale: flush %lld, state %s, pending %lld, last_error \"%s\") ", (long long)postedA, stateA, (long long)pendA, errA);
+    if (postedA != 0 || chainAfterA != chainB) FAIL("the stale instance posted over the new history");
+    if (strcmp(stateA, "error") != 0 || !errA[0]) FAIL("the stale instance did not refuse loudly");
+    if (pendA != 2) FAIL("the stale instance's rows must stay in its own file");
+    if (leaseB != 1) { dump_state(nb->l1, nb->instanceId, "after a's close"); FAIL("a's close cut b's lease"); }
+
+    /* the idle sibling wakes with nothing pending: it follows the new history and waits */
+    if (scalar(c, "SELECT hpplite_flush()") != 0) FAIL("c posted with nothing pending");
+    if (scalar(c, "SELECT count(*) FROM m") != 2 || scalar(c, "SELECT height FROM hpplite_status") != scalar(b, "SELECT height FROM hpplite_status")) FAIL("c did not follow the new history");
+    sqlite3_exec(c, "INSERT INTO m VALUES(3, 'sibling')", NULL, NULL, NULL);
+    sqlite3_int64 postedC = scalar(c, "SELECT hpplite_flush()");
+    char stateC[64];
+    text_of(c, "SELECT state FROM hpplite_status", stateC, sizeof stateC);
+    sqlite3_int64 leaseC = scalar(c, "SELECT lease FROM hpplite_status"), pendC = scalar(c, "SELECT pending FROM hpplite_status");
+    sqlite3_close(c);
+    hpplite_l1_get_da_state(nb->l1, &chainAfterA, &total, NULL);
+    printf("(sibling: flush %lld, lease %lld, pending %lld, state %s) ", (long long)postedC, (long long)leaseC, (long long)pendC, stateC);
+    if (postedC != 0 || chainAfterA != chainB || leaseC != 0) FAIL("the sibling posted into b's lease");
+    if (lease_is(nb->l1, nb->instanceId) != 1) FAIL("c's close cut b's lease");
+    if (pendC != 1) FAIL("the sibling's row must stay in its own file");
+
+    /* the new machine goes on; a replica rebuilt from the chain equals it */
+    sqlite3_exec(b, "INSERT INTO m VALUES(3, 'new machine again')", NULL, NULL, NULL);
+    if (scalar(b, "SELECT hpplite_flush()") <= 0) FAIL("b keeps posting");
+    const char *why = chain_contiguous(nb);
+    if (why) { sqlite3_close(b); FAIL(why); }
+    sqlite3_int64 rowsB = scalar(b, "SELECT count(*) FROM m");
+    sqlite3_close(b);
+    sqlite3 *b2 = open_db("mig_b.db", KEY6, NULL);          /* b's file, reopened: the current sequencer */
+    if (!b2) FAIL("reopen b");
+    if (scalar(b2, "SELECT count(*) FROM m") != rowsB || scalar(b2, "SELECT pending FROM hpplite_status") != 0) FAIL("b's reopen");
+    why = replica_equals(b2, "mig_r.db", KEY6);
+    sqlite3_close(b2);
+    if (why) FAIL(why);
+    /* the sibling's status must say what it is doing: waiting for the lease */
+    if (strcmp(stateC, "waiting") != 0) FAILF("the sibling's state is '%s', want 'waiting'", stateC);
+    PASS();
+}
+
+/* 13. Two processes of the application on one file (#49): the first holds
+** the file lock and sequences, the second captures into the shared log.
+** Each is killed (-9) and started again, the holder first, then the
+** follower, with writes before and after every kill. After each restart
+** exactly one of them sequences; at the end every write is on the chain
+** once and a replica equals the file. KEY7's own rollup. */
+typedef struct ProcStatus { long seq, height, pending, busy; int sequencer, lease; char state[32]; } ProcStatus;
+
+static void proc_status_path(int proc, char *out, size_t n) { snprintf(out, n, DIR "/status.%d", proc); }
+static void proc_stop_path(int proc, char *out, size_t n) { snprintf(out, n, DIR "/stop.%d", proc); }
+
+static void write_proc_status(int proc, long seq, long busy, sqlite3 *db) {
+    char tmp[300], fin[300];
+    ProcStatus st;
+    proc_status_path(proc, fin, sizeof fin);
+    snprintf(tmp, sizeof tmp, "%s.tmp", fin);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    text_of(db, "SELECT state FROM hpplite_status", st.state, sizeof st.state);
+    fprintf(f, "%ld %lld %lld %ld %lld %lld %s\n", seq, (long long)scalar(db, "SELECT height FROM hpplite_status"),
+            (long long)scalar(db, "SELECT pending FROM hpplite_status"), busy,
+            (long long)scalar(db, "SELECT sequencer FROM hpplite_status"), (long long)scalar(db, "SELECT lease FROM hpplite_status"), st.state);
+    fclose(f);
+    rename(tmp, fin);
+}
+
+static int read_proc_status(int proc, ProcStatus *st) {
+    char path[300];
+    proc_status_path(proc, path, sizeof path);
+    FILE *f = fopen(path, "r");
+    int ok;
+    if (!f) return 0;
+    memset(st, 0, sizeof *st);
+    ok = fscanf(f, "%ld %ld %ld %ld %d %d %31s", &st->seq, &st->height, &st->pending, &st->busy, &st->sequencer, &st->lease, st->state) == 7;
+    fclose(f);
+    return ok;
+}
+
+/* The application's process: one row every 20 ms until its stop file
+** appears, then a clean close. The parent reads its status file. */
+static pid_t spawn_writer(int proc, const char *file, const char *key) {
+    char path[300];
+    proc_stop_path(proc, path, sizeof path); unlink(path);
+    proc_status_path(proc, path, sizeof path); unlink(path);
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid != 0) return pid;
+    sqlite3 *db = open_db(file, key, "&interval=200ms");
+    if (!db) _exit(2);
+    sqlite3_busy_timeout(db, 10000);
+    long busy = 0, seq;
+    char stop[300];
+    proc_stop_path(proc, stop, sizeof stop);
+    for (seq = 1; ; seq++) {
+        char sql[96];
+        snprintf(sql, sizeof sql, "INSERT INTO w VALUES(%d, %ld)", proc, seq);
+        if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) { busy++; seq--; }
+        if (seq % 10 == 0) write_proc_status(proc, seq, busy, db);
+        if (access(stop, F_OK) == 0) break;
+        usleep(20000);
+    }
+    write_proc_status(proc, seq, busy, db);
+    sqlite3_close(db);
+    _exit(0);
+}
+
+/* until pred(status) holds, or `secs` pass: 1 if it did */
+static int wait_proc(int proc, int (*pred)(const ProcStatus *, long), long arg, double secs) {
+    double t0 = now_s();
+    ProcStatus st;
+    do {
+        if (read_proc_status(proc, &st) && pred(&st, arg)) return 1;
+        usleep(100000);
+    } while (now_s() - t0 < secs);
+    return 0;
+}
+static int seq_past(const ProcStatus *st, long n) { return st->seq >= n; }
+static int height_past(const ProcStatus *st, long n) { return st->height >= n; }
+static int sequences(const ProcStatus *st, long want) { return st->sequencer == want; }
+static int seq_past_as_sequencer(const ProcStatus *st, long n) { return st->seq >= n && st->sequencer == 1; }
+static int seq_past_as_follower(const ProcStatus *st, long n) { return st->seq >= n && st->sequencer == 0; }
+
+static long proc_seq(int proc) { ProcStatus st; return read_proc_status(proc, &st) ? st.seq : 0; }
+static long proc_height(int proc) { ProcStatus st; return read_proc_status(proc, &st) ? st.height : 0; }
+/* "proc N: seq S height H pending P sequencer Q lease L state Z", for a failure */
+static const char *proc_line(int proc) {
+    static char line[2][160];
+    static int which;
+    char *out = line[which ^= 1];
+    ProcStatus st;
+    if (!read_proc_status(proc, &st)) snprintf(out, sizeof line[0], "proc %d: no status", proc);
+    else snprintf(out, sizeof line[0], "proc %d: seq %ld height %ld pending %ld sequencer %d lease %d state %s", proc, st.seq, st.height, st.pending, st.sequencer, st.lease, st.state);
+    return out;
+}
+
+/* a clean stop: the stop file, then the exit within `secs` (else killed) */
+static int stop_writer(int proc, pid_t pid, double secs) {
+    char path[300];
+    int status = 0;
+    double t0 = now_s();
+    proc_stop_path(proc, path, sizeof path);
+    FILE *f = fopen(path, "w");
+    if (f) fclose(f);
+    while (waitpid(pid, &status, WNOHANG) == 0) {
+        if (now_s() - t0 > secs) { kill(pid, SIGKILL); waitpid(pid, &status, 0); return -1; }
+        usleep(100000);
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void test_two_processes_one_file(void) {
+    TEST("two processes on one file: killed and restarted, holder first then follower; one sequencer after each restart, every write on chain once");
+    sqlite3 *w = open_db("two.db", KEY7, NULL);
+    if (!w) FAIL("open");
+    sqlite3_exec(w, "CREATE TABLE w(proc INTEGER, seq INTEGER)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("schema batch"); }
+    sqlite3_close(w);
+
+    pid_t pid[5] = {0};
+    pid[1] = spawn_writer(1, "two.db", KEY7);
+    pid[2] = spawn_writer(2, "two.db", KEY7);
+    if (!wait_proc(1, seq_past, 30, 15) || !wait_proc(2, seq_past, 30, 15)) { kill(pid[1], SIGKILL); kill(pid[2], SIGKILL); FAIL("the processes did not write"); }
+    ProcStatus s1, s2;
+    read_proc_status(1, &s1); read_proc_status(2, &s2);
+    if (s1.sequencer + s2.sequencer != 1) { kill(pid[1], SIGKILL); kill(pid[2], SIGKILL); FAILF("%d sequencers on one file (1: %s, 2: %s)", s1.sequencer + s2.sequencer, s1.state, s2.state); }
+    int holder = s1.sequencer ? 1 : 2, follower = 3 - holder;
+    long hBefore = proc_height(holder);
+    if (!wait_proc(holder, seq_past_as_sequencer, 60, 20) || !wait_proc(holder, height_past, hBefore + 1, 20)) { kill(pid[1], SIGKILL); kill(pid[2], SIGKILL); FAILF("the holder does not post (%s; %s)", proc_line(holder), proc_line(follower)); }
+
+    /* the holder dies mid-flight: the follower takes over and keeps posting; the holder comes back as a follower */
+    kill(pid[holder], SIGKILL); waitpid(pid[holder], NULL, 0);
+    long seqAtKill = proc_seq(follower);
+    if (!wait_proc(follower, seq_past_as_sequencer, seqAtKill + 40, 30)) { kill(pid[follower], SIGKILL); FAILF("after the holder's death, process %d did not take over and keep writing (%s)", follower, proc_line(follower)); }
+    hBefore = proc_height(follower);
+    pid[3] = spawn_writer(3, "two.db", KEY7);
+    if (!wait_proc(3, seq_past_as_follower, 30, 20)) { kill(pid[follower], SIGKILL); kill(pid[3], SIGKILL); FAILF("the restarted holder did not come back as a follower (%s; %s)", proc_line(3), proc_line(follower)); }
+    if (!wait_proc(follower, sequences, 1, 5) || !wait_proc(follower, height_past, hBefore + 1, 20)) { kill(pid[follower], SIGKILL); kill(pid[3], SIGKILL); FAILF("process %d stopped sequencing when 3 restarted (%s; %s)", follower, proc_line(follower), proc_line(3)); }
+
+    /* the follower dies: the holder goes on; the follower comes back */
+    kill(pid[3], SIGKILL); waitpid(pid[3], NULL, 0);
+    seqAtKill = proc_seq(follower);
+    if (!wait_proc(follower, seq_past_as_sequencer, seqAtKill + 40, 30)) { kill(pid[follower], SIGKILL); FAILF("the holder stopped when its follower died (%s)", proc_line(follower)); }
+    hBefore = proc_height(follower);
+    pid[4] = spawn_writer(4, "two.db", KEY7);
+    if (!wait_proc(4, seq_past_as_follower, 30, 20)) { kill(pid[follower], SIGKILL); kill(pid[4], SIGKILL); FAILF("the restarted follower did not come back as a follower (%s; %s)", proc_line(4), proc_line(follower)); }
+    if (!wait_proc(follower, sequences, 1, 5) || !wait_proc(follower, height_past, hBefore + 1, 20)) { kill(pid[follower], SIGKILL); kill(pid[4], SIGKILL); FAILF("process %d stopped sequencing when 4 restarted (%s; %s)", follower, proc_line(follower), proc_line(4)); }
+
+    /* both stop cleanly, the holder first (the follower takes over for its last rows) */
+    int rcH = stop_writer(follower, pid[follower], 60);
+    int rc4 = stop_writer(4, pid[4], 60);
+    ProcStatus sH, s4;
+    read_proc_status(follower, &sH); read_proc_status(4, &s4);
+    printf("(holder %d and follower 3 killed; busy retries %ld+%ld) ", holder, sH.busy, s4.busy);
+    if (rcH != 0 || rc4 != 0) FAILF("the processes did not close cleanly (%d, %d)", rcH, rc4);
+
+    w = open_db("two.db", KEY7, NULL);
+    if (!w) FAIL("reopen");
+    HppliteNode *nw = hpplite_get_node(w);
+    sqlite3_int64 pend = scalar(w, "SELECT pending FROM hpplite_status");
+    sqlite3_int64 n1 = scalar(w, "SELECT count(*) FROM w WHERE proc = 1"), n2 = scalar(w, "SELECT count(*) FROM w WHERE proc = 2");
+    sqlite3_int64 n3 = scalar(w, "SELECT count(*) FROM w WHERE proc = 3"), n4 = scalar(w, "SELECT count(*) FROM w WHERE proc = 4");
+    sqlite3_int64 dup = scalar(w, "SELECT count(*) FROM (SELECT proc, seq FROM w GROUP BY proc, seq HAVING count(*) > 1)");
+    printf("(rows %lld/%lld/%lld/%lld, height %lld) ", (long long)n1, (long long)n2, (long long)n3, (long long)n4, (long long)scalar(w, "SELECT height FROM hpplite_status"));
+    if (pend != 0) { sqlite3_close(w); FAILF("%lld rows left pending: the last process out did not post them", (long long)pend); }
+    if (n1 < 30 || n2 < 30 || n3 < 30 || n4 < 30) { sqlite3_close(w); FAIL("a process's writes are missing"); }
+    if (dup != 0) { sqlite3_close(w); FAIL("a row was written twice"); }
+    const char *why = chain_contiguous(nw);
+    if (!why) why = replica_equals(w, "two_r.db", KEY7);
+    sqlite3_close(w);
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* 14. The RPC endpoint misbehaves (#49): a proxy (tests/l1/rpc_proxy.py) in
+** front of anvil adds latency, loses answers, holds them past the timeout
+** and refuses with 503, a phase each and then all at once. The application
+** writes throughout, fast; once the endpoint is healthy every write is on
+** the chain exactly once (contiguous heights, each row in one batch) and a
+** replica equals the file. KEY8's own rollup. */
+static pid_t g_proxyPid = 0;
+static void kill_proxy(void) {
+    if (g_proxyPid > 0) { kill(g_proxyPid, SIGTERM); waitpid(g_proxyPid, NULL, 0); g_proxyPid = 0; }
+}
+static int start_proxy(int port, const char *modeFile) {
+    const char *script = getenv("HPPLITE_RPC_PROXY");
+    char portStr[16], upstream[128];
+    const char *host = strstr(RPC, "://");
+    if (!script || access(script, R_OK) != 0) return -1;
+    snprintf(portStr, sizeof portStr, "%d", port);
+    snprintf(upstream, sizeof upstream, "%s", host ? host + 3 : RPC);
+    fflush(stdout); fflush(stderr);
+    g_proxyPid = fork();
+    if (g_proxyPid == 0) {
+        execlp("python3", "python3", "-I", script, portStr, upstream, modeFile, (char *)NULL);
+        _exit(127);
+    }
+    if (g_proxyPid < 0) return -1;
+    atexit(kill_proxy);
+    /* up when it answers a request (a bad python3 exits first) */
+    for (int i = 0; i < 50; i++) {
+        char cmd[200];
+        int status;
+        if (waitpid(g_proxyPid, &status, WNOHANG) == g_proxyPid) { g_proxyPid = 0; return -1; }
+        snprintf(cmd, sizeof cmd, "cast chain-id --rpc-url http://127.0.0.1:%d >/dev/null 2>&1", port);
+        if (system(cmd) == 0) return 0;
+        usleep(200000);
+    }
+    kill_proxy();
+    return -1;
+}
+static void set_proxy_mode(const char *modeFile, const char *mode) {
+    char tmp[300];
+    snprintf(tmp, sizeof tmp, "%s.tmp", modeFile);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fputs(mode, f);
+    fclose(f);
+    rename(tmp, modeFile);
+}
+static long proxy_stat(const char *modeFile, const char *key) {
+    char path[300], line[80];
+    long v = -1;
+    snprintf(path, sizeof path, "%s.stats", modeFile);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, key, strlen(key)) == 0 && line[strlen(key)] == '=') v = atol(line + strlen(key) + 1);
+    }
+    fclose(f);
+    return v;
+}
+static void test_rpc_faults(void) {
+    TEST("RPC faults through a proxy: latency, lost answers, timeouts, 503s; writes stay fast, all on chain once when healthy again");
+    static const char *modeFile = DIR "/proxy.mode";
+    static const struct { const char *name, *mode; } phase[] = {
+        { "latency",  "latency_ms=400\n" },
+        { "dropped",  "drop=0.3\n" },
+        { "timeouts", "timeout=0.15\nhold_ms=4000\n" },
+        { "503s",     "error=0.4\n" },
+        { "storm",    "latency_ms=100\ndrop=0.2\ntimeout=0.1\nhold_ms=4000\nerror=0.2\n" },
+    };
+    int port = 8400 + (int)(getpid() % 200);
+    char proxyRpc[64];
+    snprintf(proxyRpc, sizeof proxyRpc, "http://127.0.0.1:%d", port);
+    set_proxy_mode(modeFile, "");
+    if (start_proxy(port, modeFile) != 0) { printf("SKIP (python3 or tests/l1/rpc_proxy.py not available) "); PASS(); return; }
+    setenv("HPPLITE_RPC_TIMEOUT", "2", 1);                   /* read per request: a held answer costs 2 s, not 15 */
+    sqlite3 *w = open_db_at(proxyRpc, "rpc_writer.db", KEY8, "&interval=300ms");
+    if (!w) { kill_proxy(); unsetenv("HPPLITE_RPC_TIMEOUT"); FAIL("open through the proxy"); }
+    HppliteNode *nw = hpplite_get_node(w);
+    sqlite3_exec(w, "CREATE TABLE f(id INTEGER PRIMARY KEY, phase TEXT)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); kill_proxy(); unsetenv("HPPLITE_RPC_TIMEOUT"); FAIL("schema batch through the healthy proxy"); }
+    int written = 0;
+    double slowest = 0, t0 = now_s();
+    for (size_t p = 0; p < sizeof phase / sizeof phase[0]; p++) {
+        set_proxy_mode(modeFile, phase[p].mode);
+        /* four rounds a phase: writes, a flush (the application's own, past
+        ** the timer's backoff), a second for the chain */
+        for (int round = 0; round < 4; round++) {
+            for (int i = 0; i < 2; i++) {
+                char sql[128];
+                snprintf(sql, sizeof sql, "INSERT INTO f VALUES(%d, '%s')", ++written, phase[p].name);
+                double t1 = now_s();
+                int rc = sqlite3_exec(w, sql, NULL, NULL, NULL);
+                if (now_s() - t1 > slowest) slowest = now_s() - t1;
+                if (rc != SQLITE_OK) { sqlite3_close(w); kill_proxy(); unsetenv("HPPLITE_RPC_TIMEOUT"); FAILF("a write failed in the %s phase", phase[p].name); }
+            }
+            scalar(w, "SELECT hpplite_flush()");            /* whatever the endpoint allows; the timer keeps trying too */
+            sleep(1);
+        }
+    }
+    double faulty = now_s() - t0;
+    long delayed = proxy_stat(modeFile, "delayed"), dropped = proxy_stat(modeFile, "dropped"),
+         timedOut = proxy_stat(modeFile, "timed_out"), errored = proxy_stat(modeFile, "errored");
+    /* healthy again: everything drains */
+    set_proxy_mode(modeFile, "");
+    t0 = now_s();
+    for (int k = 0; k < 40 && scalar(w, "SELECT pending FROM hpplite_status") > 0; k++) { scalar(w, "SELECT hpplite_flush()"); sleep(1); }
+    double drain = now_s() - t0;
+    sqlite3_int64 pend = scalar(w, "SELECT pending FROM hpplite_status");
+    char state[64];
+    text_of(w, "SELECT state FROM hpplite_status", state, sizeof state);
+    printf("(write max %.3fs; faults: %ld delayed, %ld dropped, %ld timed out, %ld 503s in %.0fs; drained in %.0fs, state %s) ",
+           slowest, delayed, dropped, timedOut, errored, faulty, drain, state);
+    const char *why = NULL;
+    if (slowest > 0.5) why = "a write waited on the endpoint";
+    else if (delayed <= 0 || dropped <= 0 || timedOut <= 0 || errored <= 0) why = "the proxy did not fault every kind: the test is not exercising them";
+    else if (pend != 0) why = "rows still pending once the endpoint is healthy";
+    else why = chain_contiguous(nw);
+    if (!why) {
+        /* each row in exactly one batch: the chain's entries are the schema statement plus every row */
+        uint64_t last = 0, total = 0;
+        long entries = 0;
+        hpplite_l1_get_da_state(nw->l1, &last, &total, NULL);
+        for (uint64_t h = 1; h <= last; h++) {
+            HppliteBatch *b = hpplite_node_fetch_batch(nw, h);
+            if (b) { entries += b->nTxns; hpplite_batch_free(b); }
+        }
+        if (entries != 1 + written) {
+            static char dupWhy[120];
+            snprintf(dupWhy, sizeof dupWhy, "the chain holds %ld entries for %d rows and the schema: a row posted twice or lost", entries, written);
+            why = dupWhy;
+        }
+    }
+    if (!why && scalar(w, "SELECT count(*) FROM f") != written) why = "the file lost a row";
+    sqlite3_close(w);                                        /* through the healthy proxy */
+    kill_proxy();
+    unsetenv("HPPLITE_RPC_TIMEOUT");
+    if (why) FAIL(why);
+    sqlite3 *w2 = open_db("rpc_writer.db", KEY8, NULL);
+    if (!w2) FAIL("reopen");
+    why = replica_equals(w2, "rpc_replica.db", KEY8);
+    sqlite3_close(w2);
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* 15. Power loss (#49): the application's process is killed (-9) in the
+** middle of a transaction while its timer posts; the database file and its
+** -wal are copied as they lie (what the disk holds after the loss), and
+** the copy is opened on another instance: it must open consistent (every
+** transaction whole or absent, the height where the chain is), continue,
+** and equal a replica. KEY9's own rollup. */
+static void test_power_loss(void) {
+    TEST("power loss mid-transaction: the file and its -wal copied as they lie and reopened; meta consistent, transactions whole or absent, continues, replica equal");
+    sqlite3 *w = open_db("pl.db", KEY9, NULL);
+    if (!w) FAIL("open");
+    sqlite3_exec(w, "CREATE TABLE p(txn INTEGER, i INTEGER)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("schema batch"); }
+    sqlite3_close(w);
+    char stat[300];
+    proc_status_path(9, stat, sizeof stat); unlink(stat);
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        sqlite3 *db = open_db("pl.db", KEY9, "&interval=200ms");
+        if (!db) _exit(2);
+        sqlite3_busy_timeout(db, 10000);
+        /* a transaction of three rows, ~10 ms inside it (the flag file is up
+        ** then), ~20 ms between transactions (the poster's window) */
+        for (long txn = 1; ; txn++) {
+            char sql[128];
+            FILE *f;
+            if ((f = fopen(DIR "/in_txn", "w")) != NULL) fclose(f);
+            snprintf(sql, sizeof sql, "BEGIN; INSERT INTO p VALUES(%ld, 1)", txn);
+            if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); continue; }
+            usleep(4000);
+            snprintf(sql, sizeof sql, "INSERT INTO p VALUES(%ld, 2)", txn);
+            sqlite3_exec(db, sql, NULL, NULL, NULL);
+            usleep(4000);
+            snprintf(sql, sizeof sql, "INSERT INTO p VALUES(%ld, 3); COMMIT", txn);
+            if (sqlite3_exec(db, sql, NULL, NULL, NULL) != SQLITE_OK) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            unlink(DIR "/in_txn");
+            if (txn % 5 == 0 && (f = fopen(stat, "w")) != NULL) {
+                fprintf(f, "%ld %lld\n", txn, (long long)scalar(db, "SELECT height FROM hpplite_status"));
+                fclose(f);
+            }
+            usleep(20000);
+        }
+    }
+    /* once a few batches are posted, the power goes - while a transaction is open */
+    double t0 = now_s();
+    long txn = 0, height = 0;
+    while (now_s() - t0 < 60) {
+        FILE *f = fopen(stat, "r");
+        if (f) { if (fscanf(f, "%ld %ld", &txn, &height) != 2) txn = 0; fclose(f); }
+        if (txn >= 40 && height >= 4) break;
+        usleep(50000);
+    }
+    for (int i = 0; i < 5000 && access(DIR "/in_txn", F_OK) != 0; i++) usleep(1000);
+    kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+    if (txn < 40 || height < 4) FAILF("the writer did not get going (txn %ld, height %ld after 60 s)", txn, height);
+    if (access(DIR "/pl.db-wal", F_OK) != 0) FAIL("no -wal beside the file: the test premise (WAL mode, a writer mid-flight) is gone");
+    (void)!system("cp " DIR "/pl.db " DIR "/pl_copy.db && cp " DIR "/pl.db-wal " DIR "/pl_copy.db-wal");
+    chain_sleep(400);                                       /* the dead process's lease runs out */
+
+    sqlite3 *c = open_db("pl_copy.db", KEY9, NULL);
+    if (!c) FAIL("the copy did not open");
+    HppliteNode *nc = hpplite_get_node(c);
+    char state[64], err[512];
+    text_of(c, "SELECT state FROM hpplite_status", state, sizeof state);
+    text_of(c, "SELECT last_error FROM hpplite_status", err, sizeof err);
+    sqlite3_int64 torn = scalar(c, "SELECT count(*) FROM (SELECT txn FROM p GROUP BY txn HAVING count(*) != 3 OR min(i) != 1 OR max(i) != 3)");
+    sqlite3_int64 txns = scalar(c, "SELECT count(DISTINCT txn) FROM p"), pend = scalar(c, "SELECT pending FROM hpplite_status");
+    sqlite3_int64 hCopy = scalar(c, "SELECT height FROM hpplite_status");
+    uint64_t last = 0, total = 0;
+    hpplite_l1_get_da_state(nc->l1, &last, &total, NULL);
+    printf("(killed at txn ~%ld; copy: %lld transactions, %lld pending rows, height %lld, chain %llu, state %s) ",
+           txn, (long long)txns, (long long)pend, (long long)hCopy, (unsigned long long)last, state);
+    if (strcmp(state, "error") == 0) { sqlite3_close(c); FAILF("the copy opened in error: %s", err); }
+    if (torn != 0) { sqlite3_close(c); FAIL("a transaction is in the file in part"); }
+    if ((uint64_t)hCopy != last + 1) { sqlite3_close(c); FAIL("the copy's height is not right behind the chain after open"); }
+    if (scalar(c, "SELECT foreign_writes FROM hpplite_status") != 0) { sqlite3_close(c); FAIL("the copy counts its own rows as foreign writes"); }
+    if (pend % 3 != 0) { sqlite3_close(c); FAIL("the pending log holds part of a transaction"); }
+    /* it continues: what was pending and a new transaction post; a replica equals the file */
+    if (sqlite3_exec(c, "BEGIN; INSERT INTO p VALUES(100000, 1); INSERT INTO p VALUES(100000, 2); INSERT INTO p VALUES(100000, 3); COMMIT", NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(c); FAIL("a write on the copy"); }
+    if (scalar(c, "SELECT hpplite_flush()") <= 0) { sqlite3_close(c); FAIL("the copy does not post"); }
+    if (scalar(c, "SELECT pending FROM hpplite_status") != 0) { sqlite3_close(c); FAIL("pending left after the flush"); }
+    const char *why = chain_contiguous(nc);
+    if (!why) why = replica_equals(c, "pl_replica.db", KEY9);
+    sqlite3_close(c);
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* HPPLITE_ANVIL_TESTS=12,14 runs those cases alone (development) */
+static int wanted(int number) {
+    const char *z = getenv("HPPLITE_ANVIL_TESTS");
+    char tag[16];
+    if (!z || !z[0]) return 1;
+    snprintf(tag, sizeof tag, ",%d,", number);
+    char all[256];
+    snprintf(all, sizeof all, ",%s,", z);
+    return strstr(all, tag) != NULL;
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
     KEY3 = getenv("HPPLITE_ANVIL_KEY3"); KEY4 = getenv("HPPLITE_ANVIL_KEY4"); ANVIL_PID = getenv("HPPLITE_ANVIL_PID");
-    KEY5 = getenv("HPPLITE_ANVIL_KEY5");
-    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3 || !KEY4 || !KEY5 || !ANVIL_PID) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
+    KEY5 = getenv("HPPLITE_ANVIL_KEY5"); KEY6 = getenv("HPPLITE_ANVIL_KEY6"); KEY7 = getenv("HPPLITE_ANVIL_KEY7");
+    KEY8 = getenv("HPPLITE_ANVIL_KEY8"); KEY9 = getenv("HPPLITE_ANVIL_KEY9");
+    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3 || !KEY4 || !KEY5 || !KEY6 || !KEY7 || !KEY8 || !KEY9 || !ANVIL_PID) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
     test_suite_init("anvil", NULL, DIR);
     reset_dir();
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
     printf("=== HPPLite on anvil (%s) ===\n", RPC);
-    test_open_write_post_checkpoint();
-    test_verify_tool();
-    test_second_instance_same_wallet();
-    test_concurrent_rpc();
-    test_sleep_and_wake();
-    test_stranger_after_expiry();
-    test_edge_sql_end_to_end();
-    test_big_transaction_end_to_end();
-    test_l1_outage();
-    test_reorg();
-    test_named_databases();
-    remove_dir();
+    if (wanted(1)) test_open_write_post_checkpoint();
+    if (wanted(2)) test_verify_tool();
+    if (wanted(3)) test_second_instance_same_wallet();
+    if (wanted(4)) test_concurrent_rpc();
+    if (wanted(5)) test_sleep_and_wake();
+    if (wanted(6)) test_stranger_after_expiry();
+    if (wanted(7)) test_edge_sql_end_to_end();
+    if (wanted(8)) test_big_transaction_end_to_end();
+    if (wanted(9)) test_l1_outage();
+    if (wanted(10)) test_reorg();
+    if (wanted(11)) test_named_databases();
+    if (wanted(12)) test_resume_elsewhere();
+    if (wanted(13)) test_two_processes_one_file();
+    if (wanted(14)) test_rpc_faults();
+    if (wanted(15)) test_power_loss();
+    if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

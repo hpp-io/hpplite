@@ -12,13 +12,17 @@ for t in anvil forge cast; do
 done
 port=${HPPLITE_ANVIL_PORT:-$((8600 + $$ % 200))}
 rpc="http://127.0.0.1:$port"
-# anvil's first six default accounts (public test keys, 10000 ETH each)
+# anvil's ten default accounts (public test keys, 10000 ETH each)
 key0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 key1=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
 key2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 key3=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6
 key4=0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a
 key5=0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba
+key6=0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e
+key7=0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356
+key8=0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97
+key9=0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6
 log=${TMPDIR:-/tmp}/hpplite-anvil-$$.log
 # HPP Sepolia's block gas limit (2^50), not anvil's default 30M: a full
 # 128 KB batch in contract storage needs ~90M gas (#51)
@@ -36,4 +40,5 @@ rm -f "$log.forge"
 # forge script prints the simulated address even when the broadcast reverted (e.g. over the 24 KB size limit)
 [ "$(cast code "$factory" --rpc-url "$rpc" 2>/dev/null | wc -c)" -gt 10 ] || { echo "factory at $factory has no code: deployment reverted (forge build --sizes)"; exit 1; }
 echo "anvil on $rpc, factory $factory"
-HPPLITE_VERIFY_BIN="$(dirname "$bin")/hpplite-verify" HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 HPPLITE_ANVIL_KEY2=$key2 HPPLITE_ANVIL_KEY3=$key3 HPPLITE_ANVIL_KEY4=$key4 HPPLITE_ANVIL_KEY5=$key5 HPPLITE_ANVIL_PID=$pid "$bin"
+# the faulty-endpoint proxy (#49), started by the suite itself in front of anvil
+HPPLITE_VERIFY_BIN="$(dirname "$bin")/hpplite-verify" HPPLITE_RPC_PROXY="$here/rpc_proxy.py" HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 HPPLITE_ANVIL_KEY2=$key2 HPPLITE_ANVIL_KEY3=$key3 HPPLITE_ANVIL_KEY4=$key4 HPPLITE_ANVIL_KEY5=$key5 HPPLITE_ANVIL_KEY6=$key6 HPPLITE_ANVIL_KEY7=$key7 HPPLITE_ANVIL_KEY8=$key8 HPPLITE_ANVIL_KEY9=$key9 HPPLITE_ANVIL_PID=$pid "$bin"
