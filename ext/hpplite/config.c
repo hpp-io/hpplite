@@ -350,6 +350,15 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_L1, buf, sizeof(buf))) {
         const HppliteNetworkAlias *network = strcasecmp(buf, "local") == 0 ? NULL : hpplite_da_lookup_network(buf);
         if (strcasecmp(buf, "local") == 0) cfg->localOnly = 1;
+        if (strncmp(buf, "file://", 7) == 0) {
+            /* a directory is the chain and the rollup (#35): no contract, no factory, no wallet needed */
+            free(cfg->rpcUrl);
+            cfg->rpcUrl = strdup(buf);
+            cfg->rpcUrlSource = 2;
+            memset(cfg->contract, 0, 20);
+            cfg->hasContract = 1;
+            cfg->contractSource = 2;
+        }
         if (network) {
             cfg->chainId = network->chainId;
             cfg->chainIdSource = 2;
@@ -472,7 +481,15 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     /* L1 network alias; "local" is no chain at all, batches finalized here (#38) */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_L1);
     if (val && strcasecmp(val, "local") == 0) cfg->localOnly = 1;
-    if (val && !cfg->localOnly) {
+    if (val && strncmp(val, "file://", 7) == 0) {
+        /* a directory is the chain and the rollup (#35): no contract, no factory, no wallet needed */
+        free(cfg->rpcUrl);
+        cfg->rpcUrl = strdup(val);
+        cfg->rpcUrlSource = 2;
+        memset(cfg->contract, 0, 20);
+        cfg->hasContract = 1;
+        cfg->contractSource = 2;
+    } else if (val && !cfg->localOnly) {
         uint64_t chainId = hpplite_da_resolve_alias(val);
         if (chainId > 0) {
             cfg->chainId = chainId;

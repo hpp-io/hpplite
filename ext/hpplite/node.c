@@ -739,6 +739,8 @@ void hpplite_node_destroy(HppliteNode *node) {
 static void node_cap_batch_limit(HppliteNode *node) {
     size_t tx = node->config.maxTxBytes ? node->config.maxTxBytes
                                         : hpplite_network_max_tx_bytes(node->config.chainId);
+    /* a transaction's calldata limit is the chain's (the mock stands in for it); a directory has none (#35) */
+    if (node->l1 && strcmp(hpplite_l1_backend_name(node->l1), "dir") == 0) return;
     if (tx > SUBMIT_ABI_OVERHEAD && node->config.maxBatchBytes > tx - SUBMIT_ABI_OVERHEAD) {
         node->config.maxBatchBytes = tx - SUBMIT_ABI_OVERHEAD;
     }

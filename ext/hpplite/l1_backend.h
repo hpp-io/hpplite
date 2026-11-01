@@ -70,6 +70,7 @@ struct HppliteL1Ops {
 
 extern const HppliteL1Ops hppliteL1EthOps;    /* l1_eth.c */
 extern const HppliteL1Ops hppliteL1MockOps;   /* l1_mock.c */
+extern const HppliteL1Ops hppliteL1DirOps;    /* l1_dir.c: file:///path */
 
 /* HppliteL1State and HppliteSystemConfig (and its daScheme) are allocated
 ** with sqlite3_malloc()/sqlite3_mprintf() by every backend: l1.c frees them. */

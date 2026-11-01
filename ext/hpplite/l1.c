@@ -3,8 +3,9 @@
 **
 ** The public L1 functions forward to the backend behind a connection
 ** (l1->ops), or, for the calls made before there is a connection, to the
-** backend the endpoint names: "mock" is the in-memory mock, anything else
-** is the Ethereum client. One build carries every backend.
+** backend the endpoint names: "mock" is the in-memory mock, "file:///path"
+** the directory backend, anything else the Ethereum client. One build
+** carries every backend.
 */
 
 #include "l1_backend.h"
@@ -13,6 +14,7 @@
 
 static const HppliteL1Ops *backendFor(const char *endpoint) {
     if (endpoint && strcmp(endpoint, "mock") == 0) return &hppliteL1MockOps;
+    if (endpoint && strncmp(endpoint, "file://", 7) == 0) return &hppliteL1DirOps;
     return &hppliteL1EthOps;
 }
 
