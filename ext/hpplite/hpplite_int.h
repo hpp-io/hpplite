@@ -51,4 +51,15 @@ int hppliteBkBegin(HppliteCtx *pCtx, int bWrite);
 
 int hppliteBkEnd(HppliteCtx *pCtx, int rc);
 
+/* hpplite.c: bInternal around HPPLite's own statements when bookkeeping shares the application connection (:memory:) */
+int hppliteBkEnter(HppliteCtx *pCtx);
+
+void hppliteBkLeave(HppliteCtx *pCtx, int saved);
+
+/* hpplite.c: load the _hpplite_meta row into the context's mirror */
+int hppliteLoadMeta(HppliteCtx *pCtx);
+
+/* finalize.c: advance _hpplite_meta past a batch (finalize, adopt, replay, skip) */
+int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId, int bWriter);
+
 #endif /* HPPLITE_INT_H */

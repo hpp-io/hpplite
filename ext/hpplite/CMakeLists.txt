@@ -76,6 +76,7 @@ set(HPPLITE_SOURCES
     state_hash.c
     capture.c
     bookkeeping.c
+    finalize.c
     capture_rows.c
     batch.c
     crypto.c
