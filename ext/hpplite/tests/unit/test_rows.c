@@ -9,6 +9,10 @@
 
 #include "test_lib.h"
 #include "capture_rows.h"
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/time.h>
 
 #define DIR "/tmp/hpplite_test_rows"
 
@@ -296,6 +300,95 @@ static void test_cursor_open_across_foreign_schema_change(void) {
     if (rcClosed != SQLITE_DONE || !ok2) FAIL("the writes after the cursor closed were not accepted");
     if (texts != textsFirst || recs != 4 - textsFirst) FAILF("the write after the first one should be rows, nothing pinned: %lld text, %lld records", (long long)texts, (long long)recs);
     if (why) FAIL(why);
+    PASS();
+}
+
+/* #75: another connection commits between VACUUM's release of the file and
+** the VACUUM marker reaching the log. Its records address rowids the VACUUM
+** renumbered and precede the marker: a replica applies them before it
+** VACUUMs. The hook runs at that point; the other connection writes there
+** - from a thread, and from a process - and the barrier must hold it until
+** the marker is in. The hook waits for it a while, not for ever: with the
+** barrier the write is still waiting when the hook gives up. */
+static void other_writes(sqlite3 *db) {
+    exec(db, "UPDATE n SET v = 'seen' WHERE v = 'three'");         /* its first write after the VACUUM (text on some SQLites) */
+    exec(db, "UPDATE n SET v = 'changed' WHERE v = 'seen'");       /* ...and one its triggers record: rowid 2, post-VACUUM */
+}
+static double now_s(void) { struct timeval tv; gettimeofday(&tv, NULL); return tv.tv_sec + tv.tv_usec / 1e6; }
+typedef struct { W *w; volatile int done; } Racer;
+static void *racer_thread(void *pArg) { Racer *r = (Racer *)pArg; other_writes(r->w->db); r->done = 1; return NULL; }
+static pthread_t g_racerThread;
+static void vacuum_race_thread_hook(void *pArg) {
+    Racer *r = (Racer *)pArg;
+    double t0 = now_s();
+    pthread_create(&g_racerThread, NULL, racer_thread, r);
+    while (!r->done && now_s() - t0 < 1.5) usleep(10 * 1000);
+    printf("(the other thread %s inside the window) ", r->done ? "wrote" : "was still waiting");
+}
+static pid_t g_racerPid;
+static void vacuum_race_process_hook(void *pArg) {
+    const char *path = (const char *)pArg;
+    double t0 = now_s();
+    int status = 0;
+    g_racerPid = fork();
+    if (g_racerPid == 0) {
+        W c;
+        if (!open_writer(path, &c)) _exit(2);
+        other_writes(c.db);
+        close_writer(&c);
+        _exit(0);
+    }
+    int exited = 0;
+    while (!(exited = waitpid(g_racerPid, &status, WNOHANG) != 0) && now_s() - t0 < 1.5) usleep(10 * 1000);
+    printf("(the other process %s inside the window) ", exited ? "wrote" : "was still waiting");
+}
+static void vacuum_race_case(const char *tag, void (*hook)(void *), void *pArg, W *w, W *w2, int bThread) {
+    exec(w->db, "CREATE TABLE n(v); INSERT INTO n VALUES('one'); INSERT INTO n VALUES('two'); INSERT INTO n VALUES('three'); DELETE FROM n WHERE v = 'two'");
+    /* rowids 1 and 3 now; VACUUM renumbers 'three' to rowid 2 (no INTEGER PRIMARY KEY) */
+    sqlite3_int64 beforeId = scalar(w->db, "SELECT MAX(id) FROM _hpplite_pending");
+    hpplite_test_before_vacuum_log = hook;
+    hpplite_test_before_vacuum_log_arg = pArg;
+    int ok = exec(w->db, "VACUUM");
+    hpplite_test_before_vacuum_log = NULL;
+    hpplite_test_before_vacuum_log_arg = NULL;
+    if (bThread) pthread_join(g_racerThread, NULL);
+    else { int st = 0; waitpid(g_racerPid, &st, 0); }
+    char *order = query_text(w->db, "SELECT id || ':' || CASE WHEN op THEN 'rec' ELSE substr(sql, 1, 6) END FROM _hpplite_pending ORDER BY id");
+    char zq[200];
+    snprintf(zq, sizeof zq, "SELECT MIN(id) FROM _hpplite_pending WHERE id > %lld AND NOT (op = 0 AND sql = 'VACUUM')", (long long)beforeId);
+    sqlite3_int64 markerId = scalar(w->db, "SELECT MIN(id) FROM _hpplite_pending WHERE op = 0 AND sql = 'VACUUM'");
+    sqlite3_int64 firstAfter = scalar(w->db, zq);
+    sqlite3_int64 nMarkers = scalar(w->db, "SELECT count(*) FROM _hpplite_pending WHERE op = 0 AND sql = 'VACUUM'");
+    sqlite3_int64 changed = scalar(w->db, "SELECT count(*) FROM n WHERE v = 'changed'");
+    if (order) { char *p; for (p = order; *p; p++) if (*p == '\n') *p = ' '; }
+    printf("(%s: log %s) ", tag, order ? order : "?");
+    sqlite3_free(order);
+    int nr, nt;
+    const char *why = replica_differs(w, tpath(bThread ? "vacrace_rt.db" : "vacrace_rp.db"), &nr, &nt);
+    if (w2) close_writer(w2);
+    close_writer(w);
+    if (!ok) FAIL("VACUUM failed");
+    if (changed != 1) FAIL("the other connection's writes did not land");
+    if (markerId < 0 || firstAfter < 0) FAIL("the marker or the other connection's writes are missing from the log");
+    if (markerId > firstAfter) FAILF("the VACUUM marker (id %lld) comes after the other connection's post-VACUUM writes (id %lld)", (long long)markerId, (long long)firstAfter);
+    if (nMarkers != 1) FAILF("one VACUUM marker, got %lld", (long long)nMarkers);
+    if (why) FAIL(why);
+}
+static void test_vacuum_marker_ordered_before_foreign_records(void) {
+    TEST("a write by another thread's connection between VACUUM's release and its marker waits: the marker precedes its records, replica equal (#75)");
+    reset_dir();
+    W w, w2;
+    if (!open_writer(DIR "/vacrace.db", &w) || !open_writer(DIR "/vacrace.db", &w2)) FAIL("open");
+    Racer r = { &w2, 0 };
+    vacuum_race_case("thread", vacuum_race_thread_hook, &r, &w, &w2, 1);
+    PASS();
+}
+static void test_vacuum_marker_ordered_before_other_process(void) {
+    TEST("the same from another process's connection: it waits at the barrier until the marker is logged, replica equal (#75)");
+    reset_dir();
+    W w;
+    if (!open_writer(DIR "/vacrace2.db", &w)) FAIL("open");
+    vacuum_race_case("process", vacuum_race_process_hook, (void *)(DIR "/vacrace2.db"), &w, NULL, 0);
     PASS();
 }
 
@@ -865,6 +958,8 @@ int main(void) {
     test_table_rebuild_migration();
     test_table_from_another_connection();
     test_cursor_open_across_foreign_schema_change();
+    test_vacuum_marker_ordered_before_foreign_records();
+    test_vacuum_marker_ordered_before_other_process();
     test_autoincrement_and_fts5();
     test_failures_and_rollbacks();
     test_write_beside_open_text_statement();

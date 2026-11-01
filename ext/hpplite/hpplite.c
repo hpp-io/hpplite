@@ -18,6 +18,8 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include "state_tree.h"
 
 #include <time.h>
@@ -334,6 +336,16 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
     return rc;
   }
   hppliteLoadMeta(pCtx);
+  pCtx->vacuumFd = -1;
+  {
+    /* the VACUUM barrier (#75): one lock file per database file, by its real path */
+    const char *zFile = sqlite3_db_filename(db, "main");
+    char resolved[PATH_MAX], path[PATH_MAX + 24];
+    if (zFile && zFile[0] && realpath(zFile, resolved)) {
+      snprintf(path, sizeof path, "%s-hpplite-vacuum", resolved);
+      pCtx->vacuumFd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);     /* -1 (a read-only directory): no barrier */
+    }
+  }
   pCtx->seenSchema = hppliteSchemaVersion(pCtx);
   pCtx->bClockPin = hpplite_clock_on(db);
   hpplitePragmaModeRead(pCtx);
@@ -422,6 +434,7 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
   }
   hppliteFreeFunctionChecks(pCtx);
   hppliteTreeFree(pCtx);
+  if (pCtx->vacuumFd >= 0) close(pCtx->vacuumFd);                         /* its flock goes with it */
   sqlite3_free(pCtx->aNoClock);
   sqlite3_free(pCtx->zRowsTextOnly);
   sqlite3_free(pCtx->zRowsSeq);

@@ -246,8 +246,13 @@ file beside the database that also keeps the seed of the sequencer's id
 sequencer to L1; a copy of the file on another machine is not). Every
 connection also holds `<file>-hpplite-users` shared while open, so a closing
 sequencer knows whether someone will take over: it keeps the lease for them,
-or releases it when it is the last. Both files belong with the database (and
-need a local filesystem, as SQLite's WAL does). Followers capture into the
+or releases it when it is the last. A third, `<file>-hpplite-vacuum`, orders
+VACUUM against everyone else's writes (#75): a VACUUM holds it exclusively
+from before it starts until its marker is in the log, every captured
+statement outside a transaction holds it shared while it runs, so no record
+addressing the rowids a VACUUM renumbered can land ahead of the marker a
+replica must apply first. The files belong with the database (and need a
+local filesystem, as SQLite's WAL does). Followers capture into the
 shared log and post nothing; the sequencer's flush posts everyone's rows in
 commit order, transaction groups intact (`tests/unit/test_concurrency.c`:
 threads and processes writing at once, replica equal). Loading HPPLite twice

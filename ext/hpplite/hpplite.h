@@ -133,6 +133,10 @@ struct HppliteCtx {
   char *zRowsSeq;             /* sqlite_sequence when last looked at: name '\0' seq '\0' ... '\0' */
   sqlite3_stmt *pVacuumStmt;  /* A VACUUM running: the ATTACH inside it is its own */
   int vacuumSchema;           /* ...schema_version as it started (VACUUM bumps it when done) */
+  int vacuumFd;               /* <file>-hpplite-vacuum (#75): a VACUUM holds it exclusively from its start until its
+                              ** marker is logged; a captured statement holds it shared while it runs. -1: none */
+  int bBarrierHeld;           /* ...this connection's shared hold, for the statement in progress */
+  int bVacuumBarrier;         /* ...its exclusive hold, for its VACUUM */
   char zDropTable[256];       /* The table the statement being prepared drops (its triggers go with it) */
   int nDropAllowed;           /* ...how many of its capture triggers that one prepare may still drop (#71) */
   char *zDbName;              /* This database's name among its wallet's rollups (#61), or NULL */
@@ -436,6 +440,9 @@ void hpplite_refresh_meta(HppliteCtx *pCtx);
 #ifdef HPPLITE_TEST_HOOKS
 extern int hpplite_test_fail_commits;   /* mock builds: the next n bookkeeping COMMITs fail as SQLITE_FULL */
 extern long hpplite_test_rows_hashed;   /* rows read for a state root since the counter was last zeroed (#9) */
+/* called after a VACUUM released the file and before its marker is logged (#75): another connection's turn */
+extern void (*hpplite_test_before_vacuum_log)(void *pArg);
+extern void *hpplite_test_before_vacuum_log_arg;
 #endif
 
 /*

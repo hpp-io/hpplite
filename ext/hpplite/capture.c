@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -1108,9 +1109,51 @@ static void rerunStatementDone(HppliteCtx *pCtx, sqlite3_stmt *pS) {
   pCtx->seenSchema = hppliteSchemaVersion(pCtx);
 }
 
+/*
+** The VACUUM barrier (#75). VACUUM renumbers the rowids of tables without
+** an INTEGER PRIMARY KEY and its marker can only be logged after it ran
+** and released the file (a log row cannot be written inside it). Between
+** that release and the marker, another connection could log records that
+** address the new rowids, ahead of the marker a replica needs first. So a
+** VACUUM holds <file>-hpplite-vacuum exclusively from before it starts
+** until its marker is in the log, and every captured statement holds it
+** shared from its start to its end: nothing of theirs is logged inside the
+** window. Only a statement outside a transaction takes it - one inside a
+** write transaction holds the file itself and a VACUUM waits for it, one
+** under a read snapshot cannot write past a VACUUM anyway (SQLITE_BUSY) -
+** so a VACUUM never waits on a connection that waits on it. flock: per
+** descriptor, so connections in one process order themselves the same
+** way, and the OS lets go when a process dies.
+*/
+static void barrierShared(HppliteCtx *pCtx) {
+  if (pCtx->vacuumFd < 0 || pCtx->bBarrierHeld || pCtx->bVacuumBarrier) return;
+  if (sqlite3_txn_state(pCtx->db, "main") != SQLITE_TXN_NONE) return;
+  if (flock(pCtx->vacuumFd, LOCK_SH) == 0) pCtx->bBarrierHeld = 1;
+}
+static void barrierRelease(HppliteCtx *pCtx) {
+  if (!pCtx->bBarrierHeld) return;
+  flock(pCtx->vacuumFd, LOCK_UN);
+  pCtx->bBarrierHeld = 0;
+}
+static void barrierExclusive(HppliteCtx *pCtx) {
+  if (pCtx->vacuumFd < 0) return;
+  barrierRelease(pCtx);
+  if (flock(pCtx->vacuumFd, LOCK_EX) == 0) pCtx->bVacuumBarrier = 1;
+}
+static void barrierExclusiveEnd(HppliteCtx *pCtx) {
+  if (!pCtx->bVacuumBarrier) return;
+  flock(pCtx->vacuumFd, LOCK_UN);
+  pCtx->bVacuumBarrier = 0;
+}
+
 /* A VACUUM that ran, into the log as a group of its own; the application's
 ** last_insert_rowid() is kept (VACUUM is not a statement whose changes()
 ** anyone reads) */
+#ifdef HPPLITE_TEST_HOOKS
+void (*hpplite_test_before_vacuum_log)(void *pArg) = NULL;
+void *hpplite_test_before_vacuum_log_arg = NULL;
+#endif
+
 static void logVacuum(HppliteCtx *pCtx) {
   sqlite3_stmt *q = NULL;
   sqlite3_int64 appRowid = sqlite3_last_insert_rowid(pCtx->db);
@@ -1196,6 +1239,7 @@ static int hppliteSchemaProbe(HppliteCtx *pCtx) {
 static int captureStart(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *zSql, int slot) {
   char *zExpanded;
   int rc, saved, bDeferred = pCtx->bCaptureDeferred;
+  if (pS != pCtx->pVacuumStmt) barrierShared(pCtx);           /* no record of this statement inside a VACUUM's window (#75) */
   /* Row capture (#19): the triggers record what a write changes - its text,
   ** its functions and the clock no longer matter. A write on a table they do
   ** not cover yet (created by another connection since the last rebuild) is
@@ -1416,6 +1460,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
     rerunCommit(pCtx);
   }
   if (mask == SQLITE_TRACE_STMT) { pCtx->pRefusedStmt = NULL; pCtx->bDenyReprepare = 0; }   /* a new statement: the refused one ran or failed */
+  if (mask == SQLITE_TRACE_PROFILE) barrierRelease(pCtx);     /* the statement is over: its records are in (#75) */
   if (mask == SQLITE_TRACE_STMT) {
     /* Sub-programs are traced too and have no PROFILE event of their own.
     ** Named triggers say so ("-- TRIGGER x"); foreign key actions (ON
@@ -1475,7 +1520,11 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
       ** now, not as it started (VACUUM cannot run in the transaction a log
       ** row would open), and only when it ran (it bumps schema_version). */
       pCtx->pVacuumStmt = NULL;
+#ifdef HPPLITE_TEST_HOOKS
+      if (hpplite_test_before_vacuum_log) hpplite_test_before_vacuum_log(hpplite_test_before_vacuum_log_arg);
+#endif
       if (pCtx->vacuumSchema >= 0 && hppliteSchemaVersion(pCtx) != pCtx->vacuumSchema) logVacuum(pCtx);
+      barrierExclusiveEnd(pCtx);
     }
     if (pS == pCtx->pRerunStmt && pCtx->rerunStage == 1 && stmtExpired(pS)) {
       /* the failed first run of a stale statement: no effect to check - the
@@ -1536,6 +1585,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
       /* VACUUM INTO writes a copy elsewhere: this database is unchanged */
       pCtx->pVacuumStmt = pS;
       pCtx->vacuumSchema = strcasestr(z, "INTO") ? -1 : hppliteSchemaVersion(pCtx);
+      if (pCtx->vacuumSchema >= 0) barrierExclusive(pCtx);    /* ours alone until the marker is logged (#75) */
     }
   }
   return captureStart(pCtx, pS, zSql, slot);
