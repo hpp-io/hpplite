@@ -705,6 +705,97 @@ static void refuseStatement(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *zWhy
   sqlite3_interrupt(pCtx->db);
 }
 
+/* 'localtime' / 'utc' as a time function's modifier; zIn lower-cased.
+** Literals already looked at are blanked, as isTimeFunctionArg expects. */
+static int usesTimeZone(const char *zIn) {
+  size_t n = strlen(zIn), i;
+  char *z = sqlite3_malloc64(n + 1);
+  int hit = 0;
+  if (!z) return 0;
+  memcpy(z, zIn, n + 1);
+  for (i = 0; i < n && !hit; i++) {
+    if (z[i] == '\'') {
+      size_t j = i + 1;
+      while (j < n && !(z[j] == '\'' && z[j + 1] != '\'')) j += (z[j] == '\'') ? 2 : 1;
+      if (((j - i - 1 == 9 && strncmp(z + i + 1, "localtime", 9) == 0)
+           || (j - i - 1 == 3 && strncmp(z + i + 1, "utc", 3) == 0)) && isTimeFunctionArg(z, i)) {
+        hit = 1;
+      }
+      for (size_t m = i; m <= j && m < n; m++) z[m] = '#';
+      i = j;
+    }
+  }
+  sqlite3_free(z);
+  return hit;
+}
+
+/*
+** Why a statement logged as text could not replay (#104): the one place the
+** text rules are applied, with no effect on the connection (the function
+** check keeps its cache; see functionVerdict). Writes the reason, with its
+** advice, into zWhy. The caller counts, warns or refuses by the verdict.
+** Only for a tracked statement (isTrackedSql), as the rules presume one.
+*/
+typedef enum {
+  TEXT_REPLAYS = 0,  /* nothing against it */
+  TEXT_VALUE,        /* a value replay cannot reproduce: counted; determinism=warn lets it through */
+  TEXT_FUNCTION,     /* a function the replica does not have: counted, never let through */
+  TEXT_NEVER         /* never, and not a determinism matter: the check failed, our tables named,
+                     ** bound values this SQLite cuts (#62) */
+} TextVerdict;
+
+static TextVerdict textVerdict(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *zSql, char *zWhy, size_t nWhy) {
+  /* the refusal says why this statement is text, so the rule is not taken
+  ** for row capture's (#85) */
+  const char *zAsText = pCtx->bRows
+    ? " - this statement is logged as text (a schema change, a write reaching a virtual table, or a table another"
+      " connection just created) and replays as written"
+    : "";
+  const char *zWhat = NULL;
+  char *lower = lowercaseDup(zSql);
+  if (lower) {
+    /* the clock replays when the connection is on the clock VFS (#56);
+    ** a machine's time zone never does */
+    if (usesTimeZone(lower))
+      zWhat = "'localtime'/'utc' depend on the machine's time zone, which differs between replicas";
+    else if (!pCtx->bClockPin && isNondeterministicSql(lower))
+      zWhat = "non-deterministic SQL (random(), 'now', CURRENT_TIMESTAMP, date() ...) cannot be replayed";
+    sqlite3_free(lower);
+  }
+  if (zWhat) {
+    snprintf(zWhy, nWhy, "%s%s; bind the value instead", zWhat, zAsText);
+    return TEXT_VALUE;
+  }
+  if (mentionsHppliteTable(zSql)) {
+    /* A write that names our tables where the authorizer could not see it
+    ** (RENAME TO _hpplite_x, a subquery over the log whose rows differ on
+    ** every replica): not logged, so not allowed either. */
+    snprintf(zWhy, nWhy, "application writes may not reference _hpplite_ tables");
+    return TEXT_NEVER;
+  }
+  zWhat = functionVerdict(pCtx, pS);
+  if (zWhat && strncmp(zWhat, "could not check", 15) == 0) {
+    /* the check itself failed (out of memory): nothing to advise */
+    snprintf(zWhy, nWhy, "%s", zWhat);
+    return TEXT_NEVER;
+  }
+  if (zWhat) {
+    snprintf(zWhy, nWhy, "%s%s; compute the value in the application and bind it", zWhat, zAsText);
+    return strstr(zWhat, "defined by the application") ? TEXT_FUNCTION : TEXT_VALUE;
+  }
+  /* A SQLite that cuts bound values in the expansion is used with row
+  ** capture only (#62): the few statements still logged as text are
+  ** refused when they bind anything, which would replay cut */
+  if (pCtx->bExpandTruncates && pS && sqlite3_bind_parameter_count(pS) > 0) {
+    snprintf(zWhy, nWhy, "this SQLite truncates bound values in sqlite3_expanded_sql() (better-sqlite3's "
+             "bundled SQLite), and this statement is logged as text (a schema change, a write that "
+             "reaches a virtual table, or the first write to a table another connection just "
+             "created): put the values in its text, or run it on a stock SQLite");
+    return TEXT_NEVER;
+  }
+  return TEXT_REPLAYS;
+}
+
 /*
 ** Trace callback. SQLITE_TRACE_STMT runs at the start of every statement on
 ** the application connection: the statement text is written into
@@ -739,30 +830,6 @@ static int currentMode(HppliteCtx *pCtx) {
     }
   }
   return mode | pCtx->pragmaMode;
-}
-
-/* 'localtime' / 'utc' as a time function's modifier; zIn lower-cased.
-** Literals already looked at are blanked, as isTimeFunctionArg expects. */
-static int usesTimeZone(const char *zIn) {
-  size_t n = strlen(zIn), i;
-  char *z = sqlite3_malloc64(n + 1);
-  int hit = 0;
-  if (!z) return 0;
-  memcpy(z, zIn, n + 1);
-  for (i = 0; i < n && !hit; i++) {
-    if (z[i] == '\'') {
-      size_t j = i + 1;
-      while (j < n && !(z[j] == '\'' && z[j + 1] != '\'')) j += (z[j] == '\'') ? 2 : 1;
-      if (((j - i - 1 == 9 && strncmp(z + i + 1, "localtime", 9) == 0)
-           || (j - i - 1 == 3 && strncmp(z + i + 1, "utc", 3) == 0)) && isTimeFunctionArg(z, i)) {
-        hit = 1;
-      }
-      for (size_t m = i; m <= j && m < n; m++) z[m] = '#';
-      i = j;
-    }
-  }
-  sqlite3_free(z);
-  return hit;
 }
 
 /*
@@ -1185,52 +1252,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
     pCtx->pRowsTextStmt = pS;
     pCtx->bRowsCapOff = 1;
   }
-  /* Statements replay cannot reproduce are refused when logged as text
-  ** (every write under capture=text; with row capture a schema change, a
-  ** write reaching a virtual table, or a table another connection just
-  ** created, #19): connection state that changes what a later statement
-  ** does, and non-deterministic values. Refused by default so the
-  ** application learns at the write, not from a root mismatch 100 batches
-  ** later; determinism=warn keeps the old warn-and-count behaviour. The
-  ** refusal says why this statement is text, so the rule is not taken for
-  ** row capture's (#85). */
-  const char *zAsText = pCtx->bRows
-    ? " - this statement is logged as text (a schema change, a write reaching a virtual table, or a table another"
-      " connection just created) and replays as written"
-    : "";
-  {
-    char *lower = lowercaseDup(zSql);
-    const char *zWhy = NULL;
-    if (lower) {
-      /* the clock replays when the connection is on the clock VFS (#56);
-      ** a machine's time zone never does */
-      if (isTrackedSql(zSql) && usesTimeZone(lower))
-        zWhy = "'localtime'/'utc' depend on the machine's time zone, which differs between replicas";
-      else if (isTrackedSql(zSql) && !pCtx->bClockPin && isNondeterministicSql(lower))
-        zWhy = "non-deterministic SQL (random(), 'now', CURRENT_TIMESTAMP, date() ...) cannot be replayed";
-    }
-    sqlite3_free(lower);
-    if (zWhy) {
-      pCtx->nNondeterministic++;
-      if (!pCtx->bDeterminismWarn) {
-        char why[400];
-        snprintf(why, sizeof(why), "%s%s; bind the value instead", zWhy, zAsText);
-        refuseStatement(pCtx, pS, why, zSql);
-        return 0;
-      }
-      if (pCtx->nNondeterministic == 1) {
-        fprintf(stderr, "hpplite: %s; verification will report a mismatch: %.80s\n", zWhy, zSql);
-      }
-    }
-  }
   if (!isTrackedSql(zSql)) return 0;
-  if (mentionsHppliteTable(zSql)) {
-    /* A write that names our tables where the authorizer could not see it
-    ** (RENAME TO _hpplite_x, a subquery over the log whose rows differ on
-    ** every replica): not logged, so not allowed either. */
-    refuseStatement(pCtx, pS, "application writes may not reference _hpplite_ tables", zSql);
-    return 0;
-  }
   {
     const char *z = zSql;
     while (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r') z++;
@@ -1239,37 +1261,28 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
       pCtx->nDdlGen++;                    /* views and triggers change what a write calls */
     }
   }
+  /* Statements replay cannot reproduce are refused when logged as text
+  ** (every write under capture=text; with row capture a schema change, a
+  ** write reaching a virtual table, or a table another connection just
+  ** created, #19). Refused by default so the application learns at the
+  ** write, not from a root mismatch 100 batches later; determinism=warn
+  ** keeps the old warn-and-count behaviour for a value (never for a
+  ** function the replica lacks, or a statement that cannot be logged). */
   {
-    const char *zWhy = functionVerdict(pCtx, pS);
-    if (zWhy && strncmp(zWhy, "could not check", 15) == 0) {
-      /* the check itself failed (out of memory): refused, nothing to advise */
-      refuseStatement(pCtx, pS, zWhy, zSql);
-      return 0;
-    }
-    if (zWhy) {
-      int bAppFn = strstr(zWhy, "defined by the application") != NULL;
-      char why[400];
-      pCtx->nNondeterministic++;
-      /* determinism=warn lets non-deterministic values through (counted);
-      ** a function the replica does not have never replays at all */
-      if (!pCtx->bDeterminismWarn || bAppFn) {
-        snprintf(why, sizeof(why), "%s%s; compute the value in the application and bind it", zWhy, zAsText);
+    char why[512];
+    TextVerdict v = textVerdict(pCtx, pS, zSql, why, sizeof why);
+    if (v != TEXT_REPLAYS) {
+      if (v != TEXT_NEVER) pCtx->nNondeterministic++;
+      if (v != TEXT_VALUE || !pCtx->bDeterminismWarn) {
         refuseStatement(pCtx, pS, why, zSql);
         return 0;
+      }
+      if (pCtx->nNondeterministic == 1) {
+        fprintf(stderr, "hpplite: %s; verification will report a mismatch: %.80s\n", why, zSql);
       }
     }
   }
 
-  /* A SQLite that cuts bound values in the expansion (below) is used with
-  ** row capture only (#62): the few statements still logged as text are
-  ** refused when they bind anything, which would replay cut */
-  if (pCtx->bExpandTruncates && pS && sqlite3_bind_parameter_count(pS) > 0) {
-    refuseStatement(pCtx, pS, "this SQLite truncates bound values in sqlite3_expanded_sql() (better-sqlite3's "
-                    "bundled SQLite), and this statement is logged as text (a schema change, a write that "
-                    "reaches a virtual table, or the first write to a table another connection just "
-                    "created): put the values in its text, or run it on a stock SQLite", zSql);
-    return 0;
-  }
   /* Bound parameters are substituted so the statement can be replayed */
   zExpanded = sqlite3_expanded_sql(pS);
   if (!zExpanded) {
