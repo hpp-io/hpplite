@@ -48,8 +48,8 @@ jobs:
           HPPLITE_SOAK_SECONDS: ${{ github.event.inputs.seconds || '3600' }}
           HPPLITE_SOAK_EVERY: ${{ github.event.inputs.every || '10' }}
           HPPLITE_ANVIL_TESTS: '16'
-          # an hour of blocks would otherwise fill the runner's disk with anvil's state snapshots
-          HPPLITE_ANVIL_ARGS: '--prune-history'
+          # states older than 200 blocks are dropped: an hour of blocks would otherwise fill the runner's disk with anvil's state snapshots; block 0 must still be there when forge deploys the factory (a bare --prune-history keeps the latest state only and the deployment fails)
+          HPPLITE_ANVIL_ARGS: '--prune-history 200'
         run: sh ext/hpplite/tests/l1/anvil_test.sh ext/hpplite/build_real/test_anvil
       - name: disk after the run
         if: always()
