@@ -182,9 +182,9 @@ the statement's first run's end when its start finds the schema pinned.
 
 ## Versions (GitHub milestones)
 
-- **v0.1 — Small databases, on-chain DA** (current, complete): scope: databases up to ~100 MB, batches in contract storage on L1 (the cost driver; #11/#33).
-- **v0.2 — Verification**: #5 `hpplite verify`, per-table hashes for divergence reporting; #17 key roles and #15 viewing keys so someone without the wallet key can verify; #12 batch compression.
-- **v0.3 — Large databases, economical DA**: #11 S3 DA with L1 commitments, #9 incremental state root, #19 row-level capture. These ship together: cheap DA invites the sizes where a full-scan root is the wall.
+- **v0.1 — Small databases, on-chain DA** (complete, end of life): scope: databases up to ~100 MB, batches in contract storage on L1 (the cost driver; #11/#33).
+- **v0.2 — Verification** (v0.2.0 tagged 2026-11-01): #19 row capture by default, #5 `hpplite verify`, several writers per file, the fault harness (#98) as the gate, the SQLite-dependence inventory and trunk CI job (#105, #108). Still open in the milestone: #49 realistic singleton tests on anvil, #62 the SQLite TCL suite with HPPLite on every connection.
+- **v0.3 — Large databases, economical DA**: #11 S3 DA with L1 commitments, #9 incremental state root, #12 batch compression, #17 key roles and #15 viewing keys. These ship together: cheap DA invites the sizes where a full-scan root is the wall.
 - **v1.0 — Stable formats**: frozen batch JSON / `_hpplite_meta` / `hppda://`, bindings.
 
 ---
