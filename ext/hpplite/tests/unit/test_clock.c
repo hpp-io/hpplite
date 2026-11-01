@@ -22,7 +22,7 @@ static const unsigned char PRIVKEY[32] = {
 #define DIR "/tmp/hpplite_test_clock"
 
 static HppliteNode *open_node_lim(const char *dbPath, HppliteL1 *l1, size_t limit) {
-    TestNodeOpts o = { .maxBatchBytes = limit };
+    TestNodeOpts o = { .maxBatchBytes = limit, .checkpointInterval = TEST_INTERVAL_1000 };
     return test_open_node(dbPath, l1, &o);
 }
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_lim(dbPath, l1, 0); }

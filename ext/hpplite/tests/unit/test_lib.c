@@ -133,7 +133,7 @@ HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpt
     config.hasPrivkey = 1;
     config.dataDir = g_dir;
     config.dbPath = (char *)dbPath;
-    config.checkpointInterval = o->checkpointInterval == TEST_INTERVAL_NODE ? 0 : o->checkpointInterval ? o->checkpointInterval : 1000;
+    config.checkpointInterval = o->checkpointInterval;                   /* 0: the node's default, as in the config (#114) */
     config.maxBatchBytes = o->maxBatchBytes;
     config.noEncrypt = o->noEncrypt;
     config.verifyOnly = o->verifyOnly;

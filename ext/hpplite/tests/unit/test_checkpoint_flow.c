@@ -17,7 +17,7 @@ static const unsigned char SEQ_PRIVKEY[32] = {
 /* a fresh file each time, in the local throw-away mode (#38) with the mock
 ** attached but not synced from; checkpointInterval 0: none given */
 static HppliteNode *open_node(HppliteL1 *l1, int checkpointInterval) {
-    TestNodeOpts o = { .checkpointInterval = checkpointInterval ? checkpointInterval : TEST_INTERVAL_NODE, .localOnly = 1, .noSync = 1 };
+    TestNodeOpts o = { .checkpointInterval = checkpointInterval, .localOnly = 1, .noSync = 1 };
     reset_dir();
     return test_open_node(DIR "/test.db", l1, &o);
 }

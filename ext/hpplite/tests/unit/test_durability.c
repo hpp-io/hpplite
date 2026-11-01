@@ -26,7 +26,7 @@ static const unsigned char PRIVKEY[32] = {
 
 /* no checkpoint interval given: the node's own default */
 static HppliteNode *open_node_mode(const char *dbPath, HppliteL1 *l1, int determinismWarn) {
-    TestNodeOpts o = { .checkpointInterval = TEST_INTERVAL_NODE, .determinismWarn = determinismWarn };
+    TestNodeOpts o = { .determinismWarn = determinismWarn };           /* the node's own checkpoint interval */
     return test_open_node(dbPath, l1, &o);
 }
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_mode(dbPath, l1, 0); }

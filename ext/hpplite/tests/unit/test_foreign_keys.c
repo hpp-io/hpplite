@@ -27,7 +27,8 @@ static const unsigned char PRIVKEY[32] = {
 
 #define DIR "/tmp/hpplite_test_fk"
 
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, NULL); }
+static const TestNodeOpts NODE = { .checkpointInterval = TEST_INTERVAL_1000 };
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, &NODE); }
 
 /* The check every test ends with: one flush, rebuild a replica from L1,
 ** compare every row and the state root. Destroys the writer. */

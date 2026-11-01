@@ -38,7 +38,7 @@ static pid_t spawn_writer(const char *mode, const char *db, const char *who, int
 }
 
 /* the mock's DA limit is lifted: these tests are about order, not size */
-static const TestNodeOpts NODE = { .daLimit = 64 * 1024 * 1024 };
+static const TestNodeOpts NODE = { .daLimit = 64 * 1024 * 1024, .checkpointInterval = TEST_INTERVAL_1000 };
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, &NODE); }
 
 /* A full node - L1 configured, as an application's connection is - on the

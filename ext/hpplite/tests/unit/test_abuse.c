@@ -25,7 +25,7 @@ static const unsigned char PRIVKEY[32] = {
 #define DIR "/tmp/hpplite_test_abuse"
 
 static HppliteNode *open_node_ex(const char *dbPath, HppliteL1 *l1, size_t maxBatchBytes, int noEncrypt) {
-    TestNodeOpts o = { .maxBatchBytes = maxBatchBytes, .noEncrypt = noEncrypt };
+    TestNodeOpts o = { .maxBatchBytes = maxBatchBytes, .noEncrypt = noEncrypt, .checkpointInterval = TEST_INTERVAL_1000 };
     return test_open_node(dbPath, l1, &o);
 }
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_ex(dbPath, l1, 0, 0); }
@@ -430,7 +430,7 @@ static void test_text_verdicts(void) {
 
     /* determinism=warn: a value replay cannot reproduce is let through and
     ** counted; a function the replica does not have is still refused */
-    TestNodeOpts o = { .determinismWarn = 1 };
+    TestNodeOpts o = { .determinismWarn = 1, .checkpointInterval = TEST_INTERVAL_1000 };
     HppliteNode *w = test_open_node(DIR "/verdict_warn.db", NULL, &o);
     if (!w) FAIL("open warn");
     sqlite3_create_function(w->db, "app_double", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, fn_app_double, NULL, NULL);

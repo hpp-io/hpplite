@@ -13,7 +13,8 @@ static const unsigned char PRIVKEY[32] = {
     0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xbb,0xbc,0xbd,0xbe,0xbf,0xc0
 };
 #define DIR "/tmp/hpplite_test_reorg"
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, NULL); }
+static const TestNodeOpts NODE = { .checkpointInterval = TEST_INTERVAL_1000 };
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, &NODE); }
 static void write_and_flush(HppliteNode *n, int i) {
     char sql[64];
     snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%d)", i);

@@ -56,11 +56,11 @@ char *query_text(sqlite3 *db, const char *sql);               /* every row, colu
 
 /* A node: created on dbPath with the suite's id and key, then, with an L1,
 ** attached to it, synced from it and started (hpplite_node_start). Options
-** at zero are the suites' usual: a checkpoint every 1000 batches, sealed
-** batches, local-only when there is no L1 (#38), not started without one. */
-#define TEST_INTERVAL_NODE (-1)              /* checkpointInterval: none given, the node's own default */
+** at zero are the node's own, but for the chain: local-only when there is
+** no L1 (#38), not started without one. Most suites set TEST_INTERVAL_1000. */
+#define TEST_INTERVAL_1000 1000              /* checkpointInterval the suites usually want: a checkpoint (a root) every 1000 batches, not the node's every 100 */
 typedef struct TestNodeOpts {
-    int checkpointInterval;                  /* 0: 1000; TEST_INTERVAL_NODE: none given */
+    int checkpointInterval;                  /* as HppliteNodeConfig: 0 = the node's own default (100); TEST_INTERVAL_1000 is the suites' usual */
     size_t maxBatchBytes;                    /* the node's DA limit; the mock takes it as the contract's */
     size_t daLimit;                          /* the mock's DA limit alone, the node left to find it */
     int noEncrypt;                           /* plaintext batches */

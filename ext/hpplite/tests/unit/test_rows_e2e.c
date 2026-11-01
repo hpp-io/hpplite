@@ -32,7 +32,7 @@ static const unsigned char PRIVKEY[32] = {
 #define DIR "/tmp/hpplite_test_rows_e2e"
 
 static HppliteNode *open_node_ex(const char *dbPath, HppliteL1 *l1, size_t maxBatch, int noEncrypt) {
-    TestNodeOpts o = { .maxBatchBytes = maxBatch, .noEncrypt = noEncrypt };
+    TestNodeOpts o = { .maxBatchBytes = maxBatch, .noEncrypt = noEncrypt, .checkpointInterval = TEST_INTERVAL_1000 };
     return test_open_node(dbPath, l1, &o);
 }
 static int g_plain;                     /* replicas of an encrypt=off history read plaintext */
@@ -44,7 +44,7 @@ static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_n
 /* Flush everything, rebuild a replica from L1, compare all rows and the
 ** root. Destroys the writer. */
 static const char *replica_matches(HppliteNode *w, HppliteL1 *l1, const char *replicaFile) {
-    TestNodeOpts o = { .noEncrypt = g_plain };
+    TestNodeOpts o = { .noEncrypt = g_plain, .checkpointInterval = TEST_INTERVAL_1000 };
     return test_replica_check(w, l1, tpath(replicaFile), &o, DUMP_FLAGS, 50, 1);
 }
 
@@ -395,7 +395,7 @@ static void test_text_history_then_rows(void) {
     TEST("a database with statement history (posted and pending) continues with records: replica equal");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts text = { .captureText = 1 };
+    TestNodeOpts text = { .captureText = 1, .checkpointInterval = TEST_INTERVAL_1000 };
     HppliteNode *w = test_open_node(DIR "/hist.db", l1, &text);
     if (!w) FAIL("open text");
     hpplite_node_exec(w, "CREATE TABLE e(id INTEGER PRIMARY KEY, body, at)", NULL);
@@ -589,7 +589,7 @@ static void test_connection_pragmas(void) {
 
     /* text capture: LIKE's case sensitivity decides which rows a write touches */
     l1 = hpplite_l1_create_mock();
-    TestNodeOpts text = { .captureText = 1 };
+    TestNodeOpts text = { .captureText = 1, .checkpointInterval = TEST_INTERVAL_1000 };
     w = test_open_node(DIR "/like.db", l1, &text);
     if (!w) FAIL("open text");
     const char *sql2[] = {
@@ -701,7 +701,7 @@ static void test_state_and_last_error(void) {
 /* No chain configured (#38): the log is the product, so it is kept pending
 ** until one is; l1=local is the explicit throw-away mode */
 static HppliteNode *open_chainless(const char *dbPath, int localOnly) {
-    TestNodeOpts o = { .localOnly = localOnly ? 1 : -1, .start = 1 };
+    TestNodeOpts o = { .localOnly = localOnly ? 1 : -1, .start = 1, .checkpointInterval = TEST_INTERVAL_1000 };
     return test_open_node(dbPath, NULL, &o);
 }
 static void test_no_chain_keeps_the_log(void) {

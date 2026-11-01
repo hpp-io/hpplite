@@ -25,7 +25,7 @@ static const unsigned char PRIVKEY[32] = {
 #define DIR "/tmp/hpplite_test_big_txn"
 #define LIMIT 2000                       /* DA batch limit in these tests */
 
-static const TestNodeOpts NODE = { .maxBatchBytes = LIMIT };
+static const TestNodeOpts NODE = { .maxBatchBytes = LIMIT, .checkpointInterval = TEST_INTERVAL_1000 };
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, &NODE); }
 
 /* One transaction of n inserts of ~90 bytes each (n=60: ~3 batches) */

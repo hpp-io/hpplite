@@ -20,7 +20,7 @@ static const unsigned char PRIVKEY[32] = {
 #define DIR "/tmp/hpplite_test_big_stmt"
 #define LIMIT 3000
 
-static const TestNodeOpts NODE = { .maxBatchBytes = LIMIT };
+static const TestNodeOpts NODE = { .maxBatchBytes = LIMIT, .checkpointInterval = TEST_INTERVAL_1000 };
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, &NODE); }
 /* INSERT INTO p VALUES (...),(...) ... with n rows: quotes, escapes and
 ** multi-byte UTF-8 in it, so a cut has to respect all three */
