@@ -173,10 +173,10 @@ if(HPPLITE_BUILD_TESTS)
 
     # === Unit Tests (no network required) ===
     add_executable(test_hpplite tests/unit/test_hpplite.c)
-    target_link_libraries(test_hpplite hpplite)
+    target_link_libraries(test_hpplite hpplite_testlib)
 
     add_executable(test_batch tests/unit/test_batch.c)
-    target_link_libraries(test_batch hpplite)
+    target_link_libraries(test_batch hpplite_testlib)
 
     add_executable(test_node tests/unit/test_node.c)
     target_link_libraries(test_node hpplite)
@@ -188,7 +188,7 @@ if(HPPLITE_BUILD_TESTS)
     target_link_libraries(test_simple_open hpplite)
 
     add_executable(test_cipher tests/unit/test_cipher.c)
-    target_link_libraries(test_cipher hpplite)
+    target_link_libraries(test_cipher hpplite_testlib)
 
     # Tests that use mock L1 - only build when not using real L1
     if(NOT HPPLITE_USE_REAL_L1)
@@ -268,7 +268,7 @@ if(HPPLITE_BUILD_TESTS)
 
         # Real contracts on a local anvil chain (issue #47): free, deterministic, in ctest
         add_executable(test_anvil tests/l1/test_anvil.c)
-        target_link_libraries(test_anvil hpplite)
+        target_link_libraries(test_anvil hpplite_testlib)
         target_include_directories(test_anvil PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME test_anvil COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/anvil_test.sh $<TARGET_FILE:test_anvil>)
         set_tests_properties(test_anvil PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)

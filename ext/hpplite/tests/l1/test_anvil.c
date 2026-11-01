@@ -10,25 +10,16 @@
 ** that what capture accepts survives the real path: sealed, posted to
 ** contract storage at the size limit, replayed by a fresh replica.
 */
-#include "hpplite.h"
-#include "node.h"
+#include "test_lib.h"
 #include "l1_interface.h"
 #include "eth/eth_client.h"
 #include "batch.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
 
 #define DIR "/tmp/hpplite_anvil"
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); fflush(stdout); tests_run++; } while (0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while (0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while (0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while (0)
 
 static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3, *KEY4, *KEY5, *ANVIL_PID;
 
@@ -49,14 +40,6 @@ static sqlite3 *open_db(const char *file, const char *key, const char *extra) {
         return NULL;
     }
     return db;
-}
-
-static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
-    sqlite3_stmt *s; sqlite3_int64 v = -1;
-    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
-    return v;
 }
 
 static void dump_state(HppliteL1 *l1, const unsigned char *mine, const char *why) {
@@ -586,14 +569,6 @@ static void test_reorg(void) {
     PASS();
 }
 
-static void text_of(sqlite3 *db, const char *sql, char *out, size_t n) {
-    sqlite3_stmt *s;
-    out[0] = 0;
-    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return;
-    if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_text(s, 0)) snprintf(out, n, "%s", sqlite3_column_text(s, 0));
-    sqlite3_finalize(s);
-}
-
 /* 10. One wallet, several databases (#61): each named database gets its own
 ** rollup beside the wallet's first (which already has history here), and a
 ** replica that only knows the name finds it; {file} names a database by its
@@ -643,7 +618,8 @@ int main(void) {
     KEY3 = getenv("HPPLITE_ANVIL_KEY3"); KEY4 = getenv("HPPLITE_ANVIL_KEY4"); ANVIL_PID = getenv("HPPLITE_ANVIL_PID");
     KEY5 = getenv("HPPLITE_ANVIL_KEY5");
     if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3 || !KEY4 || !KEY5 || !ANVIL_PID) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
+    test_suite_init("anvil", NULL, DIR);
+    reset_dir();
     printf("=== HPPLite on anvil (%s) ===\n", RPC);
     test_open_write_post_checkpoint();
     test_verify_tool();
@@ -656,7 +632,6 @@ int main(void) {
     test_l1_outage();
     test_reorg();
     test_named_databases();
-    printf("=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
-    (void)!system("rm -rf " DIR);
-    return tests_passed == tests_run ? 0 : 1;
+    remove_dir();
+    return test_report();
 }

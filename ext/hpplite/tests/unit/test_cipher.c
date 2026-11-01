@@ -3,15 +3,8 @@
 ** envelope round trip.
 */
 
+#include "test_lib.h"
 #include "cipher.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
 static int hexeq(const uint8_t *b, const char *hex, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -134,6 +127,5 @@ int main(void) {
     test_rfc5869_hkdf();
     test_hmac();
     test_envelope();
-    printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

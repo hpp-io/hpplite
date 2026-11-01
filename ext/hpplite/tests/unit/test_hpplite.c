@@ -8,15 +8,8 @@
 **   - commit / rollback callbacks
 */
 
-#include <stdio.h>
-#include <string.h>
-#include "hpplite.h"
+#include "test_lib.h"
 #include "batch.h"
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
 static int commits = 0, rollbacks = 0;
 static void on_commit(void *arg, unsigned char *root, int n) { (void)arg; (void)root; (void)n; commits++; }
@@ -33,9 +26,7 @@ static void close_ctx(sqlite3 *db, HppliteCtx *ctx) {
     sqlite3_close(db);
 }
 
-static int exec(sqlite3 *db, const char *sql) {
-    return sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
-}
+static int exec(sqlite3 *db, const char *sql) { return exec_sql(db, sql) == SQLITE_OK; }
 
 static int root_is_zero(const unsigned char *r) {
     unsigned char zero[HPPLITE_HASH_SIZE] = {0};
@@ -336,6 +327,5 @@ int main(void) {
     test_nondeterminism_detected();
     test_callbacks();
     test_txn_groups();
-    printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

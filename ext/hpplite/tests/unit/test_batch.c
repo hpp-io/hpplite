@@ -2,15 +2,8 @@
 ** HPPLite batch serialization tests
 */
 
-#include <stdio.h>
-#include <string.h>
-#include "hpplite_sqlite.h"
+#include "test_lib.h"
 #include "batch.h"
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
 static void test_roundtrip(void) {
     HppliteBatch *b, *p;
@@ -148,6 +141,5 @@ int main(void) {
     test_legacy_and_partial();
     test_empty_and_malformed();
     test_hex();
-    printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }
