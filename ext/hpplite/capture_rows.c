@@ -458,7 +458,12 @@ static int rebuild(HppliteCtx *pCtx) {
       "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table'"
       " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\' ORDER BY name",
       -1, &q, NULL);
-    while (rc == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
+    while (rc == SQLITE_OK) {
+      /* a listing that fails (the schema stale and pinned by a running
+      ** statement, #108) is a failed rebuild, not a database without tables:
+      ** triggers for none would cover nothing and say "covered" */
+      int s = sqlite3_step(q);
+      if (s != SQLITE_ROW) { if (s != SQLITE_DONE) rc = s; break; }
       if (n == cap) { cap = cap ? cap * 2 : 16; azName = sqlite3_realloc(azName, cap * (int)sizeof(char *)); }
       azName[n++] = sqlite3_mprintf("%s", (const char *)sqlite3_column_text(q, 0));
     }
