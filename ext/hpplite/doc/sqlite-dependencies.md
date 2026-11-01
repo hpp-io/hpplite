@@ -30,7 +30,7 @@ the same binary with `HPPLITE_CAPTURE=text`.
 | 5 | The connection's error code is SQLITE_SCHEMA while SQLite reprepares a stale statement | test_rows | ok |
 | 6 | `sqlite3_expired()` is set by a stale first run and by a rollback that undid a schema change | test_rows | ok |
 | 7 | `SQLITE_FCNTL_DATA_VERSION` moves per own commit and per detected change, not per foreign commit | test_rows_e2e | ok |
-| 8 | The rollback hook fires for the implicit rollback of a failed autocommit statement | **not pinned** | ok |
+| 8 | The rollback hook fires for the implicit rollback of a failed autocommit statement | test_hpplite(+_text) | ok |
 | 9 | `sqlite3_expanded_sql()` truncates bound values in some builds | test_env_enable | ok |
 | 10 | A schema reset is immediate even while another statement of the connection is running | test_rows, test_concurrency(+_text), test_faults(+_text), test_rows_e2e | **broken** |
 
@@ -286,16 +286,14 @@ that began writing is.
 **HPPLite code.** `capture.c` `hppliteRollbackHook()`; installed in
 `hpplite.c` `hpplite_init_ex()` and re-armed by `rearmHooks()`.
 
-**Pinned by.** Not pinned. test_hpplite `test_callbacks` ("commit and
-rollback callbacks fire per transaction") counts one rollback for an
-explicit ROLLBACK only. test_rows `test_failures_and_rollbacks` runs a
-failing autocommit INSERT followed by autocommit writes but asserts on
-record count and replica equality, which a stale group id does not change.
-Proposed test (test_hpplite, the core path under both capture modes):
-after a successful autocommit INSERT, an autocommit INSERT that fails a
-UNIQUE constraint, then another successful one; assert the `on_rollback`
-callback count is 1, and that the last row of `_hpplite_pending` has
-`txn = 0` (a group of its own), not the id of the rolled-back row.
+**Pinned by.** test_hpplite and test_hpplite_text
+`test_rollback_hook_failed_autocommit` ("a failed autocommit statement fires
+the rollback hook; the next row starts its own group", #109): after a
+successful autocommit INSERT, one that fails a UNIQUE constraint, then
+another successful one, the `on_rollback` callback has fired once and the
+last `_hpplite_pending` row has `txn = 0` (a group of its own). Without the
+hook's `curTxn = 0` the row joins the rolled-back row's group ("group 3,
+want 0").
 
 ## 9. `sqlite3_expanded_sql()` truncates bound values in some builds
 

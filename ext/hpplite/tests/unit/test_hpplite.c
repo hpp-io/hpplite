@@ -297,6 +297,32 @@ static void test_callbacks(void) {
     PASS();
 }
 
+/* SQLite's rollback hook fires for the implicit rollback of a failed
+** autocommit statement (doc/sqlite-dependencies.md, entry 8): HPPLite's
+** hook ends the transaction group there, so the next autocommit row is a
+** group of its own and not one whose first row was rolled back */
+static void test_rollback_hook_failed_autocommit(void) {
+    sqlite3 *db; HppliteCtx *ctx;
+    TEST("a failed autocommit statement fires the rollback hook; the next row starts its own group (#109)");
+    if (!open_ctx(&db, &ctx)) FAIL("open");
+    hpplite_set_callbacks(ctx, NULL, on_commit, on_rollback);
+    exec(db, "CREATE TABLE t(x UNIQUE)");
+    exec(db, "INSERT INTO t VALUES(1)");
+    commits = rollbacks = 0;
+    if (sqlite3_exec(db, "INSERT INTO t VALUES(1)", NULL, NULL, NULL) != SQLITE_CONSTRAINT) FAIL("the UNIQUE failure");
+    if (rollbacks != 1) FAILF("rollbacks %d after the failed statement, want 1 (its implicit rollback)", rollbacks);
+    if (commits != 0) FAILF("commits %d after the failed statement, want 0", commits);
+    exec(db, "INSERT INTO t VALUES(2)");
+    if (commits != 1) FAILF("commits %d, want 1", commits);
+    /* a group is named by its first row's id, stored as 0 there: an autocommit row stands alone */
+    if (scalar(db, "SELECT txn FROM _hpplite_pending ORDER BY id DESC LIMIT 1") != 0)
+        FAILF("the row after the failure is in group %lld, want its own (0): the failed statement's group was not closed",
+              (long long)scalar(db, "SELECT txn FROM _hpplite_pending ORDER BY id DESC LIMIT 1"));
+    if (count_rows(db, "t") != 2) FAIL("two rows");
+    close_ctx(db, ctx);
+    PASS();
+}
+
 static void test_txn_groups(void) {
     sqlite3 *db; HppliteCtx *ctx;
     HppliteBatch *b;
@@ -326,6 +352,7 @@ int main(void) {
     test_statement_classification();
     test_nondeterminism_detected();
     test_callbacks();
+    test_rollback_hook_failed_autocommit();
     test_txn_groups();
     return test_report();
 }
