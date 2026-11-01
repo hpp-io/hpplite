@@ -177,6 +177,10 @@ against upstream `master` and runs the mock suite, advisory
 run found trunk's deferred schema reset (2026-10-26/27) breaking the stale
 rerun path (entry 10 there), handled in #108: the capture is deferred to
 the statement's first run's end when its start finds the schema pinned.
+The nightly `hpplite soak` workflow (#120) runs scenario 16 of the anvil
+suite for an hour: a demo-like workload against the real contracts, a
+fresh replica rebuilt from the chain and `hpplite-verify` every ten
+batches; `workflow_dispatch` takes a duration.
 
 ---
 

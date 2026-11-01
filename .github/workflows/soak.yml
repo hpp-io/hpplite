@@ -1,0 +1,63 @@
+# Nightly soak (#120): a demo-like workload for an hour against the real
+# contracts on a local anvil chain, with a fresh replica rebuilt from the
+# chain and hpplite-verify run every ten batches (tests/l1/test_anvil.c,
+# scenario 16). Catches what a minute of ctest cannot: drift between the
+# writer and its history over hundreds of batches, a lease or checkpoint
+# cadence that goes wrong after a while, a leak. Manual runs take a duration.
+# No network, no funds: anvil's test accounts.
+name: hpplite soak
+on:
+  schedule:
+    - cron: '17 3 * * *'        # 03:17 UTC, daily
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'workload duration in seconds'
+        default: '3600'
+        required: false
+      every:
+        description: 'batches between oracle passes (replica rebuild + hpplite-verify)'
+        default: '10'
+        required: false
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: 1
+
+jobs:
+  soak:
+    name: soak on anvil
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config tcl \
+            libsecp256k1-dev libcurl4-openssl-dev python3
+      - name: SQLite amalgamation
+        run: mkdir -p build && cd build && ../configure >/dev/null && make -s sqlite3.c sqlite3ext.h >/dev/null
+      - name: build (real L1)
+        run: |
+          cmake -S ext/hpplite -B ext/hpplite/build_real -DHPPLITE_SQLITE_SRC=$PWD/build -DHPPLITE_USE_REAL_L1=ON \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
+          cmake --build ext/hpplite/build_real -j"$(nproc)"
+      - name: soak
+        env:
+          HPPLITE_SOAK_SECONDS: ${{ github.event.inputs.seconds || '3600' }}
+          HPPLITE_SOAK_EVERY: ${{ github.event.inputs.every || '10' }}
+          HPPLITE_ANVIL_TESTS: '16'
+          # an hour of blocks would otherwise fill the runner's disk with anvil's state snapshots
+          HPPLITE_ANVIL_ARGS: '--prune-history'
+        run: sh ext/hpplite/tests/l1/anvil_test.sh ext/hpplite/build_real/test_anvil
+      - name: disk after the run
+        if: always()
+        run: df -h / | tail -1; du -sh ~/.foundry/anvil/tmp 2>/dev/null || true
+      - name: files of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-files
+          path: /tmp/hpplite_anvil
+          if-no-files-found: ignore

@@ -26,7 +26,10 @@ key9=0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6
 log=${TMPDIR:-/tmp}/hpplite-anvil-$$.log
 # HPP Sepolia's block gas limit (2^50), not anvil's default 30M: a full
 # 128 KB batch in contract storage needs ~90M gas (#51)
-anvil --port "$port" --chain-id 31337 --silent --block-time 1 --gas-limit 1125899906842624 >"$log" 2>&1 &
+# HPPLITE_ANVIL_ARGS: extra anvil flags (the soak passes --prune-history: an
+# hour of blocks otherwise fills the runner's disk with state snapshots)
+# shellcheck disable=SC2086
+anvil --port "$port" --chain-id 31337 --silent --block-time 1 --gas-limit 1125899906842624 ${HPPLITE_ANVIL_ARGS:-} >"$log" 2>&1 &
 pid=$!
 trap 'kill -CONT $pid 2>/dev/null; kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -f "$log"' EXIT INT TERM
 for i in $(seq 1 50); do cast chain-id --rpc-url "$rpc" >/dev/null 2>&1 && break; sleep 0.2; done

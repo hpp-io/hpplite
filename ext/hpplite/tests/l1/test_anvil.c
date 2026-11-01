@@ -15,7 +15,9 @@
 ** one file killed and restarted in both orders; a misbehaving RPC endpoint
 ** (tests/l1/rpc_proxy.py in front of anvil); a power loss mid-transaction,
 ** the file and its -wal reopened as they lie. HPPLITE_ANVIL_TESTS=12,15
-** runs a selection.
+** runs a selection. 16 is the soak (#120): hours of a demo-like workload
+** with a rebuild and hpplite-verify every N batches, run only when
+** HPPLITE_SOAK_SECONDS is set (the nightly soak workflow).
 */
 #include "test_lib.h"
 #include "l1_interface.h"
@@ -646,12 +648,12 @@ static const char *chain_contiguous(HppliteNode *n) {
 
 /* A fresh file with the same key rebuilt from the chain alone has every row
 ** of `w` and its root. NULL, or why. */
-static const char *replica_equals(sqlite3 *w, const char *replicaFile, const char *key) {
+static const char *replica_equals_as(sqlite3 *w, const char *replicaFile, const char *key, const char *extra) {
     static char why[400];
     unsigned char rootW[32], rootR[32];
     char *a = test_dump(w, 0), *b;
     hpplite_state_root(w, rootW);
-    sqlite3 *r = open_db(replicaFile, key, NULL);
+    sqlite3 *r = open_db(replicaFile, key, extra);
     if (!r) { sqlite3_free(a); return "replica open"; }
     b = test_dump(r, 0);
     hpplite_state_root(r, rootR);
@@ -666,6 +668,7 @@ static const char *replica_equals(sqlite3 *w, const char *replicaFile, const cha
     sqlite3_free(a); sqlite3_free(b);
     return rows || root ? why : NULL;
 }
+static const char *replica_equals(sqlite3 *w, const char *replicaFile, const char *key) { return replica_equals_as(w, replicaFile, key, NULL); }
 
 /* 12. The database moves to another machine (#49): an empty file with the
 ** same key rebuilds from the chain and sequences once the old lease has run
@@ -1155,6 +1158,191 @@ static void test_power_loss(void) {
 }
 
 /* HPPLITE_ANVIL_TESTS=12,14 runs those cases alone (development) */
+/* 16. Soak (#120): a demo-like workload for HPPLITE_SOAK_SECONDS against
+** the real contracts, the timer posting every two seconds, a checkpoint
+** every five batches. Every HPPLITE_SOAK_EVERY batches the workload pauses,
+** the log drains, and three oracles run: a fresh file rebuilt from the chain
+** alone equals the writer (rows and root), hpplite-verify says "verified"
+** against the live file, and the status counts no refusal and no
+** non-deterministic statement. At the end the chain is contiguous. Runs
+** only when HPPLITE_SOAK_SECONDS is set (nightly, .github/workflows/soak.yml);
+** meant to run alone (HPPLITE_ANVIL_TESTS=16): it writes KEY0's rollup.
+** Not a test of SQL coverage (test_edge_sql is): a test of hours. */
+static long soak_env(const char *name, long dflt) { const char *z = getenv(name); return z && z[0] ? atol(z) : dflt; }
+static void soak_text(char *out, size_t n) {
+    static const char *words[] = { "alpha", "it's", "\"quoted\"", "caf\xc3\xa9", "x", "semi;colon", "--dash", "/*c*/", "tab\t", "nl\n", "0.1", "1e308", "", "NULL", "%s", "%%" };
+    size_t len = (size_t)(rand() % 100 < 3 ? 2000 + rand() % 20000 : rand() % 200), k = 0;
+    while (k + 1 < n && k < len) {
+        const char *w = words[rand() % (sizeof words / sizeof words[0])];
+        size_t m = strlen(w);
+        if (k + m + 1 >= n) break;
+        memcpy(out + k, w, m); k += m;
+        out[k++] = ' ';
+    }
+    out[k] = 0;
+}
+static int soak_step(sqlite3 *w, long *pStmts, long *pTxns, int *pCols) {
+    char body[24000];
+    sqlite3_stmt *st = NULL;
+    int rc = SQLITE_OK, r = rand() % 100;
+    sqlite3_int64 id = 1 + rand() % 2000;
+    if (r < 45) {
+        soak_text(body, sizeof body);
+        rc = sqlite3_prepare_v2(w, "INSERT INTO entries(name, body, posted_at, kind) VALUES(?1, ?2, ?3, ?4)", -1, &st, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, rand() % 5 ? "soak" : "", -1, SQLITE_STATIC);
+            sqlite3_bind_text(st, 2, body, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
+            if (rand() % 4) sqlite3_bind_int(st, 4, rand() % 3); else sqlite3_bind_null(st, 4);
+            rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : sqlite3_errcode(w);
+        }
+        sqlite3_finalize(st);
+        (*pStmts)++;
+    } else if (r < 60) {
+        soak_text(body, sizeof body);
+        rc = sqlite3_prepare_v2(w, "UPDATE entries SET body = ?1, kind = coalesce(kind, 0) + 1 WHERE id = ?2", -1, &st, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, body, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 2, id);
+            rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : sqlite3_errcode(w);
+        }
+        sqlite3_finalize(st);
+        (*pStmts)++;
+    } else if (r < 68) {
+        char sql[200];
+        snprintf(sql, sizeof sql, "DELETE FROM entries WHERE id = %lld", (long long)id);
+        rc = exec_sql(w, sql);
+        (*pStmts)++;
+    } else if (r < 80) {
+        /* a blob, a float, a WITHOUT ROWID key: the record kinds the demo never writes */
+        unsigned char blob[512];
+        int n = rand() % (int)sizeof blob, i;
+        for (i = 0; i < n; i++) blob[i] = (unsigned char)rand();
+        rc = sqlite3_prepare_v2(w, "INSERT OR REPLACE INTO soak_bin(id, b, f) VALUES(?1, ?2, ?3)", -1, &st, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, id);
+            sqlite3_bind_blob(st, 2, blob, n, SQLITE_STATIC);
+            sqlite3_bind_double(st, 3, rand() / 7.0);
+            rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : sqlite3_errcode(w);
+        }
+        sqlite3_finalize(st);
+        snprintf(body, sizeof body, "INSERT OR REPLACE INTO soak_kv(k, v) VALUES('k%lld', %d)", (long long)id, rand());
+        if (rc == SQLITE_OK) rc = exec_sql(w, body);
+        *pStmts += 2;
+    } else if (r < 95) {
+        /* a transaction of several statements, one in five rolled back */
+        int n = 2 + rand() % 6, i, back = rand() % 5 == 0;
+        rc = exec_sql(w, "BEGIN");
+        for (i = 0; i < n && rc == SQLITE_OK; i++) {
+            int inner = rand() % 100;
+            if (inner < 50) {
+                soak_text(body, sizeof body);
+                char sql[200];
+                snprintf(sql, sizeof sql, "INSERT INTO entries(name, body, posted_at) VALUES('txn', ?1, %ld)", (long)time(NULL));
+                rc = sqlite3_prepare_v2(w, sql, -1, &st, NULL);
+                if (rc == SQLITE_OK) { sqlite3_bind_text(st, 1, body, -1, SQLITE_STATIC); rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : sqlite3_errcode(w); }
+                sqlite3_finalize(st);
+            } else if (inner < 80) {
+                char sql[200];
+                snprintf(sql, sizeof sql, "UPDATE entries SET posted_at = posted_at + 1 WHERE id %% 7 = %d", rand() % 7);
+                rc = exec_sql(w, sql);
+            } else {
+                char sql[200];
+                snprintf(sql, sizeof sql, "DELETE FROM soak_kv WHERE k = 'k%lld'", (long long)(1 + rand() % 2000));
+                rc = exec_sql(w, sql);
+            }
+            (*pStmts)++;
+        }
+        if (rc == SQLITE_OK) rc = exec_sql(w, back ? "ROLLBACK" : "COMMIT"); else exec_sql(w, "ROLLBACK");
+        (*pTxns)++;
+    } else {
+        /* schema changes, as a migration would make them */
+        char sql[200];
+        int which = rand() % 4;
+        if (which == 0 && *pCols < 20) { snprintf(sql, sizeof sql, "ALTER TABLE entries ADD COLUMN extra%d TEXT DEFAULT ''", (*pCols)++); }
+        else if (which == 1) snprintf(sql, sizeof sql, "CREATE INDEX IF NOT EXISTS entries_kind ON entries(kind, posted_at)");
+        else if (which == 2) snprintf(sql, sizeof sql, "DROP INDEX IF EXISTS entries_kind");
+        else snprintf(sql, sizeof sql, "CREATE TABLE IF NOT EXISTS soak_side%d(id INTEGER PRIMARY KEY, t TEXT)", rand() % 3);
+        rc = exec_sql(w, sql);
+        (*pStmts)++;
+    }
+    return rc;
+}
+/* the log drained, so the file equals what the chain holds */
+static const char *soak_drain(sqlite3 *w) {
+    int i;
+    for (i = 0; i < 60; i++) {
+        if (scalar(w, "SELECT pending FROM hpplite_status") == 0) return NULL;
+        if (scalar(w, "SELECT hpplite_flush()") < 0) return "flush failed";
+        usleep(200000);
+    }
+    return "the log did not drain in 60 flushes";
+}
+static void test_soak(void) {
+    long seconds = soak_env("HPPLITE_SOAK_SECONDS", 0), every = soak_env("HPPLITE_SOAK_EVERY", 10);
+    long stmts = 0, txns = 0, checks = 0, failedStmts = 0;
+    int cols = 0;
+    double start = now_s(), deadline = start + seconds, worstRebuild = 0, worstVerify = 0;
+    sqlite3_int64 lastCheckHeight = 1;
+    char out[8192], verifyCmd[300];
+    const char *why = NULL;
+    TEST("soak: a demo-like workload for hours; every N batches a fresh replica equals the writer and hpplite-verify agrees (#120)");
+    printf("\n    %ld s, an oracle pass every %ld batches\n", seconds, every);
+    sqlite3 *w = open_db("soak.db", KEY0, "&interval=2000ms&checkpoint=5");
+    if (!w) FAIL("open writer");
+    if (exec_sql(w, "CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, name TEXT NOT NULL, body TEXT NOT NULL, posted_at INTEGER NOT NULL, kind INTEGER);"
+                    "CREATE TABLE IF NOT EXISTS soak_bin(id INTEGER PRIMARY KEY, b BLOB, f REAL);"
+                    "CREATE TABLE IF NOT EXISTS soak_kv(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID") != SQLITE_OK) { sqlite3_close(w); FAIL("schema"); }
+    cols = (int)scalar(w, "SELECT count(*) FROM pragma_table_info('entries') WHERE name LIKE 'extra%'");
+    snprintf(verifyCmd, sizeof verifyCmd, "--db " DIR "/soak.db");
+    while (now_s() < deadline && !why) {
+        int rc = soak_step(w, &stmts, &txns, &cols);
+        if (rc != SQLITE_OK) {
+            failedStmts++;
+            if (rc == SQLITE_INTERRUPT) { snprintf(out, sizeof out, "a statement was refused: %s", sqlite3_errmsg(w)); why = out; break; }
+        }
+        usleep((useconds_t)(20000 + rand() % 180000));
+        sqlite3_int64 height = scalar(w, "SELECT height FROM hpplite_status");
+        if (height >= lastCheckHeight + every) {
+            double t0, tRebuild, tVerify;
+            int vrc;
+            checks++;
+            if ((why = soak_drain(w)) != NULL) break;
+            t0 = now_s();
+            unlink(DIR "/soak_replica.db"); unlink(DIR "/soak_replica.db-wal"); unlink(DIR "/soak_replica.db-shm");
+            why = replica_equals_as(w, "soak_replica.db", KEY0, "&role=verify");
+            tRebuild = now_s() - t0;
+            if (why) break;
+            t0 = now_s();
+            out[0] = 0;
+            vrc = run_verify(verifyCmd, out, sizeof out);
+            tVerify = now_s() - t0;
+            if (vrc != 0 || !strstr(out, "\nverified")) { snprintf(out + strlen(out), sizeof out - strlen(out), "\n(hpplite-verify exit %d)", vrc); why = out; break; }
+            if (scalar(w, "SELECT log_errors FROM hpplite_status") != 0) { why = "log_errors > 0"; break; }
+            if (scalar(w, "SELECT nondeterministic FROM hpplite_status") != 0) { why = "a non-deterministic statement was let through"; break; }
+            if (tRebuild > worstRebuild) worstRebuild = tRebuild;
+            if (tVerify > worstVerify) worstVerify = tVerify;
+            printf("    %6.0f s  height %5lld  %7ld statements  %5ld txns  rebuild %.1f s  verify %.1f s  rows %lld\n",
+                   now_s() - start, (long long)height, stmts, txns, tRebuild, tVerify, (long long)scalar(w, "SELECT count(*) FROM entries"));
+            fflush(stdout);
+            lastCheckHeight = height;
+        }
+    }
+    if (!why) {
+        HppliteNode *n = hpplite_get_node(w);
+        why = soak_drain(w);
+        if (!why) why = chain_contiguous(n);
+        if (!why) { unlink(DIR "/soak_replica.db"); unlink(DIR "/soak_replica.db-wal"); unlink(DIR "/soak_replica.db-shm"); why = replica_equals_as(w, "soak_replica.db", KEY0, "&role=verify"); }
+        if (!why && run_verify(verifyCmd, out, sizeof out) != 0) why = out;
+    }
+    printf("    end: height %lld, %ld statements (%ld failed, none refused), %ld transactions, %ld oracle passes, worst rebuild %.1f s, worst verify %.1f s\n",
+           (long long)scalar(w, "SELECT height FROM hpplite_status"), stmts, failedStmts, txns, checks, worstRebuild, worstVerify);
+    sqlite3_close(w);
+    if (why) FAIL(why);
+    if (checks == 0) FAIL("no oracle pass ran: too short, or the timer never posted");
+    PASS();
+}
+
 static int wanted(int number) {
     const char *z = getenv("HPPLITE_ANVIL_TESTS");
     char tag[16];
@@ -1191,6 +1379,7 @@ int main(void) {
     if (wanted(13)) test_two_processes_one_file();
     if (wanted(14)) test_rpc_faults();
     if (wanted(15)) test_power_loss();
+    if (soak_env("HPPLITE_SOAK_SECONDS", 0) > 0) test_soak();   /* 16: only when asked (#120) */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }
