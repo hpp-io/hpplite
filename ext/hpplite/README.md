@@ -360,7 +360,13 @@ database costs nothing.
 
 | File | Description |
 |------|-------------|
-| `hpplite.c` | Capture into `_hpplite_pending` (statements, and the text-logged part of row capture), content-hash state root, batch build/finalize/replay, `hpplite_status` table, transparent API, extension entry point |
+| `hpplite.c` | Lifecycle of a tracked connection, the connection registry, transparent API, extension entry point |
+| `capture.c` | Capture into `_hpplite_pending`: the trace, authorizer, commit and rollback hooks; the text rules; the stale-rerun machinery |
+| `bookkeeping.c` | The bookkeeping transaction and the foreign-write check |
+| `finalize.c` | Batch build, size cut, finalize; the posted batches kept for a reorg |
+| `replay.c` | Applying batches from the chain; adopt, skipped heights, checkpoints |
+| `state_hash.c` | Content-hash state root and block hash (`sha256.c`) |
+| `status.c` | `hpplite_status` table and the close sentinel |
 | `capture_rows.c` | Row capture (#19): the TEMP triggers, the record format, what stays text, `sqlite_sequence`, applying records on a replica |
 | `cipher.c` | Batch encryption: ChaCha20-Poly1305, HKDF-SHA256 key derivation, envelope format, pluggable schemes |
 | `node.c` | Node lifecycle, bookkeeping connection, L1 sync, flush with retry, lease |

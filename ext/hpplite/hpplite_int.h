@@ -2,9 +2,21 @@
 ** HPPLite - internal interface between the extension's source files.
 **
 ** hpplite.h is what applications and node.c see; this header is what the
-** files of the capture engine share with each other: the context (hpplite.h),
-** and the functions one file defines for another. Everything declared here
-** is internal: the names may change with the files.
+** files of the capture engine share with each other: the context (hpplite.h)
+** and the functions one file defines for another. Everything here is
+** internal; the names may change with the files. By file:
+**
+**   hpplite.c      lifecycle (init, shutdown), the _hpplite_meta mirror, the
+**                  connection registry and the open/close API, extension entry
+**   capture.c      the hooks on the application connection: trace, authorizer,
+**                  commit and rollback; text rules; the stale-rerun machinery
+**   capture_rows.c row capture: the TEMP triggers and their records
+**   bookkeeping.c  the bookkeeping transaction and the foreign-write check
+**   finalize.c     batch building, the size cut, finalizing and posted batches
+**   replay.c       applying batches from the chain; adopt, skip, checkpoint
+**   state_hash.c   the content hash (state root) and the block hash
+**   status.c       the hpplite_status virtual table and the close sentinel
+**   sha256.c       SHA-256
 */
 #ifndef HPPLITE_INT_H
 #define HPPLITE_INT_H
@@ -22,55 +34,32 @@
 #define TEST_FAIL_COMMIT(rc) ((void)0)
 #endif
 
-/* hpplite.c: run SQL of HPPLite's own on the application connection, hooks silent */
-int hppliteInternalExec(HppliteCtx *pCtx, sqlite3 *db, const char *zSql);
-
-/* capture.c: PRAGMA schema_version (cached statement) */
-int hppliteSchemaVersion(HppliteCtx *pCtx);
-
-/* capture.c: read the connection pragmas the mode bits mirror (#28) */
-void hpplitePragmaModeRead(HppliteCtx *pCtx);
-
-/* capture.c: drop the function verdicts and the replica's function list */
-void hppliteFreeFunctionChecks(HppliteCtx *pCtx);
-
-/* capture.c: the hooks hpplite_init installs and rearmHooks re-installs */
-int hppliteCommitHook(void *pArg);
-
-/* capture.c: the hooks hpplite_init installs and rearmHooks re-installs */
-void hppliteRollbackHook(void *pArg);
-
-/* capture.c: the hooks hpplite_init installs and rearmHooks re-installs */
-int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX);
-
-/* capture.c: the hooks hpplite_init installs and rearmHooks re-installs */
-int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const char *z3, const char *z4);
-
-/* bookkeeping.c: a bookkeeping transaction, read or write; bkEnd commits or rolls back and notices foreign writes */
-int hppliteBkBegin(HppliteCtx *pCtx, int bWrite);
-
-int hppliteBkEnd(HppliteCtx *pCtx, int rc);
-
-/* hpplite.c: bInternal around HPPLite's own statements when bookkeeping shares the application connection (:memory:) */
-int hppliteBkEnter(HppliteCtx *pCtx);
-
-void hppliteBkLeave(HppliteCtx *pCtx, int saved);
-
-/* hpplite.c: load the _hpplite_meta row into the context's mirror */
-int hppliteLoadMeta(HppliteCtx *pCtx);
-
-/* finalize.c: advance _hpplite_meta past a batch (finalize, adopt, replay, skip) */
-int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId, int bWriter);
-
-/* status.c: the close sentinel and the hpplite_status table on a registered connection */
-void hppliteStatusRegister(sqlite3 *db);
-
-/* hpplite.c: the registry of application connections and their nodes */
-struct HppliteNode *hppliteFindNode(sqlite3 *db);
-
+/* hpplite.c */
+int hppliteInternalExec(HppliteCtx *pCtx, sqlite3 *db, const char *zSql);  /* SQL of HPPLite's own on the application connection, hooks silent */
+int hppliteBkEnter(HppliteCtx *pCtx);          /* bInternal around HPPLite's own statements when bookkeeping shares the */
+void hppliteBkLeave(HppliteCtx *pCtx, int saved);  /* ...application connection (:memory:) */
+int hppliteLoadMeta(HppliteCtx *pCtx);         /* the _hpplite_meta row into the context's mirror */
+struct HppliteNode *hppliteFindNode(sqlite3 *db);  /* the registry of application connections and their nodes */
 void hppliteRemoveNode(sqlite3 *db);
+void hppliteOnClose(sqlite3 *db);              /* the connection close, from the status table's xDisconnect */
 
-/* hpplite.c: the connection close, from the status table's xDisconnect */
-void hppliteOnClose(sqlite3 *db);
+/* capture.c */
+int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX);  /* the hooks hpplite_init installs */
+int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const char *z3, const char *z4);  /* ...and re-arms */
+int hppliteCommitHook(void *pArg);
+void hppliteRollbackHook(void *pArg);
+int hppliteSchemaVersion(HppliteCtx *pCtx);    /* PRAGMA schema_version (cached statement) */
+void hpplitePragmaModeRead(HppliteCtx *pCtx);  /* the connection pragmas the mode bits mirror (#28) */
+void hppliteFreeFunctionChecks(HppliteCtx *pCtx);  /* the function verdicts and the replica's function list */
+
+/* bookkeeping.c */
+int hppliteBkBegin(HppliteCtx *pCtx, int bWrite);  /* a bookkeeping transaction, read or write... */
+int hppliteBkEnd(HppliteCtx *pCtx, int rc);    /* ...committed or rolled back; a foreign write is noticed here (#37) */
+
+/* finalize.c */
+int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId, int bWriter);  /* past a batch: finalize, adopt, replay, skip */
+
+/* status.c */
+void hppliteStatusRegister(sqlite3 *db);       /* the close sentinel and the hpplite_status table on a registered connection */
 
 #endif /* HPPLITE_INT_H */

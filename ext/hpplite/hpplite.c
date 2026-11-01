@@ -1,8 +1,10 @@
 /*
 ** HPPLite - Verifiable SQLite
 **
-** Core: statement capture into _hpplite_pending, batch building, content-hash
-** state roots, replay from L1. See hpplite.h for the persistence model.
+** Lifecycle of a tracked connection (init, shutdown, the _hpplite_meta
+** mirror), the connection registry and the open/close API, the extension
+** entry point. The capture engine's other files are listed in hpplite_int.h;
+** hpplite.h has the persistence model.
 */
 
 #include "hpplite_int.h"

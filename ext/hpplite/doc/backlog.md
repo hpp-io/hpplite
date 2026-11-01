@@ -224,7 +224,13 @@ The code for these features still exists but is not part of the primary architec
 
 ```
 ext/hpplite/
-├── hpplite.c/h          # Core state tracking, transparent API
+├── hpplite.c/h          # Lifecycle, registry, transparent API (hpplite_int.h lists the files below)
+├── capture.c            # Trace/authorizer/commit/rollback hooks, text rules, stale reruns
+├── bookkeeping.c        # Bookkeeping transaction, foreign-write check
+├── finalize.c           # Batch build, size cut, finalize
+├── replay.c             # Replay, adopt, skip, checkpoint
+├── state_hash.c         # State root, block hash
+├── status.c             # hpplite_status table
 ├── batch.c/h            # Batch serialization
 ├── crypto.c/h           # secp256k1 signing
 ├── node.c/h             # Node lifecycle, timer
