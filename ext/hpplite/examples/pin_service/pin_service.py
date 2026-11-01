@@ -52,6 +52,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -232,10 +233,22 @@ class Payments:
             return None
 
     def _facilitator_post(self, path, body):
+        # a named User-Agent: HPP's facilitator sits behind a WAF that answers 403 to Python's default
         req = urllib.request.Request(self.facilitator + path, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read())
+                                     headers={"Content-Type": "application/json", "Accept": "application/json",
+                                              "User-Agent": "hpplite-pin-service/1 (+https://github.com/shepelt/hpplite)"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", "replace")[:300]
+            sys.stderr.write("pin_service: facilitator %s answered %d: %s\n" % (path, e.code, text))
+            return {"isValid": False, "success": False, "invalidReason": "facilitator_error", "errorReason": "facilitator_error",
+                    "invalidMessage": "%d %s" % (e.code, text), "errorMessage": "%d %s" % (e.code, text), "transaction": "", "network": self.network}
+        except (OSError, ValueError) as e:
+            sys.stderr.write("pin_service: facilitator %s unreachable: %s\n" % (path, e))
+            return {"isValid": False, "success": False, "invalidReason": "facilitator_unreachable", "errorReason": "facilitator_unreachable",
+                    "invalidMessage": str(e), "errorMessage": str(e), "transaction": "", "network": self.network}
 
     # --- the mock facilitator: anvil, the token itself checks the signature ---
     def _mock_calldata(self, auth, sig_hex):
@@ -480,7 +493,7 @@ def main():
     ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, 'mock' (anvil), or none: free")
     ap.add_argument("--network", default="eip155:181228")
     ap.add_argument("--asset", default="0x401eCb1D350407f13ba348573E5630B83638E30D", help="the EIP-3009 token (USDC.e on HPP)")
-    ap.add_argument("--asset-name", default="USDC.e", help="the token's EIP-712 domain name")
+    ap.add_argument("--asset-name", default="Bridged USDC", help="the token's EIP-712 domain name (USDC.e on HPP: name() is \"Bridged USDC\", version \"2\")")
     ap.add_argument("--asset-version", default="2")
     ap.add_argument("--rpc", default=None, help="mock facilitator: the chain to verify and settle on")
     ap.add_argument("--settle-key", default=None, help="mock facilitator: the key that submits transferWithAuthorization")

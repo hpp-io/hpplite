@@ -5,12 +5,13 @@ pragma solidity ^0.8.19;
  * @title MockUSDC
  * @notice A stand-in for USDC.e on anvil (#125): an ERC-20 with EIP-3009
  *         transferWithAuthorization, which is what x402's `exact` scheme
- *         settles with. Six decimals; the deployer gets the supply. The
- *         EIP-712 domain is ("USDC.e", "2"), what the pin service quotes.
- *         Not for any chain that matters.
+ *         settles with. Six decimals; the deployer gets the supply.
+ *         Not for any chain that matters. The EIP-712 domain is the real
+ *         token's: name "Bridged USDC", version "2" (its symbol is USDC.e;
+ *         HPP's facilitator checks the name against the token, #11).
  */
 contract MockUSDC {
-    string public constant name = "USDC.e";
+    string public constant name = "Bridged USDC";
     string public constant symbol = "USDC.e";
     uint8 public constant decimals = 6;
     uint256 public totalSupply;

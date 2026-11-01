@@ -63,8 +63,9 @@ nonce; the facilitator submits it and pays the gas. `hpp-x402 serve
 `--facilitator mock` stands in for the facilitator on anvil: verify is an
 `eth_call` of `transferWithAuthorization` (the token itself checks the
 signature), settle is `cast send` of the same call from `--settle-key`.
-`contracts/src/test/MockUSDC.sol` is the token, EIP-3009 with the domain
-`("USDC.e", "2")`. That is anvil scenario 18 (`tests/l1/test_anvil.c`):
+`contracts/src/test/MockUSDC.sol` is the token, EIP-3009 with the real
+token's domain, `("Bridged USDC", "2")` (its `name()`; the symbol is USDC.e,
+and HPP's facilitator checks the quoted name against the token). That is anvil scenario 18 (`tests/l1/test_anvil.c`):
 the buyer pays a put and a pin, is refused over its cap before signing,
 and the pay-to wallet ends richer by what settled.
 
