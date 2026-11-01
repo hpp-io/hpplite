@@ -4,6 +4,8 @@
 
 #include "crypto.h"
 #include "hpplite_sqlite.h"
+#include "keccak256.h"
+#include "eth_client.h"
 #include <secp256k1.h>
 #include <secp256k1_recovery.h>
 #include <string.h>
@@ -16,95 +18,11 @@ struct HppliteCrypto {
     secp256k1_context *ctx;
 };
 
-/*
-** Keccak256 implementation (simplified - Ethereum's hash)
-** In production, use a proper library like tiny_keccak
-*/
-
-/* Keccak constants */
-static const uint64_t keccak_round_constants[24] = {
-    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL,
-    0x8000000080008000ULL, 0x000000000000808bULL, 0x0000000080000001ULL,
-    0x8000000080008081ULL, 0x8000000000008009ULL, 0x000000000000008aULL,
-    0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
-    0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL,
-    0x8000000000008003ULL, 0x8000000000008002ULL, 0x8000000000000080ULL,
-    0x000000000000800aULL, 0x800000008000000aULL, 0x8000000080008081ULL,
-    0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
-};
-
-static const int keccak_rotation[24] = {
-    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14,
-    27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44
-};
-
-static const int keccak_pi[24] = {
-    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4,
-    15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1
-};
-
-#define ROTL64(x, n) (((x) << (n)) | ((x) >> (64 - (n))))
-
-static void keccak_f1600(uint64_t state[25]) {
-    uint64_t t, bc[5];
-    int round, i, j;
-
-    for (round = 0; round < 24; round++) {
-        /* Theta */
-        for (i = 0; i < 5; i++)
-            bc[i] = state[i] ^ state[i + 5] ^ state[i + 10] ^ state[i + 15] ^ state[i + 20];
-        for (i = 0; i < 5; i++) {
-            t = bc[(i + 4) % 5] ^ ROTL64(bc[(i + 1) % 5], 1);
-            for (j = 0; j < 25; j += 5)
-                state[j + i] ^= t;
-        }
-
-        /* Rho and Pi */
-        t = state[1];
-        for (i = 0; i < 24; i++) {
-            j = keccak_pi[i];
-            bc[0] = state[j];
-            state[j] = ROTL64(t, keccak_rotation[i]);
-            t = bc[0];
-        }
-
-        /* Chi */
-        for (j = 0; j < 25; j += 5) {
-            for (i = 0; i < 5; i++)
-                bc[i] = state[j + i];
-            for (i = 0; i < 5; i++)
-                state[j + i] ^= (~bc[(i + 1) % 5]) & bc[(i + 2) % 5];
-        }
-
-        /* Iota */
-        state[0] ^= keccak_round_constants[round];
-    }
-}
-
+/* Keccak-256 and hex: eth/keccak256.c and eth_client.c hold the one
+** implementation of each (#50); these are the names the rest of HPPLite
+** uses */
 void hpplite_keccak256(const unsigned char *data, size_t len, unsigned char *hash_out) {
-    uint64_t state[25] = {0};
-    size_t rate = 136;  /* (1600 - 256*2) / 8 */
-    size_t i;
-    unsigned char *state_bytes = (unsigned char *)state;
-
-    /* Absorb */
-    while (len >= rate) {
-        for (i = 0; i < rate; i++)
-            state_bytes[i] ^= data[i];
-        keccak_f1600(state);
-        data += rate;
-        len -= rate;
-    }
-
-    /* Pad and absorb final block */
-    for (i = 0; i < len; i++)
-        state_bytes[i] ^= data[i];
-    state_bytes[len] ^= 0x01;
-    state_bytes[rate - 1] ^= 0x80;
-    keccak_f1600(state);
-
-    /* Squeeze */
-    memcpy(hash_out, state, 32);
+    keccak256(data, len, hash_out);
 }
 
 /*
@@ -351,53 +269,12 @@ void hpplite_sig_to_eth_format(
     if (v) *v = 27 + sig->recid;
 }
 
-/*
-** Bytes to hex string
-*/
+/* Bytes to lowercase hex (no 0x), terminated; hex (0x or not) to bytes: the
+** count, or -1 on an odd length, a bad digit or more than max_len bytes */
 void hpplite_bytes_to_hex(const unsigned char *bytes, size_t len, char *hex_out) {
-    static const char hex_chars[] = "0123456789abcdef";
-    size_t i;
-
-    for (i = 0; i < len; i++) {
-        hex_out[i * 2] = hex_chars[(bytes[i] >> 4) & 0xf];
-        hex_out[i * 2 + 1] = hex_chars[bytes[i] & 0xf];
-    }
-    hex_out[len * 2] = '\0';
+    eth_hex_encode_to(bytes, len, hex_out);
 }
 
-/*
-** Hex string to bytes
-*/
 int hpplite_hex_to_bytes(const char *hex, unsigned char *bytes_out, size_t max_len) {
-    size_t hex_len = strlen(hex);
-    size_t i;
-    int hi, lo;
-
-    /* Skip 0x prefix */
-    if (hex_len >= 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
-        hex += 2;
-        hex_len -= 2;
-    }
-
-    if (hex_len % 2 != 0) return -1;
-    if (hex_len / 2 > max_len) return -1;
-
-    for (i = 0; i < hex_len / 2; i++) {
-        hi = hex[i * 2];
-        lo = hex[i * 2 + 1];
-
-        if (hi >= '0' && hi <= '9') hi = hi - '0';
-        else if (hi >= 'a' && hi <= 'f') hi = hi - 'a' + 10;
-        else if (hi >= 'A' && hi <= 'F') hi = hi - 'A' + 10;
-        else return -1;
-
-        if (lo >= '0' && lo <= '9') lo = lo - '0';
-        else if (lo >= 'a' && lo <= 'f') lo = lo - 'a' + 10;
-        else if (lo >= 'A' && lo <= 'F') lo = lo - 'A' + 10;
-        else return -1;
-
-        bytes_out[i] = (hi << 4) | lo;
-    }
-
-    return hex_len / 2;
+    return eth_hex_decode_any(hex, bytes_out, max_len);
 }

@@ -94,6 +94,10 @@ const char *eth_client_error(EthClient *client);
 /* Hex encode/decode utilities */
 char *eth_hex_encode(const uint8_t *data, size_t len);
 int eth_hex_decode(const char *hex, uint8_t *out, size_t out_len);
+/* Hex of any even length (0x or not) to bytes: the count, or -1 on an odd length, a bad digit or more than max bytes */
+int eth_hex_decode_any(const char *hex, uint8_t *out, size_t max);
+/* Lowercase hex without 0x into a caller's buffer of 2 * len + 1 */
+void eth_hex_encode_to(const uint8_t *data, size_t len, char *out);
 
 /* Derive Ethereum address from compressed (33-byte) public key */
 int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address[20]);

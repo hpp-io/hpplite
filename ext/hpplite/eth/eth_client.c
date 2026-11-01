@@ -61,33 +61,48 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
 }
 
 /* Hex utilities */
+void eth_hex_encode_to(const uint8_t *data, size_t len, char *out) {
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2] = digits[(data[i] >> 4) & 0xf];
+        out[i * 2 + 1] = digits[data[i] & 0xf];
+    }
+    out[len * 2] = '\0';
+}
+
 char *eth_hex_encode(const uint8_t *data, size_t len) {
     char *hex = malloc(2 + len * 2 + 1);
     if (!hex) return NULL;
-    
     hex[0] = '0';
     hex[1] = 'x';
-    for (size_t i = 0; i < len; i++) {
-        sprintf(hex + 2 + i * 2, "%02x", data[i]);
-    }
-    hex[2 + len * 2] = '\0';
+    eth_hex_encode_to(data, len, hex + 2);
     return hex;
 }
 
+static int hex_digit(int ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+int eth_hex_decode_any(const char *hex, uint8_t *out, size_t max) {
+    size_t n, i;
+    if (!hex) return -1;
+    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex += 2;
+    n = strlen(hex);
+    if (n % 2 != 0 || n / 2 > max) return -1;
+    for (i = 0; i < n / 2; i++) {
+        int hi = hex_digit((unsigned char)hex[i * 2]), lo = hex_digit((unsigned char)hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return (int)(n / 2);
+}
+
+/* Exactly out_len bytes: 0, or -1 */
 int eth_hex_decode(const char *hex, uint8_t *out, size_t out_len) {
-    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) {
-        hex += 2;
-    }
-    
-    size_t hex_len = strlen(hex);
-    if (hex_len != out_len * 2) return -1;
-    
-    for (size_t i = 0; i < out_len; i++) {
-        unsigned int byte;
-        if (sscanf(hex + i * 2, "%02x", &byte) != 1) return -1;
-        out[i] = (uint8_t)byte;
-    }
-    return 0;
+    return eth_hex_decode_any(hex, out, out_len) == (int)out_len ? 0 : -1;
 }
 
 /* Make JSON-RPC call */
