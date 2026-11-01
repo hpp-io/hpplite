@@ -122,6 +122,7 @@ HppliteConfig *hpplite_config_create(void) {
     cfg->role = HPPLITE_CFG_ROLE_OBSERVER;  /* Safe default */
     cfg->batchIntervalMs = 5000;  /* 5 seconds default */
     cfg->encrypt = 1;             /* everything posted is public otherwise */
+    cfg->storeFallback = 1;       /* a store that does not answer never holds a batch back (#11) */
 
     return cfg;
 }
@@ -455,6 +456,9 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_STORE_CAP, buf, sizeof(buf)) && atoll(buf) > 0) {
         cfg->storeCap = (uint64_t)atoll(buf);
     }
+    if (get_uri_param(uri, HPPLITE_URI_STORE_FALLBACK, buf, sizeof(buf))) {
+        cfg->storeFallback = strcasecmp(buf, "off") != 0 && strcmp(buf, "0") != 0;
+    }
     if (get_uri_param(uri, HPPLITE_URI_MAX_TX_GAS, buf, sizeof(buf)) && atoll(buf) > 0) {
         cfg->maxTxGas = (uint64_t)atoll(buf);
     }
@@ -598,6 +602,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_CAP);
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_FALLBACK);
+    if (val) cfg->storeFallback = strcasecmp(val, "off") != 0 && strcmp(val, "0") != 0;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX_GAS);
     if (val && atoll(val) > 0) cfg->maxTxGas = (uint64_t)atoll(val);
 

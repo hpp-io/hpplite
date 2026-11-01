@@ -74,6 +74,39 @@ static void test_roundtrip(HppliteStore *s) {
     PASS();
 }
 
+static void test_receipt(HppliteStore *s) {
+    TEST("the receipt's signature recovers to the provider's published signer; a changed byte or another signer does not verify");
+    const uint8_t data[] = "bytes under a receipt";
+    unsigned char signer[20], payTo[20], h[32];
+    uint64_t chainId = 0;
+    uint8_t compact[HPPLITE_RECEIPT_SIZE];
+    if (hpplite_store_signer(s, signer) != 0 || hpplite_store_domain(s, payTo, &chainId) != 0) FAIL("the service's /status should name its signer and domain");
+    char *zReceipt = NULL, *zRef = hpplite_store_put(s, data, sizeof(data) - 1, &zReceipt);
+    if (!zRef || !zReceipt) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAILF("put: %s", hpplite_store_error(s)); }
+    if (hpplite_store_receipt_compact(zReceipt, payTo, compact) != HPPLITE_RECEIPT_SIZE) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("compact"); }
+    hpplite_keccak256(data, sizeof(data) - 1, h);
+    if (hpplite_store_receipt_verify(compact, sizeof compact, h, zRef, chainId, signer) != 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("a good receipt does not verify"); }
+    {
+        unsigned char other[20];
+        memset(other, 0x42, 20);
+        if (hpplite_store_receipt_verify(compact, sizeof compact, h, zRef, chainId, other) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified against another signer"); }
+        uint8_t bad[HPPLITE_RECEIPT_SIZE];
+        memcpy(bad, compact, sizeof bad);
+        bad[41 + 7] ^= 1;                                  /* the expiry */
+        if (hpplite_store_receipt_verify(bad, sizeof bad, h, zRef, chainId, signer) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified with a changed expiry"); }
+        memcpy(bad, compact, sizeof bad);
+        bad[60] ^= 1;                                      /* a signature byte */
+        if (hpplite_store_receipt_verify(bad, sizeof bad, h, zRef, chainId, signer) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified with a changed signature"); }
+        unsigned char h2[32];
+        memcpy(h2, h, 32); h2[0] ^= 1;
+        if (hpplite_store_receipt_verify(compact, sizeof compact, h2, zRef, chainId, signer) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified for other bytes"); }
+        if (hpplite_store_receipt_verify(compact, sizeof compact, h, zRef, chainId + 1, signer) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified on another chain"); }
+    }
+    sqlite3_free(zRef);
+    sqlite3_free(zReceipt);
+    PASS();
+}
+
 static void test_errors(HppliteStore *s) {
     TEST("an unknown reference is NULL with a reason; an empty put is refused; an unknown scheme does not open");
     size_t n = 1;
@@ -103,6 +136,7 @@ int main(int argc, char **argv) {
     HppliteStore *s = hpplite_store_open(url, NULL, 0);
     if (!s) { stop_service(); printf("FAIL: open\n"); return 1; }
     test_roundtrip(s);
+    test_receipt(s);
     test_errors(s);
     hpplite_store_close(s);
     stop_service();

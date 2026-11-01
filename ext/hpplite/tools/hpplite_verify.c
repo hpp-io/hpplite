@@ -280,13 +280,16 @@ int main(int argc, char **argv) {
             unsigned char signer[20];
             uint64_t expires = 0;
             printf("batch %llu: bytes in a store, reference %s", (unsigned long long)onChain, zRef);
-            if (hpplite_store_receipt_decode(receipt, nReceipt, signer, &expires, NULL) == 0) {
+            if (hpplite_store_receipt_decode(receipt, nReceipt, signer, NULL, &expires, NULL) == 0) {
                 char zs[41];
                 time_t t = (time_t)expires;
                 char when[40];
+                int verifies = hpplite_store_receipt_verify(receipt, nReceipt, h, zRef, node->config.chainId, NULL) == 0;
                 hpplite_bytes_to_hex(signer, 20, zs);
                 strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S UTC", gmtime(&t));
-                printf("; receipt signed by 0x%s, held until %s%s", zs, when, expires > (uint64_t)time(NULL) ? "" : " <- EXPIRED");
+                printf("; receipt signed by 0x%s, held until %s%s%s", zs, when, expires > (uint64_t)time(NULL) ? "" : " <- EXPIRED",
+                       verifies ? " (signature verifies)" : " <- the signature DOES NOT VERIFY");
+                if (!verifies) rc = 1;
             } else {
                 printf("; no receipt");
             }

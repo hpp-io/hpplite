@@ -116,6 +116,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.maxTxGas = config->maxTxGas;
     node->config.storeUrl = node_strdup(config->storeUrl);
     node->config.storeCap = config->storeCap;
+    node->config.storeFallback = config->storeFallback;
     if (node->config.storeUrl) {
         /* the batch bytes' store (#11): the chain will hold commitments only */
         node->store = hpplite_store_open(node->config.storeUrl, config->hasPrivkey ? config->privkey : NULL, config->storeCap);
@@ -1259,12 +1260,26 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                     char *zReceipt = NULL;
                     char *zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
                     if (!zRef) {
-                        snprintf(zStoreWhy, sizeof zStoreWhy, "the store did not take it: %s", hpplite_store_error(node->store));
-                        txHash = NULL;
+                        if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE) {
+                            /* the store does not answer: the chain carries the bytes meanwhile, as
+                            ** before the store (#11); availability never waits on a provider */
+                            txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
+                            if (!node->warnedStoreDown) {
+                                fprintf(stderr, "hpplite: store %s does not answer (%s): batch %llu %s on the chain instead\n",
+                                        hpplite_store_url(node->store), hpplite_store_error(node->store), (unsigned long long)height,
+                                        txHash ? "posted" : "could not be posted");
+                                node->warnedStoreDown = 1;
+                            }
+                        } else {
+                            snprintf(zStoreWhy, sizeof zStoreWhy, "the store did not take it: %s", hpplite_store_error(node->store));
+                            txHash = NULL;
+                        }
                     } else {
-                        unsigned char h[32];
+                        unsigned char h[32], payTo[20];
                         uint8_t compact[HPPLITE_RECEIPT_SIZE];
-                        int nCompact = zReceipt ? hpplite_store_receipt_compact(zReceipt, compact) : -1;
+                        int nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0)
+                                       ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
+                        node->warnedStoreDown = 0;
                         hpplite_keccak256(payload, payloadLen, h);
                         txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef,
                                                          nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);

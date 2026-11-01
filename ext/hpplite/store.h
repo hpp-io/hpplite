@@ -51,9 +51,28 @@ void hpplite_store_set_valid_for(HppliteStore *store, uint64_t seconds);
 ** answers (94, or -1 when it is not a receipt); decode back for display
 ** and verification.
 */
-#define HPPLITE_RECEIPT_SIZE 94
-int hpplite_store_receipt_compact(const char *zReceiptJson, uint8_t out[HPPLITE_RECEIPT_SIZE]);
-int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char signer[20], uint64_t *pExpires, unsigned char sig[65]);
+#define HPPLITE_RECEIPT_SIZE 114
+/* version 1 | signer (20) | payTo (20, the receipt domain's verifyingContract) | expires (8) | signature (65) */
+int hpplite_store_receipt_compact(const char *zReceiptJson, const unsigned char payTo[20], uint8_t out[HPPLITE_RECEIPT_SIZE]);
+int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char signer[20], unsigned char payTo[20],
+                                 uint64_t *pExpires, unsigned char sig[65]);
+/* The receipt's signature recovers to its signer over (hash, cid, expires) in the domain
+** ("HPPLitePinService", "1", chainId, payTo); and, when expected is given, that signer is
+** the expected one. 0 verified, -1 not. */
+int hpplite_store_receipt_verify(const uint8_t *receipt, size_t n, const unsigned char hash[32], const char *zCid,
+                                 uint64_t chainId, const unsigned char *expectedSigner);
+
+/* The provider's published signer and receipt domain (from its /status at open); 0 with them, -1 when the provider named none */
+int hpplite_store_signer(HppliteStore *store, unsigned char out[20]);
+int hpplite_store_domain(HppliteStore *store, unsigned char payTo[20], uint64_t *pChainId);
+
+/* Why the last put or get failed, for the node's choice between waiting and posting on chain */
+#define HPPLITE_STORE_FAIL_NONE        0
+#define HPPLITE_STORE_FAIL_UNREACHABLE 1   /* no answer: the chain can carry the bytes meanwhile */
+#define HPPLITE_STORE_FAIL_CAP         2   /* the price is over storecap=: nothing signed, the batch waits */
+#define HPPLITE_STORE_FAIL_RECEIPT     3   /* the receipt does not verify: the provider is not to be trusted with this batch */
+#define HPPLITE_STORE_FAIL_OTHER       4
+int hpplite_store_last_failure(HppliteStore *store);
 
 #ifdef __cplusplus
 }

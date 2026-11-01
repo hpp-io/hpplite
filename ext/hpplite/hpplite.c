@@ -703,6 +703,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->checkpointInterval = cfg->checkpointInterval;
     nc->storeUrl = cfg->storeUrl;
     nc->storeCap = cfg->storeCap;
+    nc->storeFallback = cfg->storeFallback;
 
     /* Role removed - always sequencer in simplified model */
 }

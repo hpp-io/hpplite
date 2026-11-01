@@ -81,6 +81,7 @@ extern "C" {
 #define HPPLITE_URI_FACTORY       "factory"
 #define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
 #define HPPLITE_URI_STORE_CAP     "storecap"    /* the most to pay the store per call, atomic units of its asset */
+#define HPPLITE_URI_STORE_FALLBACK "storefallback"   /* off: a batch waits while the store is down; on (default): the chain carries it */
 
 /*
 ** Default values
@@ -135,6 +136,7 @@ typedef struct HppliteConfig {
     uint64_t maxTxGas;               /* Gas cap per transaction (0 = by chain id, else unknown) */
     char *storeUrl;                  /* store=: the batch bytes' store (#11); NULL = on chain */
     uint64_t storeCap;               /* storecap=: the most to pay the store per call (0 = pay nothing) */
+    int storeFallback;               /* storefallback=off keeps a batch waiting while the store is down; on (default): the chain carries it */
 
     /* Source tracking (for debugging) */
     int roleSource;                  /* 0=default, 1=env, 2=uri */

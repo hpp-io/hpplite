@@ -12,6 +12,7 @@
 #include "hpplite_sqlite.h"
 #include "crypto.h"
 #include "cJSON.h"
+#include "eth_client.h"
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,11 @@ struct HppliteStore {
     uint64_t validFor;              /* seconds an authorization stays valid (a test chain whose clock ran ahead needs more) */
     uint64_t spent;
     int calls;
+    int lastFailure;                /* HPPLITE_STORE_FAIL_* */
+    int hasSigner;                  /* the provider's /status named its receipt signer and domain */
+    unsigned char signer[20];
+    unsigned char payTo[20];        /* the receipt domain's verifyingContract */
+    uint64_t chainId;
     char error[256];
     HppliteCrypto *crypto;
 };
@@ -306,8 +312,45 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
         }
     }
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    {
+        /* the provider's /status: which key signs its receipts, in which domain */
+        Buf out = {0};
+        if (storeRequest(s, "GET", "/status", NULL, 0, NULL, &out, NULL, NULL) == 200 && out.p) {
+            cJSON *st = cJSON_Parse(out.p);
+            cJSON *signer = st ? cJSON_GetObjectItem(st, "signer") : NULL;
+            cJSON *receipt = st ? cJSON_GetObjectItem(st, "receipt") : NULL;
+            cJSON *domain = receipt ? cJSON_GetObjectItem(receipt, "domain") : NULL;
+            cJSON *chainId = domain ? cJSON_GetObjectItem(domain, "chainId") : NULL;
+            cJSON *contract = domain ? cJSON_GetObjectItem(domain, "verifyingContract") : NULL;
+            if (signer && cJSON_IsString(signer) && strlen(signer->valuestring) == 42
+                && contract && cJSON_IsString(contract) && strlen(contract->valuestring) == 42 && chainId
+                && hpplite_hex_to_bytes(signer->valuestring + 2, s->signer, 20) >= 0
+                && hpplite_hex_to_bytes(contract->valuestring + 2, s->payTo, 20) >= 0) {
+                s->chainId = cJSON_IsNumber(chainId) ? (uint64_t)chainId->valuedouble : strtoull(chainId->valuestring ? chainId->valuestring : "0", NULL, 10);
+                s->hasSigner = 1;
+            }
+            cJSON_Delete(st);
+        }
+        free(out.p);
+        s->error[0] = 0;
+    }
     return s;
 }
+
+int hpplite_store_signer(HppliteStore *s, unsigned char out[20]) {
+    if (!s || !s->hasSigner) return -1;
+    memcpy(out, s->signer, 20);
+    return 0;
+}
+
+int hpplite_store_domain(HppliteStore *s, unsigned char payTo[20], uint64_t *pChainId) {
+    if (!s || !s->hasSigner) return -1;
+    if (payTo) memcpy(payTo, s->payTo, 20);
+    if (pChainId) *pChainId = s->chainId;
+    return 0;
+}
+
+int hpplite_store_last_failure(HppliteStore *s) { return s ? s->lastFailure : HPPLITE_STORE_FAIL_OTHER; }
 
 void hpplite_store_close(HppliteStore *s) {
     if (!s) return;
@@ -319,7 +362,7 @@ void hpplite_store_close(HppliteStore *s) {
 
 void hpplite_store_set_valid_for(HppliteStore *s, uint64_t seconds) { if (s && seconds) s->validFor = seconds; }
 
-int hpplite_store_receipt_compact(const char *zJson, uint8_t out[HPPLITE_RECEIPT_SIZE]) {
+int hpplite_store_receipt_compact(const char *zJson, const unsigned char payTo[20], uint8_t out[HPPLITE_RECEIPT_SIZE]) {
     cJSON *r = zJson ? cJSON_Parse(zJson) : NULL;
     cJSON *signer = r ? cJSON_GetObjectItem(r, "signer") : NULL, *expires = r ? cJSON_GetObjectItem(r, "expires") : NULL,
           *sig = r ? cJSON_GetObjectItem(r, "signature") : NULL;
@@ -329,20 +372,23 @@ int hpplite_store_receipt_compact(const char *zJson, uint8_t out[HPPLITE_RECEIPT
         || !sig || !cJSON_IsString(sig) || strlen(sig->valuestring) != 132 || !expires) { cJSON_Delete(r); return -1; }
     exp = cJSON_IsNumber(expires) ? (uint64_t)expires->valuedouble : (uint64_t)strtoull(expires->valuestring ? expires->valuestring : "0", NULL, 10);
     out[0] = 1;
-    if (hpplite_hex_to_bytes(signer->valuestring + 2, out + 1, 20) < 0 || hpplite_hex_to_bytes(sig->valuestring + 2, out + 29, 65) < 0) { cJSON_Delete(r); return -1; }
-    for (i = 0; i < 8; i++) out[21 + 7 - i] = (uint8_t)(exp >> (8 * i));
+    if (hpplite_hex_to_bytes(signer->valuestring + 2, out + 1, 20) < 0 || hpplite_hex_to_bytes(sig->valuestring + 2, out + 49, 65) < 0) { cJSON_Delete(r); return -1; }
+    memcpy(out + 21, payTo, 20);
+    for (i = 0; i < 8; i++) out[41 + 7 - i] = (uint8_t)(exp >> (8 * i));
     cJSON_Delete(r);
     return HPPLITE_RECEIPT_SIZE;
 }
 
-int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char signer[20], uint64_t *pExpires, unsigned char sig[65]) {
+int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char signer[20], unsigned char payTo[20],
+                                 uint64_t *pExpires, unsigned char sig[65]) {
     uint64_t exp = 0;
     int i;
     if (!receipt || n != HPPLITE_RECEIPT_SIZE || receipt[0] != 1) return -1;
     if (signer) memcpy(signer, receipt + 1, 20);
-    for (i = 0; i < 8; i++) exp = (exp << 8) | receipt[21 + i];
+    if (payTo) memcpy(payTo, receipt + 21, 20);
+    for (i = 0; i < 8; i++) exp = (exp << 8) | receipt[41 + i];
     if (pExpires) *pExpires = exp;
-    if (sig) memcpy(sig, receipt + 29, 65);
+    if (sig) memcpy(sig, receipt + 49, 65);
     return 0;
 }
 
@@ -357,12 +403,13 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
     if (pzReceipt) *pzReceipt = NULL;
     if (!s || !data || !len) return NULL;
     s->error[0] = 0;
+    s->lastFailure = HPPLITE_STORE_FAIL_NONE;
     status = storeRequest(s, "POST", "/put", data, len, NULL, &out, &zRequired, NULL);
     if (status == 402 && zRequired) {
         uint64_t amount = 0;
         char *zPay = storePay(s, zRequired, &amount);
         free(out.p); out.p = NULL; out.n = 0;
-        if (!zPay) { sqlite3_free(zRequired); return NULL; }
+        if (!zPay) { s->lastFailure = strstr(s->error, "storecap") ? HPPLITE_STORE_FAIL_CAP : HPPLITE_STORE_FAIL_OTHER; sqlite3_free(zRequired); return NULL; }
         status = storeRequest(s, "POST", "/put", data, len, zPay, &out, NULL, &zResponse);
         sqlite3_free(zPay);
         if (status == 200) { s->spent += amount; s->calls++; }
@@ -371,6 +418,7 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
     sqlite3_free(zResponse);
     if (status != 200) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to put: %.120s", status, out.p ? out.p : "");
+        s->lastFailure = status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;
         free(out.p);
         return NULL;
     }
@@ -379,17 +427,76 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
         cJSON *cid = r ? cJSON_GetObjectItem(r, "cid") : NULL, *receipt = r ? cJSON_GetObjectItem(r, "receipt") : NULL;
         if (cid && cJSON_IsString(cid) && cid->valuestring[0]) {
             zRef = sqlite3_mprintf("%s", cid->valuestring);
-            if (pzReceipt && receipt && cJSON_IsObject(receipt)) {
+            if (receipt && cJSON_IsObject(receipt)) {
                 char *z = cJSON_PrintUnformatted(receipt);
-                if (z) { *pzReceipt = sqlite3_mprintf("%s", z); free(z); }
+                /* the receipt must be the provider's own promise over these bytes, or it is worth nothing */
+                if (z && s->hasSigner) {
+                    uint8_t compact[HPPLITE_RECEIPT_SIZE];
+                    unsigned char h[32];
+                    hpplite_keccak256(data, len, h);
+                    if (hpplite_store_receipt_compact(z, s->payTo, compact) != HPPLITE_RECEIPT_SIZE
+                        || hpplite_store_receipt_verify(compact, HPPLITE_RECEIPT_SIZE, h, zRef, s->chainId, s->signer) != 0) {
+                        snprintf(s->error, sizeof s->error, "the store's receipt for %s does not verify against its published signer", zRef);
+                        s->lastFailure = HPPLITE_STORE_FAIL_RECEIPT;
+                        sqlite3_free(zRef);
+                        zRef = NULL;
+                    }
+                }
+                if (zRef && pzReceipt && z) *pzReceipt = sqlite3_mprintf("%s", z);
+                free(z);
             }
         } else {
             snprintf(s->error, sizeof s->error, "store's answer to put names no cid");
+            s->lastFailure = HPPLITE_STORE_FAIL_OTHER;
         }
         cJSON_Delete(r);
     }
     free(out.p);
     return zRef;
+}
+
+/* The receipt's domain ("HPPLitePinService", "1", chainId, payTo) and struct Receipt(bytes32 hash, string cid, uint256 expires) */
+static void receiptDigest(const unsigned char hash[32], const char *zCid, uint64_t expires, uint64_t chainId,
+                          const unsigned char payTo[20], unsigned char digest[32]) {
+    static const char zDomainType[] = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+    static const char zReceiptType[] = "Receipt(bytes32 hash,string cid,uint256 expires)";
+    unsigned char w[160], domain[32], st[32], pre[66];
+    hpplite_keccak256((const unsigned char *)zDomainType, sizeof(zDomainType) - 1, w);
+    hpplite_keccak256((const unsigned char *)"HPPLitePinService", 17, w + 32);
+    hpplite_keccak256((const unsigned char *)"1", 1, w + 64);
+    wordInt(chainId, w + 96);
+    memset(w + 128, 0, 32); memcpy(w + 128 + 12, payTo, 20);
+    hpplite_keccak256(w, 160, domain);
+    hpplite_keccak256((const unsigned char *)zReceiptType, sizeof(zReceiptType) - 1, w);
+    memcpy(w + 32, hash, 32);
+    hpplite_keccak256((const unsigned char *)zCid, strlen(zCid), w + 64);
+    wordInt(expires, w + 96);
+    hpplite_keccak256(w, 128, st);
+    pre[0] = 0x19; pre[1] = 0x01;
+    memcpy(pre + 2, domain, 32);
+    memcpy(pre + 34, st, 32);
+    hpplite_keccak256(pre, 66, digest);
+}
+
+int hpplite_store_receipt_verify(const uint8_t *receipt, size_t n, const unsigned char hash[32], const char *zCid,
+                                 uint64_t chainId, const unsigned char *expectedSigner) {
+    unsigned char signer[20], payTo[20], sig[65], digest[32], pub[33], addr[20];
+    uint64_t expires = 0;
+    HppliteSignature hs;
+    HppliteCrypto *crypto;
+    int rc;
+    if (hpplite_store_receipt_decode(receipt, n, signer, payTo, &expires, sig) != 0 || !hash || !zCid) return -1;
+    if (expectedSigner && memcmp(expectedSigner, signer, 20) != 0) return -1;
+    receiptDigest(hash, zCid, expires, chainId, payTo, digest);
+    memcpy(hs.sig, sig, 64);
+    hs.recid = sig[64] >= 27 ? sig[64] - 27 : sig[64];
+    if (hs.recid > 1) return -1;
+    crypto = hpplite_crypto_init();
+    if (!crypto) return -1;
+    rc = hpplite_crypto_recover_pubkey(crypto, digest, &hs, pub);
+    hpplite_crypto_free(crypto);
+    if (rc != 0 || eth_address_from_compressed_pubkey(pub, addr) != 0) return -1;
+    return memcmp(addr, signer, 20) == 0 ? 0 : -1;
 }
 
 uint8_t *hpplite_store_get(HppliteStore *s, const char *zRef, size_t *pLen) {

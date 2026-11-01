@@ -1538,7 +1538,7 @@ static pid_t start_pin_service_free(const char *svc, int port) {
         int fd = open(DIR "/store_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/store_pins", "--signer-key", DIR "/store_signer.key",
-               "--pay-to", "0x1111111111111111111111111111111111111111", (char *)NULL);
+               "--pay-to", "0x1111111111111111111111111111111111111111", "--network", "eip155:31337", (char *)NULL);   /* the receipt domain's chain: anvil's */
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -1582,7 +1582,8 @@ static void test_store_commit(void) {
         uint8_t *bytes = peek ? hpplite_l1_get_batch(peek, 2, &n) : NULL;
         int ok = peek && hpplite_l1_get_commitment(peek, 2, hash, &zRef, &receipt, &nReceipt) == 0
                  && zRef && strncmp(zRef, "bafkrei", 7) == 0 && !bytes
-                 && hpplite_store_receipt_decode(receipt, nReceipt, signer, &expires, NULL) == 0 && expires > (uint64_t)time(NULL);
+                 && hpplite_store_receipt_decode(receipt, nReceipt, signer, NULL, &expires, NULL) == 0 && expires > (uint64_t)time(NULL)
+                 && hpplite_store_receipt_verify(receipt, nReceipt, hash, zRef, 31337, NULL) == 0;
         if (!ok) printf("(commitment: ref %s, receipt %zu bytes, bytes on chain %zu) ", zRef ? zRef : "(none)", nReceipt, n);
         free(bytes);
         sqlite3_free(zRef); sqlite3_free(receipt);
@@ -1693,6 +1694,53 @@ static void test_store_paid(void) {
     PASS();
 }
 
+/* 21. The store does not answer (#11): with storefallback on (the default)
+** the chain carries the bytes meanwhile, as before the store, and a replica
+** with no store rebuilds; with storefallback=off the batch waits and says
+** why. KEY4, its own named database; the store is a port nobody listens on. */
+static void test_store_fallback(void) {
+    TEST("the store does not answer (#11): the chain carries the bytes meanwhile; storefallback=off keeps the batch waiting instead");
+    char extra[200];
+    snprintf(extra, sizeof extra, "&dbname=fallback&store=http://127.0.0.1:9");
+    sqlite3 *w = open_db("fb_writer.db", KEY4, extra);
+    if (!w) FAIL("open writer");
+    sqlite3_exec(w, "CREATE TABLE fb(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO fb(v) VALUES('carried by the chain')", NULL, NULL, NULL);
+    long long h = scalar(w, "SELECT hpplite_flush()");
+    if (h != 1) { printf("(flush %lld, '%s') ", h, status_text(w, "last_error")); sqlite3_close(w); FAIL("the chain should have carried the batch"); }
+    {
+        char contract[80];
+        snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+        HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
+        size_t n = 0;
+        uint8_t *bytes = peek ? hpplite_l1_get_batch(peek, 1, &n) : NULL;
+        int onChain = bytes != NULL && n > 0;
+        free(bytes);
+        hpplite_l1_disconnect(peek);
+        if (!onChain) { sqlite3_close(w); FAIL("the bytes should be on the chain"); }
+    }
+    sqlite3 *r = open_db("fb_replica.db", KEY4, "&dbname=fallback&role=verify");
+    if (!r) { sqlite3_close(w); FAIL("open replica"); }
+    if (scalar(r, "SELECT count(*) FROM fb") != 1 || strcmp(status_text(r, "state"), "verify") != 0) {
+        printf("(replica state %s, '%s') ", status_text(r, "state"), status_text(r, "last_error"));
+        sqlite3_close(r); sqlite3_close(w);
+        FAIL("a replica without a store should rebuild what the chain carries");
+    }
+    sqlite3_close(r);
+    sqlite3_close(w);
+
+    snprintf(extra, sizeof extra, "&dbname=fallback&store=http://127.0.0.1:9&storefallback=off");
+    sqlite3 *w2 = open_db("fb_writer.db", KEY4, extra);
+    if (!w2) FAIL("reopen writer");
+    sqlite3_exec(w2, "INSERT INTO fb(v) VALUES('waits')", NULL, NULL, NULL);
+    long long h2 = scalar(w2, "SELECT hpplite_flush()");
+    const char *err = status_text(w2, "last_error");
+    int waited = h2 == 0 && strstr(err, "store") != NULL && scalar(w2, "SELECT pending FROM hpplite_status") > 0;
+    printf("(fallback off: flush %lld, '%.50s') ", h2, err);
+    sqlite3_close(w2);
+    if (!waited) FAIL("with storefallback=off the batch should wait with the store's reason");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -1724,6 +1772,7 @@ int main(void) {
     if (wanted(18)) test_pin_service();
     if (wanted(19)) test_store_commit();
     if (wanted(20)) test_store_paid();
+    if (wanted(21)) test_store_fallback();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

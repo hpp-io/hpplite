@@ -114,6 +114,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
 | `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
 | `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
+| `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason |
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
 | `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
@@ -566,12 +567,17 @@ the gap grows with size). A replica with the same `store=` reads the
 commitment, fetches by the CID, checks the hash, replays; one without says
 `batch N is in a store (...) and no store= names one` and rebuilds nothing.
 A 402 from the service is paid in x402's exact scheme with the node's key
-up to `storecap=` per call; the receipt goes on chain in a 94-byte form
-(signer, expiry, signature) that `hpplite-verify` prints for the last
-batch. ctest `test_store` runs the client free; anvil scenarios 19 and 20
-run it free and paid. Not here yet: S3 and Kubo adapters, receipt
-signature verification against the provider's published signer, `upto`
-and payment channels.
+up to `storecap=` per call. The receipt is checked before it is believed:
+its signature must recover to the signer the service publishes at
+`/status`, over the batch's hash, the CID and the expiry, or the batch is
+not committed under it; it goes on chain in a 114-byte form (signer, the
+domain's pay-to, expiry, signature) that anyone can verify from the chain
+alone, and `hpplite-verify` prints it for the last batch, saying whether
+the signature verifies. A store that does not answer never holds a batch
+back: the chain carries the bytes meanwhile (`storefallback=on`, the
+default). ctest `test_store` runs the client free; anvil scenarios 19, 20
+and 21 run it free, paid, and with the store down. Not here yet: S3 and
+Kubo adapters, `upto` and payment channels, a USDC.e balance in the status.
 
 ## Versions
 
