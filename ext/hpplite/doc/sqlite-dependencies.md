@@ -61,7 +61,7 @@ starts. SQLITE_SCHEMA itself is raised in `vdbe.c` `OP_Transaction` when the
 schema cookie or generation differs from the one compiled in (`p->expired =
 1; rc = SQLITE_SCHEMA`).
 
-**HPPLite code.** `hpplite.c`: `rerunTrack()`, `rerunBegin()`,
+**HPPLite code.** `capture.c`: `rerunTrack()`, `rerunBegin()`,
 `rerunCommit()`, `rerunCommitRetry()`, `rerunStatementDone()`; the comment
 above `rerunTrack()` names `tag-20220401a`. The refusal's carry-over to the
 rerun: `hppliteAuthorizer()` (`pCtx->pRefusedStmt`) and the PROFILE branch
@@ -93,7 +93,7 @@ returns, `checkProfileCallback(db, p)` (which calls
 error is transferred afterwards, by `sqlite3VdbeTransferError()`
 (`vdbeaux.c`) in the `rc!=SQLITE_DONE` branch and then `db->errCode = rc`.
 
-**HPPLite code.** `hpplite.c` `hppliteStatementDone()` and the comment
+**HPPLite code.** `capture.c` `hppliteStatementDone()` and the comment
 above it ("the profile callback runs before SQLite records the result
 code"); called from the PROFILE branch of `hppliteTraceCallback()`.
 
@@ -130,7 +130,7 @@ active writer. `db->nVdbeWrite` is incremented in `vdbeapi.c`
 statement halts with `nVdbeWrite==2`, so nothing is committed; the
 transaction ends with the application's statement.
 
-**HPPLite code.** `hpplite.c` `hppliteTraceCallback()` (the STMT branch:
+**HPPLite code.** `capture.c` `hppliteTraceCallback()` (the STMT branch:
 `pCtx->pLogStmt` stepped by `hpplite_step_write()`), `rerunTrack()` (the
 schema read "in the write transaction"), `hppliteStatementDone()` ("In
 autocommit a failed statement's implicit transaction already rolled the row
@@ -167,8 +167,8 @@ only when `inTransaction==TRANS_NONE`) returns at once.
 
 **HPPLite code.** `capture_rows.c` `hpplite_rows_covered_for_write()`
 (comment: "SQLITE_BUSY at once (no busy handler)", the `HPPLITE_ROWS_BUSY`
-return); `hpplite.c` `hppliteTraceCallback()` STMT branch (`covered ==
-HPPLITE_ROWS_BUSY`, #92) and `bkBegin()` (the SQLITE_BUSY_SNAPSHOT comment:
+return); `capture.c` `hppliteTraceCallback()` STMT branch (`covered ==
+HPPLITE_ROWS_BUSY`, #92) and `hppliteBkBegin()` (the SQLITE_BUSY_SNAPSHOT comment:
 bookkeeping never commits under an application statement).
 
 **Pinned by.** test_rows_e2e `test_lock_contention` ("write lock held
@@ -178,7 +178,7 @@ write under the new schema are rows", #92): it counts the busy-handler
 waits with its own handler and asserts one, not two. test_abuse and
 test_abuse_text "read-then-write transactions never hit 'database is
 locked' while flushes run" and "a flush during an application's
-read-then-write transaction does not lock it out" pin the `bkBegin()` side.
+read-then-write transaction does not lock it out" pin the `hppliteBkBegin()` side.
 
 ## 5. The connection's error code is SQLITE_SCHEMA while SQLite reprepares a stale statement
 
@@ -198,7 +198,7 @@ application's own prepare after a failed step follows a reset or
 finalize, which leaves the statement's own code in `db->errCode`, or a new
 statement's prepare, which ends with its own code.
 
-**HPPLite code.** `hpplite.c` `hppliteAuthorizer()`: `int bReprepare =
+**HPPLite code.** `capture.c` `hppliteAuthorizer()`: `int bReprepare =
 sqlite3_errcode(pCtx->db) == SQLITE_SCHEMA;` under `pCtx->pRefusedStmt`.
 
 **Pinned by.** test_rows `test_refused_stale_statement` (the reprepare is
@@ -228,7 +228,7 @@ covers it).
 (`vdbeaux.c` `sqlite3ExpirePreparedStatements()` sets `expired` on every
 statement of the connection).
 
-**HPPLite code.** `hpplite.c` `stmtExpired()`, `rerunStatementDone()`, the
+**HPPLite code.** `capture.c` `stmtExpired()`, `rerunStatementDone()`, the
 PROFILE branch of `hppliteTraceCallback()`.
 
 **Pinned by.** test_rows `test_refused_stale_statement` (expired by a stale
@@ -257,11 +257,11 @@ which is `pPager->iDataVersion`. Incremented in `pager.c`
 one last read (rollback journal) and from `pagerBeginReadTransaction()`
 when `sqlite3WalBeginReadTransaction()` reports a change (WAL).
 
-**HPPLite code.** `hpplite.c` `bkForeignCheck()`, `bkEnd()` (the baseline
-after an own commit), `bkBegin()` (`commitsDoneBefore`), the PROFILE branch
-of `hppliteTraceCallback()` (`nCommitDone`), `hppliteCommitHook()`
+**HPPLite code.** `bookkeeping.c` `bkForeignCheck()`, `hppliteBkEnd()` (the baseline
+after an own commit), `hppliteBkBegin()` (`commitsDoneBefore`), the PROFILE branch
+of `hppliteTraceCallback()` (`nCommitDone`, `capture.c`), `hppliteCommitHook()`
 (`nCommitBegun`); the comment above `fnv()` ("Writes past the log (#37)");
-`functionVerdict()` (the cache key).
+`functionVerdict()` (`capture.c`, the cache key).
 
 **Pinned by.** test_rows_e2e `test_foreign_writes_detected` ("a write by a
 connection without HPPLite is counted in hpplite_status.foreign_writes;
@@ -283,8 +283,8 @@ block, `p->rc != SQLITE_OK` leads to `sqlite3RollbackAll(db, SQLITE_OK)`;
 - `inTrans` is set when a b-tree was in SQLITE_TXN_WRITE, which a statement
 that began writing is.
 
-**HPPLite code.** `hpplite.c` `hppliteRollbackHook()`; installed in
-`hpplite_init_ex()` and re-armed by `rearmHooks()`.
+**HPPLite code.** `capture.c` `hppliteRollbackHook()`; installed in
+`hpplite.c` `hpplite_init_ex()` and re-armed by `rearmHooks()`.
 
 **Pinned by.** Not pinned. test_hpplite `test_callbacks` ("commit and
 rollback callbacks fire per transaction") counts one rollback for an
@@ -315,7 +315,7 @@ SQLITE_TRACE_SIZE_LIMIT; ...` for text and blob values. `vdbeapi.c`
 
 **HPPLite code.** `hpplite.c` `expandedSqlIsFaithful()`, `hpplite_init_ex()`
 (`bTruncates`, `gInitError`), the STMT branch of `hppliteTraceCallback()`
-(`pCtx->bExpandTruncates`); `node.c` `node_init_tracking()` (row capture
+(`pCtx->bExpandTruncates`, `capture.c`); `node.c` `node_init_tracking()` (row capture
 passes `!captureText`).
 
 **Pinned by.** test_env_enable `test_truncating_sqlite_refused` ("a SQLite
@@ -354,9 +354,9 @@ is reprepared against the unreset, stale schema, fails SQLITE_SCHEMA again,
 and after SQLITE_MAX_SCHEMA_RETRY attempts `sqlite3_step()` returns
 SQLITE_SCHEMA ("database schema has changed").
 
-**HPPLite code.** `hpplite.c` `hppliteTraceCallback()` STMT branch: the
+**HPPLite code.** `capture.c` `hppliteTraceCallback()` STMT branch: the
 `hpplite_step_write(pCtx->pLogStmt)` whose failure refuses the statement
-("could not log statement (database schema has changed)"); `schemaVersion()`
+("could not log statement (database schema has changed)"); `hppliteSchemaVersion()`
 (`pSchemaStmt`); `capture_rows.c` `hpplite_rows_covered_for_write()`
 (`pRowsLockStmt`), `schemaVersionOf()`.
 
@@ -372,8 +372,8 @@ replica). What HPPLite should do about it is not decided here: it may
 reprepare its own statements itself when a step returns SQLITE_SCHEMA
 (SQLite's reprepare of the application's statement then happens at its
 own retry, with the schema reset once the first run halts), or read the
-schema with a fresh prepare; that is a change to `hpplite.c`, outside this
-inventory.
+schema with a fresh prepare; that is a change to `capture.c`, outside this
+inventory (#108).
 
 ## Adding an entry
 
