@@ -97,6 +97,14 @@ int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
     return l1 ? l1->ops->get_my_address(l1, out) : -1;
 }
 
+uint64_t hpplite_l1_chain_id(HppliteL1 *l1) {
+    return (l1 && l1->ops->chain_id) ? l1->ops->chain_id(l1) : 0;
+}
+
+int hpplite_l1_token_balance(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]) {
+    return (l1 && l1->ops->token_balance) ? l1->ops->token_balance(l1, token, owner, out) : -1;
+}
+
 uint64_t hpplite_l1_get_lease_time_remaining(HppliteL1 *l1) {
     return l1 ? l1->ops->get_lease_time_remaining(l1) : 0;
 }

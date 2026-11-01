@@ -37,8 +37,14 @@ uint8_t *hpplite_store_get(HppliteStore *store, const char *zRef, size_t *pLen);
 const char *hpplite_store_error(HppliteStore *store);
 const char *hpplite_store_url(HppliteStore *store);
 
-/* How much the store paid so far (atomic units) and for how many calls */
+/* How much the store paid so far (atomic units) and for how many paid calls */
 uint64_t hpplite_store_spent(HppliteStore *store, int *pCalls);
+/* Puts and gets that succeeded, paid or not; the last put's size */
+int hpplite_store_calls(HppliteStore *store);
+size_t hpplite_store_last_bytes(HppliteStore *store);
+/* What the provider charges, from its /status: the asset, its chain, the price per byte and per
+** pin (a put costs perPin + perByte * bytes). -1 when it charges nothing or said nothing. */
+int hpplite_store_payment(HppliteStore *store, unsigned char asset[20], uint64_t *pChainId, uint64_t *pPerByte, uint64_t *pPerPin);
 
 /* Seconds a payment authorization stays valid (default 120; a test chain whose clock ran ahead needs more) */
 void hpplite_store_set_valid_for(HppliteStore *store, uint64_t seconds);

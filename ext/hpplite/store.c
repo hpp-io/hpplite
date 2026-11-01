@@ -27,7 +27,13 @@ struct HppliteStore {
     uint64_t cap;
     uint64_t validFor;              /* seconds an authorization stays valid (a test chain whose clock ran ahead needs more) */
     uint64_t spent;
-    int calls;
+    int calls;                      /* ...paid calls */
+    int nOk;                        /* puts and gets that succeeded */
+    size_t lastBytes;               /* the last put's size: what a quote is for */
+    int hasPayment;                 /* the provider's /status named its asset and prices (#11) */
+    unsigned char asset[20];
+    uint64_t payChainId;
+    uint64_t pricePerByte, pricePerPin;
     int lastFailure;                /* HPPLITE_STORE_FAIL_* */
     int hasSigner;                  /* the provider's /status named its receipt signer and domain */
     unsigned char signer[20];
@@ -318,6 +324,20 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
         if (storeRequest(s, "GET", "/status", NULL, 0, NULL, &out, NULL, NULL) == 200 && out.p) {
             cJSON *st = cJSON_Parse(out.p);
             cJSON *signer = st ? cJSON_GetObjectItem(st, "signer") : NULL;
+            cJSON *pay = st ? cJSON_GetObjectItem(st, "payment") : NULL;
+            if (pay && cJSON_IsObject(pay)) {
+                /* what it charges, for the status row: asset, chain, the price of a put */
+                cJSON *asset = cJSON_GetObjectItem(pay, "asset"), *network = cJSON_GetObjectItem(pay, "network"),
+                      *perByte = cJSON_GetObjectItem(pay, "pricePerByte"), *perPin = cJSON_GetObjectItem(pay, "pricePerPin");
+                if (asset && cJSON_IsString(asset) && strlen(asset->valuestring) == 42
+                    && hpplite_hex_to_bytes(asset->valuestring + 2, s->asset, 20) >= 0
+                    && network && cJSON_IsString(network) && strncmp(network->valuestring, "eip155:", 7) == 0) {
+                    s->payChainId = strtoull(network->valuestring + 7, NULL, 10);
+                    s->pricePerByte = (perByte && cJSON_IsNumber(perByte)) ? (uint64_t)perByte->valuedouble : 0;
+                    s->pricePerPin = (perPin && cJSON_IsNumber(perPin)) ? (uint64_t)perPin->valuedouble : 0;
+                    s->hasPayment = 1;
+                }
+            }
             cJSON *receipt = st ? cJSON_GetObjectItem(st, "receipt") : NULL;
             cJSON *domain = receipt ? cJSON_GetObjectItem(receipt, "domain") : NULL;
             cJSON *chainId = domain ? cJSON_GetObjectItem(domain, "chainId") : NULL;
@@ -395,6 +415,17 @@ int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char
 const char *hpplite_store_error(HppliteStore *s) { return s ? s->error : "no store"; }
 const char *hpplite_store_url(HppliteStore *s) { return s ? s->url : NULL; }
 uint64_t hpplite_store_spent(HppliteStore *s, int *pCalls) { if (pCalls) *pCalls = s ? s->calls : 0; return s ? s->spent : 0; }
+int hpplite_store_calls(HppliteStore *s) { return s ? s->nOk : 0; }
+size_t hpplite_store_last_bytes(HppliteStore *s) { return s ? s->lastBytes : 0; }
+
+int hpplite_store_payment(HppliteStore *s, unsigned char asset[20], uint64_t *pChainId, uint64_t *pPerByte, uint64_t *pPerPin) {
+    if (!s || !s->hasPayment) return -1;
+    if (asset) memcpy(asset, s->asset, 20);
+    if (pChainId) *pChainId = s->payChainId;
+    if (pPerByte) *pPerByte = s->pricePerByte;
+    if (pPerPin) *pPerPin = s->pricePerPin;
+    return 0;
+}
 
 char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char **pzReceipt) {
     Buf out = {0};
@@ -404,6 +435,7 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
     if (!s || !data || !len) return NULL;
     s->error[0] = 0;
     s->lastFailure = HPPLITE_STORE_FAIL_NONE;
+    s->lastBytes = len;
     status = storeRequest(s, "POST", "/put", data, len, NULL, &out, &zRequired, NULL);
     if (status == 402 && zRequired) {
         uint64_t amount = 0;
@@ -452,6 +484,7 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
         cJSON_Delete(r);
     }
     free(out.p);
+    if (zRef) s->nOk++;
     return zRef;
 }
 
@@ -515,5 +548,6 @@ uint8_t *hpplite_store_get(HppliteStore *s, const char *zRef, size_t *pLen) {
     }
     if (!out.p) { out.p = malloc(1); if (out.p) out.p[0] = 0; }
     if (pLen) *pLen = out.n;
+    if (out.p) s->nOk++;
     return (uint8_t *)out.p;                      /* malloc'd, terminated */
 }

@@ -979,6 +979,23 @@ static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t heig
     return data;
 }
 
+int hpplite_node_store_balance(HppliteNode *node, uint8_t out[32]) {
+    unsigned char asset[20], me[20];
+    uint64_t chainId = 0;
+    time_t now = time(NULL);
+    if (!node || !node->store || !node->l1 || !out) return -1;
+    if (hpplite_store_payment(node->store, asset, &chainId, NULL, NULL) != 0) return -1;
+    if (chainId == 0 || hpplite_l1_chain_id(node->l1) != chainId) return -1;      /* the asset is on another chain: not from here */
+    if (!node->storeBalanceOk || now - node->storeBalanceAt >= 30) {
+        if (hpplite_l1_get_my_address(node->l1, me) != 0) return -1;
+        if (hpplite_l1_token_balance(node->l1, asset, me, node->storeBalance) != 0) return -1;
+        node->storeBalanceOk = 1;
+        node->storeBalanceAt = now;
+    }
+    memcpy(out, node->storeBalance, 32);
+    return 0;
+}
+
 HppliteBatch *hpplite_node_fetch_batch(HppliteNode *node, uint64_t height) {
     size_t dataLen = 0;
     uint8_t *data;
@@ -1313,6 +1330,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                     /* the bytes to the store, the commitment to the chain (#11) */
                     char *zReceipt = NULL;
                     char *zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
+                    node->storeBalanceOk = 0;                 /* a put may have paid: the status row reads the balance again */
                     if (!zRef) {
                         if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE) {
                             /* the store does not answer: the chain carries the bytes meanwhile, as

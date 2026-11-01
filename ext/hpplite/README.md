@@ -450,7 +450,14 @@ connection, in this process or another, does), `capture` (`rows` or `text`:
 what this connection logs), `foreign_writes` (looks that found the file
 changed by something that is not HPPLite, #37), `state` and `last_error`
 (#32), `chain_hash` (the DA contract's rolling hash over every batch as this
-node tracks it, #33; NULL in a file from before it was kept). `state` says what this node is doing about posting: `sequencing`,
+node tracks it, #33; NULL in a file from before it was kept), and, with
+`store=` (#11): `store` (its URL), `store_state` (`ok`, `unreachable`, `over
+cap`, `receipt`, `error`: the last put's outcome, so a waiting batch says
+why), `store_spent` and `store_calls` (paid by this process in the asset's
+atomic units, and the puts and gets that succeeded), `store_price` (what the
+provider charges for a put of the last batch's size; NULL when it is free)
+and `store_balance` (the wallet's balance of the store's asset on the chain,
+read at most every 30 s; NULL without a paid store on this chain). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
@@ -596,7 +603,7 @@ the signature verifies. A store that does not answer never holds a batch
 back: the chain carries the bytes meanwhile (`storefallback=on`, the
 default). ctest `test_store` runs the client free; anvil scenarios 19, 20
 and 21 run it free, paid, and with the store down. Not here yet: S3 and
-Kubo adapters, `upto` and payment channels, a USDC.e balance in the status.
+Kubo adapters, `upto` and payment channels, top-up.
 
 ## Versions
 

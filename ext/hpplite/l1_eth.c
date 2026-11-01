@@ -1185,6 +1185,24 @@ static void eth_set_max_tx_gas(HppliteL1 *l1, uint64_t gas) {
     if (l1) self->maxTxGas = gas;
 }
 
+static uint64_t eth_chain_id(HppliteL1 *l1) {
+    return l1 ? eth_client_chain_id(self->eth) : 0;
+}
+
+/* balanceOf(address) (#11): selector 70a08231, the owner left-padded to a word */
+static int eth_token_balance(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]) {
+    uint8_t calldata[36] = { 0x70, 0xa0, 0x82, 0x31 };
+    size_t result_len = 0;
+    uint8_t *result;
+    if (!l1 || !token || !owner || !out) return -1;
+    memcpy(calldata + 4 + 12, owner, 20);
+    result = eth_client_call(self->eth, token, calldata, sizeof calldata, &result_len);
+    if (!result || result_len < 32) { free(result); return -1; }
+    memcpy(out, result, 32);
+    free(result);
+    return 0;
+}
+
 const HppliteL1Ops hppliteL1EthOps = {
     .name = "eth",
     .connect = eth_connect,
@@ -1222,4 +1240,6 @@ const HppliteL1Ops hppliteL1EthOps = {
     .get_chain_hash = eth_get_chain_hash,
     .commit_batch = eth_commit_batch,
     .get_commitment = eth_get_commitment,
+    .chain_id = eth_chain_id,
+    .token_balance = eth_token_balance,
 };

@@ -77,6 +77,9 @@ typedef struct TestNodeOpts {
     int start;                               /* start the node even without an L1 */
     const char *nodeId;                      /* NULL: the suite's */
     const unsigned char *privkey;            /* NULL: the suite's */
+    const char *storeUrl;                    /* store= (#11): the batch bytes go there, the chain holds commitments */
+    uint64_t storeCap;                       /* storecap= */
+    int storeFallbackOff;                    /* storefallback=off: a store that does not answer keeps the batch waiting */
 } TestNodeOpts;
 HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpts *o);
 int same_root(HppliteNode *a, HppliteNode *b);

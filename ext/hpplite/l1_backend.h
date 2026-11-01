@@ -76,6 +76,12 @@ struct HppliteL1Ops {
     char *(*commit_batch)(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32],
                           const char *zRef, const uint8_t *receipt, size_t nReceipt);
     int (*get_commitment)(HppliteL1 *l1, uint64_t height, uint8_t hash[32], char **pzRef, uint8_t **pReceipt, size_t *pnReceipt);
+    /* The chain this connection is on (0: the backend is on none) and an
+    ** ERC-20 balance there (#11): balanceOf(owner) of token as 32 big-endian
+    ** bytes; -1 when the backend cannot read one or the call fails. NULL
+    ** when the backend has neither (the mock, a directory). */
+    uint64_t (*chain_id)(HppliteL1 *l1);
+    int (*token_balance)(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]);
 };
 
 extern const HppliteL1Ops hppliteL1EthOps;    /* l1_eth.c */

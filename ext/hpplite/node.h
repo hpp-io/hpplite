@@ -104,6 +104,9 @@ typedef struct HppliteNode {
     HppliteL1 *l1;
     struct HppliteStore *store;     /* the batch bytes' store when store= is given (#11); the chain commits hash, ref, receipt */
     int warnedStoreDown;            /* said once per outage that batches go on the chain meanwhile */
+    uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
+    int storeBalanceOk;
+    long storeBalanceAt;            /* seconds (time()) */
 
     /* Crypto */
     HppliteCrypto *crypto;
@@ -209,6 +212,10 @@ int hpplite_node_release_lease(HppliteNode *node);
 ** Returns 1 if active, 0 if expired/not held.
 */
 int hpplite_node_has_lease(HppliteNode *node);
+
+/* The wallet's balance of the store's asset on the chain (#11), 32 big-endian bytes, read at
+** most every 30 s and after every put. -1 without a store that charges, a chain it is on, or a key. */
+int hpplite_node_store_balance(HppliteNode *node, uint8_t out[32]);
 
 /*
 ** Start the node (claim lease and begin operations).

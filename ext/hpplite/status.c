@@ -11,6 +11,7 @@
 #include "crypto.h"
 #include "l1_interface.h"
 #include "node.h"
+#include "store.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +73,12 @@ typedef struct StatusCursor {
 #define STATUS_COL_LAST_ERROR       24
 #define STATUS_COL_CHAIN_HASH       25
 #define STATUS_COL_ROOT_VERSION     26
+#define STATUS_COL_STORE            27     /* the store= URL (#11); NULL: the bytes go on the chain */
+#define STATUS_COL_STORE_STATE      28     /* ok, unreachable, over cap, receipt, error: the last put's outcome */
+#define STATUS_COL_STORE_SPENT      29     /* paid to the store by this process, atomic units of its asset */
+#define STATUS_COL_STORE_CALLS      30     /* puts and gets that succeeded */
+#define STATUS_COL_STORE_PRICE      31     /* what the provider charges for a put of the last batch's size; NULL when free */
+#define STATUS_COL_STORE_BALANCE    32     /* the wallet's balance of the store's asset on the chain; NULL when not readable */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -85,7 +92,8 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
         " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
         " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
-        " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER)");
+        " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
+        " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -284,6 +292,45 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             if (node->lastBatchTx[0]) sqlite3_result_text(ctx, node->lastBatchTx, -1, SQLITE_TRANSIENT);
             else sqlite3_result_null(ctx);
             break;
+        case STATUS_COL_STORE:                  /* where the batch bytes go (#11) */
+            if (node->store) sqlite3_result_text(ctx, hpplite_store_url(node->store), -1, SQLITE_TRANSIENT);
+            break;
+        case STATUS_COL_STORE_STATE:
+            if (node->store) {
+                const char *z;
+                switch (hpplite_store_last_failure(node->store)) {
+                    case HPPLITE_STORE_FAIL_NONE:        z = "ok"; break;
+                    case HPPLITE_STORE_FAIL_UNREACHABLE: z = "unreachable"; break;
+                    case HPPLITE_STORE_FAIL_CAP:         z = "over cap"; break;
+                    case HPPLITE_STORE_FAIL_RECEIPT:     z = "receipt"; break;
+                    default:                             z = "error"; break;
+                }
+                sqlite3_result_text(ctx, z, -1, SQLITE_STATIC);
+            }
+            break;
+        case STATUS_COL_STORE_SPENT:
+            if (node->store) sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_store_spent(node->store, NULL));
+            break;
+        case STATUS_COL_STORE_CALLS:
+            if (node->store) sqlite3_result_int(ctx, hpplite_store_calls(node->store));
+            break;
+        case STATUS_COL_STORE_PRICE: {
+            uint64_t perByte = 0, perPin = 0;
+            size_t n = node->store ? hpplite_store_last_bytes(node->store) : 0;
+            if (n && hpplite_store_payment(node->store, NULL, NULL, &perByte, &perPin) == 0)
+                sqlite3_result_int64(ctx, (sqlite3_int64)(perPin + perByte * (uint64_t)n));
+            break;
+        }
+        case STATUS_COL_STORE_BALANCE: {
+            uint8_t b[32];
+            static const uint8_t zero24[24];
+            if (hpplite_node_store_balance(node, b) == 0 && memcmp(b, zero24, 24) == 0 && !(b[24] & 0x80)) {
+                sqlite3_int64 v = 0;
+                for (int i = 24; i < 32; i++) v = (v << 8) | b[i];
+                sqlite3_result_int64(ctx, v);
+            }
+            break;
+        }
         default:
             sqlite3_result_null(ctx);
     }

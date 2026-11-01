@@ -195,6 +195,12 @@ int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
 /* The wallet this connection signs with (needs a private key). 0 on success. */
 int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]);
 
+/* The chain this connection is on (0 when the backend is on none: mock, directory) */
+uint64_t hpplite_l1_chain_id(HppliteL1 *l1);
+
+/* An ERC-20 balance on that chain (#11): balanceOf(owner) of token, 32 big-endian bytes. 0, or -1 when it cannot be read. */
+int hpplite_l1_token_balance(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]);
+
 /*
 ** Which backend a connection is on: "eth", "dir" or "mock" (#35). Every
 ** build has all three; the endpoint given to hpplite_l1_connect() and the

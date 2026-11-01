@@ -1674,8 +1674,22 @@ static void test_store_paid(void) {
     run_cmd(cmd, after, sizeof after);
     long gained = first_number(after) - first_number(before);
     printf("(two batches: the store's wallet gained %ld units) ", gained);
+    /* the status row says the same (#11): what was paid over how many calls, what a put costs,
+    ** the node's own balance of the asset, and that the store is fine */
+    long long spent = status_int(w, "store_spent"), calls = status_int(w, "store_calls"), price = status_int(w, "store_price");
+    long long balance = status_int(w, "store_balance");
+    char state[40], mine[80], myBal[80];
+    snprintf(state, sizeof state, "%s", status_text(w, "store_state"));
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY0);
+    run_cmd(cmd, mine, sizeof mine);
+    mine[strcspn(mine, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, mine, RPC);
+    run_cmd(cmd, myBal, sizeof myBal);
+    printf("(status: spent %lld over %lld calls, price %lld, balance %lld vs cast %ld, state %s) ", spent, calls, price, balance, first_number(myBal), state);
+    int statusOk = spent == gained && calls == 2 && price > 1000 && balance == (long long)first_number(myBal) && strcmp(state, "ok") == 0;
     sqlite3_close(w);
     if (gained <= 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("the node did not pay the store"); }
+    if (!statusOk) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("hpplite_status should say what the store cost and what the wallet holds (#11)"); }
 
     /* the cap below the price: refused before signing, the batch waits and says why */
     snprintf(extra, sizeof extra, "&dbname=paidstore&store=http://127.0.0.1:%d&storecap=10", port);
@@ -1684,8 +1698,9 @@ static void test_store_paid(void) {
     sqlite3_exec(w2, "INSERT INTO p(v) VALUES('over the cap')", NULL, NULL, NULL);
     long long h = scalar(w2, "SELECT hpplite_flush()");
     const char *err = status_text(w2, "last_error");
-    int refused = h == 0 && strstr(err, "storecap") != NULL && scalar(w2, "SELECT pending FROM hpplite_status") > 0;
-    printf("(cap 10: flush %lld, '%.50s') ", h, err);
+    int refused = h == 0 && strstr(err, "storecap") != NULL && scalar(w2, "SELECT pending FROM hpplite_status") > 0
+                  && strcmp(status_text(w2, "store_state"), "over cap") == 0;
+    printf("(cap 10: flush %lld, '%.50s', store_state %s) ", h, err, status_text(w2, "store_state"));
     snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, payTo, RPC);
     run_cmd(cmd, before, sizeof before);
     sqlite3_close(w2);

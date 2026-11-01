@@ -73,6 +73,9 @@ typedef struct MockL1 {
     uint64_t nBatches;
     uint8_t *batchData[MAX_BATCHES];
     size_t batchLen[MAX_BATCHES];
+    /* a height whose bytes live in a store (#11): the chain's commitment to them.
+    ** batchData is NULL there. In memory only: a directory-backed mock forgets them */
+    struct MockCommit { uint8_t hash[32]; char *ref; uint8_t *receipt; size_t nReceipt; } *commits[MAX_BATCHES];
 
     char *dir;                   /* Directory-backed: every change is written here */
     unsigned char address[20];   /* the rollup's identity (from the directory when backed by one) */
@@ -298,6 +301,11 @@ static void mock_disconnect(HppliteL1 *l1) {
     for (uint64_t i = 0; i < self->nBatches; i++) {
         if (self->batchData[i]) {
             free(self->batchData[i]);
+        }
+        if (self->commits[i]) {
+            sqlite3_free(self->commits[i]->ref);
+            sqlite3_free(self->commits[i]->receipt);
+            free(self->commits[i]);
         }
     }
 
@@ -964,12 +972,63 @@ static int mock_get_batch_hash(
 
     size_t idx = height - 1;
     if (!self->batchData[idx]) {
+        if (self->commits[idx]) { memcpy(hash_out, self->commits[idx]->hash, 32); return 1; }   /* committed, bytes in a store (#11) */
         memset(hash_out, 0, 32);
         return 0;
     }
 
     hpplite_keccak256(self->batchData[idx], self->batchLen[idx], hash_out);   /* as HPPLiteDA.submitBatch does */
     return 1;
+}
+
+/* commitBatch (#11): the same gate as submitBatch, then hash, reference and receipt at the height */
+static char *mock_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32],
+                               const char *zRef, const uint8_t *receipt, size_t nReceipt) {
+    struct MockCommit *c;
+    size_t idx;
+    if (l1 && self->rpcDown) return NULL;
+    if (!l1 || !instanceId || !hash || !zRef || !zRef[0] || height == 0 || height > MAX_BATCHES) return NULL;
+    if (self->failSubmit || self->failAfterPlus1 == 1) return NULL;
+    if (height != self->nBatches + 1) return NULL;
+    if (!self->hasPrivkey || memcmp(self->sequencerWallet, self->myAddress, 20) != 0) return NULL;
+    if (memcmp(instanceId, self->sequencerInstance, 32) != 0) return NULL;
+    if (self->leaseExpiry <= self->currentTimestamp) return NULL;
+    c = calloc(1, sizeof *c);
+    if (!c) return NULL;
+    memcpy(c->hash, hash, 32);
+    c->ref = sqlite3_mprintf("%s", zRef);
+    if (receipt && nReceipt) {
+        c->receipt = sqlite3_malloc((int)nReceipt);
+        if (c->receipt) { memcpy(c->receipt, receipt, nReceipt); c->nReceipt = nReceipt; }
+    }
+    idx = height - 1;
+    if (self->commits[idx]) { sqlite3_free(self->commits[idx]->ref); sqlite3_free(self->commits[idx]->receipt); free(self->commits[idx]); }
+    self->commits[idx] = c;
+    free(self->batchData[idx]);
+    self->batchData[idx] = NULL;
+    self->batchLen[idx] = 0;
+    if (self->failAfterPlus1 > 1) self->failAfterPlus1--;
+    if (height > self->nBatches) self->nBatches = height;
+    mockSaveState(l1);
+    if (self->loseConfirmation) return NULL;
+    return sqlite3_mprintf("0x%016llx", (unsigned long long)height);
+}
+
+static int mock_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32], char **pzRef, uint8_t **pReceipt, size_t *pnReceipt) {
+    struct MockCommit *c;
+    if (pzRef) *pzRef = NULL;
+    if (pReceipt) *pReceipt = NULL;
+    if (pnReceipt) *pnReceipt = 0;
+    if (!l1 || self->rpcDown || height == 0 || height > MAX_BATCHES) return -1;
+    c = self->commits[height - 1];
+    if (!c) return -1;
+    if (hash) memcpy(hash, c->hash, 32);
+    if (pzRef) *pzRef = sqlite3_mprintf("%s", c->ref);
+    if (pReceipt && c->receipt) {
+        *pReceipt = sqlite3_malloc((int)c->nReceipt);
+        if (*pReceipt) { memcpy(*pReceipt, c->receipt, c->nReceipt); if (pnReceipt) *pnReceipt = c->nReceipt; }
+    }
+    return 0;
 }
 
 static int mock_get_da_state(
@@ -1039,4 +1098,6 @@ const HppliteL1Ops hppliteL1MockOps = {
     .submit_was_oversized = mock_submit_was_oversized,
     .set_max_tx_gas = mock_set_max_tx_gas,
     .get_chain_hash = mock_get_chain_hash,
+    .commit_batch = mock_commit_batch,
+    .get_commitment = mock_get_commitment,
 };

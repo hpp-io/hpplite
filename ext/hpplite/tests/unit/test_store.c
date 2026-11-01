@@ -123,6 +123,53 @@ static void test_errors(HppliteStore *s) {
     PASS();
 }
 
+/* 4. The status row (#11): a node on a store says where its bytes go, what
+** it paid, what a put costs, and why a batch waits. Free store here (price
+** and balance NULL); the paid figures are anvil scenario 20. */
+static void test_node_status(const char *url) {
+    TEST("hpplite_status on a store: store, store_state, store_calls, store_spent, store_price, store_balance; a replica reads the commitment; 'unreachable' when the store is down");
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url };
+    HppliteNode *w = test_open_node(tpath("st_w.db"), l1, &o);
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES('in the store')", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("flush through the store"); }
+    {
+        char store[200];
+        text_of(w->db, "SELECT store FROM hpplite_status", store, sizeof store);
+        if (strcmp(store, url) != 0) { printf("(store '%s') ", store); hpplite_node_destroy(w); FAIL("store should be the store's URL"); }
+    }
+    if (strcmp(status_text(w->db, "store_state"), "ok") != 0) { printf("('%s') ", status_text(w->db, "store_state")); hpplite_node_destroy(w); FAIL("store_state should be ok after a put"); }
+    if (status_int(w->db, "store_calls") != 1) { printf("(%lld) ", (long long)status_int(w->db, "store_calls")); hpplite_node_destroy(w); FAIL("store_calls should count the one put"); }
+    if (status_int(w->db, "store_spent") != 0) { hpplite_node_destroy(w); FAIL("nothing is paid on a free store"); }
+    if (scalar(w->db, "SELECT store_price IS NULL FROM hpplite_status") != 1) { hpplite_node_destroy(w); FAIL("a free store quotes no price"); }
+    if (scalar(w->db, "SELECT store_balance IS NULL FROM hpplite_status") != 1) { hpplite_node_destroy(w); FAIL("no balance without a paid asset on a chain"); }
+    {
+        /* a replica with the same store rebuilds from the chain's commitment */
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "store_r" };
+        HppliteNode *r = test_open_node(tpath("st_r.db"), l1, &ro);
+        int rows = r ? count_rows(r->db, "t") : -1;
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); }
+        if (rows != 1) { printf("(replica rows %d) ", rows); hpplite_node_destroy(w); FAIL("a replica on the store should rebuild the committed batch"); }
+    }
+    hpplite_node_destroy(w);                                   /* disconnects l1 */
+
+    /* the store down: the chain carries the bytes (storefallback on) and the row says why */
+    HppliteL1 *l2 = hpplite_l1_create_mock();
+    TestNodeOpts d = { .storeUrl = "http://127.0.0.1:9", .nodeId = "store_down" };
+    HppliteNode *w2 = test_open_node(tpath("st_down.db"), l2, &d);
+    if (!w2) FAIL("open with the store down");
+    hpplite_node_exec(w2, "CREATE TABLE t(x); INSERT INTO t VALUES('on the chain')", NULL);
+    if (hpplite_node_flush_batch(w2) < 1) { printf("(%s) ", status_text(w2->db, "last_error")); hpplite_node_destroy(w2); FAIL("the chain should carry the batch"); }
+    if (strcmp(status_text(w2->db, "store_state"), "unreachable") != 0 || status_int(w2->db, "store_calls") != 0) {
+        printf("('%s', calls %lld) ", status_text(w2->db, "store_state"), (long long)status_int(w2->db, "store_calls"));
+        hpplite_node_destroy(w2);
+        FAIL("store_state should say the store is unreachable, with no call counted");
+    }
+    hpplite_node_destroy(w2);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = 8470 + (int)(getpid() % 200);
@@ -139,6 +186,7 @@ int main(int argc, char **argv) {
     test_receipt(s);
     test_errors(s);
     hpplite_store_close(s);
+    test_node_status(url);
     stop_service();
     remove_dir();
     return test_report();
