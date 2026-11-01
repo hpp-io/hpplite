@@ -122,7 +122,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         /* the batch bytes' store (#11): the chain will hold commitments only */
         node->store = hpplite_store_open(node->config.storeUrl, config->hasPrivkey ? config->privkey : NULL, config->storeCap);
         if (!node->store) {
-            fprintf(stderr, "hpplite: store=%s: not a store HPPLite knows (http://host:port of a pin service, kubo://host:port of a Kubo node)\n", node->config.storeUrl);
+            fprintf(stderr, "hpplite: store=%s: not a store HPPLite knows (http://host:port of a pin service, kubo://host:port of a Kubo node, s3://bucket/prefix)\n", node->config.storeUrl);
             return -1;
         }
     }

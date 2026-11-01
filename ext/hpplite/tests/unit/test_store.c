@@ -67,6 +67,34 @@ static void stop_kubo(void) {
     if (g_kubo > 0) { kill(g_kubo, SIGTERM); waitpid(g_kubo, NULL, 0); g_kubo = 0; }
 }
 
+/* an S3 stand-in (examples/pin_service/s3_mock.py): one bucket, Signature Version 4 checked */
+static pid_t g_s3;
+#define S3_KEY "AKIAHPPLITETEST"
+#define S3_SECRET "hpplite-test-secret-key"
+static int start_s3(const char *dir, int port) {
+    char portStr[16], script[600];
+    snprintf(portStr, sizeof portStr, "%d", port);
+    snprintf(script, sizeof script, "%s/s3_mock.py", dir);
+    g_s3 = fork();
+    if (g_s3 == 0) {
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--bucket", "batches",
+               "--access-key", S3_KEY, "--secret-key", S3_SECRET, (char *)NULL);
+        _exit(127);
+    }
+    for (int i = 0; i < 50; i++) {
+        char cmd[200];
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 'http://127.0.0.1:%d/batches/x' 2>/dev/null | grep -q SignatureDoesNotMatch", port);
+        if (system(cmd) == 0) return 0;
+        usleep(200 * 1000);
+    }
+    return -1;
+}
+static void stop_s3(void) {
+    if (g_s3 > 0) { kill(g_s3, SIGTERM); waitpid(g_s3, NULL, 0); g_s3 = 0; }
+}
+
 static void stop_service(void) {
     if (g_pid > 0) { kill(g_pid, SIGTERM); waitpid(g_pid, NULL, 0); g_pid = 0; }
 }
@@ -247,6 +275,69 @@ static void test_kubo(const char *url) {
     PASS();
 }
 
+/* 6. An S3 bucket as the store (#11): s3://bucket/prefix, Signature Version
+** 4 with the environment's credentials; the key is the bytes' CIDv1 under
+** the prefix and the reference committed is the CID alone. No receipts. */
+static void test_s3(const char *url) {
+    TEST("s3://: put signs with the environment's credentials and names the bytes' CIDv1, get reads back, a wrong secret is refused with S3's reason; a node and a replica run through it");
+    HppliteStore *s = hpplite_store_open(url, NULL, 0);
+    if (!s) FAIL("s3:// did not open");
+    const uint8_t data[] = "bytes on a Kubo node";                 /* the same bytes, the same CID as case 5 */
+    char *zReceipt = (char *)"unset";
+    char *zRef = hpplite_store_put(s, data, sizeof(data) - 1, &zReceipt);
+    if (!zRef) { printf("(%s) ", hpplite_store_error(s)); hpplite_store_close(s); FAIL("put"); }
+    if (strcmp(zRef, "bafkreihvqzvroh57j7qeruusyaoawj62ny72bxluzpmjzatjhtklrlwtte") != 0) {
+        printf("(ref %s) ", zRef); sqlite3_free(zRef); hpplite_store_close(s); FAIL("the reference is not the bytes' CIDv1");
+    }
+    if (zReceipt) { sqlite3_free(zRef); hpplite_store_close(s); FAIL("a bucket signs nothing: the receipt must be NULL"); }
+    {
+        size_t n = 0;
+        uint8_t *back = hpplite_store_get(s, zRef, &n);
+        int ok = back && n == sizeof(data) - 1 && memcmp(back, data, n) == 0;
+        free(back);
+        if (!ok) { printf("(%s) ", hpplite_store_error(s)); sqlite3_free(zRef); hpplite_store_close(s); FAIL("get"); }
+        back = hpplite_store_get(s, "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy", &n);
+        if (back) { free(back); sqlite3_free(zRef); hpplite_store_close(s); FAIL("an unknown CID should be NULL"); }
+    }
+    sqlite3_free(zRef);
+    if (hpplite_store_signer(s, NULL) != -1 || hpplite_store_calls(s) != 2 || hpplite_store_spent(s, NULL) != 0)
+        { hpplite_store_close(s); FAIL("no signer, two calls, nothing paid"); }
+    hpplite_store_close(s);
+
+    /* the wrong secret: refused with S3's reason, counted as an error, not an outage */
+    setenv("AWS_SECRET_ACCESS_KEY", "not-the-secret", 1);
+    s = hpplite_store_open(url, NULL, 0);
+    setenv("AWS_SECRET_ACCESS_KEY", S3_SECRET, 1);
+    if (!s) FAIL("reopen");
+    zRef = hpplite_store_put(s, data, sizeof(data) - 1, NULL);
+    if (zRef || !strstr(hpplite_store_error(s), "SignatureDoesNotMatch") || hpplite_store_last_failure(s) != HPPLITE_STORE_FAIL_OTHER) {
+        printf("(ref %s, '%s') ", zRef ? zRef : "none", hpplite_store_error(s)); sqlite3_free(zRef); hpplite_store_close(s);
+        FAIL("a wrong secret should be refused with SignatureDoesNotMatch");
+    }
+    hpplite_store_close(s);
+
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "s3_w" };
+    HppliteNode *w = test_open_node(tpath("s3_w.db"), l1, &o);
+    if (!w) FAIL("open node");
+    hpplite_node_exec(w, "CREATE TABLE b(x); INSERT INTO b VALUES('in the bucket')", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("flush through S3"); }
+    if (strcmp(status_text(w->db, "store_state"), "ok") != 0 || strcmp(status_text(w->db, "store"), url) != 0) {
+        printf("(state '%s', store '%s') ", status_text(w->db, "store_state"), status_text(w->db, "store"));
+        hpplite_node_destroy(w);
+        FAIL("the status row should name the bucket, ok");
+    }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "s3_r" };
+        HppliteNode *r = test_open_node(tpath("s3_r.db"), l1, &ro);
+        int rows = r ? count_rows(r->db, "b") : -1;
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); }
+        if (rows != 1) { printf("(replica rows %d) ", rows); hpplite_node_destroy(w); FAIL("a replica on the bucket should rebuild the committed batch"); }
+    }
+    hpplite_node_destroy(w);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = 8470 + (int)(getpid() % 200);
@@ -272,6 +363,20 @@ int main(int argc, char **argv) {
         test_kubo(kurl);
         stop_kubo();
         if (getenv("HPPLITE_KUBO")) test_kubo(getenv("HPPLITE_KUBO"));    /* a real daemon, when one is named (kubo://127.0.0.1:5001) */
+    }
+    {
+        int sport = 8870 + (int)(getpid() % 200);
+        char endpoint[64];
+        snprintf(endpoint, sizeof endpoint, "http://127.0.0.1:%d", sport);
+        if (start_s3(dir, sport) != 0) { stop_s3(); stop_service(); printf("FAIL: the S3 stand-in did not start\n"); return 1; }
+        setenv("HPPLITE_S3_ENDPOINT", endpoint, 1);
+        setenv("AWS_REGION", "us-east-1", 1);
+        setenv("AWS_ACCESS_KEY_ID", S3_KEY, 1);
+        setenv("AWS_SECRET_ACCESS_KEY", S3_SECRET, 1);
+        test_s3("s3://batches/hpplite/test");
+        stop_s3();
+        unsetenv("HPPLITE_S3_ENDPOINT"); unsetenv("AWS_REGION"); unsetenv("AWS_ACCESS_KEY_ID"); unsetenv("AWS_SECRET_ACCESS_KEY");
+        if (getenv("HPPLITE_S3")) test_s3(getenv("HPPLITE_S3"));          /* a real bucket, with the environment's credentials */
     }
     stop_service();
     remove_dir();

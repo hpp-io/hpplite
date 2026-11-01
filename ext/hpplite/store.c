@@ -13,6 +13,7 @@
 #include "crypto.h"
 #include "cJSON.h"
 #include "eth_client.h"
+#include "sha256.h"
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,11 +22,16 @@
 
 #define STORE_PIN  0                /* http(s)://host:port: a pin service (examples/pin_service) */
 #define STORE_KUBO 1                /* kubo://host:port: a Kubo node's own RPC (#11); no receipts, no payment */
+#define STORE_S3   2                /* s3://bucket[/prefix]: a bucket over Signature Version 4 (#11); no receipts, no payment */
 
 struct HppliteStore {
     char *url;                      /* as given, no trailing slash: what the status row shows */
     char *base;                     /* http(s)://host:port the requests go to */
     int kind;                       /* STORE_* */
+    char *s3Bucket, *s3Prefix;      /* S3: the bucket and the key prefix ("" for none) */
+    char *s3Host;                   /* ...the endpoint's authority, as sent and as signed */
+    char s3Region[64];
+    char s3Key[128], s3Secret[128]; /* AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY at open; empty: none */
     int hasKey;
     HppliteKeypair kp;
     unsigned char address[20];
@@ -297,6 +303,184 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
     return result;
 }
 
+/* === S3: Signature Version 4, PUT and GET of content-addressed keys (#11) === */
+
+static void sha256Hex(const uint8_t *data, size_t len, char hex[65]) {
+    uint8_t h[32];
+    SHA256_CTX c;
+    hpplite_sha256_init(&c);
+    hpplite_sha256_update(&c, data, len);
+    hpplite_sha256_final(&c, h);
+    hpplite_bytes_to_hex(h, 32, hex);
+}
+
+static void hmac256(const uint8_t *key, size_t klen, const void *msg, size_t mlen, uint8_t out[32]) {
+    uint8_t k[64], pad[64], inner[32];
+    SHA256_CTX c;
+    size_t i;
+    memset(k, 0, sizeof k);
+    if (klen > 64) { hpplite_sha256_init(&c); hpplite_sha256_update(&c, key, klen); hpplite_sha256_final(&c, k); }
+    else memcpy(k, key, klen);
+    for (i = 0; i < 64; i++) pad[i] = k[i] ^ 0x36;
+    hpplite_sha256_init(&c); hpplite_sha256_update(&c, pad, 64); hpplite_sha256_update(&c, msg, mlen); hpplite_sha256_final(&c, inner);
+    for (i = 0; i < 64; i++) pad[i] = k[i] ^ 0x5c;
+    hpplite_sha256_init(&c); hpplite_sha256_update(&c, pad, 64); hpplite_sha256_update(&c, inner, 32); hpplite_sha256_final(&c, out);
+}
+
+/* CIDv1, raw (0x55), sha2-256 multihash, base32 lower with the 'b' prefix:
+** what a pin service and Kubo (raw leaves) name the same bytes */
+static void cidOf(const uint8_t *data, size_t len, char out[64]) {
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
+    uint8_t raw[36] = { 0x01, 0x55, 0x12, 0x20 };
+    SHA256_CTX c;
+    unsigned bits = 0, acc = 0;
+    size_t i, n = 0;
+    hpplite_sha256_init(&c);
+    hpplite_sha256_update(&c, data, len);
+    hpplite_sha256_final(&c, raw + 4);
+    out[n++] = 'b';
+    for (i = 0; i < sizeof raw; i++) {
+        acc = (acc << 8) | raw[i];
+        bits += 8;
+        while (bits >= 5) { out[n++] = alphabet[(acc >> (bits - 5)) & 31]; bits -= 5; }
+    }
+    if (bits) out[n++] = alphabet[(acc << (5 - bits)) & 31];
+    out[n] = 0;
+}
+
+/* /bucket/prefix/cid, every segment URI-encoded the way the signature wants it */
+static char *s3Path(HppliteStore *s, const char *zCid) {
+    char raw[1200], *out, *q;
+    const char *p;
+    snprintf(raw, sizeof raw, "/%s/%s%s%s", s->s3Bucket, s->s3Prefix, s->s3Prefix[0] ? "/" : "", zCid);
+    out = sqlite3_malloc((int)strlen(raw) * 3 + 1);
+    if (!out) return NULL;
+    for (p = raw, q = out; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch == '/' || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~')
+            *q++ = (char)ch;
+        else { sprintf(q, "%%%02X", ch); q += 3; }
+    }
+    *q = 0;
+    return out;
+}
+
+/* One signed request. The status (0: unreachable, with s->error and lastFailure set) and the body. */
+static long s3Request(HppliteStore *s, const char *method, const char *path, const uint8_t *body, size_t bodyLen, Buf *out) {
+    CURL *c;
+    struct curl_slist *hdrs = NULL;
+    char amzDate[24], date[12], payloadHash[65], canonHash[65], scope[160], sigHex[65];
+    char canonical[2400], toSign[400], hdr[600], url[1300];
+    uint8_t kDate[32], kRegion[32], kService[32], kSigning[32], sig[32];
+    char *kSecret;
+    time_t now = time(NULL);
+    struct tm tm;
+    long status = 0;
+    if (!s->s3Key[0] || !s->s3Secret[0]) {
+        snprintf(s->error, sizeof s->error, "no AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for %s", s->url);
+        s->lastFailure = HPPLITE_STORE_FAIL_OTHER;
+        return 0;
+    }
+    gmtime_r(&now, &tm);
+    strftime(amzDate, sizeof amzDate, "%Y%m%dT%H%M%SZ", &tm);
+    memcpy(date, amzDate, 8); date[8] = 0;
+    sha256Hex(body ? body : (const uint8_t *)"", bodyLen, payloadHash);
+    snprintf(canonical, sizeof canonical, "%s\n%s\n\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n\nhost;x-amz-content-sha256;x-amz-date\n%s",
+             method, path, s->s3Host, payloadHash, amzDate, payloadHash);
+    sha256Hex((const uint8_t *)canonical, strlen(canonical), canonHash);
+    snprintf(scope, sizeof scope, "%s/%s/s3/aws4_request", date, s->s3Region);
+    snprintf(toSign, sizeof toSign, "AWS4-HMAC-SHA256\n%s\n%s\n%s", amzDate, scope, canonHash);
+    kSecret = sqlite3_mprintf("AWS4%s", s->s3Secret);
+    if (!kSecret) return 0;
+    hmac256((const uint8_t *)kSecret, strlen(kSecret), date, 8, kDate);
+    sqlite3_free(kSecret);
+    hmac256(kDate, 32, s->s3Region, strlen(s->s3Region), kRegion);
+    hmac256(kRegion, 32, "s3", 2, kService);
+    hmac256(kService, 32, "aws4_request", 12, kSigning);
+    hmac256(kSigning, 32, toSign, strlen(toSign), sig);
+    hpplite_bytes_to_hex(sig, 32, sigHex);
+
+    c = curl_easy_init();
+    if (!c) return 0;
+    snprintf(url, sizeof url, "%s%s", s->base, path);
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, bufWrite);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, out);
+    snprintf(hdr, sizeof hdr, "Host: %s", s->s3Host);                      hdrs = curl_slist_append(hdrs, hdr);
+    snprintf(hdr, sizeof hdr, "x-amz-date: %s", amzDate);                  hdrs = curl_slist_append(hdrs, hdr);
+    snprintf(hdr, sizeof hdr, "x-amz-content-sha256: %s", payloadHash);    hdrs = curl_slist_append(hdrs, hdr);
+    snprintf(hdr, sizeof hdr, "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=%s",
+             s->s3Key, scope, sigHex);
+    hdrs = curl_slist_append(hdrs, hdr);
+    hdrs = curl_slist_append(hdrs, "Expect:");
+    if (strcmp(method, "PUT") == 0) {
+        curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)bodyLen);
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/octet-stream");
+    }
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+    if (curl_easy_perform(c) != CURLE_OK) {
+        snprintf(s->error, sizeof s->error, "store unreachable: %s", url);
+        s->lastFailure = HPPLITE_STORE_FAIL_UNREACHABLE;
+    } else {
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    }
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(c);
+    return status;
+}
+
+/* S3's <Code> from an error body, for the message */
+static void s3ErrorCode(const Buf *out, char *code, size_t n) {
+    const char *p = out->p ? strstr(out->p, "<Code>") : NULL, *q = p ? strstr(p, "</Code>") : NULL;
+    if (p && q && (size_t)(q - p - 6) < n) { memcpy(code, p + 6, (size_t)(q - p - 6)); code[q - p - 6] = 0; }
+    else snprintf(code, n, "%.80s", out->p ? out->p : "");
+}
+
+static char *s3Put(HppliteStore *s, const uint8_t *data, size_t len) {
+    Buf out = {0};
+    char cid[64], *path, *zRef = NULL;
+    long status;
+    cidOf(data, len, cid);
+    path = s3Path(s, cid);
+    if (!path) return NULL;
+    status = s3Request(s, "PUT", path, data, len, &out);
+    if (status == 200) zRef = sqlite3_mprintf("%s", cid);
+    else if (status) {
+        char code[120];
+        s3ErrorCode(&out, code, sizeof code);
+        snprintf(s->error, sizeof s->error, "S3 answered %ld to put %s: %s", status, path, code);
+        s->lastFailure = HPPLITE_STORE_FAIL_OTHER;
+    }
+    sqlite3_free(path);
+    free(out.p);
+    return zRef;
+}
+
+static uint8_t *s3Get(HppliteStore *s, const char *zRef, size_t *pLen) {
+    Buf out = {0};
+    char *path = s3Path(s, zRef);
+    long status;
+    if (!path) return NULL;
+    status = s3Request(s, "GET", path, NULL, 0, &out);
+    if (status != 200) {
+        if (status) {
+            char code[120];
+            s3ErrorCode(&out, code, sizeof code);
+            snprintf(s->error, sizeof s->error, "S3 answered %ld to get %s: %s", status, path, code);
+        }
+        sqlite3_free(path);
+        free(out.p);
+        return NULL;
+    }
+    sqlite3_free(path);
+    if (!out.p) { out.p = malloc(1); if (out.p) out.p[0] = 0; }
+    if (pLen) *pLen = out.n;
+    return (uint8_t *)out.p;
+}
+
 /* === The API === */
 
 HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64_t cap) {
@@ -306,6 +490,7 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
     if (!url) return NULL;
     if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) kind = STORE_PIN;
     else if (strncmp(url, "kubo://", 7) == 0) kind = STORE_KUBO;
+    else if (strncmp(url, "s3://", 5) == 0 && url[5]) kind = STORE_S3;
     else return NULL;
     s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -313,8 +498,28 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
     n = strlen(s->url);
     while (n > 0 && s->url[n - 1] == '/') s->url[--n] = 0;
     s->kind = kind;
-    s->base = kind == STORE_KUBO ? sqlite3_mprintf("http://%s", s->url + 7) : sqlite3_mprintf("%s", s->url);
-    if (!s->base) { free(s->url); free(s); return NULL; }
+    if (kind == STORE_S3) {
+        /* s3://bucket[/prefix]; the endpoint, region and credentials from the environment */
+        const char *slash = strchr(s->url + 5, '/'), *ep = getenv("HPPLITE_S3_ENDPOINT"), *region = getenv("AWS_REGION"), *z;
+        if (!region || !region[0]) region = getenv("AWS_DEFAULT_REGION");
+        snprintf(s->s3Region, sizeof s->s3Region, "%s", (region && region[0]) ? region : "us-east-1");
+        s->s3Bucket = slash ? sqlite3_mprintf("%.*s", (int)(slash - (s->url + 5)), s->url + 5) : sqlite3_mprintf("%s", s->url + 5);
+        s->s3Prefix = sqlite3_mprintf("%s", slash ? slash + 1 : "");
+        s->base = (ep && ep[0]) ? sqlite3_mprintf("%s", ep) : sqlite3_mprintf("https://s3.%s.amazonaws.com", s->s3Region);
+        if (s->base) {
+            size_t bn = strlen(s->base);
+            while (bn > 0 && s->base[bn - 1] == '/') s->base[--bn] = 0;
+            z = strstr(s->base, "://");
+            z = z ? z + 3 : s->base;
+            s->s3Host = sqlite3_mprintf("%.*s", (int)strcspn(z, "/"), z);
+        }
+        if ((z = getenv("AWS_ACCESS_KEY_ID")) != NULL) snprintf(s->s3Key, sizeof s->s3Key, "%s", z);
+        if ((z = getenv("AWS_SECRET_ACCESS_KEY")) != NULL) snprintf(s->s3Secret, sizeof s->s3Secret, "%s", z);
+        if (!s->s3Bucket || !s->s3Prefix || !s->base || !s->s3Host || !s->s3Bucket[0]) { hpplite_store_close(s); return NULL; }
+    } else {
+        s->base = kind == STORE_KUBO ? sqlite3_mprintf("http://%s", s->url + 7) : sqlite3_mprintf("%s", s->url);
+        if (!s->base) { free(s->url); free(s); return NULL; }
+    }
     s->cap = cap;
     s->validFor = 120;
     {
@@ -390,6 +595,10 @@ void hpplite_store_close(HppliteStore *s) {
     memset(&s->kp, 0, sizeof s->kp);
     free(s->url);
     sqlite3_free(s->base);
+    sqlite3_free(s->s3Bucket);
+    sqlite3_free(s->s3Prefix);
+    sqlite3_free(s->s3Host);
+    memset(s->s3Secret, 0, sizeof s->s3Secret);
     free(s);
 }
 
@@ -498,10 +707,10 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
     s->error[0] = 0;
     s->lastFailure = HPPLITE_STORE_FAIL_NONE;
     s->lastBytes = len;
-    if (s->kind == STORE_KUBO) {
-        zRef = kuboAdd(s, data, len);
+    if (s->kind == STORE_KUBO || s->kind == STORE_S3) {
+        zRef = s->kind == STORE_KUBO ? kuboAdd(s, data, len) : s3Put(s, data, len);
         if (zRef) s->nOk++;
-        return zRef;                              /* no receipt: a Kubo node promises nothing */
+        return zRef;                              /* no receipt: a Kubo node or a bucket promises nothing */
     }
     status = storeRequest(s, "POST", "/put", data, len, NULL, &out, &zRequired, NULL);
     if (status == 402 && zRequired) {
@@ -606,6 +815,11 @@ uint8_t *hpplite_store_get(HppliteStore *s, const char *zRef, size_t *pLen) {
     if (pLen) *pLen = 0;
     if (!s || !zRef || !zRef[0] || strlen(zRef) > 500 || strchr(zRef, '/')) return NULL;
     s->error[0] = 0;
+    if (s->kind == STORE_S3) {
+        uint8_t *data = s3Get(s, zRef, pLen);
+        if (data) s->nOk++;
+        return data;
+    }
     if (s->kind == STORE_KUBO) {
         snprintf(path, sizeof path, "/api/v0/cat?arg=%s", zRef);
         status = storeRequest(s, "POST", path, NULL, 0, NULL, &out, NULL, NULL);

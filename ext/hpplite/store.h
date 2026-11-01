@@ -9,7 +9,10 @@
 ** paid in x402's exact scheme with the node's key, up to storecap= per call.
 ** store=kubo://host:port is a Kubo node's own RPC (add, cat): the node pins
 ** what it is given and signs nothing, so the chain commits (hash, CID) with
-** no receipt.
+** no receipt. store=s3://bucket[/prefix] is a bucket over Signature Version
+** 4 (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION; HPPLITE_S3_ENDPOINT
+** for a compatible service), keyed by the bytes' CID under the prefix; the
+** same (hash, CID) commitment, no receipt.
 */
 #ifndef HPPLITE_STORE_H
 #define HPPLITE_STORE_H
