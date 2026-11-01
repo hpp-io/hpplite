@@ -446,6 +446,10 @@ static void test_text_verdicts(void) {
     if (sqlite3_exec(w->db, "INSERT INTO t SELECT datetime('now', 'localtime') FROM _hpplite_pending", NULL, NULL, NULL) != SQLITE_INTERRUPT)
         FAIL("warn: a time zone value let a _hpplite_ reference through");
     if (count_rows(w->db, "t") != 1 || w->ctx->nNondeterministic != 6) FAILF("warn: %d rows, counted %llu; want 1 and 6 (every determinism rule hit counts)", count_rows(w->db, "t"), (unsigned long long)w->ctx->nNondeterministic);
+    /* a non-deterministic builtin before an application function in the same statement does not hide it (#115) */
+    if (sqlite3_exec(w->db, "INSERT INTO t VALUES(random() + app_double(1))", NULL, NULL, NULL) != SQLITE_INTERRUPT)
+        FAIL("warn: random() before app_double() let the application function through");
+    if (count_rows(w->db, "t") != 1) FAIL("warn: the hidden application function ran");
     hpplite_node_destroy(w);
     PASS();
 }

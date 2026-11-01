@@ -418,6 +418,7 @@ static void collectFunction(HppliteCtx *pCtx, const char *zName) {
   lower[n] = 0;
   for (i = 0; aNondet[i]; i++) {
     if (strcmp(lower, aNondet[i]) == 0) {
+      if (pCtx->zCollectWhy[0]) return;           /* the first reason stays the reason */
       snprintf(pCtx->zCollectWhy, sizeof(pCtx->zCollectWhy),
                "non-deterministic function %s() in a write; replay cannot reproduce it", lower);
       pCtx->collectKind = TEXT_VALUE;
@@ -623,7 +624,9 @@ int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const 
   if (pCtx->bCollectFns) {
     /* the capture triggers' functions are ours, and silent in a text statement */
     if (pCtx->bRows && z4 && sqlite3_strnicmp(z4, "hpplite_cap_", 12) == 0) return SQLITE_OK;
-    if (op == SQLITE_FUNCTION && z2 && !pCtx->zCollectWhy[0]) collectFunction(pCtx, z2);
+    /* every function, until one the replica lacks is found: that verdict
+    ** wins over a non-deterministic builtin seen before it (#115) */
+    if (op == SQLITE_FUNCTION && z2 && pCtx->collectKind != TEXT_FUNCTION) collectFunction(pCtx, z2);
     return SQLITE_OK;
   }
   if (pCtx->bInternal || !pCtx->bEnabled) return SQLITE_OK;
