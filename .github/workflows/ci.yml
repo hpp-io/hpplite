@@ -103,6 +103,47 @@ jobs:
       - name: ctest
         run: cd ext/hpplite/build && ctest
 
+  # The extension against SQLite trunk (#105): the capture path relies on SQLite
+  # behaviours outside its documented API (ext/hpplite/doc/sqlite-dependencies.md),
+  # and this is where a change upstream shows first - as a red job here, not as a
+  # user's diverged rollup. Advisory: trunk moves every day and must not block a
+  # release of this branch, so the job never fails the workflow.
+  sqlite-trunk:
+    name: sqlite trunk (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: SQLite trunk checkout
+        uses: actions/checkout@v4
+        with:
+          repository: sqlite/sqlite
+          ref: master
+          path: sqlite-trunk
+          fetch-depth: 1
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config tcl \
+            libsecp256k1-dev libcurl4-openssl-dev sqlite3 python3
+      - name: SQLite trunk amalgamation
+        run: |
+          mkdir -p sqlite-trunk/build && cd sqlite-trunk/build
+          ../configure >/dev/null
+          make -s sqlite3.c sqlite3ext.h >/dev/null
+          ls -l sqlite3.c sqlite3.h sqlite3ext.h
+          grep -m1 'define SQLITE_VERSION ' sqlite3.h
+          grep -m1 'define SQLITE_SOURCE_ID' sqlite3.h
+      - name: configure
+        run: |
+          cmake -S ext/hpplite -B ext/hpplite/build_trunk \
+            -DHPPLITE_SQLITE_SRC=$PWD/sqlite-trunk/build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
+      - name: build
+        run: cmake --build ext/hpplite/build_trunk -j"$(nproc)"
+      - name: ctest
+        run: cd ext/hpplite/build_trunk && ctest
+
   # Real HPP Sepolia run: manual only, spends testnet ETH from the HPPLITE_PRIVATE_KEY secret.
   integration:
     name: integration (manual, real L1)
