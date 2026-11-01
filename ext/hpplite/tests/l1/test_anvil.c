@@ -220,7 +220,7 @@ static void test_sleep_and_wake(void) {
     chain_sleep(3 * 24 * 3600);
     HppliteNode *na = hpplite_get_node(a);
     if (hpplite_l1_is_lease_active(na->l1)) FAIL("lease should have expired");
-    sqlite3_exec(a, "INSERT INTO t VALUES(4)", NULL, NULL, NULL);
+    sqlite3_exec(a, "CREATE TABLE IF NOT EXISTS t(x); INSERT INTO t VALUES(4)", NULL, NULL, NULL);   /* t is scenario 1's; alone, it is made here */
     if (scalar(a, "SELECT hpplite_flush()") == 0) FAIL("flush after sleep");
     if (lease_is(na->l1, na->instanceId) != 1) FAIL("lease re-claimed");
     sqlite3_close(a);
