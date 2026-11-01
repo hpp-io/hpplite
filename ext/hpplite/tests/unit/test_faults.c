@@ -15,19 +15,14 @@
 **   HPPLITE_FAULT_SEED=17 ./test_faults       (one seed, verbose)
 */
 
-#include "hpplite.h"
-#include "node.h"
+#include "test_lib.h"
 #include "l1_interface.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <strings.h>
 #include <unistd.h>
 
-/* a scratch directory of this process's own: two harness runs at once
-** (a long seed sweep beside ctest) must not share one */
-static char g_dir[64];
-static char g_wdb[96], g_rdb[96];
+/* in a scratch directory of this process's own (test_suite_init): two
+** harness runs at once (a long seed sweep beside ctest) must not share one */
+static char g_wdb[600], g_rdb[600];
 
 static const unsigned char PRIVKEY[32] = {
     0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
@@ -39,59 +34,12 @@ static unsigned rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^=
 static int chance(int percent) { return (int)(rnd() % 100) < percent; }
 
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1, int interval) {
-    HppliteNodeConfig config;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "faults";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = g_dir;
-    config.dbPath = (char *)dbPath;
-    config.checkpointInterval = interval;
-    HppliteNode *n = hpplite_node_create(&config);
-    if (!n) return NULL;
-    hpplite_node_set_l1(n, l1);
-    hpplite_node_sync_from_l1(n, 1);
-    hpplite_node_start(n);
-    return n;
+    TestNodeOpts o = { .checkpointInterval = interval };
+    return test_open_node(dbPath, l1, &o);
 }
 
 /* Every row of every application table, in order, typed */
-static char *dump(sqlite3 *db) {
-    sqlite3_str *out = sqlite3_str_new(NULL);
-    sqlite3_stmt *t;
-    if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\'"
-                               " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name", -1, &t, NULL) == SQLITE_OK) {
-        while (sqlite3_step(t) == SQLITE_ROW) {
-            const char *zTab = (const char *)sqlite3_column_text(t, 0);
-            char *q = sqlite3_mprintf("SELECT rowid, * FROM \"%w\" ORDER BY rowid", zTab);
-            sqlite3_stmt *r;
-            sqlite3_str_appendf(out, "[%s]", zTab);
-            if (q && sqlite3_prepare_v2(db, q, -1, &r, NULL) == SQLITE_OK) {
-                while (sqlite3_step(r) == SQLITE_ROW) {
-                    for (int i = 0; i < sqlite3_column_count(r); i++) {
-                        int ty = sqlite3_column_type(r, i);
-                        if (ty == SQLITE_NULL) sqlite3_str_appendf(out, "N|");
-                        else if (ty == SQLITE_BLOB) sqlite3_str_appendf(out, "B%d|", sqlite3_column_bytes(r, i));
-                        else sqlite3_str_appendf(out, "%d%s|", ty, sqlite3_column_text(r, i));
-                    }
-                    sqlite3_str_appendchar(out, 1, ';');
-                }
-                sqlite3_finalize(r);
-            }
-            sqlite3_free(q);
-        }
-        sqlite3_finalize(t);
-    }
-    return sqlite3_str_finish(out);
-}
-
-static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
-    sqlite3_stmt *s; sqlite3_int64 v = -1;
-    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
-    return v;
-}
+#define dump(db) test_dump(db, TEST_DUMP_SKIP_SQLITE)
 
 enum { F_NONE, F_SUBMIT_FAILS, F_CONFIRMATION_LOST, F_TX_PENDING, F_CLAIM_REVERTS, F_COMMIT_FAILS, F_REORG, F_LEASE_EXPIRES, F_RPC_DOWN, F_COUNT };
 static const char *fault_name[] = { "none", "submit fails", "confirmation lost", "tx pending", "claim reverts", "commit fails", "reorg", "lease expires", "rpc down" };
@@ -145,11 +93,7 @@ static const char *run_seed(unsigned seed, int two) {
     int nFaults[F_COUNT] = {0};
     int altered = 0, step, nextId = 1, nRows = 0;
     g_rng = seed * 2654435761u + 12345;
-    {
-        char cmd[200];
-        snprintf(cmd, sizeof cmd, "rm -rf %s && mkdir -p %s", g_dir, g_dir);
-        (void)!system(cmd);
-    }
+    reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *w = open_node(g_wdb, l1, 1 + (int)(rnd() % 4));
     if (!w) return "open writer";
@@ -256,8 +200,7 @@ static const char *run_seed(unsigned seed, int two) {
     hpplite_l1_disconnect(l1);
     int same = strcmp(a, b) == 0;
     if (!same) {
-        size_t i = 0; while (a[i] && a[i] == b[i]) i++;
-        while (i > 0 && a[i - 1] != ';' && a[i - 1] != ']') i--;
+        size_t i = test_dump_diff(a, b);
         snprintf(why, sizeof why, "seed %u: replica differs: writer [%.60s] replica [%.60s]", seed, a + i, b + i);
     } else if (errState || heightR != heightW) {
         snprintf(why, sizeof why, "seed %u: replica %s at height %llu, writer at %llu", seed, errState ? "in error" : "stopped",
@@ -280,9 +223,9 @@ static const char *run_seed(unsigned seed, int two) {
 
 int main(void) {
     const char *one = getenv("HPPLITE_FAULT_SEED"), *many = getenv("HPPLITE_FAULT_SEEDS");
-    snprintf(g_dir, sizeof g_dir, "/tmp/hpplite_test_faults.%d", (int)getpid());
-    snprintf(g_wdb, sizeof g_wdb, "%s/w.db", g_dir);
-    snprintf(g_rdb, sizeof g_rdb, "%s/r.db", g_dir);
+    test_suite_init("faults", PRIVKEY, NULL);
+    snprintf(g_wdb, sizeof g_wdb, "%s", tpath("w.db"));
+    snprintf(g_rdb, sizeof g_rdb, "%s", tpath("r.db"));
     unsigned nSeeds = many ? (unsigned)atoi(many) : 60, failed = 0;
     printf("=== HPPLite under injected faults (#98), %s capture ===\n",
            getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0 ? "statement" : "row");
@@ -292,7 +235,7 @@ int main(void) {
         printf("one connection: %s\n", why ? why : "ok");
         const char *why2 = run_seed((unsigned)atoi(one), 1);
         printf("two connections: %s\n", why2 ? why2 : "ok");
-        { char cmd[120]; snprintf(cmd, sizeof cmd, "rm -rf %s", g_dir); (void)!system(cmd); }
+        remove_dir();
         return why || why2 ? 1 : 0;
     }
     for (unsigned s = 1; s <= nSeeds; s++) {
@@ -301,7 +244,7 @@ int main(void) {
         why = run_seed(s, 1);
         if (why) { printf("  FAIL (two connections): %s\n", why); failed++; }
     }
-    { char cmd[120]; snprintf(cmd, sizeof cmd, "rm -rf %s", g_dir); (void)!system(cmd); }
+    remove_dir();
     printf("\n%u/%u seeds passed\n", nSeeds - failed, nSeeds);
     return failed ? 1 : 0;
 }

@@ -14,19 +14,11 @@
 ** replica rebuilt from L1 must have the same rows and the same root.
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "batch.h"
 #include "cipher.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
 static const unsigned char PRIVKEY[32] = {
     0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4a,0x4b,0x4c,0x4d,0x4e,0x4f,0x50,
@@ -35,78 +27,12 @@ static const unsigned char PRIVKEY[32] = {
 
 #define DIR "/tmp/hpplite_test_fk"
 
-static void reset_dir(void) {
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
-}
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, NULL); }
 
-static int scalar(sqlite3 *db, const char *sql) {
-    sqlite3_stmt *s;
-    int v = -1;
-    if (sqlite3_prepare_v2(db, sql, -1, &s, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int(s, 0);
-    sqlite3_finalize(s);
-    return v;
-}
-
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "fk";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.checkpointInterval = 1000;
-    node = hpplite_node_create(&config);
-    if (node && l1) {
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_sync_from_l1(node, 1);
-        hpplite_node_start(node);
-    }
-    return node;
-}
-
-/* Run each statement on the writer's application connection; any failure
-** is reported (these are all statements the application expects to work) */
-static int run(HppliteNode *n, const char **aSql) {
-    for (int i = 0; aSql[i]; i++) {
-        char *err = NULL;
-        if (sqlite3_exec(n->db, aSql[i], NULL, NULL, &err) != SQLITE_OK) {
-            printf("[%s: %s] ", aSql[i], err ? err : "?");
-            sqlite3_free(err);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/* The check every test ends with: flush, rebuild a replica from L1,
-** compare a probe query and the state root. Destroys the writer. */
-static const char *replica_matches(HppliteNode *w, HppliteL1 *l1, const char *replicaFile, const char *probe) {
-    static char why[256];
-    unsigned char rootW[32], rootR[32];
-    int probeW, probeR;
-    hpplite_node_flush_batch(w);
-    if (hpplite_node_pending_count(w) != 0) return "writer still has pending rows after flush";
-    probeW = scalar(w->db, probe);
-    hpplite_state_root(w->db, rootW);
-    hpplite_node_destroy(w);
-
-    char path[256];
-    snprintf(path, sizeof(path), DIR "/%s", replicaFile);
-    HppliteNode *r = open_node(path, l1);
-    if (!r) return "replica open";
-    if (r->state == HPPLITE_STATE_ERROR) { hpplite_node_destroy(r); return "replica sync failed"; }
-    probeR = scalar(r->db, probe);
-    hpplite_state_root(r->db, rootR);
-    hpplite_node_destroy(r);
-    if (probeW != probeR) {
-        snprintf(why, sizeof(why), "replica diverged: \"%s\" is %d on the writer, %d on the replica", probe, probeW, probeR);
-        return why;
-    }
-    if (memcmp(rootW, rootR, 32) != 0) return "replica state root differs from the writer's";
-    return NULL;
+/* The check every test ends with: one flush, rebuild a replica from L1,
+** compare every row and the state root. Destroys the writer. */
+static const char *replica_matches(HppliteNode *w, HppliteL1 *l1, const char *replicaFile) {
+    return test_replica_check(w, l1, tpath(replicaFile), NULL, 0, 1, 1);
 }
 
 #define SCHEMA_PARENT "CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT)"
@@ -128,7 +54,7 @@ static void test_delete_cascade(void) {
         NULL };
     if (run(w, sql) != 0) FAIL("writer SQL");
     if (scalar(w->db, "SELECT count(*) FROM child") != 1) FAIL("the writer did not cascade (test premise)");
-    const char *why = replica_matches(w, l1, "cascade_r.db", "SELECT count(*) FROM child");
+    const char *why = replica_matches(w, l1, "cascade_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -151,7 +77,7 @@ static void test_delete_set_null(void) {
         NULL };
     if (run(w, sql) != 0) FAIL("writer SQL");
     if (scalar(w->db, "SELECT count(*) FROM child WHERE parent_id IS NULL") != 2) FAIL("test premise");
-    const char *why = replica_matches(w, l1, "setnull_r.db", "SELECT count(*) FROM child WHERE parent_id IS NULL");
+    const char *why = replica_matches(w, l1, "setnull_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -174,7 +100,7 @@ static void test_delete_set_default(void) {
         NULL };
     if (run(w, sql) != 0) FAIL("writer SQL");
     if (scalar(w->db, "SELECT parent_id FROM child WHERE id = 10") != 0) FAIL("test premise");
-    const char *why = replica_matches(w, l1, "setdefault_r.db", "SELECT parent_id FROM child WHERE id = 10");
+    const char *why = replica_matches(w, l1, "setdefault_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -197,7 +123,7 @@ static void test_update_cascade(void) {
         NULL };
     if (run(w, sql) != 0) FAIL("writer SQL");
     if (scalar(w->db, "SELECT count(*) FROM child WHERE code = 'new'") != 2) FAIL("test premise");
-    const char *why = replica_matches(w, l1, "updcascade_r.db", "SELECT count(*) FROM child WHERE code = 'new'");
+    const char *why = replica_matches(w, l1, "updcascade_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -221,7 +147,7 @@ static void test_enforcement_only(void) {
     if (run(w, sql) != 0) FAIL("writer SQL");
     if (sqlite3_exec(w->db, "INSERT INTO child VALUES(11, 99)", NULL, NULL, NULL) == SQLITE_OK) FAIL("the writer accepted an orphan (test premise)");
     if (sqlite3_exec(w->db, "DELETE FROM parent WHERE id = 1", NULL, NULL, NULL) == SQLITE_OK) FAIL("the writer deleted a referenced parent (test premise)");
-    const char *why = replica_matches(w, l1, "enforce_r.db", "SELECT count(*) FROM child");
+    const char *why = replica_matches(w, l1, "enforce_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -244,7 +170,7 @@ static void test_deferred(void) {
         NULL };
     if (run(w, sql) != 0) FAIL("writer SQL");
     if (scalar(w->db, "SELECT count(*) FROM child") != 0) FAIL("test premise");
-    const char *why = replica_matches(w, l1, "deferred_r.db", "SELECT count(*) FROM child");
+    const char *why = replica_matches(w, l1, "deferred_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -266,7 +192,7 @@ static void test_recursive_triggers(void) {
         NULL };
     if (run(w, sql) != 0) FAIL("writer SQL");
     if (scalar(w->db, "SELECT count(*) FROM n") != 6) FAIL("test premise");
-    const char *why = replica_matches(w, l1, "rectrig_r.db", "SELECT count(*) FROM n");
+    const char *why = replica_matches(w, l1, "rectrig_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -293,7 +219,7 @@ static void test_mode_changes_midstream(void) {
         NULL };
     if (run(w, sql) != 0) FAIL("writer SQL");
     if (scalar(w->db, "SELECT group_concat(id) FROM child") != 20) FAIL("test premise: only child 20 should be left");
-    const char *why = replica_matches(w, l1, "toggle_r.db", "SELECT count(*) FROM child");
+    const char *why = replica_matches(w, l1, "toggle_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -324,7 +250,7 @@ static void test_mode_across_batches_and_reopen(void) {
     if (!w) FAIL("reopen");
     if (sqlite3_exec(w->db, "DELETE FROM parent WHERE id = 2", NULL, NULL, NULL) != SQLITE_OK) FAIL("delete 2");
     if (scalar(w->db, "SELECT count(*) FROM child") != 1) FAIL("test premise: child 20 survives with foreign keys off");
-    const char *why = replica_matches(w, l1, "reopen_r.db", "SELECT count(*) FROM child");
+    const char *why = replica_matches(w, l1, "reopen_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -361,7 +287,7 @@ static void test_mode_survives_crash(void) {
     if (!w) FAIL("reopen");
     if (hpplite_node_pending_count(w) == 0) FAIL("pending rows lost");
     if (scalar(w->db, "SELECT count(*) FROM child") != 0) FAIL("test premise: the cascade ran before the crash");
-    const char *why = replica_matches(w, l1, "crash_r.db", "SELECT count(*) FROM child");
+    const char *why = replica_matches(w, l1, "crash_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -484,7 +410,7 @@ static void test_old_log_migrated(void) {
     if (scalar(w->db, "SELECT count(*) FROM pragma_table_info('_hpplite_pending') WHERE name = 'mode'") != 1) FAIL("column not added");
     if (hpplite_node_pending_count(w) != 2) FAIL("old rows lost");
     if (sqlite3_exec(w->db, "PRAGMA foreign_keys = ON; INSERT INTO t VALUES(2)", NULL, NULL, NULL) != SQLITE_OK) FAIL("new write");
-    const char *why = replica_matches(w, l1, "old_r.db", "SELECT count(*) FROM t");
+    const char *why = replica_matches(w, l1, "old_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -538,7 +464,7 @@ static void test_adopt_with_mode(void) {
     uint64_t height = hpplite_node_get_height(n);
     if (pending != 0) { hpplite_node_destroy(n); hpplite_l1_disconnect(l1); FAIL("reopen did not adopt the batch (mode compared wrong?)"); }
     if (height != 2) { hpplite_node_destroy(n); hpplite_l1_disconnect(l1); FAIL("height should be 2"); }
-    const char *why = replica_matches(n, l1, "adopt_r.db", "SELECT count(*) FROM child");
+    const char *why = replica_matches(n, l1, "adopt_r.db");
     hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
@@ -566,6 +492,7 @@ static void test_close_after_recursive_triggers(void) {
 
 int main(void) {
     printf("=== HPPLite foreign keys and recursive triggers (#52) ===\n");
+    test_suite_init("fk", PRIVKEY, DIR);
     test_delete_cascade();
     test_delete_set_null();
     test_delete_set_default();
@@ -582,6 +509,5 @@ int main(void) {
     test_old_log_migrated();
     test_adopt_with_mode();
     test_close_after_recursive_triggers();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

@@ -8,22 +8,13 @@
 ** row for row.
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "batch.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 static const unsigned char PRIVKEY[32] = {
     0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8,0xa9,0xaa,0xab,0xac,0xad,0xae,0xaf,0xb0,
@@ -45,28 +36,10 @@ static pid_t spawn_writer(const char *mode, const char *db, const char *who, int
     }
     return pid;
 }
-static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); }
 
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "conc";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.checkpointInterval = 1000;
-    config.localOnly = (l1 == NULL);   /* no chain in these tests: the local throw-away mode (#38) */
-    node = hpplite_node_create(&config);
-    if (node && l1) {
-        hpplite_l1_mock_set_batch_size_limit(l1, 64 * 1024 * 1024);
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_sync_from_l1(node, 1);
-        hpplite_node_start(node);
-    }
-    return node;
-}
+/* the mock's DA limit is lifted: these tests are about order, not size */
+static const TestNodeOpts NODE = { .daLimit = 64 * 1024 * 1024 };
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, &NODE); }
 
 /* A full node - L1 configured, as an application's connection is - on the
 ** file-backed mock, which every process sees as one chain */
@@ -91,40 +64,10 @@ static int lease_holder(HppliteL1 *l1, unsigned char out[32]) {
     return held;
 }
 
-/* every row of t, in id order, as one string: the writer's and the replica's must be equal */
-static char *dump(sqlite3 *db) {
-    sqlite3_stmt *st; size_t cap = 1 << 16, len = 0; char *out = malloc(cap);
-    out[0] = 0;
-    if (sqlite3_prepare_v2(db, "SELECT id, who, k FROM t ORDER BY id", -1, &st, NULL) != SQLITE_OK) return out;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        char row[96];
-        int n = snprintf(row, sizeof(row), "%lld:%s:%lld;", (long long)sqlite3_column_int64(st, 0),
-                         (const char *)sqlite3_column_text(st, 1), (long long)sqlite3_column_int64(st, 2));
-        if (len + n + 1 > cap) { cap *= 2; out = realloc(out, cap); }
-        memcpy(out + len, row, n + 1); len += n;
-    }
-    sqlite3_finalize(st);
-    return out;
-}
-
-/* the replica check: rebuild from L1 into an empty file, compare root and rows */
+/* the replica check: rebuild from L1 into an empty file, compare root and
+** every row of every table (the caller flushed; the writer stays open) */
 static const char *replica_differs(HppliteNode *w, HppliteL1 *l1, const char *path) {
-    static char why[160];
-    unsigned char ra[32], rb[32];
-    HppliteNode *r = open_node(path, l1);
-    if (!r) return "replica open";
-    hpplite_node_get_state_root(w, ra);
-    hpplite_node_get_state_root(r, rb);
-    char *a = dump(w->db), *b = dump(r->db);
-    int rows = strcmp(a, b) != 0, root = memcmp(ra, rb, 32) != 0;
-    if (rows) {
-        size_t i = 0; while (a[i] && a[i] == b[i]) i++;
-        while (i > 0 && a[i - 1] != ';') i--;
-        snprintf(why, sizeof(why), "replica rows differ at writer [%.40s] replica [%.40s]", a + i, b + i);
-    } else if (root) snprintf(why, sizeof(why), "replica root differs");
-    free(a); free(b);
-    hpplite_node_destroy(r);
-    return rows || root ? why : NULL;
+    return test_replica_check(w, l1, path, &NODE, 0, 0, 0);
 }
 
 typedef struct { sqlite3 *db; const char *who; int n; int failed; } Writer;
@@ -170,41 +113,6 @@ static void *write_mixed(void *arg) {
         }
     }
     return NULL;
-}
-static char *dump_all(sqlite3 *db) {
-    static const char *q[] = { "SELECT group_concat(id||':'||who||':'||k, ';') FROM (SELECT * FROM t ORDER BY id)",
-        "SELECT group_concat(id||':'||who, ';') FROM (SELECT * FROM s ORDER BY id)",
-        "SELECT group_concat(key||':'||v||':'||who, ';') FROM (SELECT * FROM u ORDER BY key)",
-        "SELECT v FROM c", "SELECT group_concat(name||':'||seq, ';') FROM sqlite_sequence", NULL };
-    size_t cap = 1 << 20, len = 0; char *out = malloc(cap); out[0] = 0;
-    for (int i = 0; q[i]; i++) {
-        sqlite3_stmt *st;
-        if (sqlite3_prepare_v2(db, q[i], -1, &st, NULL) != SQLITE_OK) continue;
-        if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
-            const char *v = (const char *)sqlite3_column_text(st, 0); size_t n = strlen(v);
-            while (len + n + 2 > cap) { cap *= 2; out = realloc(out, cap); }
-            memcpy(out + len, v, n); len += n; out[len++] = '|'; out[len] = 0;
-        }
-        sqlite3_finalize(st);
-    }
-    return out;
-}
-static const char *mixed_replica_differs(HppliteNode *w, HppliteL1 *l1, const char *path) {
-    static char why[200];
-    unsigned char ra[32], rb[32];
-    HppliteNode *r = open_node(path, l1);
-    if (!r) return "replica open";
-    hpplite_node_get_state_root(w, ra);
-    hpplite_node_get_state_root(r, rb);
-    char *a = dump_all(w->db), *b = dump_all(r->db);
-    int rows = strcmp(a, b) != 0, root = memcmp(ra, rb, 32) != 0;
-    if (rows) {
-        size_t i = 0; while (a[i] && a[i] == b[i]) i++;
-        snprintf(why, sizeof(why), "replica differs at writer [%.50s] replica [%.50s]", a + i, b + i);
-    } else if (root) snprintf(why, sizeof(why), "replica root differs");
-    free(a); free(b);
-    hpplite_node_destroy(r);
-    return rows || root ? why : NULL;
 }
 #define SCHEMA "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k); " \
     "CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT, who); " \
@@ -328,7 +236,7 @@ static void test_mixed_threads_and_processes(void) {
     f.stop = 1; pthread_join(tf, NULL);
     for (int i = 1; i < nthreads; i++) hpplite_node_destroy(conn[i]);
     while (hpplite_node_pending_count(a) > 0 && hpplite_node_flush_batch(a) > 0) {}
-    const char *why = mixed_replica_differs(a, l1, DIR "/mixed_replica.db");
+    const char *why = replica_differs(a, l1, DIR "/mixed_replica.db");
     int left = hpplite_node_pending_count(a);
     hpplite_node_destroy(a);
     hpplite_l1_disconnect(l1);
@@ -460,14 +368,6 @@ static void test_lease_on_close(void) {
 ** first run's log row rolled back with it. The rerun must be logged: it was
 ** taken for a trigger's sub-program (same statement, same step count) and the
 ** write never reached the log. */
-static sqlite3_int64 status_int(sqlite3 *db, const char *col) {
-    char sql[96]; sqlite3_stmt *st; sqlite3_int64 v = -1;
-    snprintf(sql, sizeof sql, "SELECT %s FROM hpplite_status", col);
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    return v;
-}
 /* A follower's hpplite_status is what the application sees (php-fpm workers
 ** are all followers of hpplite-sequencer): it must say what the file says,
 ** not what the follower read at open (#100, found by the fault harness) */
@@ -558,6 +458,7 @@ static void test_rerun_in_transaction(void) {
 
 int main(int argc, char **argv) {
     self_path = argv[0];
+    test_suite_init("conc", PRIVKEY, DIR);
     if (argc == 5 && strcmp(argv[1], "--hold") == 0) return holder_main(argv);
     if (argc == 5 && strncmp(argv[1], "--", 2) == 0) return writer_main(argv);
     printf("HPPLite concurrent writers\n");
@@ -569,6 +470,5 @@ int main(int argc, char **argv) {
     test_rerun_after_foreign_schema_change();
     test_rerun_in_transaction();
     test_follower_status_follows_the_file();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }
