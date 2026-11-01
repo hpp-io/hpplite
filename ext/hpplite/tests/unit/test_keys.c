@@ -3,30 +3,18 @@
 ** paths, and what happens when none does.
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "config.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <strings.h>
 #include <unistd.h>
 #include <sys/stat.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-
-/* Row capture (#19) is the default; cases about statement capture run with
-** HPPLITE_CAPTURE=text (the _text tests) and skip otherwise */
-static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return !(v && strcasecmp(v, "text") == 0); }
-#define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 
 #define DIR "/tmp/hpplite_test_keys"
 #define KEY_A "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 #define KEY_B "0x2020202020202020202020202020202020202020202020202020202020202020"
 
-static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); unsetenv("HPPLITE_PRIVATE_KEY"); unsetenv("HPPLITE_PRIVATE_KEY_FILE"); }
+/* a fresh directory, and no key from the environment */
+static void reset_keys(void) { reset_dir(); unsetenv("HPPLITE_PRIVATE_KEY"); unsetenv("HPPLITE_PRIVATE_KEY_FILE"); }
 
 static void write_file(const char *path, const char *content, mode_t mode) {
     FILE *f = fopen(path, "w");
@@ -48,7 +36,7 @@ static sqlite3 *open_v2(const char *uri) {
 
 static void test_uri_key(void) {
     TEST("privkey= in URI, both open paths");
-    reset_dir();
+    reset_keys();
     sqlite3 *db = hpplite_open("file:" DIR "/a.db?hpplite=on&datadir=" DIR "&privkey=" KEY_A);
     if (!db || key_first_byte(db) != 0x01) FAIL("hpplite_open");
     sqlite3_close(db);
@@ -60,7 +48,7 @@ static void test_uri_key(void) {
 
 static void test_env_key_and_precedence(void) {
     TEST("HPPLITE_PRIVATE_KEY env; URI wins over env");
-    reset_dir();
+    reset_keys();
     setenv("HPPLITE_PRIVATE_KEY", KEY_B, 1);
     sqlite3 *db = hpplite_open("file:" DIR "/a.db?hpplite=on&datadir=" DIR);
     if (!db || key_first_byte(db) != 0x20) FAIL("env key via hpplite_open");
@@ -77,7 +65,7 @@ static void test_env_key_and_precedence(void) {
 
 static void test_keyfile(void) {
     TEST("keyfile: 0600 accepted, formats tolerated, both open paths and env");
-    reset_dir();
+    reset_keys();
     write_file(DIR "/key", KEY_A "\n", 0600);
     sqlite3 *db = hpplite_open("file:" DIR "/a.db?hpplite=on&datadir=" DIR "&keyfile=" DIR "/key");
     if (!db || key_first_byte(db) != 0x01) FAIL("keyfile via hpplite_open");
@@ -97,7 +85,7 @@ static void test_keyfile(void) {
 
 static void test_keyfile_rejections(void) {
     TEST("keyfile: world/group-readable, missing, directory, malformed are refused");
-    reset_dir();
+    reset_keys();
     write_file(DIR "/loose", KEY_A, 0644);
     sqlite3 *db = open_v2("file:" DIR "/a.db?hpplite=on&datadir=" DIR "&keyfile=" DIR "/loose");
     if (!db) FAIL("open");
@@ -131,7 +119,7 @@ static void test_keyfile_rejections(void) {
 
 static void test_no_key_never_posts(void) {
     TEST("no key: writes captured, nothing posted, status says keyed=0");
-    reset_dir();
+    reset_keys();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNodeConfig config;
     memset(&config, 0, sizeof(config));
@@ -176,7 +164,7 @@ static void test_no_key_never_posts(void) {
 static void test_encrypt_off_is_explicit(void) {
     TEST("encrypt=off with a key posts plaintext; with a key and default, sealed");
     SKIP_IF_ROWS("the plaintext batch carries records (test_rows_e2e)");
-    reset_dir();
+    reset_keys();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     sqlite3 *db = hpplite_open("file:" DIR "/p.db?hpplite=on&encrypt=off&datadir=" DIR "&privkey=" KEY_A);
     if (!db) FAIL("open");
@@ -207,13 +195,13 @@ static void test_encrypt_off_is_explicit(void) {
 
 int main(void) {
     printf("=== HPPLite Key Provisioning Tests ===\n");
+    test_suite_init("keys", NULL, DIR);
     test_uri_key();
     test_env_key_and_precedence();
     test_keyfile();
     test_keyfile_rejections();
     test_no_key_never_posts();
     test_encrypt_off_is_explicit();
-    (void)!system("rm -rf " DIR);
-    printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    remove_dir();
+    return test_report();
 }

@@ -12,19 +12,10 @@
 **   - a crash between the halves loses nothing
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "cipher.h"
 #include "batch.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 static const unsigned char PRIVKEY[32] = {
     0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x4a,0x4b,0x4c,0x4d,0x4e,0x4f,0x50,
@@ -34,42 +25,8 @@ static const unsigned char PRIVKEY[32] = {
 #define DIR "/tmp/hpplite_test_big_txn"
 #define LIMIT 2000                       /* DA batch limit in these tests */
 
-static void reset_dir(void) {
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
-}
-
-static int count_rows(sqlite3 *db, const char *table) {
-    char sql[128];
-    sqlite3_stmt *stmt;
-    int n = -1;
-    snprintf(sql, sizeof(sql), "SELECT count(*) FROM \"%s\"", table);
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(stmt) == SQLITE_ROW) n = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
-    return n;
-}
-
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "bigtxn";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.maxBatchBytes = LIMIT;
-    config.checkpointInterval = 1000;
-    config.localOnly = (l1 == NULL);   /* no chain in these tests: the local throw-away mode (#38) */
-    node = hpplite_node_create(&config);
-    if (node && l1) {
-        hpplite_l1_mock_set_batch_size_limit(l1, LIMIT);
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_sync_from_l1(node, 1);
-        hpplite_node_start(node);
-    }
-    return node;
-}
+static const TestNodeOpts NODE = { .maxBatchBytes = LIMIT };
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, &NODE); }
 
 /* One transaction of n inserts of ~90 bytes each (n=60: ~3 batches) */
 static int big_txn(HppliteNode *n, const char *table, int base, int rows) {
@@ -110,13 +67,6 @@ static uint8_t *sealed(HppliteNode *n, uint64_t height, const char **aSql, const
     sqlite3_free(json);
     hpplite_batch_free(b);
     return out;
-}
-
-static int same_root(HppliteNode *a, HppliteNode *b) {
-    unsigned char ra[32], rb[32];
-    hpplite_node_get_state_root(a, ra);
-    hpplite_node_get_state_root(b, rb);
-    return memcmp(ra, rb, 32) == 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -430,6 +380,7 @@ static void test_known_chain_capped(void) {
 
 int main(void) {
     printf("=== HPPLite transactions across batches (#57) ===\n");
+    test_suite_init("bigtxn", PRIVKEY, DIR);
     test_format();
     test_spans_batches();
     test_reader_between_halves();
@@ -439,6 +390,5 @@ int main(void) {
     test_multi_connection_groups();
     test_rpc_size_limit_below_contract_limit();
     test_known_chain_capped();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

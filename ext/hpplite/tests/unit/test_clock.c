@@ -9,25 +9,11 @@
 ** in writes stay refused.
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "batch.h"
 #include "clock.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <strings.h>
 #include <unistd.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-
-/* Row capture (#19) is the default; cases about statement capture run with
-** HPPLITE_CAPTURE=text (the _text tests) and skip otherwise */
-static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return !(v && strcasecmp(v, "text") == 0); }
-#define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 static const unsigned char PRIVKEY[32] = {
     0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x6a,0x6b,0x6c,0x6d,0x6e,0x6f,0x70,
@@ -36,63 +22,14 @@ static const unsigned char PRIVKEY[32] = {
 
 #define DIR "/tmp/hpplite_test_clock"
 
-static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); }
-
 static HppliteNode *open_node_lim(const char *dbPath, HppliteL1 *l1, size_t limit) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "clock";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.maxBatchBytes = limit;
-    config.checkpointInterval = 1000;
-    config.localOnly = (l1 == NULL);   /* no chain in these tests: the local throw-away mode (#38) */
-    node = hpplite_node_create(&config);
-    if (node && l1) {
-        if (limit) hpplite_l1_mock_set_batch_size_limit(l1, limit);
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_sync_from_l1(node, 1);
-        hpplite_node_start(node);
-    }
-    return node;
+    TestNodeOpts o = { .maxBatchBytes = limit };
+    return test_open_node(dbPath, l1, &o);
 }
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_lim(dbPath, l1, 0); }
 
 /* Every row of a table, as one string (column values joined) */
-static char *dump(sqlite3 *db, const char *sql) {
-    sqlite3_stmt *st;
-    sqlite3_str *s = sqlite3_str_new(NULL);
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            for (int i = 0; i < sqlite3_column_count(st); i++) {
-                const char *v = (const char *)sqlite3_column_text(st, i);
-                sqlite3_str_appendf(s, "%s|", v ? v : "NULL");
-            }
-            sqlite3_str_appendf(s, "\n");
-        }
-        sqlite3_finalize(st);
-    }
-    return sqlite3_str_finish(s);
-}
-
-static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
-    sqlite3_stmt *st;
-    sqlite3_int64 v = -1;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    return v;
-}
-
-static int same_root(HppliteNode *a, HppliteNode *b) {
-    unsigned char ra[32], rb[32];
-    hpplite_node_get_state_root(a, ra);
-    hpplite_node_get_state_root(b, rb);
-    return memcmp(ra, rb, 32) == 0;
-}
+#define dump(db, sql) query_text(db, sql)
 
 static const char *SCHEMA =
     "CREATE TABLE ev(id INTEGER PRIMARY KEY, name TEXT,"
@@ -313,6 +250,7 @@ static void test_format(void) {
 
 int main(void) {
     printf("=== HPPLite clock SQL (#56) ===\n");
+    test_suite_init("clock", PRIVKEY, DIR);
     test_format();
     test_defaults_replay();
     test_clock_in_statements();
@@ -321,6 +259,5 @@ int main(void) {
     test_time_zones_refused();
     test_survives_restart_and_big_txn();
     test_other_vfs_still_refused();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

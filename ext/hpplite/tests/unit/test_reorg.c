@@ -6,46 +6,14 @@
 ** posts the lost heights again, byte for byte, then carries on; a batch it no
 ** longer keeps cannot be restored, and it stops rather than post past a gap.
 */
-#include "node.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
+#include "test_lib.h"
 
 static const unsigned char PRIVKEY[32] = {
     0xa1,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,0xa8,0xa9,0xaa,0xab,0xac,0xad,0xae,0xaf,0xb0,
     0xb1,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xbb,0xbc,0xbd,0xbe,0xbf,0xc0
 };
 #define DIR "/tmp/hpplite_test_reorg"
-static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); }
-
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "reorg";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.checkpointInterval = 1000;
-    node = hpplite_node_create(&config);
-    if (node && l1) { hpplite_node_set_l1(node, l1); hpplite_node_sync_from_l1(node, 1); hpplite_node_start(node); }
-    return node;
-}
-static int count_rows(sqlite3 *db, const char *t) {
-    char sql[96]; sqlite3_stmt *st; int n = -1;
-    snprintf(sql, sizeof(sql), "SELECT count(*) FROM %s", t);
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
-    sqlite3_finalize(st);
-    return n;
-}
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, NULL); }
 static void write_and_flush(HppliteNode *n, int i) {
     char sql[64];
     snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%d)", i);
@@ -144,9 +112,9 @@ static void test_other_rollup_refused(void) {
 
 int main(void) {
     printf("=== HPPLite chain reorganisation (#49) ===\n");
+    test_suite_init("reorg", PRIVKEY, DIR);
     test_lost_batches_reposted();
     test_lost_beyond_retention_stops();
     test_other_rollup_refused();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

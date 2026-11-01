@@ -8,31 +8,12 @@
 ** (l1=hpp-sepolia&interval=5s ...). Everything else opens as plain SQLite.
 */
 
-#include "node.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "test_lib.h"
 #include <unistd.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 #define DIR "/tmp/hpplite_test_env"
 #define KEY "0x8182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0"
 
-static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); }
-
-static sqlite3_int64 scalar(sqlite3 *db, const char *sql) {
-    sqlite3_stmt *st;
-    sqlite3_int64 v = -1;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(st) == SQLITE_ROW) v = sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    return v;
-}
 
 static void test_plain_path_enabled(void) {
     TEST("a plain-path open of a file named in HPPLITE_FILES is an HPPLite connection");
@@ -237,6 +218,7 @@ static void test_params_under_uri(void) {
 
 int main(void) {
     printf("=== HPPLite enabled from the environment (#55) ===\n");
+    test_suite_init("env", NULL, DIR);
     test_plain_path_enabled();
     test_others_untouched();
     test_uri_still_wins();
@@ -245,6 +227,5 @@ int main(void) {
     test_read_only_open();
     test_capture_values();
     test_params_under_uri();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

@@ -10,17 +10,8 @@
 ** writer's root.
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "batch.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 static const unsigned char PRIVKEY[32] = {
     0xc1,0xc2,0xc3,0xc4,0xc5,0xc6,0xc7,0xc8,0xc9,0xca,0xcb,0xcc,0xcd,0xce,0xcf,0xd0,
@@ -29,42 +20,8 @@ static const unsigned char PRIVKEY[32] = {
 #define DIR "/tmp/hpplite_test_big_stmt"
 #define LIMIT 3000
 
-static void reset_dir(void) { (void)!system("rm -rf " DIR " && mkdir -p " DIR); }
-
-static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "bigstmt";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.maxBatchBytes = LIMIT;
-    config.checkpointInterval = 1000;
-    node = hpplite_node_create(&config);
-    if (node && l1) {
-        hpplite_l1_mock_set_batch_size_limit(l1, LIMIT);
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_sync_from_l1(node, 1);
-        hpplite_node_start(node);
-    }
-    return node;
-}
-static int count_rows(sqlite3 *db, const char *t) {
-    char sql[96]; sqlite3_stmt *st; int n = -1;
-    snprintf(sql, sizeof(sql), "SELECT count(*) FROM %s", t);
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
-    sqlite3_finalize(st);
-    return n;
-}
-static int same_root(HppliteNode *a, HppliteNode *b) {
-    unsigned char ra[32], rb[32];
-    hpplite_node_get_state_root(a, ra);
-    hpplite_node_get_state_root(b, rb);
-    return memcmp(ra, rb, 32) == 0;
-}
+static const TestNodeOpts NODE = { .maxBatchBytes = LIMIT };
+static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return test_open_node(dbPath, l1, &NODE); }
 /* INSERT INTO p VALUES (...),(...) ... with n rows: quotes, escapes and
 ** multi-byte UTF-8 in it, so a cut has to respect all three */
 static char *big_insert(int base, int n) {
@@ -245,11 +202,11 @@ static void test_lost_confirmation_of_a_piece(void) {
 
 int main(void) {
     printf("=== HPPLite statements across batches (#59) ===\n");
+    test_suite_init("bigstmt", PRIVKEY, DIR);
     test_format();
     test_statement_over_batches();
     test_statement_in_transaction_and_reader_between();
     test_crash_between_pieces();
     test_lost_confirmation_of_a_piece();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }

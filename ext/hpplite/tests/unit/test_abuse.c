@@ -13,25 +13,11 @@
 **   - what capture lets through fits in one batch as posted
 */
 
-#include "node.h"
+#include "test_lib.h"
 #include "cipher.h"
 #include "batch.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <strings.h>
 #include <unistd.h>
-
-static int tests_run = 0, tests_passed = 0;
-#define TEST(name) do { printf("  Testing: %s... ", name); tests_run++; fflush(stdout); } while(0)
-#define PASS() do { printf("PASS\n"); tests_passed++; } while(0)
-
-/* Row capture (#19) is the default; cases about statement capture run with
-** HPPLITE_CAPTURE=text (the _text tests) and skip otherwise */
-static int rows_mode(void) { const char *v = getenv("HPPLITE_CAPTURE"); return !(v && strcasecmp(v, "text") == 0); }
-#define SKIP_IF_ROWS(why) do { if (rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
-#define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
-#define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
 static const unsigned char PRIVKEY[32] = {
     0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e,0x2f,0x30,
@@ -40,43 +26,9 @@ static const unsigned char PRIVKEY[32] = {
 
 #define DIR "/tmp/hpplite_test_abuse"
 
-static void reset_dir(void) {
-    (void)!system("rm -rf " DIR " && mkdir -p " DIR);
-}
-
-static int count_rows(sqlite3 *db, const char *table) {
-    char sql[128];
-    sqlite3_stmt *stmt;
-    int n = -1;
-    snprintf(sql, sizeof(sql), "SELECT count(*) FROM \"%s\"", table);
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
-    if (sqlite3_step(stmt) == SQLITE_ROW) n = sqlite3_column_int(stmt, 0);
-    sqlite3_finalize(stmt);
-    return n;
-}
-
 static HppliteNode *open_node_ex(const char *dbPath, HppliteL1 *l1, size_t maxBatchBytes, int noEncrypt) {
-    HppliteNodeConfig config;
-    HppliteNode *node;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "abuse";
-    memcpy(config.privkey, PRIVKEY, 32);
-    config.hasPrivkey = 1;
-    config.dataDir = DIR;
-    config.dbPath = (char *)dbPath;
-    config.maxBatchBytes = maxBatchBytes;
-    config.noEncrypt = noEncrypt;
-    config.checkpointInterval = 1000;
-    config.localOnly = (l1 == NULL);   /* no chain in these tests: the local throw-away mode (#38) */
-    node = hpplite_node_create(&config);
-    if (node && l1) {
-        /* the DA limit is the contract's; the mock stands in for it */
-        if (maxBatchBytes) hpplite_l1_mock_set_batch_size_limit(l1, maxBatchBytes);
-        hpplite_node_set_l1(node, l1);
-        hpplite_node_sync_from_l1(node, 1);
-        hpplite_node_start(node);
-    }
-    return node;
+    TestNodeOpts o = { .maxBatchBytes = maxBatchBytes, .noEncrypt = noEncrypt };
+    return test_open_node(dbPath, l1, &o);
 }
 static HppliteNode *open_node(const char *dbPath, HppliteL1 *l1) { return open_node_ex(dbPath, l1, 0, 0); }
 
@@ -419,14 +371,6 @@ static void test_app_defined_functions(void) {
 
 /* "interrupted" / "not authorized" is all a driver reports for a refusal:
 ** the reason must be one query away for the application (or its agent) */
-static void text_of(sqlite3 *db, const char *sql, char *out, size_t n) {
-    sqlite3_stmt *st;
-    out[0] = 0;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
-    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0))
-        snprintf(out, n, "%s", (const char *)sqlite3_column_text(st, 0));
-    sqlite3_finalize(st);
-}
 static void test_last_refusal(void) {
     TEST("the reason of the last refusal is in hpplite_status.last_refusal");
     SKIP_IF_ROWS("random() is accepted");
@@ -1270,6 +1214,7 @@ static void test_oversized_transaction(void) {
 
 int main(void) {
     printf("=== HPPLite abuse tests ===\n");
+    test_suite_init("abuse", PRIVKEY, DIR);
     test_guard_spellings();
     test_app_defined_functions();
     test_last_refusal();
@@ -1293,6 +1238,5 @@ int main(void) {
     test_escaped_size_limit();
     test_transaction_boundary();
     test_oversized_transaction();
-    printf("\n%d/%d passed\n", tests_passed, tests_run);
-    return tests_passed == tests_run ? 0 : 1;
+    return test_report();
 }
