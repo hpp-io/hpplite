@@ -16,10 +16,16 @@ interface IHPPLiteDAHeight {
     function lastBatchHeight() external view returns (uint256);
 }
 
+import "./EIP712Sig.sol";
+
 contract HPPLite {
+    using EIP712Sig for bytes32;
+
     // ============ Constants ============
     uint256 public constant LEASE_DURATION = 5 minutes;
-    uint256 public constant VERSION = 7;   // 7: a checkpoint cannot reach past the DA's height (#44)
+    uint256 public constant VERSION = 8;   // 8: signed forms of the lease and checkpoint calls, DA v2 (#33); 7: a checkpoint cannot reach past the DA's height (#44)
+    bytes32 public constant LEASE_TYPEHASH = keccak256("Lease(string action,bytes32 instanceId,uint256 nonce)");
+    bytes32 public constant CHECKPOINT_TYPEHASH = keccak256("Checkpoint(bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 stateRoot)");
 
     // ============ State ============
     address public owner;
@@ -29,6 +35,7 @@ contract HPPLite {
     address public sequencerWallet;
     bytes32 public sequencerInstance;  // Unique per process (e.g., hash of pid+timestamp+random)
     uint256 public leaseExpiry;
+    uint256 public leaseNonce;         // spent by every signed lease call: a signature is used once (#126)
 
     // Checkpoints
     uint256 public lastCheckpointHeight;
@@ -83,21 +90,25 @@ contract HPPLite {
      * @param instanceId Unique identifier for this process instance
      */
     function claimSequencer(bytes32 instanceId) external {
+        _claim(msg.sender, instanceId);
+    }
+
+    function _claim(address wallet, bytes32 instanceId) internal {
         // Permissionless claiming was a leftover of the witness design: any
         // wallet could take an expired lease and post a batch nobody else can
         // decrypt, stopping every rebuild at that height for good.
-        require(msg.sender == sequencer, "Not the sequencer");
+        require(wallet == sequencer, "Not the sequencer");
         require(
             sequencerWallet == address(0) || block.timestamp >= leaseExpiry,
             "Lease still active"
         );
         require(instanceId != bytes32(0), "Invalid instance ID");
 
-        sequencerWallet = msg.sender;
+        sequencerWallet = wallet;
         sequencerInstance = instanceId;
         leaseExpiry = block.timestamp + LEASE_DURATION;
 
-        emit SequencerClaimed(msg.sender, instanceId, leaseExpiry);
+        emit SequencerClaimed(wallet, instanceId, leaseExpiry);
     }
 
     /**
@@ -105,8 +116,68 @@ contract HPPLite {
      * @param instanceId Must match current sequencer instance
      */
     function renewLease(bytes32 instanceId) external onlyActiveSequencer(instanceId) {
+        _renew(msg.sender, instanceId);
+    }
+
+    function _renew(address wallet, bytes32 instanceId) internal {
         leaseExpiry = block.timestamp + LEASE_DURATION;
-        emit LeaseRenewed(msg.sender, instanceId, leaseExpiry);
+        emit LeaseRenewed(wallet, instanceId, leaseExpiry);
+    }
+
+    // ============ Signed forms (#33, #126) ============
+    // The sequencer wallet signs, anyone submits and pays the gas. A lease
+    // signature carries the contract's nonce and is spent by its use; a
+    // checkpoint signature names its range, which must be the next one.
+
+    function domainSeparator() public view returns (bytes32) {
+        return EIP712Sig.domain("HPPLite", "8", address(this));
+    }
+
+    /// What the sequencer wallet signs for claimSequencerFor ("claim"), renewLeaseFor ("renew"), releaseLeaseFor ("release")
+    function leaseDigest(string memory action, bytes32 instanceId, uint256 nonce) public view returns (bytes32) {
+        return domainSeparator().digest(keccak256(abi.encode(LEASE_TYPEHASH, keccak256(bytes(action)), instanceId, nonce)));
+    }
+
+    /// What the sequencer wallet signs for submitCheckpointFor
+    function checkpointDigest(bytes32 instanceId, uint256 fromHeight, uint256 toHeight, bytes32 stateRoot) public view returns (bytes32) {
+        return domainSeparator().digest(keccak256(abi.encode(CHECKPOINT_TYPEHASH, instanceId, fromHeight, toHeight, stateRoot)));
+    }
+
+    function _spendLeaseSig(string memory action, bytes32 instanceId, uint256 nonce, bytes calldata sig) internal returns (address wallet) {
+        require(nonce == leaseNonce, "Wrong nonce");
+        wallet = leaseDigest(action, instanceId, nonce).recover(sig);
+        require(wallet != address(0), "Bad signature");
+        leaseNonce = nonce + 1;
+    }
+
+    function claimSequencerFor(bytes32 instanceId, uint256 nonce, bytes calldata sig) external {
+        _claim(_spendLeaseSig("claim", instanceId, nonce, sig), instanceId);
+    }
+
+    function renewLeaseFor(bytes32 instanceId, uint256 nonce, bytes calldata sig) external {
+        address wallet = _spendLeaseSig("renew", instanceId, nonce, sig);
+        _requireActive(wallet, instanceId);
+        _renew(wallet, instanceId);
+    }
+
+    function releaseLeaseFor(bytes32 instanceId, uint256 nonce, bytes calldata sig) external {
+        address wallet = _spendLeaseSig("release", instanceId, nonce, sig);
+        _release(wallet, instanceId);
+    }
+
+    function submitCheckpointFor(bytes32 instanceId, uint256 fromHeight, uint256 toHeight, bytes32 stateRoot, bytes calldata sig) external {
+        address wallet = checkpointDigest(instanceId, fromHeight, toHeight, stateRoot).recover(sig);
+        require(wallet != address(0), "Bad signature");
+        _requireActive(wallet, instanceId);
+        _checkpoint(fromHeight, toHeight, stateRoot);
+    }
+
+    /// onlyActiveSequencer for a recovered signer instead of msg.sender
+    function _requireActive(address wallet, bytes32 instanceId) internal view {
+        require(wallet == sequencer, "Not the sequencer");
+        require(wallet == sequencerWallet, "Not sequencer wallet");
+        require(instanceId == sequencerInstance, "Wrong instance");
+        require(block.timestamp < leaseExpiry, "Lease expired");
     }
 
     /**
@@ -139,6 +210,10 @@ contract HPPLite {
         uint256 toHeight,
         bytes32 stateRoot
     ) external onlyActiveSequencer(instanceId) {
+        _checkpoint(fromHeight, toHeight, stateRoot);
+    }
+
+    function _checkpoint(uint256 fromHeight, uint256 toHeight, bytes32 stateRoot) internal {
         require(fromHeight == lastCheckpointHeight + 1 || lastCheckpointHeight == 0, "Non-sequential");
         require(toHeight >= fromHeight, "Invalid range");
         // a root for batches the DA does not hold would be a root nobody can
@@ -183,11 +258,15 @@ contract HPPLite {
      * @notice Give the lease up now (graceful close) - the active instance itself, no owner needed
      */
     function releaseLease(bytes32 instanceId) external {
-        require(msg.sender == sequencerWallet, "Not sequencer wallet");
+        _release(msg.sender, instanceId);
+    }
+
+    function _release(address wallet, bytes32 instanceId) internal {
+        require(wallet == sequencerWallet, "Not sequencer wallet");
         require(instanceId == sequencerInstance, "Wrong instance");
         require(block.timestamp < leaseExpiry, "Lease expired");
         leaseExpiry = block.timestamp;
-        emit LeaseReleased(msg.sender, instanceId);
+        emit LeaseReleased(wallet, instanceId);
     }
 
     function setDAConfig(string calldata _scheme, address _da) external onlyOwner {

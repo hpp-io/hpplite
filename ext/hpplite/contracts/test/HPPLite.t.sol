@@ -43,7 +43,8 @@ contract HPPLiteTest is Test {
         assertEq(hpplite.sequencerInstance(), bytes32(0));
         assertEq(hpplite.checkpointInterval(), 100);
         assertEq(hpplite.daContract(), address(da));
-        assertEq(hpplite.VERSION(), 7);
+        assertEq(hpplite.VERSION(), 8);
+        assertEq(da.VERSION(), 2);
     }
 
     function test_ClaimSequencer() public {
@@ -296,7 +297,7 @@ contract HPPLiteTest is Test {
 
         assertEq(daScheme, "hppda");
         assertEq(daContract, address(da));
-        assertEq(version, 7);
+        assertEq(version, 8);
         assertEq(checkpointInterval, 100);
         assertEq(leaseDuration, 5 minutes);
     }
@@ -313,10 +314,12 @@ contract HPPLiteDATest is Test {
     HPPLiteDA public da;
 
     address sequencer;
+    uint256 sequencerKey = 0x1;                 // the signed forms need a key, not just an address
     bytes32 instanceId = keccak256("instance1");
+    bytes32 instanceId2 = keccak256("instance2");
 
     function setUp() public {
-        sequencer = address(0x1);
+        sequencer = vm.addr(sequencerKey);
 
         hpplite = new HPPLite(100, "hppda", address(0));
         da = new HPPLiteDA(address(hpplite), 128 * 1024);
@@ -328,14 +331,141 @@ contract HPPLiteDATest is Test {
         hpplite.claimSequencer(instanceId);
     }
 
+    event BatchSubmitted(uint256 indexed height, bytes32 indexed batchHash, bytes data);
+    event BatchCommitted(uint256 indexed height, bytes32 indexed batchHash, bytes ref, bytes receipt);
+
+    function chain(bytes32 prev, uint256 height, bytes memory data) internal pure returns (bytes32) {
+        return keccak256(abi.encode(prev, height, keccak256(data)));
+    }
+
+    function sign(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    /* #33: the bytes go into the log, storage keeps the height, the rolling hash and the block */
     function test_SubmitBatch() public {
         bytes memory batchData = '{"ops":[{"type":"insert"}]}';
 
+        vm.roll(1234);
+        vm.expectEmit(true, true, false, true, address(da));
+        emit BatchSubmitted(1, keccak256(batchData), batchData);
         vm.prank(sequencer);
         da.submitBatch(instanceId, 1, batchData);
 
         assertEq(da.lastBatchHeight(), 1);
-        assertEq(da.getBatch(1), batchData);
+        assertEq(da.chainHash(), chain(bytes32(0), 1, batchData));
+        assertEq(da.blockOf(1), 1234);
+        vm.expectRevert("No such batch");
+        da.blockOf(2);
+    }
+
+    /* The cost cut this issue is for: a 1 KB batch below 100 k gas (storage took ~700 k) */
+    function test_SubmitBatch_Gas() public {
+        bytes memory batchData = new bytes(1024);
+        for (uint256 i = 0; i < batchData.length; i++) batchData[i] = bytes1(uint8(32 + i % 90));
+        vm.prank(sequencer);
+        da.submitBatch(instanceId, 1, "warm up");        // the storage slots exist after the first batch
+        vm.prank(sequencer);
+        uint256 gas = gasleft();
+        da.submitBatch(instanceId, 2, batchData);
+        gas -= gasleft();
+        emit log_named_uint("gas for a 1 KB batch", gas);
+        assertLt(gas, 100000);
+    }
+
+    function test_ChainHash_TenBatches() public {
+        bytes32 h = bytes32(0);
+        vm.startPrank(sequencer);
+        for (uint256 i = 1; i <= 10; i++) {
+            bytes memory data = abi.encodePacked("batch ", i);
+            vm.roll(100 + i);
+            da.submitBatch(instanceId, i, data);
+            h = chain(h, i, data);
+            assertEq(da.chainHash(), h);
+            assertEq(da.blockOf(i), 100 + i);
+        }
+        vm.stopPrank();
+        (uint256 last, uint256 total, bytes32 ch) = da.getDAState();
+        assertEq(last, 10);
+        assertEq(total, 10);
+        assertEq(ch, h);
+    }
+
+    function test_SubmitBatchFor_RelayPaysWithSequencerSignature() public {
+        bytes memory batchData = "signed batch";
+        bytes memory sig = sign(sequencerKey, da.batchDigest(instanceId, 1, keccak256(batchData)));
+        address relay = address(0xBEEF);
+        vm.prank(relay);
+        da.submitBatchFor(instanceId, 1, batchData, sig);
+        assertEq(da.lastBatchHeight(), 1);
+        assertEq(da.chainHash(), chain(bytes32(0), 1, batchData));
+
+        // the same signature again: that height is taken
+        vm.prank(relay);
+        vm.expectRevert("Non-sequential batch");
+        da.submitBatchFor(instanceId, 1, batchData, sig);
+    }
+
+    function test_SubmitBatchFor_WrongSignerOrData() public {
+        bytes memory batchData = "signed batch";
+        bytes memory other = sign(0x2, da.batchDigest(instanceId, 1, keccak256(batchData)));
+        vm.expectRevert("Not sequencer wallet");
+        da.submitBatchFor(instanceId, 1, batchData, other);
+
+        bytes memory sig = sign(sequencerKey, da.batchDigest(instanceId, 1, keccak256(batchData)));
+        vm.expectRevert("Not sequencer wallet");          // other bytes: another hash, so another signer recovers
+        da.submitBatchFor(instanceId, 1, "tampered", sig);
+
+        bytes memory wrongInstance = sign(sequencerKey, da.batchDigest(keccak256("other"), 1, keccak256(batchData)));
+        vm.expectRevert("Wrong instance");
+        da.submitBatchFor(keccak256("other"), 1, batchData, wrongInstance);
+
+        vm.expectRevert("Not sequencer wallet");
+        da.submitBatchFor(instanceId, 1, batchData, "short");
+    }
+
+    function test_SubmitBatchFor_LeaseExpired() public {
+        bytes memory sig = sign(sequencerKey, da.batchDigest(instanceId, 1, keccak256("x")));
+        vm.warp(block.timestamp + 6 minutes);
+        vm.expectRevert("Lease expired");
+        da.submitBatchFor(instanceId, 1, "x", sig);
+    }
+
+    function test_CommitBatch_OffChainStore() public {
+        bytes32 h = keccak256("bytes held elsewhere");
+        vm.expectEmit(true, true, false, true, address(da));
+        emit BatchCommitted(1, h, "bafkreiabc", "receipt");
+        vm.prank(sequencer);
+        da.commitBatch(instanceId, 1, h, "bafkreiabc", "receipt");
+        assertEq(da.lastBatchHeight(), 1);
+        assertEq(da.chainHash(), keccak256(abi.encode(bytes32(0), uint256(1), h)));
+
+        vm.prank(sequencer);
+        vm.expectRevert("Empty ref");
+        da.commitBatch(instanceId, 2, h, "", "");
+        vm.prank(sequencer);
+        vm.expectRevert("Empty hash");
+        da.commitBatch(instanceId, 2, bytes32(0), "ref", "");
+
+        // the signed form, by a relay
+        bytes memory sig = sign(sequencerKey, da.batchDigest(instanceId, 2, h));
+        vm.prank(address(0xBEEF));
+        da.commitBatchFor(instanceId, 2, h, "bafkreidef", "", sig);
+        assertEq(da.lastBatchHeight(), 2);
+    }
+
+    /* a commitment and a posted batch share one chain: a reader recomputes it the same way */
+    function test_ChainHash_MixedSubmitAndCommit() public {
+        vm.startPrank(sequencer);
+        da.submitBatch(instanceId, 1, "one");
+        da.commitBatch(instanceId, 2, keccak256("two"), "ref2", "");
+        da.submitBatch(instanceId, 3, "three");
+        vm.stopPrank();
+        bytes32 h = chain(bytes32(0), 1, "one");
+        h = chain(h, 2, "two");
+        h = chain(h, 3, "three");
+        assertEq(da.chainHash(), h);
     }
 
     function test_SubmitBatch_WrongInstance() public {
@@ -368,45 +498,84 @@ contract HPPLiteDATest is Test {
         da.submitBatch(instanceId, 1, "data");
     }
 
-    function test_SubmitBatches() public {
-        bytes[] memory batches = new bytes[](3);
-        batches[0] = "batch1";
-        batches[1] = "batch2";
-        batches[2] = "batch3";
-
-        vm.prank(sequencer);
-        da.submitBatches(instanceId, 1, batches);
-
-        assertEq(da.lastBatchHeight(), 3);
-        assertEq(da.getBatch(1), "batch1");
-        assertEq(da.getBatch(2), "batch2");
-        assertEq(da.getBatch(3), "batch3");
-    }
-
     function test_GetDAState() public {
         vm.startPrank(sequencer);
         da.submitBatch(instanceId, 1, "batch1");
         da.submitBatch(instanceId, 2, "batch2");
         vm.stopPrank();
 
-        (uint256 lastHeight, uint256 total, bytes32 latestHash) = da.getDAState();
+        (uint256 lastHeight, uint256 total, bytes32 ch) = da.getDAState();
         assertEq(lastHeight, 2);
         assertEq(total, 2);
-        assertEq(latestHash, keccak256("batch2"));
+        assertEq(ch, chain(chain(bytes32(0), 1, "batch1"), 2, "batch2"));
     }
 
-    function test_GetBatchHashes() public {
-        vm.startPrank(sequencer);
-        da.submitBatch(instanceId, 1, "batch1");
-        da.submitBatch(instanceId, 2, "batch2");
-        da.submitBatch(instanceId, 3, "batch3");
-        vm.stopPrank();
+    /* ============ The coordinator's signed forms (#126) ============ */
 
-        bytes32[] memory hashes = da.getBatchHashes(1, 3);
-        assertEq(hashes.length, 3);
-        assertEq(hashes[0], keccak256("batch1"));
-        assertEq(hashes[1], keccak256("batch2"));
-        assertEq(hashes[2], keccak256("batch3"));
+    function test_ClaimSequencerFor_RelayWithNonce() public {
+        // the lease of the setup is released first: a signed claim takes a free lease
+        vm.prank(sequencer);
+        hpplite.releaseLease(instanceId);
+        assertEq(hpplite.leaseNonce(), 0);
+        bytes memory sig = sign(sequencerKey, hpplite.leaseDigest("claim", instanceId2, 0));
+        vm.prank(address(0xBEEF));
+        hpplite.claimSequencerFor(instanceId2, 0, sig);
+        assertEq(hpplite.sequencerWallet(), sequencer);
+        assertEq(hpplite.sequencerInstance(), instanceId2);
+        assertTrue(hpplite.isLeaseActive());
+        assertEq(hpplite.leaseNonce(), 1);
+
+        // the signature is spent
+        vm.prank(sequencer);
+        hpplite.releaseLease(instanceId2);
+        vm.expectRevert("Wrong nonce");
+        hpplite.claimSequencerFor(instanceId2, 0, sig);
+
+        // a stranger's signature is no claim
+        bytes memory other = sign(0x2, hpplite.leaseDigest("claim", instanceId2, 1));
+        vm.expectRevert("Not the sequencer");
+        hpplite.claimSequencerFor(instanceId2, 1, other);
+    }
+
+    function test_RenewAndReleaseLeaseFor() public {
+        uint256 expiry = hpplite.leaseExpiry();
+        vm.warp(block.timestamp + 2 minutes);
+        bytes memory renew = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 0));
+        vm.prank(address(0xBEEF));
+        hpplite.renewLeaseFor(instanceId, 0, renew);
+        assertGt(hpplite.leaseExpiry(), expiry);
+
+        // a renew signature does not release
+        bytes memory renew2 = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 1));
+        vm.expectRevert("Not sequencer wallet");          // the digest of "release" recovers another signer
+        hpplite.releaseLeaseFor(instanceId, 1, renew2);
+
+        bytes memory release = sign(sequencerKey, hpplite.leaseDigest("release", instanceId, 1));
+        vm.prank(address(0xBEEF));
+        hpplite.releaseLeaseFor(instanceId, 1, release);
+        assertFalse(hpplite.isLeaseActive());
+        assertEq(hpplite.leaseNonce(), 2);
+    }
+
+    function test_SubmitCheckpointFor() public {
+        vm.startPrank(sequencer);
+        da.submitBatch(instanceId, 1, "b1");
+        da.submitBatch(instanceId, 2, "b2");
+        vm.stopPrank();
+        bytes32 root = keccak256("root");
+        bytes memory sig = sign(sequencerKey, hpplite.checkpointDigest(instanceId, 1, 2, root));
+        vm.prank(address(0xBEEF));
+        hpplite.submitCheckpointFor(instanceId, 1, 2, root, sig);
+        assertEq(hpplite.lastCheckpointHeight(), 2);
+        assertEq(hpplite.lastStateRoot(), root);
+
+        // the same range again is not the next one
+        vm.expectRevert("Non-sequential");
+        hpplite.submitCheckpointFor(instanceId, 1, 2, root, sig);
+        // a signature for another root is another signer
+        bytes memory sig2 = sign(sequencerKey, hpplite.checkpointDigest(instanceId, 3, 3, root));
+        vm.expectRevert("Not the sequencer");
+        hpplite.submitCheckpointFor(instanceId, 3, 3, keccak256("other"), sig2);
     }
 }
 
