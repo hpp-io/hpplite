@@ -74,6 +74,7 @@ set(HPPLITE_SOURCES
     hpplite.c
     sha256.c
     state_hash.c
+    capture.c
     capture_rows.c
     batch.c
     crypto.c
