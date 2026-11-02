@@ -47,7 +47,7 @@ static void test_checkpoint_auto(void) {
     for (uint64_t h = 1; h <= 3; h++) {
         HppliteBatch *b = l1_batch(node, h);
         if (!b) FAIL("batch missing");
-        if (h < 3 && b->hasRoot) FAIL("non-closing batch must not carry a root");
+        if (h < 3 && b->hasRoot && !test_pages_mode()) FAIL("non-closing batch must not carry a root");   /* page batches always carry theirs (#154) */
         if (h == 3 && !b->hasRoot) FAIL("closing batch must carry the root");
         if (h == 3) {
             hpplite_node_get_state_root(node, root);

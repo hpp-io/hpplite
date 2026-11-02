@@ -309,6 +309,26 @@ static void test_unreadable_file_fails_the_open(void) {
     PASS();
 }
 
+/* every page batch carries its root (#154) */
+static void test_every_page_batch_carries_its_root(void) {
+    TEST("a page batch fetched back carries the root of its trailer");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/root.db", l1, 1, 1);
+    if (!s) FAIL("open");
+    hpplite_node_exec(s, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush");
+    unsigned char root[32]; hpplite_node_get_state_root(s, root);
+    HppliteBatch *b = hpplite_node_fetch_batch(s, 1);
+    if (!b) FAIL("fetch");
+    int has = b->hasRoot, same = memcmp(b->postStateRoot, root, 32) == 0;
+    hpplite_batch_free(b);
+    hpplite_node_destroy(s); hpplite_l1_disconnect(l1);
+    if (!has) FAIL("the batch has no root");
+    if (!same) FAIL("the batch root is not the posted one");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -320,6 +340,7 @@ int main(void) {
     test_file_not_where_its_sidecar_says();
     test_rules_that_keep_capture_possible();
     test_unreadable_file_fails_the_open();
+    test_every_page_batch_carries_its_root();
     remove_dir();
     return test_report();
 }

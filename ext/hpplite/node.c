@@ -975,6 +975,10 @@ static HppliteBatch *node_batch_from_plain(uint64_t height, const uint8_t *plain
         if (!b->pPagesRaw) { sqlite3_free(b); return NULL; }
         memcpy(b->pPagesRaw, plain, n);
         b->nPagesRaw = n;
+        /* every page batch carries its root in the trailer: what reads batches
+        ** (the checkpoint flow, verify, the demo) sees it as the batch's (#154) */
+        { HpplitePageBatch *pb = hpplite_pagebatch_decode(plain, n);
+          if (pb) { memcpy(b->postStateRoot, pb->root, 32); b->hasRoot = 1; hpplite_pagebatch_free(pb); } }
         return b;
     }
     return hpplite_batch_from_json((const char *)plain);
