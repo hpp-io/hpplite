@@ -76,6 +76,7 @@ void hpplite_batch_free(HppliteBatch *pBatch) {
     sqlite3_free(pBatch->aTxns);
     sqlite3_free(pBatch->zDbName);
     if (pBatch->bOwnsPosted) free((void *)pBatch->pPosted);
+    sqlite3_free(pBatch->pPagesRaw);
     sqlite3_free(pBatch);
   }
 }

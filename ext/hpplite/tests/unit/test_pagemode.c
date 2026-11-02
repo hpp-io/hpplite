@@ -8,7 +8,10 @@
 
 #define DIR "/tmp/hpplite_test_pagemode"
 
-static HppliteNode *open_pages(const char *dbPath, HppliteL1 *l1, int noEncrypt, int noCompress) {
+static HppliteNode *open_pages_role(const char *dbPath, HppliteL1 *l1, int noEncrypt, int noCompress, int verifyOnly);
+static HppliteNode *open_pages(const char *dbPath, HppliteL1 *l1, int noEncrypt, int noCompress) { return open_pages_role(dbPath, l1, noEncrypt, noCompress, 0); }
+
+static HppliteNode *open_pages_role(const char *dbPath, HppliteL1 *l1, int noEncrypt, int noCompress, int verifyOnly) {
     HppliteNodeConfig config;
     HppliteNode *n;
     memset(&config, 0, sizeof(config));
@@ -22,6 +25,7 @@ static HppliteNode *open_pages(const char *dbPath, HppliteL1 *l1, int noEncrypt,
     config.noCompress = noCompress;
     config.checkpointInterval = 1000;
     config.localOnly = l1 == NULL;
+    config.verifyOnly = verifyOnly;
     n = hpplite_node_create(&config);
     if (n && l1) { hpplite_node_set_l1(n, l1); hpplite_node_sync_from_l1(n, 1); hpplite_node_start(n); }
     else if (n) hpplite_node_start(n);
@@ -43,7 +47,7 @@ static void test_no_hooks_sidecar_and_roots(void) {
     hpplite_node_exec(n, "BEGIN; INSERT INTO t(v) VALUES('a'); INSERT INTO t(v) VALUES('b'); COMMIT", NULL);
     hpplite_node_exec(n, "INSERT INTO t(v) VALUES('c')", NULL);
     int pending = hpplite_node_pending_count(n);
-    if (pending != 3) FAILF("pending = %d commits, expected 3", pending);
+    if (pending != 4) FAILF("pending = %d commits, expected 4 (the file as it started, and three)", pending);
     uint64_t h = hpplite_node_flush_batch(n);
     if (h != 1) FAILF("flush posted height %llu, expected 1", (unsigned long long)h);
     if (hpplite_node_pending_count(n) != 0) FAIL("commits still pending after the flush");
@@ -100,11 +104,103 @@ static void test_posted_bytes_are_page_batches(void) {
     PASS();
 }
 
+static unsigned char *read_whole(const char *path, size_t *pLen) {
+    FILE *f = fopen(path, "rb"); unsigned char *buf; long n;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+    buf = malloc((size_t)n + 1); if (fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); buf = NULL; } fclose(f);
+    *pLen = (size_t)n; return buf;
+}
+/* the two files equal but for page 1's mode bytes and change counters */
+static int files_equal_masked(const char *a, const char *b, size_t *pLen) {
+    size_t la = 0, lb = 0; unsigned char *fa = read_whole(a, &la), *fb = read_whole(b, &lb);
+    int same = fa && fb && la == lb;
+    if (same) {
+        fa[18] = fb[18] = fa[19] = fb[19] = 0;
+        memset(fa + 24, 0, 4); memset(fb + 24, 0, 4); memset(fa + 92, 0, 4); memset(fb + 92, 0, 4);
+        same = memcmp(fa, fb, la) == 0;
+    }
+    if (pLen) *pLen = la;
+    free(fa); free(fb);
+    return same;
+}
+
+static void test_replica_applies_pages(void) {
+    TEST("a replica rebuilt from the chain equals the sequencer's file, and keeps up as it posts more; its readers see the rows");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/s.db", l1, 0, 0);                     /* sealed and deflated, as in production */
+    if (!s) FAIL("open the sequencer");
+    hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v TEXT); CREATE INDEX tk ON t(k)", NULL);
+    for (int i = 0; i < 6; i++) {
+        char sql[160];
+        snprintf(sql, sizeof sql, "BEGIN; WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 300) INSERT INTO t(k, v) SELECT i * %d, 'row ' || i FROM s; COMMIT", i + 1);
+        hpplite_node_exec(s, sql, NULL);
+        if (i % 2) hpplite_node_exec(s, "DELETE FROM t WHERE id % 7 = 0", NULL);
+        if (hpplite_node_flush_batch(s) == 0) FAIL("flush");
+    }
+    exec_sql(s->db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    HppliteNode *r = open_pages_role(DIR "/r.db", l1, 0, 0, 1);              /* a verifier: rebuilt from the chain alone */
+    if (!r) FAIL("open the replica");
+    size_t len = 0;
+    int same = files_equal_masked(DIR "/s.db", DIR "/r.db", &len);
+    long long compared = scalar(r->db, "SELECT roots_compared FROM hpplite_status"), mism = scalar(r->db, "SELECT root_mismatches FROM hpplite_status");
+    long long rowsS = scalar(s->db, "SELECT count(*) FROM t"), rowsR = scalar(r->db, "SELECT count(*) FROM t");
+    printf("(%zu bytes, %lld roots compared, %lld mismatches, %lld rows) ", len, compared, mism, rowsR);
+    if (!same) FAIL("the replica's file differs from the sequencer's");
+    if (compared < 6 || mism != 0) FAIL("roots");
+    if (rowsS != rowsR) FAIL("the replica's connection does not see the rows");
+    if (!same_root(s, r)) FAIL("the state roots differ");
+    /* more on the sequencer, the replica syncs again: its open connection must see the change */
+    hpplite_node_exec(s, "UPDATE t SET v = 'later' WHERE id % 5 = 0; INSERT INTO t(k, v) VALUES(1, 'new')", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 7");
+    exec_sql(s->db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    if (hpplite_node_sync_from_l1(r, 1) < 1) FAIL("the replica did not take the new batch");
+    if (!files_equal_masked(DIR "/s.db", DIR "/r.db", NULL)) FAIL("the replica differs after the second sync");
+    if (scalar(r->db, "SELECT count(*) FROM t WHERE v = 'later'") != scalar(s->db, "SELECT count(*) FROM t WHERE v = 'later'")) FAIL("the replica's reader did not see the applied pages");
+    hpplite_node_destroy(r);
+    hpplite_node_destroy(s);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+static void test_sequencer_adopts_its_own_page_batch(void) {
+    TEST("a page batch posted but not finalized (the commit failed) is adopted at the next flush from the same commits");
+#ifndef HPPLITE_TEST_HOOKS
+    printf("SKIP (no test hooks) "); PASS(); return;
+#else
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/a.db", l1, 1, 1);
+    if (!s) FAIL("open");
+    hpplite_node_exec(s, "CREATE TABLE t(x); INSERT INTO t VALUES(1); INSERT INTO t VALUES(2)", NULL);
+    hpplite_test_fail_commits = 1;
+    uint64_t h = hpplite_node_flush_batch(s);                                /* posted to the chain, the finalize's commit fails */
+    hpplite_test_fail_commits = 0;
+    uint64_t last = 0, total = 0;
+    hpplite_l1_get_da_state(l1, &last, &total, NULL);
+    if (h != 0 || last != 1) FAILF("after the failed commit: flush returned %llu, chain at %llu", (unsigned long long)h, (unsigned long long)last);
+    if (hpplite_node_pending_count(s) != 4) FAILF("the commits are not back in the queue (%d pending, expected the snapshot and three)", hpplite_node_pending_count(s));
+    hpplite_node_exec(s, "INSERT INTO t VALUES(3)", NULL);
+    h = hpplite_node_flush_batch(s);                                          /* adopts batch 1 from the chain, posts batch 2 */
+    if (scalar(s->db, "SELECT height FROM hpplite_status") != 3) FAILF("height %lld after the adoption and the next batch", (long long)scalar(s->db, "SELECT height FROM hpplite_status"));
+    if (s->state == HPPLITE_STATE_ERROR) FAIL("the node is in error");
+    HppliteNode *r = open_pages_role(DIR "/ar.db", l1, 1, 1, 1);
+    if (!r) FAIL("open the replica");
+    if (!same_root(s, r)) FAIL("a replica rebuilt from the chain has another root");
+    if (scalar(r->db, "SELECT count(*) FROM t") != 3) FAIL("the replica lacks rows");
+    hpplite_node_destroy(r); hpplite_node_destroy(s); hpplite_l1_disconnect(l1);
+    PASS();
+#endif
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
     test_no_hooks_sidecar_and_roots();
     test_posted_bytes_are_page_batches();
+    test_replica_applies_pages();
+    test_sequencer_adopts_its_own_page_batch();
     remove_dir();
     return test_report();
 }

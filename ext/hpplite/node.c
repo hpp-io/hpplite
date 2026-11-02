@@ -19,6 +19,9 @@
 #include "compress.h"
 #include "pagemode.h"
 #include "pages.h"
+
+static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch);
+static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch);
 #include "da_uri.h"
 #include "capture_rows.h"
 static void node_cap_batch_limit(HppliteNode *node);
@@ -306,10 +309,28 @@ static int node_init_pages(HppliteNode *node, const char *zFile) {
     if (rc != SQLITE_OK) return rc;
     node->ctx->bTrackRoots = node->config.verifyOnly;
     if (node->config.dbName && node->config.dbName[0]) node->ctx->zDbName = sqlite3_mprintf("%s", node->config.dbName);
-    /* the file holds everything once checkpointed: the page mode reads it once */
-    sqlite3_exec(node->db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
     if (!realpath(zFile, resolved)) snprintf(resolved, sizeof resolved, "%s", zFile);
-    node->pm = hpplite_pagemode_start(resolved);
+    if (node->config.verifyOnly) {
+        /* a replica: pages are written into its file under an exclusive lock and
+        ** its readers see them by the change counter, which rollback-journal
+        ** mode checks at every transaction and WAL mode does not */
+        sqlite3_exec(node->db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL);
+        node->pm = hpplite_pagemode_start(resolved, 0);
+    } else {
+        /* the sequencer: WAL, its commits watched; the file holds everything once checkpointed */
+        sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+        sqlite3_exec(node->db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
+        node->pm = hpplite_pagemode_start(resolved, 1);
+        if (node->pm) {
+            /* a new rollup's first batch is the file as it starts; a sequencer back
+            ** on a file whose root is not the last one it posted (commits captured
+            ** and lost with the process, a file changed while it was away) ships
+            ** the file whole again: the chain can always rebuild it */
+            unsigned char have[32];
+            hpplite_pagemode_root(node->pm, have);
+            if (node->ctx->blockHeight <= 1 || memcmp(have, node->ctx->stateRoot, 32) != 0) hpplite_pagemode_snapshot(node->pm);
+        }
+    }
     if (!node->pm) { fprintf(stderr, "hpplite: page mode could not start on %s\n", zFile); return SQLITE_ERROR; }
     return SQLITE_OK;
 }
@@ -319,9 +340,9 @@ static int node_init_tracking(HppliteNode *node) {
     int rc;
 
     if (zFile && zFile[0]) {
+        if (node->config.capturePages) { sqlite3_busy_timeout(node->db, 5000); return node_init_pages(node, zFile); }
         sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
         sqlite3_busy_timeout(node->db, 5000);
-        if (node->config.capturePages) return node_init_pages(node, zFile);
     }
 
     /* a SQLite that cuts bound values in expanded SQL serves row capture (#62) */
@@ -908,6 +929,23 @@ static int node_check_rollup(HppliteNode *node) {
     return rc == -2 ? 0 : 1;
 }
 
+/* the bytes inside an envelope: a page batch by its magic (#146), else JSON */
+static HppliteBatch *node_batch_from_plain(uint64_t height, const uint8_t *plain, size_t n) {
+    if (hpplite_pagebatch_is(plain, n)) {
+        HppliteBatch *b = sqlite3_malloc64(sizeof(*b));
+        if (!b) return NULL;
+        memset(b, 0, sizeof(*b));
+        b->height = height;
+        b->bPages = 1;
+        b->pPagesRaw = sqlite3_malloc64((sqlite3_uint64)n);
+        if (!b->pPagesRaw) { sqlite3_free(b); return NULL; }
+        memcpy(b->pPagesRaw, plain, n);
+        b->nPagesRaw = n;
+        return b;
+    }
+    return hpplite_batch_from_json((const char *)plain);
+}
+
 /*
 ** Decode batch bytes from L1: open the envelope if sealed, else plaintext JSON.
 */
@@ -936,16 +974,17 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         }
         encoding = hpplite_envelope_pk_encoding(data, dataLen);
         if (encoding == HPPLITE_ENCODING_DEFLATE) {
-            uint8_t *inflated = hpplite_inflate(plain, plainLen, NULL);
+            size_t n2 = 0;
+            uint8_t *inflated = hpplite_inflate(plain, plainLen, &n2);
             free(plain);
             if (!inflated) { hpplite_error(node->ctx, "batch %llu: sealed and compressed, but the compressed bytes do not inflate", (unsigned long long)height); return NULL; }
-            plain = inflated;
+            plain = inflated; plainLen = n2;
         } else if (encoding != HPPLITE_ENCODING_NONE) {
             free(plain);
             hpplite_error(node->ctx, "batch %llu uses encoding %d, which this version does not know", (unsigned long long)height, encoding);
             return NULL;
         }
-        batch = hpplite_batch_from_json((const char *)plain);
+        batch = node_batch_from_plain(height, plain, plainLen);
         free(plain);
     } else if (hpplite_envelope_is_sealed(data, dataLen)) {
         const HppliteCipher *scheme = NULL;
@@ -969,20 +1008,21 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
             /* what the envelope's encoding byte says is inside (#12) */
             int encoding = hpplite_envelope_encoding(data, dataLen);
             if (encoding == HPPLITE_ENCODING_DEFLATE) {
-                uint8_t *inflated = hpplite_inflate(plain, plainLen, NULL);
+                size_t n2 = 0;
+                uint8_t *inflated = hpplite_inflate(plain, plainLen, &n2);
                 free(plain);
                 if (!inflated) {
                     hpplite_error(node->ctx, "batch %llu: sealed and compressed, but the compressed bytes do not inflate", (unsigned long long)height);
                     return NULL;
                 }
-                plain = inflated;
+                plain = inflated; plainLen = n2;
             } else if (encoding != HPPLITE_ENCODING_NONE) {
                 free(plain);
                 hpplite_error(node->ctx, "batch %llu uses encoding %d, which this version does not know", (unsigned long long)height, encoding);
                 return NULL;
             }
         }
-        batch = hpplite_batch_from_json((const char *)plain);
+        batch = node_batch_from_plain(height, plain, plainLen);
         free(plain);
     } else if (node->cipher) {
         /* An encrypting node never posts plaintext, so a plaintext batch at
@@ -993,15 +1033,16 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         hpplite_error(node->ctx, "batch %llu is plaintext on an encrypting rollup: not ours", (unsigned long long)height);
         return NULL;
     } else if (hpplite_is_plain_compressed(data, dataLen)) {
-        uint8_t *inflated = hpplite_inflate(data + HPPLITE_PLAIN_MAGIC_LEN, dataLen - HPPLITE_PLAIN_MAGIC_LEN, NULL);
+        size_t n2 = 0;
+        uint8_t *inflated = hpplite_inflate(data + HPPLITE_PLAIN_MAGIC_LEN, dataLen - HPPLITE_PLAIN_MAGIC_LEN, &n2);
         if (!inflated) {
             hpplite_error(node->ctx, "batch %llu: compressed plaintext that does not inflate", (unsigned long long)height);
             return NULL;
         }
-        batch = hpplite_batch_from_json((const char *)inflated);
+        batch = node_batch_from_plain(height, inflated, n2);
         free(inflated);
     } else {
-        batch = hpplite_batch_from_json((const char *)data);
+        batch = node_batch_from_plain(height, data, dataLen);
     }
     if (batch && batch->height != height) {
         /* the slot is the truth; a batch claiming another height is corrupt */
@@ -1187,7 +1228,7 @@ static int node_adopt_existing(HppliteNode *node) {
         if (node->lastFetchForeign && node_skip_foreign_height(node, node->ctx->blockHeight) == 0) return 1;
         return 0;
     }
-    rc = hpplite_adopt_batch(node->ctx, batch);
+    rc = batch->bPages ? node_adopt_pages(node, batch) : hpplite_adopt_batch(node->ctx, batch);
     hpplite_batch_free(batch);
     if (rc == SQLITE_OK) {
         node->batchesProduced++;
@@ -1339,6 +1380,100 @@ static void test_crash_point(const char *zName) {
 /* Raw page records deflate about this many times as diffs: the build's budget
 ** of raw bytes for a posted limit, corrected when a batch comes out over it */
 #define HPPLITE_PAGE_DEFLATE_GUESS 8
+
+/* A replica takes a page batch into its file (#146): the records applied at
+** their offsets (a diff XORed onto the page as it is), the file cut to the
+** batch's size, page 1 marked rollback-journal with the change counter moved
+** so the connections reading the file notice, all under SQLite's exclusive
+** lock taken through a connection of our own; then the root, compared with
+** the batch's trailer, and the meta row. */
+static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
+    HpplitePageBatch *b = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
+    const char *zFile = sqlite3_db_filename(node->db, "main");
+    sqlite3 *adb = NULL;
+    sqlite3_file *pf = NULL;
+    unsigned char *page = NULL, root[32];
+    unsigned i, counter = 0;
+    int rc;
+    if (!b) { hpplite_error(node->ctx, "batch %llu: page batch that does not decode", (unsigned long long)batch->height); return SQLITE_CORRUPT; }
+    if (!node->pm) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu is a page batch and this node is not in page mode (capture=pages)", (unsigned long long)batch->height); return SQLITE_MISMATCH; }
+    hpplite_internal_open_begin();
+    rc = sqlite3_open_v2(zFile, &adb, SQLITE_OPEN_READWRITE, NULL);
+    hpplite_internal_open_end();
+    if (rc != SQLITE_OK) { if (adb) sqlite3_close(adb); hpplite_pagebatch_free(b); return rc; }
+    sqlite3_busy_timeout(adb, 5000);
+    rc = sqlite3_exec(adb, "BEGIN EXCLUSIVE", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_file_control(adb, "main", SQLITE_FCNTL_FILE_POINTER, &pf);
+    page = sqlite3_malloc64((sqlite3_uint64)b->pageSize);
+    if (rc == SQLITE_OK && (!pf || !pf->pMethods || !page)) rc = SQLITE_ERROR;
+    for (i = 0; rc == SQLITE_OK && i < b->nPages; i++) {
+        sqlite3_int64 off = (sqlite3_int64)(b->aPage[i].pgno - 1) * (sqlite3_int64)b->pageSize;
+        unsigned k;
+        if (b->aPage[i].flags & HPPLITE_PAGE_DIFF) {
+            rc = pf->pMethods->xRead(pf, page, (int)b->pageSize, off);
+            if (rc == SQLITE_IOERR_SHORT_READ) rc = SQLITE_OK;          /* a diff onto a page the file does not have yet reads as zeros */
+            if (rc != SQLITE_OK) break;
+            for (k = 0; k < b->pageSize; k++) page[k] ^= b->aPage[i].body[k];
+        } else memcpy(page, b->aPage[i].body, b->pageSize);
+        if (b->aPage[i].pgno == 1) { counter = ((unsigned)page[24] << 24) | ((unsigned)page[25] << 16) | ((unsigned)page[26] << 8) | page[27]; page[18] = page[19] = 1; }
+        rc = pf->pMethods->xWrite(pf, page, (int)b->pageSize, off);
+        if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, b->aPage[i].pgno, page);
+    }
+    if (rc == SQLITE_OK) {
+        /* page 1 as the file has it: the counters moved, rollback-journal mode */
+        rc = pf->pMethods->xRead(pf, page, (int)b->pageSize, 0);
+        if (rc == SQLITE_OK) {
+            counter = (((unsigned)page[24] << 24) | ((unsigned)page[25] << 16) | ((unsigned)page[26] << 8) | page[27]) + 1;
+            page[24] = (unsigned char)(counter >> 24); page[25] = (unsigned char)(counter >> 16); page[26] = (unsigned char)(counter >> 8); page[27] = (unsigned char)counter;
+            memcpy(page + 92, page + 24, 4);
+            page[18] = page[19] = 1;
+            rc = pf->pMethods->xWrite(pf, page, (int)b->pageSize, 0);
+            if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, 1, page);
+        }
+    }
+    if (rc == SQLITE_OK) rc = pf->pMethods->xTruncate(pf, (sqlite3_int64)b->commitSize * (sqlite3_int64)b->pageSize);
+    if (rc == SQLITE_OK) rc = hpplite_pagemode_applied_size(node->pm, b->commitSize);
+    if (rc == SQLITE_OK) rc = pf->pMethods->xSync(pf, SQLITE_SYNC_NORMAL);
+    sqlite3_exec(adb, "ROLLBACK", NULL, NULL, NULL);          /* nothing of SQLite's to commit; the lock goes */
+    sqlite3_close(adb);
+    sqlite3_free(page);
+    if (rc != SQLITE_OK) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu: its pages could not be written (rc=%d)", (unsigned long long)batch->height, rc); return rc; }
+    hpplite_pagemode_root(node->pm, root);
+    node->ctx->nRootsCompared++;
+    if (memcmp(root, b->root, 32) != 0) {
+        node->ctx->nRootMismatches++;
+        hpplite_error(node->ctx, "batch %llu: the root after applying it differs from the posted one", (unsigned long long)batch->height);
+        hpplite_pagebatch_free(b);
+        return SQLITE_MISMATCH;
+    }
+    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, NULL, 0, b->root);
+    hpplite_pagebatch_free(b);
+    return rc;
+}
+
+/* The sequencer finds its own page batch on the chain, not finalized here (a
+** commit that failed, a crash): the same commits, still queued, build the
+** same pages; the roots must agree, then the chain's bytes are the posted copy */
+static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
+    HpplitePageBatch *b = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
+    unsigned char *bytes = NULL, root[32];
+    size_t len = 0;
+    int more = 0, rc;
+    if (!b) return SQLITE_CORRUPT;
+    if (!node->pm || b->lastCommit < b->firstCommit) { hpplite_pagebatch_free(b); return SQLITE_MISMATCH; }
+    rc = hpplite_pagemode_build_n(node->pm, (unsigned)(b->lastCommit - b->firstCommit + 1), &bytes, &len, root, &more);
+    if (rc != SQLITE_OK) { hpplite_pagebatch_free(b); return rc == SQLITE_DONE ? SQLITE_MISMATCH : rc; }
+    if (memcmp(root, b->root, 32) != 0) {
+        hpplite_pagemode_failed(node->pm);
+        sqlite3_free(bytes); hpplite_pagebatch_free(b);
+        hpplite_error(node->ctx, "page batch %llu on the chain is not what this node would post (a fork?)", (unsigned long long)batch->height);
+        return SQLITE_MISMATCH;
+    }
+    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root);
+    if (rc == SQLITE_OK) hpplite_pagemode_finalized(node->pm); else hpplite_pagemode_failed(node->pm);
+    sqlite3_free(bytes); hpplite_pagebatch_free(b);
+    return rc;
+}
 
 static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes) {
     HppliteCtx *ctx = node->ctx;
@@ -1772,6 +1907,15 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
             }
             node->state = HPPLITE_STATE_ERROR;
             return synced ? synced : -1;
+        }
+        if (batch->bPages) {
+            /* a page batch: applied to the file (a replica), or adopted (the sequencer's own) */
+            rc = (node->pm && hpplite_pagemode_pending(node->pm) > 0 && !node->config.verifyOnly) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
+            if (rc != SQLITE_OK) { hpplite_batch_free(batch); node->state = HPPLITE_STATE_ERROR; return -1; }
+            node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
+            hpplite_batch_free(batch);
+            synced++;
+            continue;
         }
         if (hpplite_pending_count(node->ctx) > 0) {
             /* Local writes exist: the L1 batch must be ours */

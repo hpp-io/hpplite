@@ -31,8 +31,22 @@ struct HpplitePageRoot {
 };
 #define NODE(pr, i) ((pr)->aNode + (size_t)(i) * 32)
 
+/* Page 1's file format bytes (18-19: 1 in rollback-journal mode, 2 in WAL) and
+** its change counters (24-27, 92-95: moved by a rollback-mode replica so its
+** readers notice) are not content: a WAL-mode sequencer and a rollback-mode
+** replica hash to one root. */
 static void leafHash(unsigned pgno, const unsigned char *page, int pageSize, unsigned char out[32]) {
   unsigned char tag[8] = { 'H', 'P', 'P', '4', (unsigned char)(pgno >> 24), (unsigned char)(pgno >> 16), (unsigned char)(pgno >> 8), (unsigned char)pgno };
+  if (pgno == 1 && pageSize >= 100) {
+    unsigned char *masked = sqlite3_malloc64((sqlite3_uint64)pageSize);
+    if (masked) {
+      memcpy(masked, page, (size_t)pageSize);
+      masked[18] = masked[19] = 0; memset(masked + 24, 0, 4); memset(masked + 92, 0, 4);
+      hpplite_sha256_prefixed(tag, 8, masked, (size_t)pageSize, out);
+      sqlite3_free(masked);
+      return;
+    }
+  }
   hpplite_sha256_prefixed(tag, 8, page, (size_t)pageSize, out);
 }
 static void innerHash(const unsigned char *l, const unsigned char *r, unsigned char out[32]) {

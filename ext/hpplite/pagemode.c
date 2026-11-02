@@ -37,6 +37,8 @@ struct HpplitePageMode {
   unsigned *aDirty; unsigned nDirty;          /* its dirty pages, each with its last image in the building commits */
   unsigned char **aLast;
   unsigned sizeAfter;
+  int bWatch;
+  unsigned takeExactly;       /* a build of exactly this many commits (0: by the budget) */
 };
 
 static void qfree(QCommit *q) { while (q) { QCommit *n = q->pNext; sqlite3_free(q->aPgno); sqlite3_free(q->aImg); sqlite3_free(q); q = n; } }
@@ -71,7 +73,7 @@ static int ensurePrev(HpplitePageMode *pm, unsigned n) {
   return SQLITE_OK;
 }
 
-HpplitePageMode *hpplite_pagemode_start(const char *zPath) {
+HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch) {
   HpplitePageMode *pm = sqlite3_malloc64(sizeof(*pm));
   FILE *f;
   unsigned char hdr[100];
@@ -102,14 +104,52 @@ HpplitePageMode *hpplite_pagemode_start(const char *zPath) {
   }
   if (f) fclose(f);
   if (!pm->pRoot) { hpplite_pagemode_stop(pm); return NULL; }
-  hpplite_vfs_watch(zPath, sink, pm);
+  pm->bWatch = bWatch;
+  if (bWatch) hpplite_vfs_watch(zPath, sink, pm);
   return pm;
+}
+
+int hpplite_pagemode_snapshot(HpplitePageMode *pm) {
+  QCommit *q;
+  unsigned i, n;
+  if (!pm || !pm->pRoot || pm->pageSize <= 0) return SQLITE_MISUSE;
+  n = pm->sizeThen;
+  if (n == 0) return SQLITE_OK;
+  q = sqlite3_malloc64(sizeof(*q));
+  if (!q) return SQLITE_NOMEM;
+  memset(q, 0, sizeof(*q));
+  q->n = n; q->nTrunc = n;
+  q->aPgno = sqlite3_malloc64((sqlite3_uint64)n * sizeof(unsigned));
+  q->aImg = sqlite3_malloc64((sqlite3_uint64)n * (sqlite3_uint64)pm->pageSize);
+  if (!q->aPgno || !q->aImg) { qfree(q); return SQLITE_NOMEM; }
+  for (i = 0; i < n; i++) {
+    q->aPgno[i] = i + 1;
+    memcpy(q->aImg + (size_t)i * (size_t)pm->pageSize, pm->aPrev[i], (size_t)pm->pageSize);
+    sqlite3_free(pm->aPrev[i]); pm->aPrev[i] = NULL;          /* never shipped: the batch carries them whole */
+  }
+  pthread_mutex_lock(&pm->mu);
+  q->pNext = pm->pHead; pm->pHead = q; if (!pm->pTail) pm->pTail = q;
+  pm->nQueued++; pm->queuedBytes += (size_t)n * (size_t)pm->pageSize; pm->nCommits++;
+  if (n > pm->maxPgQueued) pm->maxPgQueued = n;
+  pthread_mutex_unlock(&pm->mu);
+  return SQLITE_OK;
+}
+
+int hpplite_pagemode_applied(HpplitePageMode *pm, unsigned pgno, const unsigned char *page) {
+  if (!pm || !pm->pRoot) return SQLITE_MISUSE;
+  if (pm->pageSize == 0 && pgno == 1) { pm->pageSize = (page[16] << 8) | page[17]; if (pm->pageSize == 1) pm->pageSize = 65536; hpplite_pageroot_free(pm->pRoot); pm->pRoot = hpplite_pageroot_new(pm->pageSize); }
+  return hpplite_pageroot_set(pm->pRoot, pgno, page);
+}
+int hpplite_pagemode_applied_size(HpplitePageMode *pm, unsigned nPages) {
+  if (!pm || !pm->pRoot) return SQLITE_MISUSE;
+  pm->sizeThen = nPages;
+  return hpplite_pageroot_truncate(pm->pRoot, nPages);
 }
 
 void hpplite_pagemode_stop(HpplitePageMode *pm) {
   unsigned i;
   if (!pm) return;
-  if (pm->zPath) hpplite_vfs_unwatch(pm->zPath);
+  if (pm->zPath && pm->bWatch) hpplite_vfs_unwatch(pm->zPath);
   pthread_mutex_lock(&pm->mu);
   qfree(pm->pHead); pm->pHead = pm->pTail = NULL;
   pthread_mutex_unlock(&pm->mu);
@@ -164,7 +204,7 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
     for (q = pm->pHead; q; q = q->pNext) {
       unsigned added = 0;
       for (i = 0; i < q->n; i++) if (!seen[q->aPgno[i]]) added++;
-      if (nTake > 0 && distinct + added > budget) break;
+      if (pm->takeExactly ? nTake >= pm->takeExactly : (nTake > 0 && distinct + added > budget)) break;
       for (i = 0; i < q->n; i++) seen[q->aPgno[i]] = 1;
       distinct += added; nTake++; last = q;
     } }
@@ -222,6 +262,15 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
   sqlite3_free(recs); sqlite3_free(bodies);
   if (!*ppBytes) { hpplite_pagemode_failed(pm); return SQLITE_NOMEM; }
   return SQLITE_OK;
+}
+
+int hpplite_pagemode_build_n(HpplitePageMode *pm, unsigned nCommits, unsigned char **ppBytes, size_t *pLen, unsigned char root[32], int *pMore) {
+  int rc;
+  if (!pm || nCommits == 0) return SQLITE_MISUSE;
+  pm->takeExactly = nCommits;
+  rc = hpplite_pagemode_build(pm, (size_t)-1 / 2, ppBytes, pLen, root, pMore);
+  pm->takeExactly = 0;
+  return rc;
 }
 
 void hpplite_pagemode_finalized(HpplitePageMode *pm) {
