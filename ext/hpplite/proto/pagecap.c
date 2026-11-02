@@ -25,6 +25,7 @@ SQLITE_EXTENSION_INIT1
 #include <stdint.h>
 #include <time.h>
 #include <zlib.h>
+#include <pthread.h>
 
 typedef struct PcDb PcDb;
 struct PcDb {
@@ -64,6 +65,19 @@ static PcDb *g_dbs;
 static int g_nowork;
 static unsigned g_batch;
 static FILE *g_spool;              /* PAGECAP_SPOOL=path: every commit's pages, for pagecap_apply.py */
+/* PAGECAP_ASYNC=1: the commit only copies its pages into a queue; a flush
+** thread takes them per batch (every PAGECAP_BATCH commits, default 100):
+** diff against the previous batch's images, deflate, CRC64-XOR rolling
+** checksum of the file, a batch file written to PAGECAP_OUT (or dropped) */
+static int g_async;
+static pthread_t g_flusher;
+static pthread_mutex_t g_qmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_qcv = PTHREAD_COND_INITIALIZER;
+typedef struct QTxn { unsigned n; unsigned *aPgno; unsigned char *aImg; unsigned nTrunc; struct QTxn *pNext; } QTxn;
+static QTxn *g_qHead, *g_qTail; static unsigned g_qLen; static int g_qStop;
+static unsigned long long g_fBatches, g_fPages, g_fRaw, g_fZ, g_fWorkNs, g_fCommits; static uint64_t g_rolling;
+static unsigned char **g_fPrev; static unsigned g_fNPrev; static uint64_t *g_fPageCrc; static unsigned g_fNCrc;
+static const char *g_out;
 
 static uint64_t now_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static unsigned be32(const unsigned char *p) { return ((unsigned)p[0] << 24) | ((unsigned)p[1] << 16) | ((unsigned)p[2] << 8) | p[3]; }
@@ -113,10 +127,26 @@ static void batchClose(PcDb *d) {
 static void put32(FILE *f, unsigned v) { unsigned char b[4] = { (unsigned char)(v >> 24), (unsigned char)(v >> 16), (unsigned char)(v >> 8), (unsigned char)v }; fwrite(b, 1, 4, f); }
 static void put64(FILE *f, uint64_t v) { put32(f, (unsigned)(v >> 32)); put32(f, (unsigned)v); }
 
+static void *flusherMain(void *arg);
+
 /* the commit: measure the transaction's pages, remember them as previous */
 static void txnCommit(PcDb *d) {
   unsigned i;
   uint64_t t0 = now_ns();
+  if (g_async) {
+    QTxn *q = malloc(sizeof *q);
+    q->n = d->nTxn; q->nTrunc = (unsigned)d->nTruncAtCommit; q->pNext = NULL;
+    q->aPgno = malloc(d->nTxn * sizeof(unsigned)); q->aImg = malloc((size_t)d->nTxn * (size_t)d->pageSize);
+    for (i = 0; i < d->nTxn; i++) { q->aPgno[i] = d->aTxnPgno[i]; memcpy(q->aImg + (size_t)i * (size_t)d->pageSize, d->aTxnImg[i], (size_t)d->pageSize); free(d->aTxnImg[i]); }
+    d->nCommits++; d->nPages += d->nTxn; d->rawBytes += (unsigned long long)d->nTxn * (unsigned long long)d->pageSize; d->nTxn = 0;
+    pthread_mutex_lock(&g_qmu);
+    if (g_qTail) g_qTail->pNext = q; else g_qHead = q; g_qTail = q; g_qLen++;
+    if (!g_flusher) pthread_create(&g_flusher, NULL, flusherMain, (void *)(intptr_t)d->pageSize);
+    if (g_qLen >= (g_batch ? g_batch : 100)) pthread_cond_signal(&g_qcv);
+    pthread_mutex_unlock(&g_qmu);
+    d->workNs += now_ns() - t0;
+    return;
+  }
   if (g_spool) {
     unsigned char hdr[32];
     if (d->pWalReal && d->pWalReal->pMethods->xRead(d->pWalReal, hdr, 32, 0) == SQLITE_OK) { d->salt1 = be32(hdr + 16); d->salt2 = be32(hdr + 20); }
@@ -301,8 +331,69 @@ static int pcCurrentTime(sqlite3_vfs *v, double *t) { (void)v; return g_orig->xC
 static int pcGetLastError(sqlite3_vfs *v, int n, char *z) { (void)v; return g_orig->xGetLastError ? g_orig->xGetLastError(g_orig, n, z) : 0; }
 static int pcCurrentTimeInt64(sqlite3_vfs *v, sqlite3_int64 *t) { (void)v; return g_orig->xCurrentTimeInt64 ? g_orig->xCurrentTimeInt64(g_orig, t) : g_orig->xCurrentTime(g_orig, (double *)t); }
 
+static uint64_t crc64(uint64_t crc, const unsigned char *p, size_t n) {
+  static uint64_t tab[256]; static int init;
+  size_t i; int k;
+  if (!init) { for (i = 0; i < 256; i++) { uint64_t c = i; for (k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xC96C5795D7870F42ull : c >> 1; tab[i] = c; } init = 1; }
+  crc = ~crc; for (i = 0; i < n; i++) crc = tab[(crc ^ p[i]) & 0xff] ^ (crc >> 8); return ~crc;
+}
+
+/* a batch: the queued transactions' last image per page, diffed against what
+** the previous batch left, deflated, the rolling checksum of the file updated
+** (XOR of per-page CRC64s, LTX's scheme: a dirty page is O(1)) */
+static void flushBatch(QTxn *list, int pageSize) {
+  uint64_t t0 = now_ns();
+  size_t ps = (size_t)pageSize;
+  QTxn *q; unsigned maxPg = 0, nDirty = 0, i, pg;
+  unsigned char *dirty;
+  for (q = list; q; q = q->pNext) for (i = 0; i < q->n; i++) if (q->aPgno[i] > maxPg) maxPg = q->aPgno[i];
+  dirty = calloc(maxPg + 1, 1);
+  if (maxPg >= g_fNPrev) { unsigned n = g_fNPrev ? g_fNPrev : 1024; while (n <= maxPg) n *= 2; g_fPrev = realloc(g_fPrev, n * sizeof(*g_fPrev)); memset(g_fPrev + g_fNPrev, 0, (n - g_fNPrev) * sizeof(*g_fPrev)); g_fPageCrc = realloc(g_fPageCrc, n * sizeof(uint64_t)); memset(g_fPageCrc + g_fNPrev, 0, (n - g_fNPrev) * sizeof(uint64_t)); g_fNPrev = n; }
+  /* the last image of each page in the batch */
+  { unsigned char **last = calloc(maxPg + 1, sizeof(*last));
+    for (q = list; q; q = q->pNext) for (i = 0; i < q->n; i++) { last[q->aPgno[i]] = q->aImg + (size_t)i * ps; if (!dirty[q->aPgno[i]]) { dirty[q->aPgno[i]] = 1; nDirty++; } g_fCommits += (i == 0); }
+    { size_t len = (size_t)nDirty * ps, k; unsigned char *diff = malloc(len), *zbuf = malloc(len + len / 8 + 64); unsigned j = 0;
+      for (pg = 1; pg <= maxPg; pg++) if (dirty[pg]) {
+        unsigned char *cur = last[pg], *old = g_fPrev[pg];
+        uint64_t c = crc64(0, cur, ps);
+        if (old) for (k = 0; k < ps; k++) diff[j * ps + k] = cur[k] ^ old[k]; else memcpy(diff + j * ps, cur, ps);
+        g_rolling ^= g_fPageCrc[pg] ^ c; g_fPageCrc[pg] = c;      /* the rolling checksum: out with the old page, in with the new */
+        if (!old) g_fPrev[pg] = malloc(ps);
+        memcpy(g_fPrev[pg], cur, ps);
+        j++;
+      }
+      { size_t z = deflated(diff, len, zbuf, len + len / 8 + 64);
+        g_fBatches++; g_fPages += nDirty; g_fRaw += len; g_fZ += z;
+        if (g_out) { char name[512]; FILE *f; snprintf(name, sizeof name, "%s/batch-%06llu.ltxish", g_out, g_fBatches); f = fopen(name, "wb"); if (f) { put32(f, pageSize); put32(f, nDirty); put64(f, g_rolling); fwrite(zbuf, 1, z, f); fclose(f); } }
+      }
+      free(diff); free(zbuf);
+    }
+    free(last);
+  }
+  free(dirty);
+  while (list) { q = list; list = q->pNext; free(q->aPgno); free(q->aImg); free(q); }
+  g_fWorkNs += now_ns() - t0;
+}
+
+static void *flusherMain(void *arg) {
+  int pageSize = (int)(intptr_t)arg;
+  for (;;) {
+    QTxn *list = NULL;
+    struct timespec until;
+    pthread_mutex_lock(&g_qmu);
+    clock_gettime(CLOCK_REALTIME, &until); until.tv_nsec += 100000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+    while (!g_qStop && g_qLen < (g_batch ? g_batch : 100)) if (pthread_cond_timedwait(&g_qcv, &g_qmu, &until) != 0) break;   /* a batch's worth, or 100 ms */
+    list = g_qHead; g_qHead = g_qTail = NULL; g_qLen = 0;
+    { int stop = g_qStop; pthread_mutex_unlock(&g_qmu); if (list) flushBatch(list, pageSize); if (stop) break; }
+  }
+  return NULL;
+}
+
 static void printStats(void) {
   PcDb *d;
+  if (g_async && g_flusher) { pthread_mutex_lock(&g_qmu); g_qStop = 1; pthread_cond_signal(&g_qcv); pthread_mutex_unlock(&g_qmu); pthread_join(g_flusher, NULL);
+    fprintf(stderr, "pagecap flush thread: %llu batches, %llu commits, %llu dirty pages (%.1f per commit), raw %.1f MB, deflated diffs %.1f MB (%.0f B per commit), rolling checksum %016llx, work %.0f ms\n",
+            g_fBatches, g_fCommits, g_fPages, g_fCommits ? (double)g_fPages / (double)g_fCommits : 0, g_fRaw / 1048576.0, g_fZ / 1048576.0, g_fCommits ? (double)g_fZ / (double)g_fCommits : 0, (unsigned long long)g_rolling, g_fWorkNs / 1e6); }
   for (d = g_dbs; d; d = d->pNext) {
     if (!d->nCommits) continue;
     if (g_batch && d->commitsInBatch) batchClose(d);
@@ -348,6 +439,8 @@ int sqlite3_pagecap_init(sqlite3 *db, char **pzErr, const sqlite3_api_routines *
     g_nowork = getenv("PAGECAP_NOWORK") != NULL;
     g_batch = getenv("PAGECAP_BATCH") ? (unsigned)atoi(getenv("PAGECAP_BATCH")) : 0;
     if (getenv("PAGECAP_SPOOL")) g_spool = fopen(getenv("PAGECAP_SPOOL"), "wb");
+    g_async = getenv("PAGECAP_ASYNC") != NULL;
+    g_out = getenv("PAGECAP_OUT");
     if (getenv("PAGECAP_STATS")) atexit(printStats);
   }
   sqlite3_create_function(db, "pagecap_stats", 0, SQLITE_UTF8, NULL, statsFunc, NULL, NULL);
