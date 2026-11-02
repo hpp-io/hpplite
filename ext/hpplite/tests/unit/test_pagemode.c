@@ -398,6 +398,36 @@ static void test_open_fails_when_wal_cannot_be_set(void) {
     PASS();
 }
 
+/* a named database (#160): batch 1 of a page-mode rollup carries the name */
+static void test_batch_one_carries_the_name(void) {
+    TEST("a named database's first page batch carries the name, later ones do not");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof config);
+    config.nodeId = "named"; config.dataDir = DIR; config.dbPath = DIR "/named.db";
+    config.capturePages = 1; config.noEncrypt = 1; config.noCompress = 1; config.dbName = "alpha";
+    for (int i = 0; i < 32; i++) config.privkey[i] = (unsigned char)(i + 1);          /* a key: the lease is claimed with it */
+    config.hasPrivkey = 1;
+    HppliteNode *n = hpplite_node_create(&config);
+    if (!n) FAIL("open");
+    hpplite_node_set_l1(n, l1); hpplite_node_sync_from_l1(n, 1); hpplite_node_start(n);
+    hpplite_node_exec(n, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    { int pend = hpplite_node_pending_count(n); uint64_t h = hpplite_node_flush_batch(n); if (h != 1) FAILF("flush 1 returned %llu with %d pending: %s", (unsigned long long)h, pend, n->ctx->zLastError); }
+    hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(n) != 2) FAIL("flush 2");
+    HppliteBatch *b1 = hpplite_node_fetch_batch(n, 1), *b2 = hpplite_node_fetch_batch(n, 2);
+    const char *name1 = b1 && b1->zDbName ? b1->zDbName : "(none)";
+    int named2 = b2 && b2->zDbName != NULL;
+    printf("(batch 1: %s) ", name1);
+    int ok = strcmp(name1, "alpha") == 0;
+    hpplite_batch_free(b1); hpplite_batch_free(b2);
+    hpplite_node_destroy(n); hpplite_l1_disconnect(l1);
+    if (!ok) FAIL("batch 1 does not carry the name");
+    if (named2) FAIL("batch 2 carries the name too");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -413,6 +443,7 @@ int main(void) {
     test_vacuum_runs();
     test_no_local_finalize_with_an_l1_configured();
     test_open_fails_when_wal_cannot_be_set();
+    test_batch_one_carries_the_name();
     remove_dir();
     return test_report();
 }

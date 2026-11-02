@@ -46,6 +46,7 @@ typedef struct HpplitePageBatch {
   HpplitePageRec *aPage;                     /* sorted by pgno */
   unsigned char root[32];                    /* hpplite_pageroot_get after the batch */
   uint64_t crc;                              /* hpplite_pageroot_crc after the batch */
+  const char *zName; unsigned nName;         /* the database's name (dbname=, #160), on batch 1; not NUL-terminated when decoded */
 } HpplitePageBatch;
 /* is this a page batch (before any parse)? */
 int hpplite_pagebatch_is(const unsigned char *p, size_t n);

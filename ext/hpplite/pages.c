@@ -158,7 +158,7 @@ HpplitePageRoot *hpplite_pageroot_from_file(const char *zPath, int *pPageSize) {
 /* --------------------------------------------------------- the batch */
 #define PB_MAGIC "HPPL"
 #define PB_VERSION 1u
-#define PB_HEADER 56u                                  /* magic 4, version 4, pageSize 4, commitSize 4, first 8, last 8, salt1 4, salt2 4, time 8, nPages 4, reserved 4 */
+#define PB_HEADER 56u                                  /* magic 4, version 4, pageSize 4, commitSize 4, first 8, last 8, salt1 4, salt2 4, time 8, nPages 4, nName 4 (the name follows the trailer, #160) */
 #define PB_TRAILER 40u                                 /* root 32, crc 8 */
 
 static void w32(unsigned char *p, unsigned v) { p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16); p[2] = (unsigned char)(v >> 8); p[3] = (unsigned char)v; }
@@ -171,19 +171,21 @@ int hpplite_pagebatch_is(const unsigned char *p, size_t n) {
 }
 
 unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen) {
-  size_t rec = 6 + (size_t)b->pageSize, len = PB_HEADER + rec * b->nPages + PB_TRAILER, o = PB_HEADER;
+  unsigned nName = b->zName ? b->nName : 0;
+  size_t rec = 6 + (size_t)b->pageSize, len = PB_HEADER + rec * b->nPages + PB_TRAILER + nName, o = PB_HEADER;
   unsigned char *p = sqlite3_malloc64(len);
   unsigned i;
   if (!p) return NULL;
   memcpy(p, PB_MAGIC, 4); w32(p + 4, PB_VERSION); w32(p + 8, b->pageSize); w32(p + 12, b->commitSize);
   w64(p + 16, b->firstCommit); w64(p + 24, b->lastCommit); w32(p + 32, b->salt1); w32(p + 36, b->salt2);
-  w64(p + 40, b->timestampMs); w32(p + 48, b->nPages); w32(p + 52, 0);
+  w64(p + 40, b->timestampMs); w32(p + 48, b->nPages); w32(p + 52, nName);
   for (i = 0; i < b->nPages; i++) {
     w32(p + o, b->aPage[i].pgno); p[o + 4] = (unsigned char)(b->aPage[i].flags >> 8); p[o + 5] = (unsigned char)b->aPage[i].flags;
     memcpy(p + o + 6, b->aPage[i].body, (size_t)b->pageSize);
     o += rec;
   }
   memcpy(p + o, b->root, 32); w64(p + o + 32, b->crc);
+  if (nName) memcpy(p + o + PB_TRAILER, b->zName, nName);
   *pLen = len;
   return p;
 }
@@ -197,10 +199,10 @@ HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n) {
   if (!b) return NULL;
   memset(b, 0, sizeof(*b));
   b->pageSize = r32(p + 8); b->commitSize = r32(p + 12); b->firstCommit = r64(p + 16); b->lastCommit = r64(p + 24);
-  b->salt1 = r32(p + 32); b->salt2 = r32(p + 36); b->timestampMs = r64(p + 40); b->nPages = r32(p + 48);
-  if (b->pageSize < 512 || b->pageSize > 65536 || (b->pageSize & (b->pageSize - 1))) { sqlite3_free(b); return NULL; }
+  b->salt1 = r32(p + 32); b->salt2 = r32(p + 36); b->timestampMs = r64(p + 40); b->nPages = r32(p + 48); b->nName = r32(p + 52);
+  if (b->pageSize < 512 || b->pageSize > 65536 || (b->pageSize & (b->pageSize - 1)) || b->nName > 255) { sqlite3_free(b); return NULL; }
   rec = 6 + (size_t)b->pageSize;
-  if (n != PB_HEADER + rec * b->nPages + PB_TRAILER) { sqlite3_free(b); return NULL; }
+  if (n != PB_HEADER + rec * b->nPages + PB_TRAILER + b->nName) { sqlite3_free(b); return NULL; }
   b->aPage = sqlite3_malloc64((sqlite3_uint64)(b->nPages ? b->nPages : 1) * sizeof(HpplitePageRec));
   if (!b->aPage) { sqlite3_free(b); return NULL; }
   for (i = 0; i < b->nPages; i++) {
@@ -209,6 +211,7 @@ HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n) {
     o += rec;
   }
   memcpy(b->root, p + o, 32); b->crc = r64(p + o + 32);
+  b->zName = b->nName ? (const char *)(p + o + PB_TRAILER) : NULL;
   return b;
 }
 

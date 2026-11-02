@@ -39,6 +39,7 @@ struct HpplitePageMode {
   unsigned char **aLast;
   unsigned sizeAfter;
   int bWatch;
+  char *zName;                /* on the next batch built: the database's name (#160) */
   unsigned takeExactly;       /* a build of exactly this many commits (0: by the budget) */
 };
 
@@ -167,6 +168,7 @@ void hpplite_pagemode_stop(HpplitePageMode *pm) {
   hpplite_pageroot_free(pm->pRoot);
   pthread_mutex_destroy(&pm->mu);
   sqlite3_free(pm->zPath);
+  sqlite3_free(pm->zName);
   sqlite3_free(pm);
 }
 
@@ -181,6 +183,11 @@ uint64_t hpplite_pagemode_captured(HpplitePageMode *pm) {
   if (!pm) return 0;
   pthread_mutex_lock(&pm->mu); n = pm->nCaptured; pthread_mutex_unlock(&pm->mu);
   return n;
+}
+void hpplite_pagemode_set_name(HpplitePageMode *pm, const char *zName) {
+  if (!pm) return;
+  sqlite3_free(pm->zName);
+  pm->zName = zName && zName[0] ? sqlite3_mprintf("%.255s", zName) : NULL;
 }
 void hpplite_pagemode_discard(HpplitePageMode *pm) {
   if (!pm || pm->pBuilding) return;
@@ -276,6 +283,7 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
   b.firstCommit = pm->nFinalized + 1; b.lastCommit = pm->nFinalized + nTake;
   b.salt1 = last->salt1; b.salt2 = last->salt2; b.timestampMs = now_ms();
   b.nPages = nRec; b.aPage = recs;
+  b.zName = pm->zName; b.nName = pm->zName ? (unsigned)strlen(pm->zName) : 0;
   hpplite_pageroot_get(pm->pRoot, b.root); b.crc = hpplite_pageroot_crc(pm->pRoot);
   memcpy(root, b.root, 32);
   *ppBytes = hpplite_pagebatch_encode(&b, pLen);

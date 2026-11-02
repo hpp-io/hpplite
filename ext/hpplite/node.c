@@ -993,7 +993,7 @@ static HppliteBatch *node_batch_from_plain(uint64_t height, const uint8_t *plain
         /* every page batch carries its root in the trailer: what reads batches
         ** (the checkpoint flow, verify, the demo) sees it as the batch's (#154) */
         { HpplitePageBatch *pb = hpplite_pagebatch_decode(plain, n);
-          if (pb) { memcpy(b->postStateRoot, pb->root, 32); b->hasRoot = 1; hpplite_pagebatch_free(pb); } }
+          if (pb) { memcpy(b->postStateRoot, pb->root, 32); b->hasRoot = 1; if (pb->nName) b->zDbName = sqlite3_mprintf("%.*s", (int)pb->nName, pb->zName); hpplite_pagebatch_free(pb); } }
         return b;
     }
     return hpplite_batch_from_json((const char *)plain);
@@ -1623,6 +1623,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         if (!node_ensure_lease(node)) { *pMore = 0; return 0; }          /* only the lease holder posts */
         if (node_check_rollup(node) < 0) { *pMore = 0; return 0; }
     }
+    hpplite_pagemode_set_name(node->pm, height == 1 ? ctx->zDbName : NULL);     /* batch 1 names the database (#160) */
     for (tries = 0; ; tries++) {
         rc = hpplite_pagemode_build(node->pm, budget, &bytes, &len, root, pMore);
         if (rc != SQLITE_OK) { if (rc != SQLITE_DONE) hpplite_error(ctx, "page batch %llu could not be built (rc=%d)", (unsigned long long)height, rc); return 0; }
