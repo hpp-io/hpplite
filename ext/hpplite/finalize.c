@@ -328,13 +328,24 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   return pBatch;
 }
 
+/* The bytes the pending log would post: statement text, and the row
+** records' bytes, which live in the rec column row capture adds (#19) and
+** not in sql (#143: counted as nothing, the size-triggered flush never
+** fired and a busy writer posted only on the interval). A log from before
+** row capture has no rec column: its text alone. */
 sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx) {
-  sqlite3_stmt *pStmt;
+  sqlite3_stmt *pStmt = NULL;
   sqlite3_int64 n = 0;
   if (!pCtx) return 0;
   int saved = hppliteBkEnter(pCtx);
-  if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT COALESCE(SUM(length(sql)), 0) FROM _hpplite_pending",
-                         -1, &pStmt, NULL) == SQLITE_OK) {
+  if (sqlite3_prepare_v2(pCtx->bkDb,
+        "SELECT COALESCE(SUM(length(sql) + COALESCE(length(rec), 0)), 0) FROM _hpplite_pending",
+        -1, &pStmt, NULL) != SQLITE_OK) {
+    pStmt = NULL;
+    sqlite3_prepare_v2(pCtx->bkDb, "SELECT COALESCE(SUM(length(sql)), 0) FROM _hpplite_pending",
+                       -1, &pStmt, NULL);
+  }
+  if (pStmt) {
     if (sqlite3_step(pStmt) == SQLITE_ROW) n = sqlite3_column_int64(pStmt, 0);
     sqlite3_finalize(pStmt);
   }

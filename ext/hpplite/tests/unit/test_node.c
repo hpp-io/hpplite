@@ -410,6 +410,64 @@ static void test_node_lifecycle(void) {
     PASS();
 }
 
+/* The timer flushes early once the pending log nears the DA limit (#143).
+** Under row capture a record's bytes are in the rec column, not in sql:
+** the size check must see them, or a busy writer posts only on the
+** interval and the log grows without bound between flushes. */
+static void test_size_trigger_with_row_capture(void) {
+    HppliteNodeConfig config;
+    HppliteNode *node;
+    char *errMsg = NULL;
+    uint64_t before;
+    int i, waited;
+
+    TEST("size_trigger_with_row_capture");
+    cleanup_test_files("/tmp/hpplite_test_size");
+    ensure_test_dir("/tmp/hpplite_test_size");
+
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "test-size";
+    memcpy(config.privkey, SEQ_PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = "/tmp/hpplite_test_size";
+    config.dbPath = "/tmp/hpplite_test_size/test.db";
+    config.localOnly = 1;
+    config.batchIntervalMs = 3600 * 1000;      /* the interval never comes; only the size can flush */
+    config.maxBatchBytes = 16 * 1024;          /* half of it, 8 KB, is the trigger */
+
+    node = hpplite_node_create(&config);
+    if (!node) { FAIL("Failed to create node"); return; }
+    hpplite_node_start(node);
+    hpplite_node_start_timer(node);            /* the open hook does this; the C API caller must */
+    before = hpplite_node_get_height(node);
+
+    /* 400 rows of ~100 bytes: 40 KB of row records, five times the trigger */
+    if (hpplite_node_exec(node, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); BEGIN", &errMsg) != 0) {
+        FAIL(errMsg ? errMsg : "exec"); sqlite3_free(errMsg); hpplite_node_destroy(node); return;
+    }
+    for (i = 0; i < 400; i++) {
+        if (hpplite_node_exec(node, "INSERT INTO t(v) VALUES('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')", &errMsg) != 0) {
+            FAIL(errMsg ? errMsg : "insert"); sqlite3_free(errMsg); hpplite_node_destroy(node); return;
+        }
+    }
+    if (hpplite_node_exec(node, "COMMIT", &errMsg) != 0) {
+        FAIL(errMsg ? errMsg : "commit"); sqlite3_free(errMsg); hpplite_node_destroy(node); return;
+    }
+
+    /* the timer ticks every 100 ms; give it three seconds */
+    for (waited = 0; waited < 30 && hpplite_node_get_height(node) == before; waited++) usleep(100000);
+    if (hpplite_node_get_height(node) == before) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "no flush in 3 s with %d pending rows and the interval an hour away: the size trigger did not see the row records",
+                 hpplite_node_pending_count(node));
+        FAIL(msg);
+    } else {
+        PASS();
+    }
+    hpplite_node_destroy(node);
+    cleanup_test_files("/tmp/hpplite_test_size");
+}
+
 int main(void) {
     printf("\n=== HPPLite Node Tests (Singleton Sequencer Model) ===\n\n");
 
@@ -418,6 +476,7 @@ int main(void) {
     test_multiple_batches();
     test_checkpoint_tracking();
     test_node_lifecycle();
+    test_size_trigger_with_row_capture();
 
     printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
 
