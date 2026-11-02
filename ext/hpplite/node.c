@@ -1533,7 +1533,9 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
         hpplite_pagebatch_free(b);
         return SQLITE_MISMATCH;
     }
-    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, NULL, 0, b->root);
+    node->ctx->rootCmpHeight = batch->height;          /* for the verifier: compared with the on-chain checkpoint (#5) */
+    memcpy(node->ctx->rootCmp, b->root, 32);
+    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root);   /* the posted bytes: the chain hash (#33) */
     hpplite_pagebatch_free(b);
     return rc;
 }
