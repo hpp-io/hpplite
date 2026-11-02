@@ -19,12 +19,16 @@
 #include "compress.h"
 #include "pagemode.h"
 #include "pages.h"
+#include "walread.h"
 
 static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch);
 static int node_start_pages(HppliteNode *node, const char *zFile);
 static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch);
 static void node_ck_open(HppliteNode *node);
 static void node_ck_close(HppliteNode *node);
+static void node_pins_close(HppliteNode *node);
+static void node_wal_maintenance(void *pArg);
+static void node_checkpoint_wal(HppliteNode *node, int64_t now);
 #include "da_uri.h"
 #include "capture_rows.h"
 static void node_cap_batch_limit(HppliteNode *node);
@@ -171,6 +175,12 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         if (!mutex) return -1;
         pthread_mutex_init(mutex, NULL);
         node->flushMutex = mutex;
+    }
+    {
+        pthread_mutex_t *m = sqlite3_malloc(sizeof(pthread_mutex_t));
+        if (!m) return -1;
+        pthread_mutex_init(m, NULL);
+        node->walMaintMutex = m;
     }
 
     /* Initialize state */
@@ -359,11 +369,18 @@ static int node_start_pages(HppliteNode *node, const char *zFile) {
     if (node->pm) return SQLITE_OK;
     if (!realpath(zFile, resolved)) snprintf(resolved, sizeof resolved, "%s", zFile);
     if (node->config.verifyOnly) {
-        node->pm = hpplite_pagemode_start(resolved, 0);
+        node->pm = hpplite_pagemode_start(resolved, 0, 0);
     } else {
-        /* the file holds everything once checkpointed: the page mode reads it once */
-        sqlite3_exec(node->db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
-        node->pm = hpplite_pagemode_start(resolved, 1);
+        /* the file holds everything once checkpointed: the page mode reads it
+        ** once; what a checkpoint could not fold in (another connection's
+        ** read) stays in the WAL, and the reader delivers it from the frame
+        ** after the last one the file holds */
+        int nLog = 0, nCkpt = 0;
+        if (sqlite3_wal_checkpoint_v2(node->db, "main", SQLITE_CHECKPOINT_TRUNCATE, &nLog, &nCkpt) != SQLITE_OK) sqlite3_wal_checkpoint_v2(node->db, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt);
+        node->pm = hpplite_pagemode_start(resolved, 1, nCkpt > 0 ? (unsigned)nCkpt : 0);
+        if (node->pm && node->ctx) { node->ctx->xWalMaint = node_wal_maintenance; node->ctx->pWalMaintArg = node; }
+        if (node->pm && node->ctx) hpplite_walread_poll(resolved, 0);        /* what the WAL holds beyond the file, now */
+        if (node->pm && node->ctx) node_wal_maintenance(node);                /* the first pin: from here no restart drops an unread frame */
     }
     if (!node->pm) { fprintf(stderr, "hpplite: page mode could not start on %s\n", zFile); return SQLITE_ERROR; }
     if (node->config.localOnly) node_pages_decide_snapshot(node);      /* no chain to sync from: decided now */
@@ -832,6 +849,8 @@ void hpplite_node_destroy(HppliteNode *node) {
     }
 
     node_ck_close(node);
+    node_pins_close(node);
+    if (node->ctx) { node->ctx->xWalMaint = NULL; node->ctx->pWalMaintArg = NULL; }
     if (node->bkDb) {
         sqlite3_close(node->bkDb);
     }
@@ -881,6 +900,11 @@ void hpplite_node_destroy(HppliteNode *node) {
         pthread_mutex_destroy((pthread_mutex_t *)node->flushMutex);
         sqlite3_free(node->flushMutex);
         node->flushMutex = NULL;
+    }
+    if (node->walMaintMutex) {
+        pthread_mutex_destroy((pthread_mutex_t *)node->walMaintMutex);
+        sqlite3_free(node->walMaintMutex);
+        node->walMaintMutex = NULL;
     }
     /* Key material does not outlive the node */
     memset(node->config.privkey, 0, sizeof(node->config.privkey));
@@ -1474,6 +1498,7 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
         sqlite3_finalize(q);
         if (strcasecmp(mode, "wal") == 0) {
             node_ck_close(node);
+            node_pins_close(node);
             hpplite_pagemode_pause(node->pm);
             if (hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=DELETE") != SQLITE_OK) {
                 hpplite_pagemode_resume(node->pm);
@@ -2173,7 +2198,6 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=WAL");
         hpplite_pagemode_resume(node->pm);
         node->pagesWalSuspended = 0;
-        node_ck_open(node);                         /* the timer's checkpoint connection again, if the timer runs */
     }
     return synced;
 }
@@ -2201,7 +2225,7 @@ static int node_wal_hook(void *pArg, sqlite3 *db, const char *zDb, int nFrames) 
 ** needs the file to itself. */
 static void node_ck_open(HppliteNode *node) {
     const char *zFile;
-    if (node->ckDb || !node->pm || node->config.verifyOnly || !node->timerRunning) return;
+    if (node->ckDb || !node->pm || node->config.verifyOnly) return;
     zFile = sqlite3_db_filename(node->db, "main");
     if (!zFile || !zFile[0]) return;
     hpplite_internal_open_begin();
@@ -2221,6 +2245,45 @@ static void node_ck_close(HppliteNode *node) {
     node->ckDb = NULL;
 }
 static sqlite3 *node_ck_conn(HppliteNode *node) { return node->pm ? node->ckDb : node->bkDb; }
+
+/* The pins (#155): a read transaction held on one of two plain connections,
+** moved forward right after each poll: SQLite backfills only up to the
+** oldest reader's mark and restarts the WAL only when all of it is
+** backfilled, so a frame the reader has not read is never restarted over.
+** The new pin is taken before the poll and the old one let go after it. */
+static sqlite3 *node_pin_open(HppliteNode *node, int i) {
+    const char *zFile;
+    if (node->pinDb[i]) return node->pinDb[i];
+    zFile = sqlite3_db_filename(node->db, "main");
+    if (!zFile || !zFile[0]) return NULL;
+    hpplite_internal_open_begin();
+    if (sqlite3_open_v2(zFile, &node->pinDb[i], SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) { if (node->pinDb[i]) sqlite3_close(node->pinDb[i]); node->pinDb[i] = NULL; }
+    hpplite_internal_open_end();
+    if (node->pinDb[i]) sqlite3_busy_timeout(node->pinDb[i], 5000);
+    return node->pinDb[i];
+}
+static void node_pins_close(HppliteNode *node) {
+    int i;
+    for (i = 0; i < 2; i++) if (node->pinDb[i]) { sqlite3_exec(node->pinDb[i], "COMMIT", NULL, NULL, NULL); sqlite3_close(node->pinDb[i]); node->pinDb[i] = NULL; }
+}
+/* the WAL's upkeep for a page-mode sequencer: the new pin, the poll (frames
+** another connection or process committed, #153), the old pin let go, the
+** checkpoint when due. From the timer each tick, and from a commit hook at
+** 1000 frames when no timer runs */
+static void node_wal_maintenance(void *pArg) {
+    HppliteNode *node = pArg;
+    sqlite3 *fresh;
+    if (!node || !node->pm || node->config.verifyOnly || !node->ctx || !node->ctx->zWalKey || !node->walMaintMutex) return;
+    if (pthread_mutex_trylock((pthread_mutex_t *)node->walMaintMutex) != 0) return;   /* one at a time; the other's poll covers this */
+    fresh = node_pin_open(node, !node->pinActive);
+    if (fresh) sqlite3_exec(fresh, "BEGIN; SELECT count(*) FROM sqlite_schema", NULL, NULL, NULL);   /* its snapshot: the WAL as it is now */
+    hpplite_walread_poll(node->ctx->zWalKey, 0);
+    if (node->pinDb[node->pinActive]) sqlite3_exec(node->pinDb[node->pinActive], "COMMIT", NULL, NULL, NULL);
+    if (fresh) node->pinActive = !node->pinActive;
+    node_ck_open(node);
+    node_checkpoint_wal(node, node_current_time_ms());
+    pthread_mutex_unlock((pthread_mutex_t *)node->walMaintMutex);
+}
 
 static void node_checkpoint_wal(HppliteNode *node, int64_t now) {
     int nLog = 0, nCkpt = 0;
@@ -2282,7 +2345,7 @@ static void *node_timer_thread_func(void *arg) {
         int sizeTrigger = node->config.maxBatchBytes > 0 &&
             (node->pm ? hpplite_pagemode_pending_bytes(node->pm) >= node->config.maxBatchBytes * HPPLITE_PAGE_DEFLATE_GUESS / 2
                       : hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2));
-        node_checkpoint_wal(node, now);
+        if (node->pm) node_wal_maintenance(node); else node_checkpoint_wal(node, now);
 
         if (node->follower) {
             /* capture only; every second, see whether the sequencer is gone */
@@ -2343,8 +2406,10 @@ void hpplite_node_start_timer(HppliteNode *node) {
     node->timerThread = thread;
     /* the WAL's checkpoint is this thread's now (#144); the application's
     ** commits stop doing it. interval=0 (no timer) leaves SQLite's own. */
-    if (node->pm) node_ck_open(node); else sqlite3_wal_hook(node->bkDb, node_wal_hook, node);
-    if (node->ctx) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=0");
+    if (!node->pm) sqlite3_wal_hook(node->bkDb, node_wal_hook, node);
+    /* page mode: the connection's wal hook is the capture's (#155) and already
+    ** stands in for SQLite's checkpoint; the pragma would replace it */
+    if (node->ctx && !node->pm) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=0");
 }
 
 /*
@@ -2356,8 +2421,8 @@ void hpplite_node_stop_timer(HppliteNode *node) {
     /* Signal thread to stop, and wake it */
     pthread_mutex_lock((pthread_mutex_t *)node->timerWakeMutex);
     node->timerRunning = 0;
-    if (node->pm) node_ck_close(node); else if (node->bkDb) sqlite3_wal_hook(node->bkDb, NULL, NULL);
-    if (node->ctx && node->db) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=1000");   /* SQLite's own again */
+    if (!node->pm && node->bkDb) sqlite3_wal_hook(node->bkDb, NULL, NULL);
+    if (node->ctx && node->db && !node->pm) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=1000");   /* SQLite's own again */
     pthread_cond_signal((pthread_cond_t *)node->timerWake);
     pthread_mutex_unlock((pthread_mutex_t *)node->timerWakeMutex);
 

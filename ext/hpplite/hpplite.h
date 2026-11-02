@@ -47,7 +47,11 @@ struct HppliteCtx {
   sqlite3 *db;                /* Application connection: trace + pending log */
   sqlite3 *bkDb;              /* Bookkeeping connection (== db for :memory:) */
   int bEnabled;               /* Tracking enabled flag */
-  int bPages;                 /* page mode (#146): no hooks on the application's connection, the bookkeeping in a sidecar */
+  int bPages;                 /* page mode (#146): no commit hook on the application's connection, the bookkeeping in a sidecar */
+  char *zWalKey;              /* page mode: the file's canonical path, the WAL reader's key (#155) */
+  void (*xWalMaint)(void *);  /* page mode: the node's WAL maintenance (pins, checkpoint) when no timer runs it; NULL: SQLite's own checkpoint */
+  void *pWalMaintArg;
+  int bWalHookFired;          /* page mode: the wal hook ran during this statement (else its end polls the WAL) */
   uint64_t inflightHeight;    /* page mode: a batch posted and not yet finalized (0: none), with its root; survives the process */
   unsigned char inflightRoot[32];
   int bInternal;              /* Set while HPPLite runs its own statements */

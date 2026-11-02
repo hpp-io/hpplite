@@ -33,6 +33,7 @@ the same binary with `HPPLITE_CAPTURE=text`.
 | 8 | The rollback hook fires for the implicit rollback of a failed autocommit statement | test_hpplite | ok |
 | 9 | `sqlite3_expanded_sql()` truncates bound values in some builds | test_env_enable | ok |
 | 10 | A schema reset is immediate even while another statement of the connection is running | test_rows, test_concurrency(+_text), test_faults(+_text), test_rows_e2e | handled (#108) |
+| 11 | The wal hook runs only when `sqlite3_step()` returns SQLITE_DONE in autocommit; a statement reset after a row commits without it | test_abuse_pages | handled (#155) |
 
 Entry 10 was not on the list in #105: it is the one trunk broke, found by the
 first run of the trunk build (2026-11-01; details under 10). HPPLite no
@@ -388,6 +389,31 @@ judged at the start when the statement is text in any case, so a refusal
 opens no transaction. On 3.54.1 the deferred paths are never taken (the
 nested reprepare works and the lock no-op never fails SQLITE_SCHEMA); the
 trunk CI job exercises them.
+
+## 11. The wal hook runs only when `sqlite3_step()` returns SQLITE_DONE in autocommit
+
+**Relied on, and worked around.** Page capture (#146) reads a commit's
+frames from the WAL file when the connection's wal hook says a commit
+happened (#155). SQLite runs that hook from `sqlite3_step()` when the step
+returns SQLITE_DONE in autocommit, and from COMMIT. A statement stepped to
+a row and then reset - `INSERT ... RETURNING` taken with one step, a
+driver's `.get()` - commits inside `sqlite3_reset()`, and the hook does not
+run. The frames are in the WAL all the same.
+
+**SQLite source.** `vdbeapi.c` `sqlite3Step()`: `if( rc==SQLITE_DONE &&
+db->autoCommit ){ p->rc = doWalCallbacks(db); }`; `sqlite3VdbeReset()`
+halts and commits through `sqlite3VdbeHalt()` without calling
+`doWalCallbacks()`.
+
+**HPPLite code.** `hpplite.c` `pagesWalHook()` sets `bWalHookFired`;
+`pagesTrace()` clears it at SQLITE_TRACE_STMT and, at SQLITE_TRACE_PROFILE
+(the statement's end, which `sqlite3_reset()` does run) with the hook not
+having run, polls the WAL reader with no frame hint (`walread.c`
+`hpplite_walread_poll()`), which reads to the last commit frame.
+
+**Pinned by.** test_abuse_pages, `TEST("INSERT/UPDATE ... RETURNING stepped
+once and reset, then run again: every run captured")`: 11 commits captured
+(2 without the fallback).
 
 ## Adding an entry
 

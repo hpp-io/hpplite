@@ -74,8 +74,11 @@ from any language whose SQLite binding can load extensions.
 
 The capture above records *what* each write changed and replays it. Page
 capture records *which pages* each commit wrote, as Litestream and LiteFS
-do: the extension's VFS watches the WAL frames of a commit and queues the
-pages; a flush turns the queue into a **page batch** - every page the
+do: after each commit the connection's WAL hook has HPPLite read the
+commit's frames from the WAL file and queue the pages (the sequencer also
+reads frames other connections and processes commit, and keeps a read
+transaction pinned so SQLite never restarts the WAL over a frame it has
+not read); a flush turns the queue into a **page batch** - every page the
 batch's commits touched, once, as the whole page the first time a replica
 sees it and as an XOR diff against the last posted image after - and the
 batch's root is a Merkle root over the hashes of every page in the file
@@ -90,17 +93,19 @@ What it changes: a transaction costs what SQLite charges for it (the OLTP
 numbers in [doc/performance.md](doc/performance.md): 94% of plain SQLite's
 write rate, p99 0.15 ms against 1.4 ms with row capture), any SQL replicates
 (non-deterministic functions, virtual tables, `VACUUM`), and a batch is a
-few deflated pages rather than a record per row. What it does not do yet:
-a commit that dirties more pages than fit under the posting limit is posted
-over it (#152; the default limit is 128 KB of deflated pages), a second
-connection or process on the file is not captured (#153), and a connection
-HPPLite did not open itself - the loadable extension in a driver,
-`HPPLITE_FILES` - captures nothing, since its file is not on the VFS (#155:
-the next step reads the WAL file instead). A crash between a submit and its
-finalize is recovered from the sidecar's record of the batch in flight; a
-sequencer reopened on a file the chain does not have whole ships it whole
-again. `hpplite_status.capture` says `pages`; `hpplite-verify` finds a page
-history by itself; a named database's first batch carries the name.
+few deflated pages rather than a record per row. Several connections and
+processes on one file work as with row capture: the sequencer captures
+what the others commit, a follower that is the last connection out takes
+over and ships what the file holds beyond the chain. What it does not do
+yet: a commit that dirties more pages than fit under the posting limit is
+posted over it (#152; the default limit is 128 KB of deflated pages). A
+crash between a submit and its finalize is recovered from the sidecar's
+record of the batch in flight; a sequencer reopened on a file the chain
+does not have whole ships it whole again. `PRAGMA wal_autocheckpoint` is
+refused on a page-mode connection (its WAL hook is the capture's; HPPLite
+checkpoints the file itself). `hpplite_status.capture` says `pages`;
+`hpplite-verify` finds a page history by itself; a named database's first
+batch carries the name.
 
 ## Why one writer?
 

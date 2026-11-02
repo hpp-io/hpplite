@@ -14,7 +14,7 @@ typedef struct HpplitePageMode HpplitePageMode;
 /* Start on a database file: its pages are read once (the root, the images
 ** diffs are taken against) and its commits are watched from here on. The
 ** caller has checkpointed it, so the file holds everything. */
-HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch);   /* bWatch 0: a replica, applying what it is sent */
+HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch, unsigned startFrame);   /* bWatch 0: a replica, applying what it is sent; startFrame: WAL frames the file holds already */
 void hpplite_pagemode_stop(HpplitePageMode *pm);
 /* a sequencer-to-be applying the chain's pages: its own watch off meanwhile (what the
 ** apply and the journal-mode switches write is not a commit of its own), on again after */

@@ -29,8 +29,12 @@ c.execute("UPDATE notes SET body = body || '!' WHERE id % 7 = 0")
 c.commit()
 # a changed row per log row (row capture, #19); with capture=text a statement:
 # 300 inserted, 42 updated (id % 7 = 0), and the CREATE TABLE
-rows = os.environ.get("HPPLITE_CAPTURE", "").lower() != "text"
-assert c.execute("SELECT pending FROM hpplite_status").fetchone()[0] == (343 if rows else 302)
+cap = os.environ.get("HPPLITE_CAPTURE", "").lower()
+pending = c.execute("SELECT pending FROM hpplite_status").fetchone()[0]
+if cap == "pages":
+    assert pending in (3, 4), pending       # three commits, and the file as opened when it had a page (#146)
+else:
+    assert pending == (302 if cap == "text" else 343), pending
 h = c.execute("SELECT hpplite_flush()").fetchone()[0]       # the last height posted (40 KB batches: maybe 2)
 assert h >= 1, h
 assert c.execute("SELECT height, pending FROM hpplite_status").fetchone() == (h + 1, 0)

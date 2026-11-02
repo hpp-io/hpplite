@@ -606,6 +606,14 @@ static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, cons
       ** the crash safety the log relies on. Leaving WAL failed anyway, as
       ** "database is locked" (the bookkeeping connection holds it open):
       ** say why instead. Reading the mode is fine. */
+      /* page capture reads the WAL from this connection's wal hook, which
+      ** PRAGMA wal_autocheckpoint would replace with SQLite's (#155); HPPLite
+      ** checkpoints the file itself */
+      if (pCtx->bPages && z1 && z2 && sqlite3_stricmp(z1, "wal_autocheckpoint") == 0) {
+        pCtx->zDenyWhy = "page capture: wal_autocheckpoint is HPPLite's (its hook reads the WAL; the file is checkpointed by HPPLite)";
+        pCtx->nAuthDenied++;
+        return SQLITE_DENY;
+      }
       if (z1 && z2 && sqlite3_stricmp(z1, "journal_mode") == 0 && sqlite3_stricmp(z2, "wal") != 0
           && pCtx->bkDb != pCtx->db) {
         pCtx->zDenyWhy = "HPPLite keeps the database in WAL mode (journal_mode cannot be changed)";

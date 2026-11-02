@@ -2,7 +2,7 @@
 #include "hpplite_sqlite.h"
 #include "pagemode.h"
 #include "pages.h"
-#include "vfs.h"
+#include "walread.h"
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
@@ -46,7 +46,7 @@ struct HpplitePageMode {
 static void qfree(QCommit *q) { while (q) { QCommit *n = q->pNext; sqlite3_free(q->aPgno); sqlite3_free(q->aImg); sqlite3_free(q); q = n; } }
 
 /* the sink: the commit's pages, queued */
-static void sink(void *pArg, const HppliteVfsCommit *c) {
+static void sink(void *pArg, const HppliteWalCommit *c) {
   HpplitePageMode *pm = pArg;
   QCommit *q = sqlite3_malloc64(sizeof(*q));
   unsigned i;
@@ -75,7 +75,7 @@ static int ensurePrev(HpplitePageMode *pm, unsigned n) {
   return SQLITE_OK;
 }
 
-HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch) {
+HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch, unsigned startFrame) {
   HpplitePageMode *pm = sqlite3_malloc64(sizeof(*pm));
   FILE *f;
   unsigned char hdr[100];
@@ -107,15 +107,15 @@ HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch) {
   if (f) fclose(f);
   if (!pm->pRoot) { hpplite_pagemode_stop(pm); return NULL; }
   pm->bWatch = bWatch;
-  if (bWatch) hpplite_vfs_watch(zPath, sink, pm);
+  if (bWatch) hpplite_walread_watch(zPath, sink, pm, startFrame);
   return pm;
 }
 
 void hpplite_pagemode_pause(HpplitePageMode *pm) {
-  if (pm && pm->bWatch && pm->zPath) hpplite_vfs_unwatch(pm->zPath);
+  if (pm && pm->bWatch && pm->zPath) hpplite_walread_unwatch(pm->zPath);
 }
 void hpplite_pagemode_resume(HpplitePageMode *pm) {
-  if (pm && pm->bWatch && pm->zPath) hpplite_vfs_watch(pm->zPath, sink, pm);
+  if (pm && pm->bWatch && pm->zPath) hpplite_walread_watch(pm->zPath, sink, pm, 0);
 }
 
 int hpplite_pagemode_snapshot(HpplitePageMode *pm) {
@@ -158,7 +158,7 @@ int hpplite_pagemode_applied_size(HpplitePageMode *pm, unsigned nPages) {
 void hpplite_pagemode_stop(HpplitePageMode *pm) {
   unsigned i;
   if (!pm) return;
-  if (pm->zPath && pm->bWatch) hpplite_vfs_unwatch(pm->zPath);
+  if (pm->zPath && pm->bWatch) hpplite_walread_unwatch(pm->zPath);
   pthread_mutex_lock(&pm->mu);
   qfree(pm->pHead); pm->pHead = pm->pTail = NULL;
   pthread_mutex_unlock(&pm->mu);

@@ -5,7 +5,7 @@
 */
 #include "test_lib.h"
 #include "pages.h"
-#include "vfs.h"
+#include "walread.h"
 #include <sys/stat.h>
 
 #define DIR "/tmp/hpplite_test_pages"
@@ -40,10 +40,10 @@ static void test_root_incremental_equals_scan(void) {
     PASS();
 }
 
-/* ---- commits from the VFS, batched as diffs, applied onto a fresh file ---- */
+/* ---- commits from the WAL reader, batched as diffs, applied onto a fresh file ---- */
 typedef struct { unsigned nPages; unsigned *aPgno; unsigned char **aImg; unsigned nTruncate; } Commit;
 typedef struct { Commit *a; int n, alloc; int pageSize; } Spool;
-static void sink(void *pArg, const HppliteVfsCommit *c) {
+static void sink(void *pArg, const HppliteWalCommit *c) {
     Spool *s = pArg; Commit *k; unsigned i;
     if (s->n == s->alloc) { s->alloc = s->alloc ? s->alloc * 2 : 64; s->a = realloc(s->a, (size_t)s->alloc * sizeof(Commit)); }
     k = &s->a[s->n++]; k->nPages = c->nPages; k->nTruncate = c->nTruncate;
@@ -59,7 +59,7 @@ static void test_batches_of_diffs_rebuild_file_and_root(void) {
     Spool s; memset(&s, 0, sizeof s);
     if (sqlite3_open(DIR "/w.db", &db) != SQLITE_OK) FAIL("open");
     if (!exec_ok(db, "PRAGMA journal_mode=WAL")) FAIL("WAL");
-    hpplite_vfs_watch(sqlite3_db_filename(db, "main"), sink, &s);
+    hpplite_walread_watch(sqlite3_db_filename(db, "main"), sink, &s, 0);
     if (!exec_ok(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v TEXT); CREATE INDEX tk ON t(k)")) FAIL("schema");
     for (int i = 0; i < 30; i++) {
         char sql[200];
@@ -67,10 +67,11 @@ static void test_batches_of_diffs_rebuild_file_and_root(void) {
                                   " INSERT INTO t(k, v) SELECT i * %d, 'row ' || i || ' batch %d' FROM s; COMMIT", i + 1, i);
         if (!exec_ok(db, sql)) FAIL("insert");
         if (i % 5 == 2 && !exec_ok(db, "DELETE FROM t WHERE id % 9 = 0")) FAIL("delete");
-        if (i == 20 && !exec_ok(db, "PRAGMA wal_checkpoint(TRUNCATE)")) FAIL("checkpoint");
+        if (i == 20) { hpplite_walread_poll(sqlite3_db_filename(db, "main"), 0); if (!exec_ok(db, "PRAGMA wal_checkpoint(TRUNCATE)")) FAIL("checkpoint"); }
     }
+    hpplite_walread_poll(sqlite3_db_filename(db, "main"), 0);
     if (!exec_ok(db, "PRAGMA wal_checkpoint(TRUNCATE)")) FAIL("final checkpoint");
-    hpplite_vfs_unwatch(sqlite3_db_filename(db, "main"));
+    hpplite_walread_poll(sqlite3_db_filename(db, "main"), 0); hpplite_walread_unwatch(sqlite3_db_filename(db, "main"));
     sqlite3_close(db);
 
     /* the sequencer's side: its root and the previous images (by page), batches of 5 commits */
@@ -154,9 +155,11 @@ static void test_root_from_file(void) {
     Spool s; memset(&s, 0, sizeof s);
     if (sqlite3_open(DIR "/f.db", &db) != SQLITE_OK) FAIL("open");
     if (!exec_ok(db, "PRAGMA journal_mode=WAL")) FAIL("WAL");
-    hpplite_vfs_watch(sqlite3_db_filename(db, "main"), sink, &s);
-    if (!exec_ok(db, "CREATE TABLE t(x); INSERT INTO t VALUES(zeroblob(5000)); INSERT INTO t VALUES(zeroblob(9000)); DELETE FROM t WHERE rowid = 1; INSERT INTO t VALUES(1); PRAGMA wal_checkpoint(TRUNCATE)")) FAIL("writes");
-    hpplite_vfs_unwatch(sqlite3_db_filename(db, "main"));
+    hpplite_walread_watch(sqlite3_db_filename(db, "main"), sink, &s, 0);
+    if (!exec_ok(db, "CREATE TABLE t(x); INSERT INTO t VALUES(zeroblob(5000)); INSERT INTO t VALUES(zeroblob(9000)); DELETE FROM t WHERE rowid = 1; INSERT INTO t VALUES(1)")) FAIL("writes");
+    hpplite_walread_poll(sqlite3_db_filename(db, "main"), 0);
+    if (!exec_ok(db, "PRAGMA wal_checkpoint(TRUNCATE)")) FAIL("checkpoint");
+    hpplite_walread_poll(sqlite3_db_filename(db, "main"), 0); hpplite_walread_unwatch(sqlite3_db_filename(db, "main"));
     sqlite3_close(db);
     HpplitePageRoot *kept = hpplite_pageroot_new(s.pageSize);
     int i; unsigned j;

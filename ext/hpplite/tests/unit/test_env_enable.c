@@ -17,7 +17,6 @@
 
 static void test_plain_path_enabled(void) {
     TEST("a plain-path open of a file named in HPPLITE_FILES is an HPPLite connection");
-    SKIP_IF_PAGES("page capture on a connection HPPLite did not open: #155");
     reset_dir();
     setenv("HPPLITE_FILES", "*/app*.db:" DIR "/exact.db", 1);
     setenv("HPPLITE_PARAMS", "privkey=" KEY "&datadir=" DIR "&interval=0", 1);

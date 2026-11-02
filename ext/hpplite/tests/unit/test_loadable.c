@@ -82,7 +82,7 @@ static void test_load_and_use(void) {
     PASS();
 
     TEST("writes are captured and flushed through the extension");
-    if (getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "pages") == 0) { printf("SKIP (page capture on a connection HPPLite did not open: #155) "); PASS(); } else {
+    {
     rc = sqlite3_exec(db,
         "CREATE TABLE t(id INTEGER PRIMARY KEY, v);"
         "INSERT INTO t VALUES(1,'a');"
@@ -105,19 +105,9 @@ static void test_load_and_use(void) {
     TEST("later connections get HPPLite automatically (auto-extension)");
     rc = sqlite3_open_v2(DB_URI, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     if (rc != SQLITE_OK) FAIL("reopen");
-    if (getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "pages") == 0) {
-        /* page capture: the first case skipped (#155), so this connection, opened
-        ** after the extension loaded and therefore on its VFS, writes and posts itself */
-        long long before = scalar(db, "SELECT height FROM hpplite_status", &ok);
-        sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES(7,'g'); INSERT INTO t VALUES(8,'h')", NULL, NULL, NULL);
-        if (scalar(db, "SELECT pending FROM hpplite_status", &ok) < 2) FAIL("writes on a later connection not captured");
-        if (scalar(db, "SELECT hpplite_flush()", &ok) < 1) FAIL("flush on a later connection");
-        if (scalar(db, "SELECT height FROM hpplite_status", &ok) <= before || scalar(db, "SELECT pending FROM hpplite_status", &ok) != 0) FAIL("the flush did not post");
-    } else {
     if (scalar(db, "SELECT height FROM hpplite_status", &ok) != 3 || !ok) FAIL("height should be 3 (close flushed batch 2)");
     if (scalar(db, "SELECT pending FROM hpplite_status", &ok) != 0) FAIL("nothing pending after reopen");
     if (scalar(db, "SELECT count(*) FROM t", &ok) != 4) FAIL("rows");
-    }
     sqlite3_close(db);
     PASS();
 
@@ -150,7 +140,7 @@ static void test_load_and_use(void) {
     if (rc != SQLITE_OK) FAIL("plain open");
     scalar(db, "SELECT height FROM hpplite_status", &ok);
     if (ok) FAIL("hpplite_status should not exist on a plain connection");
-    if (scalar(db, "SELECT count(*) FROM t", &ok) != ((getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "pages") == 0) ? 3 : 5)) FAIL("plain read");   /* page mode: rows 7, 8 and 5 */
+    if (scalar(db, "SELECT count(*) FROM t", &ok) != 5) FAIL("plain read");
     sqlite3_close(db);
     PASS();
 }

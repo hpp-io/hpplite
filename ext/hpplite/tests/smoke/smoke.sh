@@ -12,8 +12,6 @@ mkdir -p "$dir"
 trap 'rm -rf "$dir"' EXIT
 ran=0
 
-# page capture on a connection HPPLite did not open is #155
-case "${HPPLITE_CAPTURE:-}" in pages|PAGES) echo "SKIP: page capture on a loaded-extension connection (#155)"; exit 77;; esac
 # Python: needs a build with enable_load_extension (macOS system python lacks it)
 for py in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
     command -v "$py" >/dev/null 2>&1 || continue
@@ -47,6 +45,7 @@ SQL
     echo "$out" | tr '\n' ' '
     # the CREATE and three rows (row capture, #19); with capture=text the CREATE and the INSERT
     want=4; [ "${HPPLITE_CAPTURE:-}" = text ] && want=2
+    [ "${HPPLITE_CAPTURE:-}" = pages ] && want=3            # the file as opened and two commits (page capture, #146)
     echo "$out" | grep -q "^pending=$want\$" || { echo "cli: expected pending=$want"; exit 1; }
     echo "$out" | grep -q '^flush=1$' || { echo "cli: expected flush=1"; exit 1; }
     echo "$out" | grep -q '^height=2,pending=0$' || { echo "cli: expected height 2"; exit 1; }

@@ -8,6 +8,7 @@
 */
 
 #include "hpplite_int.h"
+#include "walread.h"
 #include <ctype.h>
 #include <fnmatch.h>
 #include <limits.h>
@@ -386,13 +387,15 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
 }
 
 static int pagesTrace(unsigned mask, void *pArg, void *pS, void *pX);
+static int pagesWalHook(void *pArg, sqlite3 *db, const char *zDb, int nFrames);
 static void rearmHooks(HppliteCtx *pCtx, int bClosing) {
   void *prevCommit, *prevRollback;
   int lost = 0;
   if (!pCtx || pCtx->bDbClosed) return;
-  if (pCtx->bPages) {   /* page mode: the authorizer and the VACUUM marker (#148) */
+  if (pCtx->bPages) {   /* page mode: the authorizer, the VACUUM marker (#148) and the wal hook (#155) */
     sqlite3_set_authorizer(pCtx->db, hppliteAuthorizer, pCtx);
     sqlite3_trace_v2(pCtx->db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, pagesTrace, pCtx);
+    sqlite3_wal_hook(pCtx->db, pagesWalHook, pCtx);
     return;
   }
   /* setting a hook returns the previous argument: not ours means replaced */
@@ -461,9 +464,11 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
     sqlite3_rollback_hook(pCtx->db, NULL, NULL);
     sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
     sqlite3_set_authorizer(pCtx->db, NULL, NULL);
+    if (pCtx->bPages) sqlite3_wal_hook(pCtx->db, NULL, NULL);
     hpplite_rows_disable(pCtx);           /* its triggers and functions hold pCtx (#66) */
     finalizeOwnStatements(pCtx);
   }
+  sqlite3_free(pCtx->zWalKey); pCtx->zWalKey = NULL;
   hppliteFreeFunctionChecks(pCtx);
   hppliteTreeFree(pCtx);
   if (pCtx->vacuumFd >= 0) close(pCtx->vacuumFd);                         /* its flock goes with it */
@@ -483,12 +488,39 @@ static int pagesTrace(unsigned mask, void *pArg, void *pS, void *pX) {
   if (!pCtx) return 0;
   if (mask == SQLITE_TRACE_STMT) {
     const char *z = (const char*)pX;
+    /* the wal hook, ours again: sqlite3_open sets SQLite's auto-checkpoint hook
+    ** after the auto-extensions ran, and a driver may set it later (#155) */
+    if (sqlite3_wal_hook(pCtx->db, pagesWalHook, pCtx) != pCtx) { /* replaced since: ours now */ }
+    pCtx->bWalHookFired = 0;
     while (z && (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r')) z++;
     if (z && sqlite3_strnicmp(z, "VACUUM", 6) == 0 && !isalnum((unsigned char)z[6]) && z[6] != '_') pCtx->pVacuumStmt = pS;
-  } else if (mask == SQLITE_TRACE_PROFILE && pS == pCtx->pVacuumStmt) {
-    pCtx->pVacuumStmt = NULL;
+  } else if (mask == SQLITE_TRACE_PROFILE) {
+    if (pS == pCtx->pVacuumStmt) pCtx->pVacuumStmt = NULL;
+    /* SQLite runs the wal hook only when sqlite3_step() returns SQLITE_DONE
+    ** in autocommit (vdbeapi.c, doWalCallbacks): a statement reset after a
+    ** row - RETURNING stepped once, a driver's .get() - commits at the reset
+    ** without it. The statement's end reads whatever was committed since */
+    if (!pCtx->bWalHookFired && pCtx->zWalKey) hpplite_walread_poll(pCtx->zWalKey, 0);
   }
   return 0;
+}
+
+/* Page mode's wal hook (#155): after each commit of this connection the WAL
+** reader takes the commit's frames, on this thread, with the count SQLite
+** hands over; and the checkpoint SQLite's own hook would have run at 1000
+** frames is this hook's now (the node's maintenance when it has pins, a
+** passive checkpoint otherwise) */
+static int pagesWalHook(void *pArg, sqlite3 *db, const char *zDb, int nFrames) {
+  HppliteCtx *pCtx = (HppliteCtx*)pArg;
+  (void)zDb;
+  if (!pCtx) return SQLITE_OK;
+  pCtx->bWalHookFired = 1;
+  if (pCtx->zWalKey) hpplite_walread_poll(pCtx->zWalKey, (unsigned)nFrames);
+  if (nFrames >= 1000) {
+    if (pCtx->xWalMaint) pCtx->xWalMaint(pCtx->pWalMaintArg);
+    else sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
+  }
+  return SQLITE_OK;
 }
 
 int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
@@ -541,6 +573,14 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
   ** reserved (#148) */
   sqlite3_set_authorizer(db, hppliteAuthorizer, pCtx);
   sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, pagesTrace, pCtx);
+  {
+    /* the WAL reader's key: the file's canonical path (the node resolves the
+    ** same for its page mode) */
+    const char *zFile = sqlite3_db_filename(db, "main");
+    char resolved[PATH_MAX];
+    if (zFile && zFile[0]) pCtx->zWalKey = sqlite3_mprintf("%s", realpath(zFile, resolved) ? resolved : zFile);
+  }
+  sqlite3_wal_hook(db, pagesWalHook, pCtx);
   *ppCtx = pCtx;
   return SQLITE_OK;
 }

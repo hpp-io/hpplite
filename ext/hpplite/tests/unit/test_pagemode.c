@@ -428,6 +428,34 @@ static void test_batch_one_carries_the_name(void) {
     PASS();
 }
 
+/* a plain node (not role=verify) opened fresh against a chain of page batches:
+** the pages are applied through a second connection with its own connection
+** switched to rollback-journal mode for the sync, and back; its reads must
+** see the applied pages, not a cache from before */
+static void test_fresh_plain_node_reads_the_applied_pages(void) {
+    TEST("a plain node opened fresh against page batches reads the rows its sync applied");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/fp.db", l1, 1, 1);
+    if (!s) FAIL("open");
+    hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k); INSERT INTO t(who, k) VALUES('a', 1), ('a', 2)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 1");
+    hpplite_node_exec(s, "INSERT INTO t(who, k) VALUES('b', 3)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 2");
+    HppliteNode *r = open_pages_role(DIR "/fpr.db", l1, 1, 1, 0);
+    if (!r) FAIL("open the plain node");
+    long long rows = scalar(r->db, "SELECT count(*) FROM t");
+    char mode[16]; text_of(r->db, "PRAGMA journal_mode", mode, sizeof mode);
+    int err = r->state == HPPLITE_STATE_ERROR;
+    printf("(rows %lld, mode %s%s%s) ", rows, mode, err ? ", error: " : "", err ? r->ctx->zLastError : "");
+    int same = same_root(s, r);
+    hpplite_node_destroy(r); hpplite_node_destroy(s); hpplite_l1_disconnect(l1);
+    if (err) FAIL("the plain node is in error");
+    if (rows != 3) FAIL("the plain node does not read the applied rows");
+    if (!same) FAIL("roots differ");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -444,6 +472,7 @@ int main(void) {
     test_no_local_finalize_with_an_l1_configured();
     test_open_fails_when_wal_cannot_be_set();
     test_batch_one_carries_the_name();
+    test_fresh_plain_node_reads_the_applied_pages();
     remove_dir();
     return test_report();
 }

@@ -94,6 +94,7 @@ set(HPPLITE_SOURCES
     keystore.c
     envelope_pk.c
     clock.c
+    walread.c
     # Web3 integration (eth/ subdirectory)
     eth/cJSON.c
     eth/keccak256.c
@@ -234,8 +235,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_keys hpplite_testlib)
         add_executable(test_keystore tests/unit/test_keystore.c)
         target_link_libraries(test_keystore hpplite_testlib)
-        add_executable(test_vfs_capture tests/unit/test_vfs_capture.c)
-        target_link_libraries(test_vfs_capture hpplite_testlib)
+        add_executable(test_walread tests/unit/test_walread.c)
+        target_link_libraries(test_walread hpplite_testlib)
         add_executable(test_pages tests/unit/test_pages.c)
         target_link_libraries(test_pages hpplite_testlib)
         add_executable(test_pagemode tests/unit/test_pagemode.c)
@@ -384,7 +385,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_faults COMMAND test_faults)
         add_test(NAME test_keys COMMAND test_keys)
         add_test(NAME test_keystore COMMAND test_keystore)
-        add_test(NAME test_vfs_capture COMMAND test_vfs_capture)
+        add_test(NAME test_walread COMMAND test_walread)
         add_test(NAME test_pages COMMAND test_pages)
         add_test(NAME test_pagemode COMMAND test_pagemode)
         add_test(NAME test_abuse COMMAND test_abuse)
