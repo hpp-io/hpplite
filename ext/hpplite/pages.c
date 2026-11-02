@@ -1,0 +1,219 @@
+/* Page-based capture (#146): the page root and the page batch. See pages.h. */
+#include "hpplite_sqlite.h"
+#include "pages.h"
+#include "sha256.h"
+#include <string.h>
+#include <stdio.h>
+
+/* ------------------------------------------------------------- CRC64 */
+uint64_t hpplite_crc64(uint64_t crc, const unsigned char *p, size_t n) {
+  static uint64_t tab[256];
+  static int init;
+  size_t i;
+  if (!init) {
+    int k;
+    for (i = 0; i < 256; i++) { uint64_t c = i; for (k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xC96C5795D7870F42ull : c >> 1; tab[i] = c; }
+    init = 1;
+  }
+  crc = ~crc;
+  for (i = 0; i < n; i++) crc = tab[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
+  return ~crc;
+}
+
+/* ---------------------------------------------------------- the root */
+struct HpplitePageRoot {
+  int pageSize;
+  unsigned nPages;                 /* the file's length in pages */
+  unsigned cap;                    /* leaves allocated, a power of two >= nPages */
+  unsigned char *aNode;            /* 2*cap nodes of 32 bytes: node i's children are 2i and 2i+1, leaves from cap */
+  uint64_t *aCrc;                  /* per page, for the rolling checksum */
+  uint64_t crc;
+};
+#define NODE(pr, i) ((pr)->aNode + (size_t)(i) * 32)
+
+static void leafHash(unsigned pgno, const unsigned char *page, int pageSize, unsigned char out[32]) {
+  SHA256_CTX c;
+  unsigned char tag[8] = { 'H', 'P', 'P', '4', (unsigned char)(pgno >> 24), (unsigned char)(pgno >> 16), (unsigned char)(pgno >> 8), (unsigned char)pgno };
+  hpplite_sha256_init(&c);
+  hpplite_sha256_update(&c, tag, 8);
+  hpplite_sha256_update(&c, page, (size_t)pageSize);
+  hpplite_sha256_final(&c, out);
+}
+static void innerHash(const unsigned char *l, const unsigned char *r, unsigned char out[32]) {
+  SHA256_CTX c;
+  hpplite_sha256_init(&c);
+  hpplite_sha256_update(&c, l, 32);
+  hpplite_sha256_update(&c, r, 32);
+  hpplite_sha256_final(&c, out);
+}
+static void pathUp(HpplitePageRoot *pr, unsigned leaf) {
+  unsigned i = pr->cap + leaf;
+  while (i > 1) { i >>= 1; innerHash(NODE(pr, 2 * i), NODE(pr, 2 * i + 1), NODE(pr, i)); }
+}
+
+HpplitePageRoot *hpplite_pageroot_new(int pageSize) {
+  HpplitePageRoot *pr = sqlite3_malloc64(sizeof(*pr));
+  if (!pr) return NULL;
+  memset(pr, 0, sizeof(*pr));
+  pr->pageSize = pageSize;
+  return pr;
+}
+void hpplite_pageroot_free(HpplitePageRoot *pr) {
+  if (!pr) return;
+  sqlite3_free(pr->aNode); sqlite3_free(pr->aCrc); sqlite3_free(pr);
+}
+
+/* room for n leaves: a bigger tree is rebuilt from the leaves (rare: the file doubled) */
+static int grow(HpplitePageRoot *pr, unsigned n) {
+  unsigned cap = pr->cap ? pr->cap : 16, i;
+  unsigned char *aNew; uint64_t *aCrc;
+  while (cap < n) cap *= 2;
+  if (cap == pr->cap) return SQLITE_OK;
+  aNew = sqlite3_malloc64((sqlite3_uint64)cap * 2 * 32);
+  aCrc = sqlite3_realloc64(pr->aCrc, (sqlite3_uint64)cap * sizeof(uint64_t));
+  if (!aNew || !aCrc) { sqlite3_free(aNew); return SQLITE_NOMEM; }
+  memset(aNew, 0, (size_t)cap * 2 * 32);
+  memset(aCrc + pr->cap, 0, (size_t)(cap - pr->cap) * sizeof(uint64_t));
+  if (pr->aNode) memcpy(aNew + (size_t)cap * 32, pr->aNode + (size_t)pr->cap * 32, (size_t)pr->cap * 32);
+  sqlite3_free(pr->aNode);
+  pr->aNode = aNew; pr->aCrc = aCrc; pr->cap = cap;
+  for (i = cap - 1; i >= 1; i--) innerHash(NODE(pr, 2 * i), NODE(pr, 2 * i + 1), NODE(pr, i));
+  return SQLITE_OK;
+}
+
+int hpplite_pageroot_set(HpplitePageRoot *pr, unsigned pgno, const unsigned char *page) {
+  uint64_t c;
+  if (!pr || pgno == 0) return SQLITE_MISUSE;
+  if (pgno > pr->cap && grow(pr, pgno) != SQLITE_OK) return SQLITE_NOMEM;
+  leafHash(pgno, page, pr->pageSize, NODE(pr, pr->cap + pgno - 1));
+  pathUp(pr, pgno - 1);
+  c = hpplite_crc64(0, page, (size_t)pr->pageSize);
+  pr->crc ^= pr->aCrc[pgno - 1] ^ c;
+  pr->aCrc[pgno - 1] = c;
+  if (pgno > pr->nPages) pr->nPages = pgno;
+  return SQLITE_OK;
+}
+
+int hpplite_pageroot_truncate(HpplitePageRoot *pr, unsigned nPages) {
+  unsigned i;
+  if (!pr) return SQLITE_MISUSE;
+  if (nPages > pr->cap && grow(pr, nPages) != SQLITE_OK) return SQLITE_NOMEM;
+  for (i = nPages; i < pr->nPages; i++) {           /* pages beyond the end: absent */
+    memset(NODE(pr, pr->cap + i), 0, 32);
+    pathUp(pr, i);
+    pr->crc ^= pr->aCrc[i];
+    pr->aCrc[i] = 0;
+  }
+  pr->nPages = nPages;
+  return SQLITE_OK;
+}
+unsigned hpplite_pageroot_pages(const HpplitePageRoot *pr) { return pr ? pr->nPages : 0; }
+uint64_t hpplite_pageroot_crc(const HpplitePageRoot *pr) { return pr ? pr->crc : 0; }
+
+void hpplite_pageroot_get(const HpplitePageRoot *pr, unsigned char out[32]) {
+  SHA256_CTX c;
+  unsigned char hdr[12];
+  unsigned ps = pr ? (unsigned)pr->pageSize : 0, n = pr ? pr->nPages : 0;
+  hdr[0] = 'H'; hdr[1] = 'P'; hdr[2] = 'R'; hdr[3] = '4';
+  hdr[4] = (unsigned char)(ps >> 24); hdr[5] = (unsigned char)(ps >> 16); hdr[6] = (unsigned char)(ps >> 8); hdr[7] = (unsigned char)ps;
+  hdr[8] = (unsigned char)(n >> 24); hdr[9] = (unsigned char)(n >> 16); hdr[10] = (unsigned char)(n >> 8); hdr[11] = (unsigned char)n;
+  hpplite_sha256_init(&c);
+  hpplite_sha256_update(&c, hdr, 12);
+  if (pr && pr->aNode && pr->cap) {
+    /* the Merkle root over the smallest power of two of leaves that holds the
+    ** pages, whatever the tree's capacity: the leftmost subtree of that size
+    ** (a tree that grew and was truncated gives the root a fresh one gives) */
+    unsigned need = 1, idx;
+    while (need < n) need *= 2;
+    idx = pr->cap / need;                            /* both powers of two: the subtree's node index */
+    hpplite_sha256_update(&c, NODE(pr, idx), 32);
+  }
+  hpplite_sha256_final(&c, out);
+}
+
+HpplitePageRoot *hpplite_pageroot_from_file(const char *zPath, int *pPageSize) {
+  FILE *f = fopen(zPath, "rb");
+  unsigned char hdr[100], *page;
+  int pageSize;
+  unsigned n, i;
+  HpplitePageRoot *pr;
+  if (!f) return NULL;
+  if (fread(hdr, 1, 100, f) != 100) { fclose(f); return NULL; }
+  pageSize = (hdr[16] << 8) | hdr[17];
+  if (pageSize == 1) pageSize = 65536;
+  n = ((unsigned)hdr[28] << 24) | ((unsigned)hdr[29] << 16) | ((unsigned)hdr[30] << 8) | hdr[31];   /* the header's page count */
+  pr = hpplite_pageroot_new(pageSize);
+  page = sqlite3_malloc64((sqlite3_uint64)pageSize);
+  if (!pr || !page || grow(pr, n ? n : 1) != SQLITE_OK) { hpplite_pageroot_free(pr); sqlite3_free(page); fclose(f); return NULL; }
+  fseek(f, 0, SEEK_SET);
+  for (i = 1; i <= n; i++) {
+    if (fread(page, 1, (size_t)pageSize, f) != (size_t)pageSize) break;
+    hpplite_pageroot_set(pr, i, page);
+  }
+  fclose(f);
+  sqlite3_free(page);
+  if (pPageSize) *pPageSize = pageSize;
+  return pr;
+}
+
+/* --------------------------------------------------------- the batch */
+#define PB_MAGIC "HPPL"
+#define PB_VERSION 1u
+#define PB_HEADER 56u                                  /* magic 4, version 4, pageSize 4, commitSize 4, first 8, last 8, salt1 4, salt2 4, time 8, nPages 4, reserved 4 */
+#define PB_TRAILER 40u                                 /* root 32, crc 8 */
+
+static void w32(unsigned char *p, unsigned v) { p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16); p[2] = (unsigned char)(v >> 8); p[3] = (unsigned char)v; }
+static void w64(unsigned char *p, uint64_t v) { w32(p, (unsigned)(v >> 32)); w32(p + 4, (unsigned)v); }
+static unsigned r32(const unsigned char *p) { return ((unsigned)p[0] << 24) | ((unsigned)p[1] << 16) | ((unsigned)p[2] << 8) | p[3]; }
+static uint64_t r64(const unsigned char *p) { return ((uint64_t)r32(p) << 32) | r32(p + 4); }
+
+int hpplite_pagebatch_is(const unsigned char *p, size_t n) {
+  return p && n >= PB_HEADER && memcmp(p, PB_MAGIC, 4) == 0 && r32(p + 4) == PB_VERSION;
+}
+
+unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen) {
+  size_t rec = 6 + (size_t)b->pageSize, len = PB_HEADER + rec * b->nPages + PB_TRAILER, o = PB_HEADER;
+  unsigned char *p = sqlite3_malloc64(len);
+  unsigned i;
+  if (!p) return NULL;
+  memcpy(p, PB_MAGIC, 4); w32(p + 4, PB_VERSION); w32(p + 8, b->pageSize); w32(p + 12, b->commitSize);
+  w64(p + 16, b->firstCommit); w64(p + 24, b->lastCommit); w32(p + 32, b->salt1); w32(p + 36, b->salt2);
+  w64(p + 40, b->timestampMs); w32(p + 48, b->nPages); w32(p + 52, 0);
+  for (i = 0; i < b->nPages; i++) {
+    w32(p + o, b->aPage[i].pgno); p[o + 4] = (unsigned char)(b->aPage[i].flags >> 8); p[o + 5] = (unsigned char)b->aPage[i].flags;
+    memcpy(p + o + 6, b->aPage[i].body, (size_t)b->pageSize);
+    o += rec;
+  }
+  memcpy(p + o, b->root, 32); w64(p + o + 32, b->crc);
+  *pLen = len;
+  return p;
+}
+
+HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n) {
+  HpplitePageBatch *b;
+  size_t rec, o = PB_HEADER;
+  unsigned i;
+  if (!hpplite_pagebatch_is(p, n)) return NULL;
+  b = sqlite3_malloc64(sizeof(*b));
+  if (!b) return NULL;
+  memset(b, 0, sizeof(*b));
+  b->pageSize = r32(p + 8); b->commitSize = r32(p + 12); b->firstCommit = r64(p + 16); b->lastCommit = r64(p + 24);
+  b->salt1 = r32(p + 32); b->salt2 = r32(p + 36); b->timestampMs = r64(p + 40); b->nPages = r32(p + 48);
+  if (b->pageSize < 512 || b->pageSize > 65536 || (b->pageSize & (b->pageSize - 1))) { sqlite3_free(b); return NULL; }
+  rec = 6 + (size_t)b->pageSize;
+  if (n != PB_HEADER + rec * b->nPages + PB_TRAILER) { sqlite3_free(b); return NULL; }
+  b->aPage = sqlite3_malloc64((sqlite3_uint64)(b->nPages ? b->nPages : 1) * sizeof(HpplitePageRec));
+  if (!b->aPage) { sqlite3_free(b); return NULL; }
+  for (i = 0; i < b->nPages; i++) {
+    b->aPage[i].pgno = r32(p + o); b->aPage[i].flags = ((unsigned)p[o + 4] << 8) | p[o + 5]; b->aPage[i].body = p + o + 6;
+    if (b->aPage[i].pgno == 0 || (i && b->aPage[i].pgno <= b->aPage[i - 1].pgno)) { hpplite_pagebatch_free(b); return NULL; }
+    o += rec;
+  }
+  memcpy(b->root, p + o, 32); b->crc = r64(p + o + 32);
+  return b;
+}
+
+void hpplite_pagebatch_free(HpplitePageBatch *b) {
+  if (!b) return;
+  sqlite3_free(b->aPage); sqlite3_free(b);
+}
