@@ -256,6 +256,7 @@ uint8_t *hpplite_posted_batch(HppliteCtx *pCtx, uint64_t height, size_t *pLen);
 int hpplite_bind_rollup(HppliteCtx *pCtx, const char *zRollup);
 /* Why the last hpplite_init() failed, when it knows (NULL otherwise) */
 const char *hpplite_init_error(void);
+void hpplite_set_init_error(const char *zWhy);   /* a static string: the reason the open fails */
 
 /*
 ** Shutdown HPPLite tracking and free resources.

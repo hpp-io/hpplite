@@ -320,7 +320,19 @@ static int node_init_pages(HppliteNode *node, const char *zFile) {
         ** mode checks at every transaction and WAL mode does not */
         hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=DELETE");
     } else {
+        /* the frames are what is captured: the file must be in WAL mode, and a
+        ** switch another connection's transaction prevents (busy past the
+        ** timeout) must not leave a connection that captures nothing */
+        sqlite3_stmt *q = NULL;
+        int wal = 0;
         hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=WAL");
+        if (sqlite3_prepare_v2(node->db, "PRAGMA journal_mode", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
+            wal = sqlite3_column_text(q, 0) && strcasecmp((const char *)sqlite3_column_text(q, 0), "wal") == 0;
+        sqlite3_finalize(q);
+        if (!wal) {
+            hpplite_set_init_error("page capture needs the database in WAL mode and it could not be switched (another connection holds it?)");
+            return SQLITE_BUSY;
+        }
     }
     return SQLITE_OK;
 }

@@ -248,6 +248,7 @@ static int addColumnIfMissing(HppliteCtx *pCtx, sqlite3 *db, const char *zTable,
 ** back, so such a build cannot be used: found once, at init.
 */
 static const char *gInitError;           /* why the last hpplite_init failed, for the open's message */
+void hpplite_set_init_error(const char *zWhy) { gInitError = zWhy; }   /* a node's init saying why an open fails (page mode, #146) */
 const char *hpplite_init_error(void) { return gInitError; }
 
 static int expandedSqlIsFaithful(sqlite3 *db) {

@@ -353,6 +353,24 @@ static void test_no_local_finalize_with_an_l1_configured(void) {
     PASS();
 }
 
+/* the file must be in WAL mode: an open that cannot put it there fails, saying so */
+static void test_open_fails_when_wal_cannot_be_set(void) {
+    TEST("page mode fails the open of a rollback-journal file another connection holds a write transaction on, naming WAL");
+    reset_dir();
+    sqlite3 *other = NULL;
+    if (sqlite3_open(DIR "/held.db", &other) != SQLITE_OK) FAIL("plain open");
+    sqlite3_exec(other, "CREATE TABLE t(x); BEGIN IMMEDIATE; INSERT INTO t VALUES(1)", NULL, NULL, NULL);
+    TestNodeOpts o = { .capturePages = 1, .noEncrypt = 1, .localOnly = 1 };
+    HppliteNode *n = test_open_node(DIR "/held.db", NULL, &o);
+    const char *why = hpplite_init_error();
+    sqlite3_exec(other, "COMMIT", NULL, NULL, NULL);
+    sqlite3_close(other);
+    printf("(%s) ", why ? why : "no reason");
+    if (n) { hpplite_node_destroy(n); FAIL("the open should fail: the file is not in WAL mode and cannot be switched"); }
+    if (!why || !strstr(why, "WAL")) FAIL("the reason does not name WAL mode");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -366,6 +384,7 @@ int main(void) {
     test_unreadable_file_fails_the_open();
     test_every_page_batch_carries_its_root();
     test_no_local_finalize_with_an_l1_configured();
+    test_open_fails_when_wal_cannot_be_set();
     remove_dir();
     return test_report();
 }
