@@ -1600,6 +1600,8 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     uint8_t *sealed = NULL, *packed = NULL, *framed = NULL;
     uint8_t encoding = HPPLITE_ENCODING_NONE;
     int rc, confirmed = 0, tries;
+    char zStoreWhy[240];
+    zStoreWhy[0] = 0;
     node_pages_decide_snapshot(node);                   /* if nothing decided it yet */
     if (!node->l1 && node->wantsL1) {
         /* l1=/contract=/factory= was given but no connection came of it (no key,
@@ -1666,7 +1668,37 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         /* the sidecar knows the batch before the chain does: a process that dies
         ** between the submit and the finalize finds it its own on reopen */
         if (hppliteMarkInflightPages(ctx, height, root) != SQLITE_OK) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); free(sealed); free(framed); *pMore = 0; return 0; }
-        txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
+        if (node->store) {
+            /* the bytes to the store, the commitment to the chain (#11), as the row flush does */
+            char *zReceipt = NULL;
+            char *zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
+            node->storeBalanceOk = 0;
+            if (!zRef) {
+                if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE) {
+                    txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
+                    if (!node->warnedStoreDown) {
+                        fprintf(stderr, "hpplite: store %s does not answer (%s): page batch %llu %s on the chain instead\n",
+                                hpplite_store_url(node->store), hpplite_store_error(node->store), (unsigned long long)height, txHash ? "posted" : "could not be posted");
+                        node->warnedStoreDown = 1;
+                    }
+                } else {
+                    snprintf(zStoreWhy, sizeof zStoreWhy, "the store did not take it: %s", hpplite_store_error(node->store));
+                    txHash = NULL;
+                }
+            } else {
+                unsigned char h[32], payTo[20];
+                uint8_t compact[HPPLITE_RECEIPT_SIZE];
+                int nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0) ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
+                node->warnedStoreDown = 0;
+                hpplite_keccak256(payload, payloadLen, h);
+                txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                if (!txHash) hpplite_error(ctx, "the chain did not take the commitment of page batch %llu (ref %s)", (unsigned long long)height, zRef);
+            }
+            sqlite3_free(zRef);
+            sqlite3_free(zReceipt);
+        } else {
+            txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
+        }
         if (txHash) { confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1); if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash); if (confirmed && node->onBatchPosted) node->onBatchPosted(node->callbackArg, height, txHash); sqlite3_free(txHash); }
         if (confirmed) test_crash_point("after_submit");
     } else {
@@ -1682,7 +1714,8 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         if (adopted == 1) { sqlite3_free(bytes); free(packed); free(sealed); free(framed); return height; }
         if (node->failStreak < 6) node->failStreak++;
         node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 0 ? node->config.batchIntervalMs : 5000);
-        hpplite_error(ctx, "page batch %llu not confirmed on L1, kept pending", (unsigned long long)height);
+        if (zStoreWhy[0]) hpplite_error(ctx, "page batch %llu kept pending: %s", (unsigned long long)height, zStoreWhy);
+        else hpplite_error(ctx, "page batch %llu not confirmed on L1, kept pending", (unsigned long long)height);
         sqlite3_free(bytes); free(packed); free(sealed); free(framed);
         *pMore = 0;
         return 0;
