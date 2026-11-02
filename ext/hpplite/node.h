@@ -103,6 +103,8 @@ typedef struct HppliteNode {
     uint8_t *postedCopy;            /* The bytes of the batch being finalized (kept for a reorg, #49) */
     int wrongRollup;                /* The database's history is on another rollup: never post or replay */
     int64_t retryAt;                /* Timer does not retry before this (ms, monotonic) */
+    int walPages;                   /* WAL frames after the last bookkeeping commit (the wal hook), for the timer's checkpoint (#144) */
+    int64_t walCheckAt;             /* the timer's next look at the WAL without the hook's say-so (ms, monotonic) */
 
     /* Database and context */
     sqlite3 *db;

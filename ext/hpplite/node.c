@@ -1713,6 +1713,32 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     return synced;
 }
 
+/* The WAL's checkpoint runs on the timer thread (#144). SQLite's automatic
+** one runs on whichever connection's commit finds a thousand frames in the
+** WAL, with an fsync of the database: on the application's thread, once
+** per thousand pages, and the bookkeeping traffic (the log rows, their
+** pruning, the posted copies) fills the WAL several times faster than the
+** application's own writes. It was the writer's p99. Here it is passive:
+** it never waits for the application and the application never waits for
+** it. The bookkeeping connection's wal hook says how big the WAL is after
+** each batch; between batches the timer looks once a second. */
+static int node_wal_hook(void *pArg, sqlite3 *db, const char *zDb, int nFrames) {
+    HppliteNode *node = (HppliteNode *)pArg;
+    (void)db; (void)zDb;
+    node->walPages = nFrames;
+    return SQLITE_OK;
+}
+
+static void node_checkpoint_wal(HppliteNode *node, int64_t now) {
+    int nLog = 0, nCkpt = 0;
+    if (!node->bkDb) return;
+    if (node->walPages < 1000 && now < node->walCheckAt) return;
+    node->walCheckAt = now + 1000;
+    if (sqlite3_wal_checkpoint_v2(node->bkDb, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt) == SQLITE_OK) {
+        node->walPages = nCkpt >= nLog ? 0 : nLog;       /* all of it in the database: the next writer restarts the WAL */
+    }
+}
+
 /*
 ** Timer thread function - auto-flush batches on interval.
 */
@@ -1761,6 +1787,7 @@ static void *node_timer_thread_func(void *arg) {
         int64_t elapsed = now - node->lastFlushTime;
         int sizeTrigger = node->config.maxBatchBytes > 0 &&
             hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2);
+        node_checkpoint_wal(node, now);
 
         if (node->follower) {
             /* capture only; every second, see whether the sequencer is gone */
@@ -1819,6 +1846,10 @@ void hpplite_node_start_timer(HppliteNode *node) {
     node->timerRunning = 1;
     pthread_create(thread, NULL, node_timer_thread_func, node);
     node->timerThread = thread;
+    /* the WAL's checkpoint is this thread's now (#144); the application's
+    ** commits stop doing it. interval=0 (no timer) leaves SQLite's own. */
+    sqlite3_wal_hook(node->bkDb, node_wal_hook, node);
+    if (node->ctx) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=0");
 }
 
 /*
@@ -1830,6 +1861,8 @@ void hpplite_node_stop_timer(HppliteNode *node) {
     /* Signal thread to stop, and wake it */
     pthread_mutex_lock((pthread_mutex_t *)node->timerWakeMutex);
     node->timerRunning = 0;
+    if (node->bkDb) sqlite3_wal_hook(node->bkDb, NULL, NULL);
+    if (node->ctx && node->db) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=1000");   /* SQLite's own again */
     pthread_cond_signal((pthread_cond_t *)node->timerWake);
     pthread_mutex_unlock((pthread_mutex_t *)node->timerWakeMutex);
 

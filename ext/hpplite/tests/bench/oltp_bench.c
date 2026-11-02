@@ -15,7 +15,7 @@
 ** Usage: oltp_bench [--ext FILE] [--mode read_write|write_only|read_only]
 **                   [--skip-trx] [--tables N] [--rows M] [--seconds S]
 **                   [--dir DIR] [--seed S] [--label TEXT] [--json FILE]
-**                   [--uri "&param=value..."] [--hist] [--think MICROSECONDS]
+**                   [--uri "&param=value..."] [--hist] [--think MICROSECONDS] [--pragma "PRAGMA ..."]
 ** Not part of ctest; tools/bench_versions.sh runs it per tag.
 */
 #include "sqlite3.h"
@@ -34,11 +34,11 @@
 typedef enum { MODE_RW, MODE_WO, MODE_RO } Mode;
 
 static struct {
-    const char *ext, *dir, *label, *json, *uriExtra;
+    const char *ext, *dir, *label, *json, *uriExtra, *pragma;
     Mode mode;
-    int skipTrx, tables, rows, seconds, hist, busyPoll, thinkUs;
+    int skipTrx, tables, rows, seconds, hist, busyPoll, thinkUs, slow;
     uint64_t seed;
-} opt = { NULL, "/tmp/hpplite_oltp", "", NULL, "", MODE_RW, 0, 4, 10000, 10, 0, 0, 0, 42 };
+} opt = { NULL, "/tmp/hpplite_oltp", "", NULL, "", NULL, MODE_RW, 0, 4, 10000, 10, 0, 0, 0, 0, 42 };
 
 static double now_ms(void) {
     struct timespec ts;
@@ -124,6 +124,8 @@ int main(int argc, char **argv) {
     sqlite3_stmt *begin = NULL, *commit = NULL;
     TableStmts *ts;
     double *lat = NULL;
+    long slowCount[6] = { 0 }; double slowMs[6] = { 0 };
+    static const char *partName[6] = { "BEGIN", "index update", "non-index update", "DELETE", "INSERT", "COMMIT" };
     size_t nLat = 0, capLat = 0;
     double t0, t1, prepMs, prepFlushMs = 0, runMs, flushMs = 0, deadline, sum = 0;
     long long txns = 0, stmts = 0, stmtsPerTxn;
@@ -136,6 +138,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--skip-trx")) { opt.skipTrx = 1; continue; }
         if (!strcmp(a, "--hist")) { opt.hist = 1; continue; }
         if (!strcmp(a, "--busy-poll")) { opt.busyPoll = 1; continue; }
+        if (!strcmp(a, "--slow")) { opt.slow = 1; continue; }     /* which statement a slow (> 1 ms) write transaction spent its time in */
         if (!v) { fprintf(stderr, "oltp_bench: %s needs a value\n", a); return 2; }
         if (!strcmp(a, "--ext")) opt.ext = v;
         else if (!strcmp(a, "--dir")) opt.dir = v;
@@ -143,6 +146,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--json")) opt.json = v;
         else if (!strcmp(a, "--uri")) opt.uriExtra = v;
         else if (!strcmp(a, "--think")) opt.thinkUs = atoi(v);
+        else if (!strcmp(a, "--pragma")) opt.pragma = v;
         else if (!strcmp(a, "--tables")) opt.tables = atoi(v);
         else if (!strcmp(a, "--rows")) opt.rows = atoi(v);
         else if (!strcmp(a, "--seconds")) opt.seconds = atoi(v);
@@ -181,6 +185,7 @@ int main(int argc, char **argv) {
     }
     if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) die("open", db);
     run(db, "PRAGMA journal_mode=WAL");
+    if (opt.pragma) run(db, opt.pragma);                           /* e.g. "PRAGMA wal_autocheckpoint=0" */
     if (opt.busyPoll) sqlite3_busy_handler(db, busy_poll, NULL);   /* retry every 200 us instead of SQLite's growing sleeps */
 
     /* ---- prepare: tables, rows, index ---- */
@@ -239,7 +244,8 @@ int main(int argc, char **argv) {
         TableStmts *s = &ts[1 + (int)(rnd() % (uint64_t)opt.tables)];
         double a = now_ms(), d;
         if (a >= deadline) break;
-        if (begin) exec_stmt(db, begin);
+        double part[6] = { 0, 0, 0, 0, 0, 0 };
+        if (begin) { double t = now_ms(); exec_stmt(db, begin); part[0] = now_ms() - t; }
         if (opt.mode != MODE_WO) {
             int lo;
             for (i = 0; i < 10; i++) { sqlite3_bind_int(s->point, 1, rnd_id()); exec_stmt(db, s->point); }
@@ -250,18 +256,24 @@ int main(int argc, char **argv) {
         }
         if (opt.mode != MODE_RO) {
             int id;
-            sqlite3_bind_int(s->idxUpd, 1, rnd_id()); exec_stmt(db, s->idxUpd);
+            double t;
+            t = now_ms(); sqlite3_bind_int(s->idxUpd, 1, rnd_id()); exec_stmt(db, s->idxUpd); part[1] = now_ms() - t;
             rnd_str(c120, 10);
-            sqlite3_bind_text(s->nonIdxUpd, 1, c120, -1, SQLITE_STATIC); sqlite3_bind_int(s->nonIdxUpd, 2, rnd_id()); exec_stmt(db, s->nonIdxUpd);
+            t = now_ms(); sqlite3_bind_text(s->nonIdxUpd, 1, c120, -1, SQLITE_STATIC); sqlite3_bind_int(s->nonIdxUpd, 2, rnd_id()); exec_stmt(db, s->nonIdxUpd); part[2] = now_ms() - t;
             id = rnd_id();
-            sqlite3_bind_int(s->del, 1, id); exec_stmt(db, s->del);
+            t = now_ms(); sqlite3_bind_int(s->del, 1, id); exec_stmt(db, s->del); part[3] = now_ms() - t;
             rnd_str(c120, 10); rnd_str(pad60, 5);
             sqlite3_bind_int(s->ins, 1, id); sqlite3_bind_int(s->ins, 2, rnd_id());
             sqlite3_bind_text(s->ins, 3, c120, -1, SQLITE_STATIC); sqlite3_bind_text(s->ins, 4, pad60, -1, SQLITE_STATIC);
-            exec_stmt(db, s->ins);
+            t = now_ms(); exec_stmt(db, s->ins); part[4] = now_ms() - t;
         }
-        if (commit) exec_stmt(db, commit);
+        if (commit) { double t = now_ms(); exec_stmt(db, commit); part[5] = now_ms() - t; }
         d = now_ms() - a;
+        if (opt.slow && d > 1.0) {
+            int k, worst = 0;
+            for (k = 1; k < 6; k++) if (part[k] > part[worst]) worst = k;
+            slowCount[worst]++; slowMs[worst] += part[worst];
+        }
         if (nLat == capLat) { capLat = capLat ? capLat * 2 : 65536; lat = realloc(lat, capLat * sizeof(double)); }
         lat[nLat++] = d;
         sum += d;
@@ -301,6 +313,12 @@ int main(int argc, char **argv) {
                (double)opt.tables * opt.rows / (prepMs / 1000.0));
         if (opt.ext) printf("  prepare-flush=%.0fms batches=%lld pending=%lld flush=%.0fms left=%lld", prepFlushMs, (long long)(heightAfter - heightBefore), (long long)pendingAfter, flushMs, (long long)pendingLeft);
         printf("  db=%.1fMB\n", dbBytes / 1048576.0);
+        if (opt.slow) {
+            int k;
+            printf("  slow transactions (> 1 ms), by the statement that took the longest:");
+            for (k = 0; k < 6; k++) if (slowCount[k]) printf(" %s:%ld (avg %.2f ms)", partName[k], slowCount[k], slowMs[k] / slowCount[k]);
+            printf("\n");
+        }
         if (opt.hist) {
             static const double edge[] = { 0.25, 0.5, 1, 2, 5, 10, 100, 1000 };
             size_t k, b, cnt[9] = { 0 };

@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <time.h>
 
 /* Test counters */
@@ -632,6 +633,60 @@ static void test_bookkeeping_commits_without_fsync(void) {
     cleanup_test_files("/tmp/hpplite_test_sync_normal");
 }
 
+/* The WAL's checkpoint runs on the timer thread, not at the application's
+** commit (#144): the application connection's automatic checkpoint is off,
+** and the timer moves the WAL into the database on its own. */
+static void test_wal_checkpoint_on_the_timer(void) {
+    HppliteNodeConfig config;
+    HppliteNode *node;
+    sqlite3_stmt *st = NULL;
+    char *err = NULL;
+    int autockpt = -1, i, waited;
+    struct stat stDb;
+
+    TEST("wal_checkpoint_on_the_timer");
+    cleanup_test_files("/tmp/hpplite_test_wal");
+    ensure_test_dir("/tmp/hpplite_test_wal");
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "test-wal";
+    memcpy(config.privkey, SEQ_PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = "/tmp/hpplite_test_wal";
+    config.dbPath = "/tmp/hpplite_test_wal/test.db";
+    config.localOnly = 1;
+    config.batchIntervalMs = 3600 * 1000;
+    node = hpplite_node_create(&config);
+    if (!node) { FAIL("create"); return; }
+    hpplite_node_start(node);
+    hpplite_node_start_timer(node);
+    if (sqlite3_prepare_v2(node->db, "PRAGMA wal_autocheckpoint", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) autockpt = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (autockpt != 0) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "the application connection still checkpoints itself (wal_autocheckpoint = %d)", autockpt);
+        FAIL(msg); hpplite_node_destroy(node); return;
+    }
+    /* 5 MB of rows in ten transactions: well past a thousand WAL pages */
+    if (hpplite_node_exec(node, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &err) != 0) { FAIL(err); hpplite_node_destroy(node); return; }
+    for (i = 0; i < 10; i++) {
+        if (hpplite_node_exec(node, "BEGIN; WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 1000)"
+                                    " INSERT INTO t(v) SELECT zeroblob(500) FROM s; COMMIT", &err) != 0) { FAIL(err); hpplite_node_destroy(node); return; }
+    }
+    /* the frames reach the database file only through a checkpoint: the
+    ** file grows past what the schema alone takes */
+    for (waited = 0; waited < 40; waited++) {
+        if (stat("/tmp/hpplite_test_wal/test.db", &stDb) == 0 && stDb.st_size > 4 * 1024 * 1024) break;
+        usleep(100000);
+    }
+    if (stat("/tmp/hpplite_test_wal/test.db", &stDb) != 0 || stDb.st_size <= 4 * 1024 * 1024) {
+        char msg[120];
+        snprintf(msg, sizeof(msg), "no checkpoint in 4 s: the database file is %lld bytes, the rows sit in the WAL", (long long)stDb.st_size);
+        FAIL(msg);
+    } else PASS();
+    hpplite_node_destroy(node);
+    cleanup_test_files("/tmp/hpplite_test_wal");
+}
+
 int main(void) {
     printf("\n=== HPPLite Node Tests (Singleton Sequencer Model) ===\n\n");
 
@@ -644,6 +699,7 @@ int main(void) {
     test_tree_sync_outside_gate();
     test_flush_gets_the_gate_from_a_busy_writer();
     test_bookkeeping_commits_without_fsync();
+    test_wal_checkpoint_on_the_timer();
 
     printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
 

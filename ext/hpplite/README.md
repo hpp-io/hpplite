@@ -878,7 +878,13 @@ flushes, height continues, nothing is replayed twice. A batch that L1 does
 not confirm stays pending and is retried at the same height.
 
 File databases are switched to WAL mode on open (bookkeeping runs on a
-second connection) and get a 5 s busy timeout. A write that cannot take the
+second connection) and get a 5 s busy timeout. While the timer runs, the
+WAL's checkpoint is the timer thread's (passive, never waiting for the
+application) and the application's own automatic checkpoint is off: with
+HPPLite's bookkeeping in the WAL it came round several times more often
+than without, each time an fsync on the application's commit, and it was
+the writer's tail latency (#144). `interval=0` keeps SQLite's own. A
+write that cannot take the
 write lock within that timeout (another process holds it) fails with
 `SQLITE_BUSY` after one wait, as it would without HPPLite, and the driver's
 retry runs it again through capture; it is never refused for that. In-memory
