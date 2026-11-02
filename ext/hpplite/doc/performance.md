@@ -189,3 +189,47 @@ What the numbers say:
 
 Reproduce: `cmake --build build_mock -t oltp_bench && sh tools/bench_versions.sh`
 (the raw runs land in `build_mock/bench/*.jsonl`).
+
+## After the fixes of 2026-11-02 (#143, #141, #142; tip 2012cc3777)
+
+The run above found three things, all fixed the same day: the size-triggered
+flush had been blind to row records since v0.2 (#143), the timer's flush held
+the writer for its whole duration (#141), and a flush paid a tree write and
+an fsync per batch under the gate (#142). Same harness, same machine, 10 s
+runs, median of three:
+
+| configuration | version | tps | stmt/s | p50 ms | p99 ms | max ms | batches in 10 s | rows left pending |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| write_only, trx | plain | 7728 | 30 914 | 0.095 | 0.133 | 7 | | |
+| write_only, trx | v0.2.0 | 5672 | 22 687 | 0.118 | 0.190 | 11 | 1 | 226 000 |
+| write_only, trx | tip before | 3368 | 13 471 | 0.119 | 0.191 | 5829 | 1 | 194 000 |
+| write_only, trx | tip after | 4065 | 16 260 | 0.132 | 2.499 | 435 | 742 | ~5 000 |
+| read_write, trx | plain | 4374 | 78 733 | 0.194 | 0.260 | 7 | | |
+| read_write, trx | v0.2.0 | 3815 | 68 669 | 0.204 | 0.289 | 9 | 2 | |
+| read_write, trx | tip after | 2462 | 44 318 | 0.216 | 1.225 | 152 | 532 | ~1 000 |
+| write_only, autocommit | plain | 4198 | 16 791 | 0.196 | 0.265 | 56 | | |
+| write_only, autocommit | tip after | 2043 | 8 171 | 0.272 | 2.662 | 112 | 438 | |
+| read_only, trx | plain | 11 131 | 155 833 | 0.090 | 0.103 | 1 | | |
+| read_only, trx | tip after | 12 656 | 177 180 | 0.079 | 0.092 | 1 | 0 | |
+
+How to read it:
+
+- **The writer is never held for a flush any more.** The 5.8 s stall is
+  gone; what remains is a few milliseconds per batch while the log rows are
+  pruned, and the tree write when a checkpoint closes or 65 536 touched
+  nodes wait in memory (the 150-435 ms maxima).
+- **A busy writer now posts as it goes.** 500-750 batches in 10 s with a few
+  thousand rows left, where every version since v0.2 posted once per
+  interval and left 200 000 rows. v0.2's higher tps bought nothing: its log
+  was unbounded and the final flush took 13 s.
+- **Throughput is 72% of v0.2's in a tight write loop**, because the writer
+  shares the file with a bookkeeping thread that takes each row into the
+  trees at ~100 µs per row (`touchRecord` reads tree nodes from SQLite per
+  level). That is the next lever, if an application ever writes at this
+  rate; the demo writes a few rows a minute. With 1 ms between
+  transactions, what applications do, the writer's max latency is under
+  50 ms and nothing waits.
+- **Bulk load** (the harness's prepare phase, 500-row transactions) runs at
+  ~100 000 rows/s with the extension against 210 000 before #143, for the
+  same reason: it is posted as it goes now.
+- Reads are unchanged (and still 12% faster with the extension loaded).
