@@ -25,6 +25,7 @@ struct HpplitePageMode {
   QCommit *pHead, *pTail;
   unsigned nQueued;
   size_t queuedBytes;
+  unsigned maxPgQueued;       /* the highest page number among queued commits: the build's arrays, without a scan of the queue */
   uint64_t nCommits;          /* captured since start */
   uint64_t nFinalized;        /* in batches finalized */
   /* the flush thread's: the state after the last finalized batch */
@@ -53,6 +54,7 @@ static void sink(void *pArg, const HppliteVfsCommit *c) {
   if (!q->aPgno || !q->aImg) { qfree(q); return; }
   for (i = 0; i < c->nPages; i++) { q->aPgno[i] = c->aPgno[i]; memcpy(q->aImg + (size_t)i * (size_t)c->pageSize, c->aImg[i], (size_t)c->pageSize); }
   pthread_mutex_lock(&pm->mu);
+  for (i = 0; i < c->nPages; i++) if (c->aPgno[i] > pm->maxPgQueued) pm->maxPgQueued = c->aPgno[i];
   if (pm->pageSize == 0) pm->pageSize = c->pageSize;
   if (pm->pTail) pm->pTail->pNext = q; else pm->pHead = q;
   pm->pTail = q; pm->nQueued++; pm->queuedBytes += (size_t)c->nPages * (size_t)c->pageSize; pm->nCommits++;
@@ -154,7 +156,7 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
   recSize = 6 + (size_t)ps;
   budget = maxBytes > 96 + recSize ? (maxBytes - 96) / recSize : 1;      /* records that fit beside the header and trailer */
   /* commits from the head while their distinct pages fit; at least one */
-  for (q = pm->pHead; q; q = q->pNext) for (i = 0; i < q->n; i++) if (q->aPgno[i] > maxPg) maxPg = q->aPgno[i];
+  maxPg = pm->maxPgQueued;
   seen = sqlite3_malloc64(maxPg + 1);
   if (!seen) { pthread_mutex_unlock(&pm->mu); return SQLITE_NOMEM; }
   memset(seen, 0, maxPg + 1);
@@ -172,6 +174,7 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
   pm->nBuilding = nTake; pm->nQueued -= nTake;
   for (q = pm->pBuilding; q; q = q->pNext) pm->queuedBytes -= (size_t)q->n * (size_t)ps;
   *pMore = pm->pHead != NULL;
+  if (!pm->pHead) pm->maxPgQueued = 0;
   pthread_mutex_unlock(&pm->mu);
 
   /* the dirty set and each page's last image; the size after */
@@ -194,16 +197,19 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
   bodies = sqlite3_malloc64((sqlite3_uint64)(pm->nDirty ? pm->nDirty : 1) * ps);
   if (!recs || !bodies) { sqlite3_free(recs); sqlite3_free(bodies); hpplite_pagemode_failed(pm); return SQLITE_NOMEM; }
   /* records in page order */
+  seen = sqlite3_malloc64(maxPg + 1);
+  if (!seen) { sqlite3_free(recs); sqlite3_free(bodies); hpplite_pagemode_failed(pm); return SQLITE_NOMEM; }
+  memset(seen, 0, maxPg + 1);
+  { unsigned k; for (k = 0; k < pm->nDirty; k++) seen[pm->aDirty[k]] = 1; }
   for (pg = 1; pg <= maxPg; pg++) {
-    unsigned k; int dirty = 0;
-    for (k = 0; k < pm->nDirty; k++) if (pm->aDirty[k] == pg) { dirty = 1; break; }
-    if (!dirty || pg > pm->sizeAfter) continue;
+    if (!seen[pg] || pg > pm->sizeAfter) continue;
     { unsigned char *body = bodies + (size_t)nRec * ps, *cur = pm->aLast[pg], *old = pm->aPrev[pg - 1];
       if (old) { unsigned j; for (j = 0; j < ps; j++) body[j] = cur[j] ^ old[j]; recs[nRec].flags = HPPLITE_PAGE_DIFF; }
       else { memcpy(body, cur, ps); recs[nRec].flags = HPPLITE_PAGE_FULL; }
       recs[nRec].pgno = pg; recs[nRec].body = body; nRec++;
       hpplite_pageroot_set(pm->pRoot, pg, cur); }
   }
+  sqlite3_free(seen);
   hpplite_pageroot_truncate(pm->pRoot, pm->sizeAfter);
   memset(&b, 0, sizeof b);
   b.pageSize = ps; b.commitSize = pm->sizeAfter;
@@ -248,6 +254,7 @@ void hpplite_pagemode_failed(HpplitePageMode *pm) {
   for (tail = pm->pBuilding; tail->pNext; tail = tail->pNext) {}
   pthread_mutex_lock(&pm->mu);
   tail->pNext = pm->pHead; pm->pHead = pm->pBuilding; if (!pm->pTail) pm->pTail = tail;
+  { QCommit *q; unsigned i; for (q = pm->pBuilding; q; q = q->pNext) { for (i = 0; i < q->n; i++) if (q->aPgno[i] > pm->maxPgQueued) pm->maxPgQueued = q->aPgno[i]; if (q == tail) break; } }
   pm->nQueued += pm->nBuilding; pm->nBuilding = 0;
   { QCommit *q; for (q = pm->pHead; q; q = q->pNext) { if (q == tail->pNext) break; pm->queuedBytes += (size_t)q->n * (size_t)pm->pageSize; } }
   pthread_mutex_unlock(&pm->mu);

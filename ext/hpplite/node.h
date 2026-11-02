@@ -112,6 +112,7 @@ typedef struct HppliteNode {
     sqlite3 *bkDb;                  /* Bookkeeping connection (NULL for :memory:) */
     HppliteCtx *ctx;
     struct HpplitePageMode *pm;     /* page mode (#146): the commits queued and the batches built from them */
+    unsigned pageDeflateRatio;      /* raw page bytes per posted byte seen on the last page batch: the next build's budget */
 
     /* L1 connection */
     HppliteL1 *l1;

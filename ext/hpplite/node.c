@@ -1336,22 +1336,39 @@ static void test_crash_point(const char *zName) {
 
 /* Page mode (#146): a batch of pages from the queued commits, deflated and
 ** sealed as any batch, posted, finalized in the sidecar. */
+/* Raw page records deflate about this many times as diffs: the build's budget
+** of raw bytes for a posted limit, corrected when a batch comes out over it */
+#define HPPLITE_PAGE_DEFLATE_GUESS 8
+
 static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes) {
     HppliteCtx *ctx = node->ctx;
     unsigned char *bytes = NULL, root[32];
-    size_t len = 0;
+    size_t len = 0, budget = maxBytes * (node->pageDeflateRatio ? node->pageDeflateRatio : HPPLITE_PAGE_DEFLATE_GUESS);
     uint64_t height = ctx->blockHeight;
-    const uint8_t *payload; size_t payloadLen;
+    const uint8_t *payload = NULL; size_t payloadLen = 0;
     uint8_t *sealed = NULL, *packed = NULL, *framed = NULL;
     uint8_t encoding = HPPLITE_ENCODING_NONE;
-    int rc, confirmed = 0;
-    rc = hpplite_pagemode_build(node->pm, maxBytes, &bytes, &len, root, pMore);
-    if (rc != SQLITE_OK) { if (rc != SQLITE_DONE) hpplite_error(ctx, "page batch %llu could not be built (rc=%d)", (unsigned long long)height, rc); return 0; }
-    payload = bytes; payloadLen = len;
-    if (!node->config.noCompress) {
-        size_t n = 0;
-        uint8_t *c = hpplite_deflate(payload, payloadLen, &n);
-        if (c && n + HPPLITE_PLAIN_MAGIC_LEN < payloadLen) { packed = c; payload = c; payloadLen = n; encoding = HPPLITE_ENCODING_DEFLATE; } else free(c);
+    int rc, confirmed = 0, tries;
+    for (tries = 0; ; tries++) {
+        rc = hpplite_pagemode_build(node->pm, budget, &bytes, &len, root, pMore);
+        if (rc != SQLITE_OK) { if (rc != SQLITE_DONE) hpplite_error(ctx, "page batch %llu could not be built (rc=%d)", (unsigned long long)height, rc); return 0; }
+        payload = bytes; payloadLen = len; encoding = HPPLITE_ENCODING_NONE; packed = NULL;
+        if (!node->config.noCompress) {
+            size_t n = 0;
+            uint8_t *c = hpplite_deflate_level(payload, payloadLen, 1, &n);      /* diffs are mostly zeros: level 1 is nearly as small and several times faster */
+            if (c && n + HPPLITE_PLAIN_MAGIC_LEN < payloadLen) { packed = c; payload = c; payloadLen = n; encoding = HPPLITE_ENCODING_DEFLATE; } else free(c);
+        }
+        if (payloadLen > 0) { unsigned r = (unsigned)(len / payloadLen); node->pageDeflateRatio = r < 1 ? 1 : r > 64 ? 64 : r; }   /* what these pages deflate to: the next budget */
+        /* over the posted limit: the guess was optimistic for these pages; half the
+        ** raw budget and build again, down to a single commit (which posts whatever its size) */
+        /* only a chain taking the bytes itself has a hard limit; a store takes any size */
+        if (maxBytes > 0 && payloadLen > maxBytes && node->l1 && !node->store && budget > 2 * (size_t)hpplite_pagemode_page_size(node->pm) && tries < 8) {
+            hpplite_pagemode_failed(node->pm);
+            sqlite3_free(bytes); free(packed); bytes = NULL; packed = NULL;
+            budget /= 2;
+            continue;
+        }
+        break;
     }
     if (node->cipher) {
         sealed = hpplite_envelope_seal(node->cipher, node->encKey, height, encoding, payload, payloadLen, &payloadLen);
@@ -1874,7 +1891,7 @@ static void *node_timer_thread_func(void *arg) {
         int64_t now = node_current_time_ms();
         int64_t elapsed = now - node->lastFlushTime;
         int sizeTrigger = node->config.maxBatchBytes > 0 &&
-            (node->pm ? hpplite_pagemode_pending_bytes(node->pm) >= node->config.maxBatchBytes / 2
+            (node->pm ? hpplite_pagemode_pending_bytes(node->pm) >= node->config.maxBatchBytes * HPPLITE_PAGE_DEFLATE_GUESS / 2
                       : hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2));
         node_checkpoint_wal(node, now);
 

@@ -32,19 +32,11 @@ struct HpplitePageRoot {
 #define NODE(pr, i) ((pr)->aNode + (size_t)(i) * 32)
 
 static void leafHash(unsigned pgno, const unsigned char *page, int pageSize, unsigned char out[32]) {
-  SHA256_CTX c;
   unsigned char tag[8] = { 'H', 'P', 'P', '4', (unsigned char)(pgno >> 24), (unsigned char)(pgno >> 16), (unsigned char)(pgno >> 8), (unsigned char)pgno };
-  hpplite_sha256_init(&c);
-  hpplite_sha256_update(&c, tag, 8);
-  hpplite_sha256_update(&c, page, (size_t)pageSize);
-  hpplite_sha256_final(&c, out);
+  hpplite_sha256_prefixed(tag, 8, page, (size_t)pageSize, out);
 }
 static void innerHash(const unsigned char *l, const unsigned char *r, unsigned char out[32]) {
-  SHA256_CTX c;
-  hpplite_sha256_init(&c);
-  hpplite_sha256_update(&c, l, 32);
-  hpplite_sha256_update(&c, r, 32);
-  hpplite_sha256_final(&c, out);
+  hpplite_sha256_prefixed(l, 32, r, 32, out);
 }
 static void pathUp(HpplitePageRoot *pr, unsigned leaf) {
   unsigned i = pr->cap + leaf;
@@ -70,10 +62,9 @@ static int grow(HpplitePageRoot *pr, unsigned n) {
   while (cap < n) cap *= 2;
   if (cap == pr->cap) return SQLITE_OK;
   aNew = sqlite3_malloc64((sqlite3_uint64)cap * 2 * 32);
-  aCrc = sqlite3_realloc64(pr->aCrc, (sqlite3_uint64)cap * sizeof(uint64_t));
-  if (!aNew || !aCrc) { sqlite3_free(aNew); return SQLITE_NOMEM; }
+  aCrc = NULL;
+  if (!aNew) return SQLITE_NOMEM;
   memset(aNew, 0, (size_t)cap * 2 * 32);
-  memset(aCrc + pr->cap, 0, (size_t)(cap - pr->cap) * sizeof(uint64_t));
   if (pr->aNode) memcpy(aNew + (size_t)cap * 32, pr->aNode + (size_t)pr->cap * 32, (size_t)pr->cap * 32);
   sqlite3_free(pr->aNode);
   pr->aNode = aNew; pr->aCrc = aCrc; pr->cap = cap;
@@ -82,14 +73,10 @@ static int grow(HpplitePageRoot *pr, unsigned n) {
 }
 
 int hpplite_pageroot_set(HpplitePageRoot *pr, unsigned pgno, const unsigned char *page) {
-  uint64_t c;
   if (!pr || pgno == 0) return SQLITE_MISUSE;
   if (pgno > pr->cap && grow(pr, pgno) != SQLITE_OK) return SQLITE_NOMEM;
   leafHash(pgno, page, pr->pageSize, NODE(pr, pr->cap + pgno - 1));
   pathUp(pr, pgno - 1);
-  c = hpplite_crc64(0, page, (size_t)pr->pageSize);
-  pr->crc ^= pr->aCrc[pgno - 1] ^ c;
-  pr->aCrc[pgno - 1] = c;
   if (pgno > pr->nPages) pr->nPages = pgno;
   return SQLITE_OK;
 }
@@ -101,14 +88,12 @@ int hpplite_pageroot_truncate(HpplitePageRoot *pr, unsigned nPages) {
   for (i = nPages; i < pr->nPages; i++) {           /* pages beyond the end: absent */
     memset(NODE(pr, pr->cap + i), 0, 32);
     pathUp(pr, i);
-    pr->crc ^= pr->aCrc[i];
-    pr->aCrc[i] = 0;
   }
   pr->nPages = nPages;
   return SQLITE_OK;
 }
 unsigned hpplite_pageroot_pages(const HpplitePageRoot *pr) { return pr ? pr->nPages : 0; }
-uint64_t hpplite_pageroot_crc(const HpplitePageRoot *pr) { return pr ? pr->crc : 0; }
+uint64_t hpplite_pageroot_crc(const HpplitePageRoot *pr) { (void)pr; return 0; }   /* no rolling checksum: the root is the integrity (#146) */
 
 void hpplite_pageroot_get(const HpplitePageRoot *pr, unsigned char out[32]) {
   SHA256_CTX c;

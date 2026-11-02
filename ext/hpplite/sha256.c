@@ -136,3 +136,26 @@ static void sha256(const uint8_t *data, size_t len, uint8_t *hash) {
 void hpplite_sha256(const uint8_t *data, size_t len, uint8_t *out) {
   sha256(data, len, out);
 }
+
+/* A one-shot SHA-256 over a prefix and a buffer (#146: a page's leaf hash,
+** tens of thousands a second on a busy sequencer). The platform's where it
+** has one with hardware support (Apple's CommonCrypto); the vendored one
+** elsewhere. Same digest everywhere. */
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+void hpplite_sha256_prefixed(const uint8_t *prefix, size_t nPrefix, const uint8_t *data, size_t n, uint8_t out[32]) {
+  CC_SHA256_CTX c;
+  CC_SHA256_Init(&c);
+  if (nPrefix) CC_SHA256_Update(&c, prefix, (CC_LONG)nPrefix);
+  if (n) CC_SHA256_Update(&c, data, (CC_LONG)n);
+  CC_SHA256_Final(out, &c);
+}
+#else
+void hpplite_sha256_prefixed(const uint8_t *prefix, size_t nPrefix, const uint8_t *data, size_t n, uint8_t out[32]) {
+  SHA256_CTX c;
+  hpplite_sha256_init(&c);
+  if (nPrefix) hpplite_sha256_update(&c, prefix, nPrefix);
+  if (n) hpplite_sha256_update(&c, data, n);
+  hpplite_sha256_final(&c, out);
+}
+#endif

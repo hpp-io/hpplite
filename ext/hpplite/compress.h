@@ -25,6 +25,8 @@ extern "C" {
 
 /* Compress: malloc'd [length][zlib]; NULL on failure or for empty input */
 uint8_t *hpplite_deflate(const uint8_t *in, size_t n, size_t *pOut);
+/* the same at a chosen zlib level: 1 for page diffs, mostly zeros, where speed matters (#146) */
+uint8_t *hpplite_deflate_level(const uint8_t *in, size_t n, int level, size_t *pOut);
 
 /* Decompress what hpplite_deflate made: malloc'd, terminated, *pOut set; NULL when malformed or over the limit */
 uint8_t *hpplite_inflate(const uint8_t *in, size_t n, size_t *pOut);

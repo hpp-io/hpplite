@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-uint8_t *hpplite_deflate(const uint8_t *in, size_t n, size_t *pOut) {
+uint8_t *hpplite_deflate_level(const uint8_t *in, size_t n, int level, size_t *pOut) {
     uLongf bound;
     uint8_t *out;
     if (pOut) *pOut = 0;
@@ -16,10 +16,12 @@ uint8_t *hpplite_deflate(const uint8_t *in, size_t n, size_t *pOut) {
     out = malloc(4 + bound);
     if (!out) return NULL;
     out[0] = (uint8_t)(n >> 24); out[1] = (uint8_t)(n >> 16); out[2] = (uint8_t)(n >> 8); out[3] = (uint8_t)n;
-    if (compress2(out + 4, &bound, in, (uLong)n, 6) != Z_OK) { free(out); return NULL; }
+    if (compress2(out + 4, &bound, in, (uLong)n, level) != Z_OK) { free(out); return NULL; }
     if (pOut) *pOut = 4 + (size_t)bound;
     return out;
 }
+
+uint8_t *hpplite_deflate(const uint8_t *in, size_t n, size_t *pOut) { return hpplite_deflate_level(in, n, 6, pOut); }
 
 uint8_t *hpplite_inflate(const uint8_t *in, size_t n, size_t *pOut) {
     size_t len;
