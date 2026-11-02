@@ -778,7 +778,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     /* A follower whose sequencer is gone takes over to post what is left:
     ** the last connection out posts */
     if (node->follower && node->ctx && !node->ctx->bDbClosed
-        && hpplite_pending_count(node->ctx) > 0 && node->flushMutex) {
+        && hpplite_node_pending_count(node) > 0 && node->flushMutex) {
         pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);
         node_try_promote(node);
         pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
@@ -787,7 +787,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     /* Flush any pending data before cleanup (not when bookkeeping shared a
     ** connection that is already closed: nothing can run there any more) */
     if (node->ctx && !(node->ctx->bDbClosed && node->ctx->bkDb == node->ctx->db)
-        && hpplite_pending_count(node->ctx) > 0) {
+        && hpplite_node_pending_count(node) > 0) {
         hpplite_node_flush_batch(node);
     }
 
@@ -1979,7 +1979,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     ** it, as open does. */
     if (node->l1) {
         int rc;
-        if (hpplite_pending_count(node->ctx) == 0) {
+        if (hpplite_node_pending_count(node) == 0) {
             if (hpplite_node_sync_from_l1(node, 1) < 0) {
                 node->state = HPPLITE_STATE_ERROR;
                 return 0;
@@ -2072,7 +2072,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
             synced++;
             continue;
         }
-        if (hpplite_pending_count(node->ctx) > 0) {
+        if (hpplite_node_pending_count(node) > 0) {
             /* Local writes exist: the L1 batch must be ours */
             rc = hpplite_adopt_batch(node->ctx, batch);
             if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {

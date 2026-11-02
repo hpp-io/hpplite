@@ -4,6 +4,7 @@
 */
 #include "test_lib.h"
 #include "pages.h"
+#include "pagemode.h"
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -49,6 +50,7 @@ static void test_no_hooks_sidecar_and_roots(void) {
     hpplite_node_exec(n, "INSERT INTO t(v) VALUES('c')", NULL);
     int pending = hpplite_node_pending_count(n);
     if (pending != 4) FAILF("pending = %d, expected 4: the file as opened (its first page, never shipped) and three commits", pending);
+    if (scalar(n->db, "SELECT pending FROM hpplite_status") != pending) FAILF("hpplite_status.pending says %lld, the node %d (#157)", scalar(n->db, "SELECT pending FROM hpplite_status"), pending);
     uint64_t h = hpplite_node_flush_batch(n);
     if (h != 1) FAILF("flush posted height %llu, expected 1", (unsigned long long)h);
     if (hpplite_node_pending_count(n) != 0) FAIL("commits still pending after the flush");
@@ -213,7 +215,8 @@ static void test_reopen_after_a_submit_the_process_did_not_survive(void) {
     hpplite_node_exec(s, "INSERT INTO t VALUES(3)", NULL);          /* after the "crash point", before the process dies */
     unsigned char rootFile1[32];
     { exec_sql(s->db, "PRAGMA wal_checkpoint(TRUNCATE)"); HpplitePageRoot *pr = hpplite_pageroot_from_file(DIR "/c.db", NULL); hpplite_pageroot_get(pr, rootFile1); hpplite_pageroot_free(pr); }
-    hpplite_node_destroy(s);                          /* the queue dies with the process; the file and the sidecar stay */
+    hpplite_pagemode_stop(s->pm); s->pm = NULL;      /* the queue dies with the process (a clean close would post it); the file and the sidecar stay */
+    hpplite_node_destroy(s);
     HppliteNode *s2 = open_pages(DIR "/c.db", l1, 1, 1);
     if (!s2) FAIL("reopen");
     long long h = scalar(s2->db, "SELECT height FROM hpplite_status");

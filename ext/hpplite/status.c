@@ -195,7 +195,7 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_get_block_height(node->ctx));
             break;
         case STATUS_COL_PENDING:
-            sqlite3_result_int(ctx, hpplite_pending_count(node->ctx));
+            sqlite3_result_int(ctx, hpplite_node_pending_count(node));      /* page mode counts its queue (#157) */
             break;
         case STATUS_COL_STATE_ROOT:
             hpplite_node_get_state_root(node, root);
