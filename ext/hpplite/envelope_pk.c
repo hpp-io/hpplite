@@ -15,7 +15,8 @@
 
 static secp256k1_context *g_ctx;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
-static void ctxInit(void) { g_ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE); }
+/* sign and verify, as crypto.c: an older libsecp256k1 (Ubuntu 22.04) aborts a key operation on a context without them */
+static void ctxInit(void) { g_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY); }
 static secp256k1_context *ctx(void) { pthread_once(&g_once, ctxInit); return g_ctx; }
 
 void hpplite_pk_fingerprint(const uint8_t pubkey[33], uint8_t fp[4]) {
