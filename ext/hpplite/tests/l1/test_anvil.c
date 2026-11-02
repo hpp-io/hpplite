@@ -110,6 +110,21 @@ static void test_open_write_post_checkpoint(void) {
 /* 1b. The verifier (#5): the tool rebuilds KEY0's rollup from the chain
 ** alone, matches the checkpoint the contract anchors, and says whether the
 ** live file equals it - before and after a write past the log */
+/* hpplite-verify with the given connection parameters (what a user would put in HPPLITE_PARAMS) */
+static int run_verify_with(const char *params, const char *extra, char *out, size_t n) {
+    const char *bin = getenv("HPPLITE_VERIFY_BIN");
+    char cmd[1600];
+    FILE *p;
+    size_t got = 0;
+    int status;
+    if (!bin) return -2;
+    snprintf(cmd, sizeof cmd, "HPPLITE_PARAMS='%s' '%s' %s 2>&1", params, bin, extra ? extra : "");
+    p = popen(cmd, "r");
+    if (!p) return -2;
+    while (got + 1 < n && fgets(out + got, (int)(n - got), p)) got = strlen(out);
+    status = pclose(p);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
 static int run_verify(const char *extra, char *out, size_t n) {
     const char *bin = getenv("HPPLITE_VERIFY_BIN");
     char cmd[1600];
@@ -1969,10 +1984,17 @@ static void test_viewing_key_reads(void) {
         snprintf(errX, sizeof errX, "%s", status_text(x, "last_error"));
     }
     sqlite3_close(x);
-    printf("(writer: batches %lld %lld, readers %lld; reader: rows %lld, state %s; other key: rows %lld, '%.60s') ", h1, h2, readers, rows, state, rowsX, errX);
+    /* hpplite-verify with the viewing key alone: the same rebuild, the tool's verdict */
+    char params[600], vout[4096] = "";
+    int vrc = -2;
+    snprintf(params, sizeof params, "rpc=%s&contract=%s&chainid=31337&viewkey=%s", RPC, contract, keyR);
+    if (getenv("HPPLITE_VERIFY_BIN")) vrc = run_verify_with(params, "", vout, sizeof vout);
+    printf("(writer: batches %lld %lld, readers %lld; reader: rows %lld, state %s; other key: rows %lld, '%.60s'; hpplite-verify with the viewing key: exit %d) ",
+           h1, h2, readers, rows, state, rowsX, errX, vrc);
     if (h1 != 1 || h2 != 2 || readers != 1) FAIL("the writer posts two batches with one reader");
     if (rows != 2) FAIL("the reader with viewkey= alone should rebuild both batches");
     if (rowsX != -1 || !strstr(errX, "sealed")) FAIL("a key never granted should be refused at batch 1");
+    if (vrc != 0 || !strstr(vout, "2 batches on chain, 2 replayed") || !strstr(vout, "\nverified")) { printf("\n%s", vout); FAIL("hpplite-verify with viewkey= should rebuild and say verified"); }
     PASS();
 }
 
