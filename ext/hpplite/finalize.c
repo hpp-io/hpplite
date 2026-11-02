@@ -524,7 +524,7 @@ void hpplite_chain_hash_next(const unsigned char *pPrev, uint64_t height, const 
 ** the height, the previous hash and the root; the contract's rolling hash
 ** advances by the posted bytes as for any batch; the meta row moves; the
 ** posted copy is kept for a reorg. No log to prune, no trees. */
-int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *posted, size_t nPosted, const unsigned char *root) {
+int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *posted, size_t nPosted, const unsigned char *root, int bSeriesOpen) {
   unsigned char blockHash[HPPLITE_HASH_SIZE], chainHash[HPPLITE_HASH_SIZE];
   sqlite3_stmt *pStmt = NULL;
   int rc, saved;
@@ -539,12 +539,15 @@ int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned ch
   rc = hppliteBkBegin(pCtx, 1);
   if (rc != SQLITE_OK) return rc;
   saved = hppliteBkEnter(pCtx);
-  rc = sqlite3_prepare_v2(pCtx->bkDb, "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, chain_hash=?3, state_root=?4, open_txn=0, frag_id=0, frag_off=0, inflight_height=0, inflight_root=NULL WHERE id=1", -1, &pStmt, NULL);
+  /* open_txn in page mode: a commit's pieces still to come (#152): the file is
+  ** not at the state root until the last */
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, chain_hash=?3, state_root=?4, open_txn=?5, frag_id=0, frag_off=0, inflight_height=0, inflight_root=NULL WHERE id=1", -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(height + 1));
     sqlite3_bind_blob(pStmt, 2, blockHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
     sqlite3_bind_blob(pStmt, 3, chainHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
     sqlite3_bind_blob(pStmt, 4, root, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+    sqlite3_bind_int(pStmt, 5, bSeriesOpen ? 1 : 0);
     rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
     sqlite3_finalize(pStmt);
   }
@@ -559,7 +562,7 @@ int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned ch
   rc = hppliteBkEnd(pCtx, rc);
   if (rc != SQLITE_OK) { hppliteLoadMeta(pCtx); return rc; }
   pCtx->blockHeight = height + 1;
-  pCtx->openTxnId = 0; pCtx->fragId = 0; pCtx->fragOff = 0;
+  pCtx->openTxnId = bSeriesOpen ? 1 : 0; pCtx->fragId = 0; pCtx->fragOff = 0;
   memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
   memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
   memcpy(pCtx->stateRoot, root, HPPLITE_HASH_SIZE);

@@ -47,6 +47,8 @@ typedef struct HpplitePageBatch {
   unsigned char root[32];                    /* hpplite_pageroot_get after the batch */
   uint64_t crc;                              /* hpplite_pageroot_crc after the batch */
   const char *zName; unsigned nName;         /* the database's name (dbname=, #160), on batch 1; not NUL-terminated when decoded */
+  unsigned piece;                            /* 0: a whole batch; k: the k-th piece of one commit cut over batches (#152) */
+  unsigned bMore;                            /* a piece with pieces after it: a replica keeps its lock until the last */
 } HpplitePageBatch;
 /* is this a page batch (before any parse)? */
 int hpplite_pagebatch_is(const unsigned char *p, size_t n);

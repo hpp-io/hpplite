@@ -456,6 +456,88 @@ static void test_fresh_plain_node_reads_the_applied_pages(void) {
     PASS();
 }
 
+/* a commit that dirties more pages than fit under the posting limit (#152):
+** posted as a series of pieces, each under the limit, the replica holding
+** its lock from the first to the last; a crash between pieces is recovered */
+static void test_commit_over_the_limit_is_cut_into_pieces(void) {
+    TEST("a commit larger than the posting limit is posted as pieces under the limit; a replica applies the series and equals; the next commit follows");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .capturePages = 1, .noEncrypt = 1, .noCompress = 1, .maxBatchBytes = 16 * 1024, .checkpointInterval = TEST_INTERVAL_1000 };
+    HppliteNode *s = test_open_node(DIR "/big.db", l1, &o);
+    if (!s) FAIL("open");
+    hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 1");
+    /* one transaction, ~30 pages of random bytes: at 16 KB a batch holds 3 */
+    hpplite_node_exec(s, "BEGIN; WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 30) INSERT INTO t(v) SELECT randomblob(3500) FROM s; COMMIT", NULL);
+    uint64_t last = hpplite_node_flush_batch(s);
+    int pending = hpplite_node_pending_count(s);
+    hpplite_node_exec(s, "INSERT INTO t(v) VALUES(x'00')", NULL);
+    uint64_t after = hpplite_node_flush_batch(s);
+    int pieces = 0, whole = 0; size_t biggest = 0;
+    for (uint64_t h = 2; h <= after; h++) {
+        size_t len = 0; uint8_t *raw = hpplite_l1_get_batch(l1, h, &len);
+        HpplitePageBatch *pb = raw ? hpplite_pagebatch_decode(raw, len) : NULL;
+        if (pb) { if (pb->piece) pieces++; else whole++; }
+        if (len > biggest) biggest = len;
+        hpplite_pagebatch_free(pb); free(raw);
+    }
+    HppliteNode *r = open_pages_role(DIR "/bigr.db", l1, 1, 1, 1);
+    long long rows = r ? scalar(r->db, "SELECT count(*) FROM t") : -1;
+    int same = r && same_root(s, r);
+    exec_sql(s->db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    int filesEqual = r && files_equal_masked(DIR "/big.db", DIR "/bigr.db", NULL);
+    printf("(series to height %llu, %d pieces, %d whole after, biggest %zu bytes, replica %lld rows, roots %s, files %s) ", (unsigned long long)last, pieces, whole, biggest, rows, same ? "equal" : "differ", filesEqual ? "equal" : "differ");
+    if (r) hpplite_node_destroy(r);
+    hpplite_node_destroy(s); hpplite_l1_disconnect(l1);
+    if (last < 5) FAILF("the commit should have been cut into several pieces, last height %llu", (unsigned long long)last);
+    if (pending != 0) FAILF("%d pending after the series", pending);
+    if (biggest > 16 * 1024) FAILF("a batch is %zu bytes, over the limit", biggest);
+    if (pieces < 5 || whole != 1) FAIL("the pieces and the whole batch after them");
+    if (after != last + 1) FAIL("the next commit did not follow as a whole batch");
+    if (!r || rows != 31 || !same || !filesEqual) FAIL("the replica does not equal the sequencer after the series");
+    PASS();
+}
+
+/* the process dies with a piece of a commit in flight (#152): the reopened
+** sequencer takes the piece as posted and ships the file whole again; a
+** reader that rebuilds from the chain, pieces and all, equals it */
+static void test_death_between_pieces(void) {
+    TEST("a sequencer that dies between two pieces of a commit reopens, re-ships the file whole, and a reader rebuilds the series");
+#ifndef HPPLITE_TEST_HOOKS
+    printf("SKIP (no test hooks) "); PASS(); return;
+#else
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .capturePages = 1, .noEncrypt = 1, .noCompress = 1, .maxBatchBytes = 16 * 1024, .checkpointInterval = TEST_INTERVAL_1000 };
+    HppliteNode *s = test_open_node(DIR "/dp.db", l1, &o);
+    if (!s) FAIL("open");
+    hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 1");
+    hpplite_node_exec(s, "BEGIN; WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 30) INSERT INTO t(v) SELECT randomblob(3500) FROM s; COMMIT", NULL);
+    hpplite_test_fail_commits = 1;                    /* the third piece's finalize fails... */
+    uint64_t h1 = hpplite_node_flush_batch(s);        /* ...the flush stops there: pieces 1, 2 finalized, 3 on the chain and in flight */
+    hpplite_test_fail_commits = 0;
+    hpplite_node_exec(s, "INSERT INTO t(v) VALUES(x'00')", NULL);
+    hpplite_pagemode_stop(s->pm); s->pm = NULL;      /* the process dies */
+    hpplite_node_destroy(s);
+    HppliteNode *s2 = test_open_node(DIR "/dp.db", l1, &o);
+    if (!s2) FAIL("reopen");
+    long long h = scalar(s2->db, "SELECT height FROM hpplite_status");
+    uint64_t h2 = hpplite_node_flush_batch(s2);
+    printf("(flush stopped at %llu, height after reopen %lld, re-ship to %llu) ", (unsigned long long)h1, h, (unsigned long long)h2);
+    HppliteNode *r = open_pages_role(DIR "/dpr.db", l1, 1, 1, 1);
+    long long rows = r ? scalar(r->db, "SELECT count(*) FROM t") : -1;
+    int same = r && same_root(s2, r), err = r && r->state == HPPLITE_STATE_ERROR;
+    if (err) printf("(reader: %s) ", r->ctx->zLastError);
+    if (r) hpplite_node_destroy(r);
+    hpplite_node_destroy(s2); hpplite_l1_disconnect(l1);
+    if (err) FAIL("the reader is in error");
+    if (rows != 31 || !same) FAILF("reader rows %lld, roots %s", rows, same ? "equal" : "differ");
+    PASS();
+#endif
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -473,6 +555,8 @@ int main(void) {
     test_open_fails_when_wal_cannot_be_set();
     test_batch_one_carries_the_name();
     test_fresh_plain_node_reads_the_applied_pages();
+    test_commit_over_the_limit_is_cut_into_pieces();
+    test_death_between_pieces();
     remove_dir();
     return test_report();
 }

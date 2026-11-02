@@ -1253,7 +1253,7 @@ static void test_transaction_boundary(void) {
 
 static void test_oversized_transaction(void) {
     TEST("a transaction that outgrows a batch is posted across batches within the limit (#57)");
-    SKIP_IF_PAGES("a commit larger than the limit is #152");
+    SKIP_IF_PAGES("these rows fit one deflated page batch under this limit; a commit cut into pieces is test_pagemode's (#152)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     const size_t LIMIT = 2000;

@@ -545,7 +545,7 @@ static void test_sync_function(void) {
 /* 16. Pending SQL beyond the DA size limit is submitted as several batches */
 static void test_batch_size_limit(void) {
     TEST("pending SQL over the DA limit is split into batches that each fit");
-    SKIP_IF_PAGES("a commit larger than the limit is #152");
+    SKIP_IF_PAGES("these rows fit one deflated page batch under this limit; a commit cut into pieces is test_pagemode's (#152)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     hpplite_l1_mock_set_batch_size_limit(l1, 3000);

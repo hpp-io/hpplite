@@ -851,6 +851,7 @@ void hpplite_node_destroy(HppliteNode *node) {
         hpplite_shutdown(node->ctx);
     }
 
+    if (node->pieceDb) { sqlite3_exec(node->pieceDb, "ROLLBACK", NULL, NULL, NULL); sqlite3_close(node->pieceDb); node->pieceDb = NULL; }
     node_ck_close(node);
     node_pins_close(node);
     if (node->ctx) { node->ctx->xWalMaint = NULL; node->ctx->pWalMaintArg = NULL; }
@@ -1477,10 +1478,13 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     int rc;
     if (!b) { hpplite_error(node->ctx, "batch %llu: page batch that does not decode", (unsigned long long)batch->height); return SQLITE_CORRUPT; }
     if (!node->pm) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu is a page batch and this node is not in page mode (capture=pages)", (unsigned long long)batch->height); return SQLITE_MISMATCH; }
-    if (batch->height > 1 && batch->height == node->ctx->blockHeight) {
+    if (batch->height > 1 && batch->height == node->ctx->blockHeight && b->piece <= 1 && !node->ctx->openTxnId) {
         /* the file must be where the sidecar says the last batch left it: a
         ** file deleted or restored while its sidecar stayed would take diffs
-        ** onto the wrong pages (the root check below catches that, this says why) */
+        ** onto the wrong pages (the root check below catches that, this says why).
+        ** Not between the pieces of one commit, nor after a series the sequencer
+        ** did not finish (open_txn in the sidecar): the sidecar holds the commit's
+        ** final root from its first piece on (#152) */
         hpplite_pagemode_root(node->pm, root);
         if (memcmp(root, node->ctx->stateRoot, 32) != 0) {
             hpplite_pagebatch_free(b);
@@ -1512,6 +1516,10 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
             node->pagesWalSuspended = 1;
         }
     }
+    if (node->pieceDb) {
+        /* a piece after the first (#152): the lock held since */
+        adb = node->pieceDb; pf = node->piecePf; rc = SQLITE_OK;
+    } else {
     hpplite_internal_open_begin();
     rc = sqlite3_open_v2(zFile, &adb, SQLITE_OPEN_READWRITE, NULL);
     hpplite_internal_open_end();
@@ -1519,6 +1527,7 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     sqlite3_busy_timeout(adb, 5000);
     rc = sqlite3_exec(adb, "BEGIN EXCLUSIVE", NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_file_control(adb, "main", SQLITE_FCNTL_FILE_POINTER, &pf);
+    }
     page = sqlite3_malloc64((sqlite3_uint64)b->pageSize);
     if (rc == SQLITE_OK && (!pf || !pf->pMethods || !page)) rc = SQLITE_ERROR;
     for (i = 0; rc == SQLITE_OK && i < b->nPages; i++) {
@@ -1549,13 +1558,21 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     if (rc == SQLITE_OK) rc = pf->pMethods->xTruncate(pf, (sqlite3_int64)b->commitSize * (sqlite3_int64)b->pageSize);
     if (rc == SQLITE_OK) rc = hpplite_pagemode_applied_size(node->pm, b->commitSize);
     if (rc == SQLITE_OK) rc = pf->pMethods->xSync(pf, SQLITE_SYNC_NORMAL);
-    sqlite3_exec(adb, "ROLLBACK", NULL, NULL, NULL);          /* nothing of SQLite's to commit; the lock goes */
-    sqlite3_close(adb);
+    if (rc == SQLITE_OK && b->bMore) {
+        /* a piece with more after it: the lock stays until the last, so no
+        ** reader of this replica sees half a commit */
+        node->pieceDb = adb; node->piecePf = pf;
+    } else {
+        sqlite3_exec(adb, "ROLLBACK", NULL, NULL, NULL);          /* nothing of SQLite's to commit; the lock goes */
+        sqlite3_close(adb);
+        node->pieceDb = NULL; node->piecePf = NULL;
+    }
     sqlite3_free(page);
     if (rc != SQLITE_OK) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu: its pages could not be written (rc=%d)", (unsigned long long)batch->height, rc); return rc; }
     hpplite_pagemode_root(node->pm, root);
-    node->ctx->nRootsCompared++;
-    if (memcmp(root, b->root, 32) != 0) {
+    /* a piece with more after it carries the whole commit's root: checked at the last piece (#152) */
+    if (!b->bMore) node->ctx->nRootsCompared++;
+    if (!b->bMore && memcmp(root, b->root, 32) != 0) {
         node->ctx->nRootMismatches++;
         hpplite_error(node->ctx, "batch %llu: the root after applying it differs from the posted one", (unsigned long long)batch->height);
         hpplite_pagebatch_free(b);
@@ -1563,7 +1580,7 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     }
     node->ctx->rootCmpHeight = batch->height;          /* for the verifier: compared with the on-chain checkpoint (#5) */
     memcpy(node->ctx->rootCmp, b->root, 32);
-    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root);   /* the posted bytes: the chain hash (#33) */
+    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root, b->bMore);   /* the posted bytes: the chain hash (#33) */
     hpplite_pagebatch_free(b);
     return rc;
 }
@@ -1584,10 +1601,10 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
         ** as posted; whatever the file holds beyond it, the first flush sees in
         ** the root and ships the file whole again. The queue, if the process is
         ** the same, holds the commits it was built from: settled too. */
-        rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root);
+        rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root, b->bMore);
         if (rc == SQLITE_OK && hpplite_pagemode_pending(node->pm) > 0) {
             unsigned char r2[32]; int more2 = 0; unsigned char *bytes2 = NULL; size_t len2 = 0;
-            if (hpplite_pagemode_build_n(node->pm, (unsigned)(b->lastCommit - b->firstCommit + 1), &bytes2, &len2, r2, &more2) == SQLITE_OK) {
+            if (hpplite_pagemode_build_n(node->pm, (unsigned)(b->lastCommit - b->firstCommit + 1), b->piece ? b->nPages : 0, &bytes2, &len2, r2, &more2) == SQLITE_OK) {
                 if (memcmp(r2, b->root, 32) == 0) hpplite_pagemode_finalized(node->pm); else hpplite_pagemode_failed(node->pm);
                 sqlite3_free(bytes2);
             }
@@ -1605,7 +1622,7 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
         hpplite_pagebatch_free(b);
         return node_apply_pages(node, batch);
     }
-    rc = hpplite_pagemode_build_n(node->pm, (unsigned)(b->lastCommit - b->firstCommit + 1), &bytes, &len, root, &more);
+    rc = hpplite_pagemode_build_n(node->pm, (unsigned)(b->lastCommit - b->firstCommit + 1), b->piece ? b->nPages : 0, &bytes, &len, root, &more);
     if (rc != SQLITE_OK) { hpplite_pagebatch_free(b); return rc == SQLITE_DONE ? SQLITE_MISMATCH : rc; }
     if (memcmp(root, b->root, 32) != 0) {
         hpplite_pagemode_failed(node->pm);
@@ -1613,7 +1630,7 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
         hpplite_error(node->ctx, "page batch %llu on the chain is not what this node would post (a fork?)", (unsigned long long)batch->height);
         return SQLITE_MISMATCH;
     }
-    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root);
+    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root, b->bMore);
     if (rc == SQLITE_OK) hpplite_pagemode_finalized(node->pm); else hpplite_pagemode_failed(node->pm);
     sqlite3_free(bytes); hpplite_pagebatch_free(b);
     return rc;
@@ -1666,7 +1683,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         /* over the posted limit: the guess was optimistic for these pages; half the
         ** raw budget and build again, down to a single commit (which posts whatever its size) */
         /* only a chain taking the bytes itself has a hard limit; a store takes any size */
-        if (maxBytes > 0 && payloadLen > maxBytes && node->l1 && !node->store && budget > 2 * (size_t)hpplite_pagemode_page_size(node->pm) && tries < 8) {
+        if (maxBytes > 0 && payloadLen > maxBytes && node->l1 && !node->store && budget > (size_t)hpplite_pagemode_page_size(node->pm) + 96 && tries < 12) {
             hpplite_pagemode_failed(node->pm);
             sqlite3_free(bytes); free(packed); bytes = NULL; packed = NULL;
             budget /= 2;
@@ -1752,7 +1769,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         *pMore = 0;
         return 0;
     }
-    rc = hppliteAdvanceMetaPages(ctx, height, node->l1 ? payload : NULL, node->l1 ? payloadLen : 0, root);
+    rc = hppliteAdvanceMetaPages(ctx, height, node->l1 ? payload : NULL, node->l1 ? payloadLen : 0, root, hpplite_pagemode_piece_more(node->pm));
     if (rc == SQLITE_OK) {
         hpplite_pagemode_finalized(node->pm);
         node->batchesProduced++;
@@ -2196,9 +2213,10 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     }
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
     node_pages_decide_snapshot(node);               /* the chain seen: is the file ahead of it? */
-    if (node->pagesWalSuspended) {
+    if (node->pagesWalSuspended && !node->pieceDb) {
         /* the pages applied: back to WAL for this node's own writes, the file as
-        ** it is now the base the page mode diffs against */
+        ** it is now the base the page mode diffs against (a commit's pieces still
+        ** to come keep the lock, and the mode, until the last) */
         hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=WAL");
         hpplite_pagemode_resume(node->pm);
         node->pagesWalSuspended = 0;
@@ -2601,6 +2619,7 @@ int hpplite_node_pending_count(HppliteNode *node) {
 */
 int hpplite_node_should_checkpoint(HppliteNode *node) {
     if (!node) return 0;
+    if (node->pm && hpplite_pagemode_piece_open(node->pm)) return 0;   /* a commit's pieces still to post: its intermediate roots are no checkpoint (#152) */
     return (node->batchesSinceCheckpoint >= node->config.checkpointInterval);
 }
 

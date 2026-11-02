@@ -34,7 +34,9 @@ size_t hpplite_pagemode_pending_bytes(HpplitePageMode *pm);
 ** root after it; *pMore says more commits wait. SQLITE_DONE: nothing queued. */
 int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char **ppBytes, size_t *pLen, unsigned char root[32], int *pMore);
 /* the same with exactly nCommits taken (adopting a batch found on the chain) */
-int hpplite_pagemode_build_n(HpplitePageMode *pm, unsigned nCommits, unsigned char **ppBytes, size_t *pLen, unsigned char root[32], int *pMore);
+int hpplite_pagemode_build_n(HpplitePageMode *pm, unsigned nCommits, unsigned maxRecords, unsigned char **ppBytes, size_t *pLen, unsigned char root[32], int *pMore);   /* exactly these commits; maxRecords: the piece of one commit this many records long (0: whole) */
+int hpplite_pagemode_piece_open(HpplitePageMode *pm);
+int hpplite_pagemode_piece_more(HpplitePageMode *pm);   /* the batch just built is a piece with more after it */   /* a commit cut over batches has pieces still to post (#152) */
 /* a replica: the pages a batch applied, into the root */
 int hpplite_pagemode_applied(HpplitePageMode *pm, unsigned pgno, const unsigned char *page);
 int hpplite_pagemode_applied_size(HpplitePageMode *pm, unsigned nPages);

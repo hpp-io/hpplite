@@ -96,9 +96,11 @@ write rate, p99 0.15 ms against 1.4 ms with row capture), any SQL replicates
 few deflated pages rather than a record per row. Several connections and
 processes on one file work as with row capture: the sequencer captures
 what the others commit, a follower that is the last connection out takes
-over and ships what the file holds beyond the chain. What it does not do
-yet: a commit that dirties more pages than fit under the posting limit is
-posted over it (#152; the default limit is 128 KB of deflated pages). A
+over and ships what the file holds beyond the chain. A commit that dirties
+more pages than fit under the posting limit is posted as a series of
+pieces, each under the limit, and a replica holds its lock from the first
+piece to the last so its readers never see half a commit (#152; a single
+page is the unit, so the limit must hold at least one deflated page). A
 crash between a submit and its finalize is recovered from the sidecar's
 record of the batch in flight; a sequencer reopened on a file the chain
 does not have whole ships it whole again. `PRAGMA wal_autocheckpoint` is

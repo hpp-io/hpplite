@@ -41,6 +41,11 @@ struct HpplitePageMode {
   int bWatch;
   char *zName;                /* on the next batch built: the database's name (#160) */
   unsigned takeExactly;       /* a build of exactly this many commits (0: by the budget) */
+  unsigned maxRecords;        /* ...and at most this many records: one piece (0: whole) */
+  unsigned pieceOff;          /* a commit cut over batches (#152): records of it already posted, in page order */
+  unsigned pieceNo;           /* ...and pieces posted */
+  unsigned pieceMore;         /* the batch being built is a piece with more after it */
+  unsigned pieceEmitted;      /* records in the piece being built */
 };
 
 static void qfree(QCommit *q) { while (q) { QCommit *n = q->pNext; sqlite3_free(q->aPgno); sqlite3_free(q->aImg); sqlite3_free(q); q = n; } }
@@ -268,18 +273,45 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
   if (!seen) { sqlite3_free(recs); sqlite3_free(bodies); hpplite_pagemode_failed(pm); return SQLITE_NOMEM; }
   memset(seen, 0, maxPg + 1);
   { unsigned k; for (k = 0; k < pm->nDirty; k++) seen[pm->aDirty[k]] = 1; }
-  for (pg = 1; pg <= maxPg; pg++) {
-    if (!seen[pg] || pg > pm->sizeAfter) continue;
-    { unsigned char *body = bodies + (size_t)nRec * ps, *cur = pm->aLast[pg], *old = pm->aPrev[pg - 1];
-      if (old) { unsigned j; for (j = 0; j < ps; j++) body[j] = cur[j] ^ old[j]; recs[nRec].flags = HPPLITE_PAGE_DIFF; }
-      else { memcpy(body, cur, ps); recs[nRec].flags = HPPLITE_PAGE_FULL; }
-      recs[nRec].pgno = pg; recs[nRec].body = body; nRec++;
-      hpplite_pageroot_set(pm->pRoot, pg, cur); }
+  /* one commit with more pages than fit is cut into pieces (#152): this
+  ** build takes the records after those already posted, as many as fit;
+  ** a replica holds its lock from the first piece to the last */
+  { unsigned cap = pm->maxRecords ? pm->maxRecords : (unsigned)budget, inOrder = 0, skipped = 0, highest = 0;
+    int piece = nTake == 1 && (pm->pieceOff > 0 || pm->nDirty > cap);
+    pm->pieceMore = 0; pm->pieceEmitted = 0;
+    for (pg = 1; pg <= maxPg; pg++) {
+      if (!seen[pg] || pg > pm->sizeAfter) continue;
+      inOrder++;
+      if (piece && skipped < pm->pieceOff) { skipped++; continue; }           /* posted in an earlier piece */
+      if (piece && nRec >= cap) { pm->pieceMore = 1; break; }                /* the next piece's */
+      { unsigned char *body = bodies + (size_t)nRec * ps, *cur = pm->aLast[pg], *old = pm->aPrev[pg - 1];
+        if (old) { unsigned j; for (j = 0; j < ps; j++) body[j] = cur[j] ^ old[j]; recs[nRec].flags = HPPLITE_PAGE_DIFF; }
+        else { memcpy(body, cur, ps); recs[nRec].flags = HPPLITE_PAGE_FULL; }
+        recs[nRec].pgno = pg; recs[nRec].body = body; nRec++; highest = pg;
+        hpplite_pageroot_set(pm->pRoot, pg, cur); }
+    }
+    (void)inOrder;
+    pm->pieceEmitted = nRec;
+    memset(&b, 0, sizeof b);
+    if (piece) {
+      /* a piece's size: the file as it was, or as far as its pages reach; the
+      ** last piece cuts to the commit's. Every piece carries the root of the
+      ** whole commit (a replica checks it at the last piece: half a commit has
+      ** no root of its own, and a file shipped whole after a crash is one commit
+      ** the replica's images cannot stand in for), so the kept root is the
+      ** commit's final state from the first piece on */
+      unsigned sz = pm->pieceMore ? (highest > pm->sizeThen ? highest : pm->sizeThen) : pm->sizeAfter;
+      b.piece = pm->pieceNo + 1; b.bMore = pm->pieceMore;
+      b.commitSize = sz;
+      for (pg = 1; pg <= maxPg; pg++) if (seen[pg] && pg <= pm->sizeAfter) hpplite_pageroot_set(pm->pRoot, pg, pm->aLast[pg]);
+      hpplite_pageroot_truncate(pm->pRoot, pm->sizeAfter);
+    } else {
+      b.commitSize = pm->sizeAfter;
+      hpplite_pageroot_truncate(pm->pRoot, pm->sizeAfter);
+    }
+    sqlite3_free(seen);
   }
-  sqlite3_free(seen);
-  hpplite_pageroot_truncate(pm->pRoot, pm->sizeAfter);
-  memset(&b, 0, sizeof b);
-  b.pageSize = ps; b.commitSize = pm->sizeAfter;
+  b.pageSize = ps;
   b.firstCommit = pm->nFinalized + 1; b.lastCommit = pm->nFinalized + nTake;
   b.salt1 = last->salt1; b.salt2 = last->salt2; b.timestampMs = now_ms();
   b.nPages = nRec; b.aPage = recs;
@@ -289,21 +321,53 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
   *ppBytes = hpplite_pagebatch_encode(&b, pLen);
   sqlite3_free(recs); sqlite3_free(bodies);
   if (!*ppBytes) { hpplite_pagemode_failed(pm); return SQLITE_NOMEM; }
+  if (pm->pieceMore) *pMore = 1;                   /* the rest of the commit follows */
   return SQLITE_OK;
 }
 
-int hpplite_pagemode_build_n(HpplitePageMode *pm, unsigned nCommits, unsigned char **ppBytes, size_t *pLen, unsigned char root[32], int *pMore) {
+int hpplite_pagemode_build_n(HpplitePageMode *pm, unsigned nCommits, unsigned maxRecords, unsigned char **ppBytes, size_t *pLen, unsigned char root[32], int *pMore) {
   int rc;
   if (!pm || nCommits == 0) return SQLITE_MISUSE;
-  pm->takeExactly = nCommits;
+  pm->takeExactly = nCommits; pm->maxRecords = maxRecords;
   rc = hpplite_pagemode_build(pm, (size_t)-1 / 2, ppBytes, pLen, root, pMore);
-  pm->takeExactly = 0;
+  pm->takeExactly = 0; pm->maxRecords = 0;
   return rc;
 }
+int hpplite_pagemode_piece_open(HpplitePageMode *pm) { return pm && pm->pieceOff > 0; }
+int hpplite_pagemode_piece_more(HpplitePageMode *pm) { return pm && pm->pieceMore; }
 
 void hpplite_pagemode_finalized(HpplitePageMode *pm) {
   unsigned k, pg;
   if (!pm || !pm->pBuilding) return;
+  if (pm->pieceMore) {
+    /* a piece: its pages are the replica's now; the commit stays, the next
+    ** build takes the records after these */
+    unsigned n = 0, skipped = 0, highest = 0;
+    unsigned char *seen = sqlite3_malloc64((sqlite3_uint64)pm->nPrev + 1);
+    if (!seen) return;
+    memset(seen, 0, (size_t)pm->nPrev + 1);
+    for (k = 0; k < pm->nDirty; k++) if (pm->aDirty[k] <= pm->nPrev) seen[pm->aDirty[k]] = 1;
+    for (pg = 1; pg <= pm->nPrev; pg++) {
+      if (!seen[pg] || pg > pm->sizeAfter) continue;
+      if (skipped < pm->pieceOff) { skipped++; continue; }
+      if (n >= pm->pieceEmitted) break;
+      if (!pm->aPrev[pg - 1]) pm->aPrev[pg - 1] = sqlite3_malloc64((sqlite3_uint64)pm->pageSize);
+      if (pm->aPrev[pg - 1]) memcpy(pm->aPrev[pg - 1], pm->aLast[pg], (size_t)pm->pageSize);
+      n++; highest = pg;
+    }
+    sqlite3_free(seen);
+    if (highest > pm->sizeThen) pm->sizeThen = highest;
+    pm->pieceOff += pm->pieceEmitted; pm->pieceNo++; pm->pieceMore = 0;
+    /* the commit goes back to the head of the queue, to be taken again */
+    pthread_mutex_lock(&pm->mu);
+    pm->pBuilding->pNext = pm->pHead; pm->pHead = pm->pBuilding; if (!pm->pTail) pm->pTail = pm->pBuilding;
+    { unsigned i; for (i = 0; i < pm->pBuilding->n; i++) if (pm->pBuilding->aPgno[i] > pm->maxPgQueued) pm->maxPgQueued = pm->pBuilding->aPgno[i]; }
+    pm->nQueued += pm->nBuilding; pm->queuedBytes += (size_t)pm->pBuilding->n * (size_t)pm->pageSize; pm->nBuilding = 0;
+    pthread_mutex_unlock(&pm->mu);
+    pm->pBuilding = NULL; pm->nDirty = 0;
+    return;
+  }
+  pm->pieceOff = 0; pm->pieceNo = 0;
   for (k = 0; k < pm->nDirty; k++) {
     pg = pm->aDirty[k];
     if (pg > pm->sizeAfter) continue;
@@ -321,12 +385,15 @@ void hpplite_pagemode_failed(HpplitePageMode *pm) {
   unsigned k, pg;
   QCommit *tail;
   if (!pm || !pm->pBuilding) return;
-  /* the root back to the last finalized state: the dirty pages' old images, the old size */
+  /* the root back to the last finalized state: the dirty pages' old images, the old size
+  ** (pages posted in an earlier piece of this commit are in aPrev as posted) */
   for (k = 0; k < pm->nDirty; k++) {
     pg = pm->aDirty[k];
     if (pg <= pm->sizeThen && pm->aPrev[pg - 1]) hpplite_pageroot_set(pm->pRoot, pg, pm->aPrev[pg - 1]);
+    else if (pg <= pm->nPrev && !pm->aPrev[pg - 1]) {}      /* beyond the posted file: cut off below */
   }
   hpplite_pageroot_truncate(pm->pRoot, pm->sizeThen);
+  pm->pieceMore = 0;
   /* the commits back at the head of the queue, in order */
   for (tail = pm->pBuilding; tail->pNext; tail = tail->pNext) {}
   pthread_mutex_lock(&pm->mu);

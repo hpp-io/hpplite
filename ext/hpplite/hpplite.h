@@ -244,7 +244,7 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture);
 ** bookkeeping (meta, posted copies) in bkDb, a sidecar file; no hook on db */
 int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx);
 /* a page batch posted at height: the meta row advances, the posted copy is kept (#146) */
-int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *posted, size_t nPosted, const unsigned char *root);
+int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *posted, size_t nPosted, const unsigned char *root, int bSeriesOpen);   /* bSeriesOpen: a commit cut over batches has pieces still to come (#152) */
 /* before a page batch is submitted: the sidecar remembers it, so a process that dies after the submit knows the batch is its own */
 int hppliteMarkInflightPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *root);
 /* Batches the writer keeps as posted, to post again after a reorg (#49) */

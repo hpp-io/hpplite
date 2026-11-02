@@ -118,6 +118,8 @@ typedef struct HppliteNode {
     struct HpplitePageMode *pm;     /* page mode (#146): the commits queued and the batches built from them */
     unsigned pageDeflateRatio;      /* raw page bytes per posted byte seen on the last page batch: the next build's budget */
     int pagesSnapshotDecided;       /* the first flush decided whether the file goes whole first */
+    sqlite3 *pieceDb;               /* a commit cut over batches (#152): the connection holding the exclusive lock from the first piece to the last */
+    sqlite3_file *piecePf;
     int pagesWalSuspended;          /* a WAL node in rollback-journal mode while chain pages are applied */
 
     /* L1 connection */
