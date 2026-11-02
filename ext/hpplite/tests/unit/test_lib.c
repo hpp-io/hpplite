@@ -288,11 +288,13 @@ const char *test_replica_check(HppliteNode *w, HppliteL1 *l1, const char *replic
     if (r->state == HPPLITE_STATE_ERROR) { sqlite3_free(a); hpplite_node_destroy(r); return "replica sync failed"; }
     b = test_dump(r->db, dumpFlags);
     hpplite_state_root(r->db, rootR);
+    unsigned long long rHeight = (unsigned long long)hpplite_node_get_height(r);
+    char rErr[100]; snprintf(rErr, sizeof rErr, "%s", r->ctx ? r->ctx->zLastError : "");
     hpplite_node_destroy(r);
     int rows = strcmp(a, b) != 0, root = memcmp(rootW, rootR, 32) != 0;
     if (rows) {
         size_t i = test_dump_diff(a, b);
-        snprintf(why, sizeof(why), "replica rows differ: writer [%.70s] replica [%.70s]", a + i, b + i);
+        snprintf(why, sizeof(why), "replica rows differ: writer [%.70s] replica [%.70s] (replica height %llu, last error: %s)", a + i, b + i, rHeight, rErr);
     } else if (root) {
         snprintf(why, sizeof(why), "replica rows equal but its state root differs");
     }

@@ -127,7 +127,6 @@ static void *flusher(void *arg) {
 
 static void test_two_connections_two_threads(void) {
     TEST("two connections on two threads, interleaved autocommit INSERTs: the replica equals the writer");
-    SKIP_IF_PAGES("followers in page mode are #153");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *a = open_node(DIR "/pool.db", l1);
@@ -160,7 +159,6 @@ static void test_two_connections_two_threads(void) {
 ** and posts nothing (no L1 of its own - what a follower process does) */
 static void test_two_processes(void) {
     TEST("a second process writing the same file at once: the replica equals the writer");
-    SKIP_IF_PAGES("followers in page mode are #153");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *a = open_node(DIR "/proc.db", l1);
@@ -196,7 +194,6 @@ static void test_two_processes(void) {
 #define MIXED 1200
 static void test_mixed_threads_and_processes(void) {
     TEST("4 threads and 3 processes, mixed workload at once, flushing throughout: the replica equals the writer");
-    SKIP_IF_PAGES("followers in page mode are #153");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *a = open_node(DIR "/mixed.db", l1);

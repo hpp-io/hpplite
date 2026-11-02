@@ -960,7 +960,7 @@ static void test_close_busy_keeps_capturing(void) {
     sqlite3_reset(leak);
     int before = hpplite_node_pending_count(hpplite_get_node(db));
     if (sqlite3_exec(db, "INSERT INTO t VALUES(2)", NULL, NULL, NULL) != SQLITE_OK) FAIL("write after failed close");
-    if (hpplite_node_pending_count(hpplite_get_node(db)) != before + 1) FAIL("write after the failed close must be captured");
+    if (hpplite_node_pending_count(hpplite_get_node(db)) != before + 1) { printf("(before %d, after %d, node %p pm %p) ", before, hpplite_node_pending_count(hpplite_get_node(db)), (void *)hpplite_get_node(db), hpplite_get_node(db) ? (void *)hpplite_get_node(db)->pm : NULL); FAIL("write after the failed close must be captured"); }
     sqlite3_finalize(leak);
     if (sqlite3_close(db) != SQLITE_OK) FAIL("close after finalize");
 
@@ -1026,7 +1026,6 @@ static void test_no_commit_under_app_read(void) {
 /* 27. Two hpplite=on connections to one file: one sequencer, one follower, one log */
 static void test_second_connection_is_follower(void) {
     TEST("second connection to the same file captures into the shared log; sequencer posts all");
-    SKIP_IF_PAGES("followers in page mode are #153");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *a = open_node(DIR "/pool.db", l1);
@@ -1048,23 +1047,25 @@ static void test_second_connection_is_follower(void) {
     hpplite_node_exec(b, "BEGIN; INSERT INTO t VALUES(3,'b'); INSERT INTO t VALUES(4,'b'); COMMIT", NULL);
     hpplite_node_exec(a, "BEGIN; INSERT INTO t VALUES(5,'a'); INSERT INTO t VALUES(6,'a'); COMMIT", NULL);
     hpplite_node_exec(b, "INSERT INTO t VALUES(7,'b')", NULL);
-    if (hpplite_node_pending_count(a) != 8 || hpplite_node_pending_count(b) != 8) FAIL("both see the shared log");
+    if (test_pages_mode() ? !test_pending_is(hpplite_node_pending_count(a), 6) : (hpplite_node_pending_count(a) != 8 || hpplite_node_pending_count(b) != 8)) FAIL("both see the shared log");   /* page mode: six commits in the sequencer's queue, the follower keeps none */
     if (hpplite_node_flush_batch(b) != 0) FAIL("follower must not post");
     if (hpplite_node_flush_batch(a) != 1) FAIL("sequencer posts");
     HppliteBatch *batch = hpplite_node_fetch_batch(a, 1);
-    if (!batch || batch->nTxns != 8) FAIL("one batch with every statement from both connections");
+    if (!batch || (test_pages_mode() ? !batch->bPages : batch->nTxns != 8)) FAIL("one batch with every statement from both connections");
+    if (!test_pages_mode()) {   /* transaction groups are statements' */
     /* transaction ids come from the log, so groups are right across connections */
     if (batch->aTxns[3].txn != batch->aTxns[4].txn) FAIL("b's transaction (3,4) should be one group");
     if (batch->aTxns[5].txn != batch->aTxns[6].txn) FAIL("a's transaction (5,6) should be one group");
     if (batch->aTxns[2].txn == batch->aTxns[3].txn || batch->aTxns[4].txn == batch->aTxns[5].txn
         || batch->aTxns[6].txn == batch->aTxns[7].txn) FAIL("separate transactions must not share a group");
+    }
     hpplite_batch_free(batch);
 
     /* the sequencer closes first; the follower keeps capturing into the file,
     ** and - the last connection out - posts what is left when it closes */
     hpplite_node_destroy(a);
     hpplite_node_exec(b, "INSERT INTO t VALUES(8,'b-after')", NULL);
-    if (!b->follower || hpplite_node_pending_count(b) != 1) FAIL("b is still a follower until it acts");
+    if (!b->follower || hpplite_node_pending_count(b) != (test_pages_mode() ? 0 : 1)) FAIL("b is still a follower until it acts");   /* page mode: a follower keeps no queue; it ships the file whole when it takes over */
     hpplite_node_destroy(b);
     HppliteNode *c = open_node(DIR "/pool.db", l1);
     if (!c) FAIL("reopen");

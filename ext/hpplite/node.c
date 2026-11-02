@@ -806,8 +806,11 @@ void hpplite_node_destroy(HppliteNode *node) {
 
     /* A follower whose sequencer is gone takes over to post what is left:
     ** the last connection out posts */
+    /* (a page-mode follower keeps no queue of its own: it takes over whenever
+    ** the sequencer is gone, and its page mode then finds what the file holds
+    ** beyond the chain) */
     if (node->follower && node->ctx && !node->ctx->bDbClosed
-        && hpplite_node_pending_count(node) > 0 && node->flushMutex) {
+        && (hpplite_node_pending_count(node) > 0 || (node->config.capturePages && !node->pm)) && node->flushMutex) {
         pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);
         node_try_promote(node);
         pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
@@ -1629,6 +1632,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     int rc, confirmed = 0, tries;
     char zStoreWhy[240];
     zStoreWhy[0] = 0;
+    node_wal_maintenance(node);                         /* frames another connection or process committed since (#153); the pins moved */
     node_pages_decide_snapshot(node);                   /* if nothing decided it yet */
     if (!node->l1 && node->wantsL1) {
         /* l1=/contract=/factory= was given but no connection came of it (no key,
