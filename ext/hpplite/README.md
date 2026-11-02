@@ -70,6 +70,38 @@ from any language whose SQLite binding can load extensions.
 - **Rebuild and check** - an empty file with the same key reconstructs from
   the chain and compares every posted state root along the way
 
+### Page capture (`capture=pages`, v0.4, #146)
+
+The capture above records *what* each write changed and replays it. Page
+capture records *which pages* each commit wrote, as Litestream and LiteFS
+do: the extension's VFS watches the WAL frames of a commit and queues the
+pages; a flush turns the queue into a **page batch** - every page the
+batch's commits touched, once, as the whole page the first time a replica
+sees it and as an XOR diff against the last posted image after - and the
+batch's root is a Merkle root over the hashes of every page in the file
+(`root_version` 4). Nothing is logged in the application's file: the
+bookkeeping lives in a sidecar beside it, `<db>-hpplite.db`, and the
+application's connection has no commit or trace hook, only the authorizer
+that keeps the file in WAL mode and refuses `ATTACH`. A replica writes the
+pages into its file under an exclusive lock, in rollback-journal mode so its
+readers see every batch through the change counter, and compares the root.
+
+What it changes: a transaction costs what SQLite charges for it (the OLTP
+numbers in [doc/performance.md](doc/performance.md): 94% of plain SQLite's
+write rate, p99 0.15 ms against 1.4 ms with row capture), any SQL replicates
+(non-deterministic functions, virtual tables, `VACUUM`), and a batch is a
+few deflated pages rather than a record per row. What it does not do yet:
+a commit that dirties more pages than fit under the posting limit is posted
+over it (#152; the default limit is 128 KB of deflated pages), a second
+connection or process on the file is not captured (#153), and a connection
+HPPLite did not open itself - the loadable extension in a driver,
+`HPPLITE_FILES` - captures nothing, since its file is not on the VFS (#155:
+the next step reads the WAL file instead). A crash between a submit and its
+finalize is recovered from the sidecar's record of the batch in flight; a
+sequencer reopened on a file the chain does not have whole ships it whole
+again. `hpplite_status.capture` says `pages`; `hpplite-verify` finds a page
+history by itself; a named database's first batch carries the name.
+
 ## Why one writer?
 
 SQLite apps expect read-your-writes. Distributed writes would need write
@@ -121,7 +153,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `compress` | No | `on` (default): the batch JSON is deflated before it is sealed or posted when that shrinks it, five to twelve times for SQL and row records (#12); `off`: posted as is. Every reader takes both forms, and batches from before stay readable. Also `HPPLITE_COMPRESS` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
-| `capture` | No | `rows` (default): log what each write changed (#19, below); `text`: log each write statement, as v0.1. Also `HPPLITE_CAPTURE` |
+| `capture` | No | `rows` (default): log what each write changed (#19, below); `text`: log each write statement, as v0.1; `pages`: the database pages each commit wrote (#146, see Page capture). Also `HPPLITE_CAPTURE` |
 | `dbname` | No | Give the database its own rollup among the wallet's, found by this name (#61): several databases on one key. Names are compared exactly and must be unique per wallet: two files with the same name on one key are one database on chain (the second, if empty, rebuilds the first's data into itself). `{file}` = the file's base name without its directory (`a/x.db` and `b/x.db` are both `x.db`; `:memory:` is `memory`), so one `HPPLITE_PARAMS` serves every file `HPPLITE_FILES` names. A name no rollup has yet creates one (~2.5M gas): a misspelt name on a replica is a new, empty database, and the message says which names the wallet has. Also `HPPLITE_DBNAME` |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
@@ -653,7 +685,7 @@ soak running through a store too. Key roles and viewing keys moved to v0.4.
 | **v0.1** | Library + loadable extension on stock SQLite, crash-safe local file, reconstruction from L1, batches cut at the DA limit, root at checkpoint cadence, encrypted batches, one writer process | per-tenant / single-tenant, up to ~100 MB | on-chain (contract storage) |
 | v0.2 | Row capture by default (#19), validated on suites and real applications (WordPress, Ghost, Rails 8), several writers per file, `hpplite verify` (#5) | same | same |
 | v0.3 | Off-chain stores with L1 commitments (#11: pin service over x402, Kubo, S3), incremental (Merkle) state root (#9), batch compression (#12) | GB range | a store + L1 commitments |
-| v0.4 | Key roles and provisioning (#17), viewing keys and the public-key envelope (#15), an HPP-only node by relay (#126) | same | same |
+| v0.4 | Key roles and provisioning (#17), viewing keys and the public-key envelope (#15), page capture (#146: the pages each commit wrote, a Merkle root over the file's pages), an HPP-only node by relay (#126) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: the state root is a content hash, O(database size) per
