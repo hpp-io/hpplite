@@ -105,9 +105,10 @@ const char *hpplite_config_error(void) { return gConfigError[0] ? gConfigError :
 
 /* capture=rows|text, nothing else: a misspelling must not quietly choose (#80) */
 static void parse_capture(HppliteConfig *cfg, const char *val, int source) {
-    if (strcasecmp(val, "rows") == 0) cfg->captureText = 0;
-    else if (strcasecmp(val, "text") == 0) cfg->captureText = 1;
-    else { snprintf(gConfigError, sizeof(gConfigError), "capture=%.40s is neither rows nor text", val); return; }
+    if (strcasecmp(val, "rows") == 0) { cfg->captureText = 0; cfg->capturePages = 0; }
+    else if (strcasecmp(val, "text") == 0) { cfg->captureText = 1; cfg->capturePages = 0; }
+    else if (strcasecmp(val, "pages") == 0) { cfg->captureText = 0; cfg->capturePages = 1; }
+    else { snprintf(gConfigError, sizeof(gConfigError), "capture=%.40s is none of rows, text, pages", val); return; }
     cfg->captureSource = source;
 }
 

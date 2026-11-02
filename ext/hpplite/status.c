@@ -198,14 +198,14 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             sqlite3_result_int(ctx, hpplite_pending_count(node->ctx));
             break;
         case STATUS_COL_STATE_ROOT:
-            hpplite_get_state_root(node->ctx, root);
+            hpplite_node_get_state_root(node, root);
             statusResultHex(ctx, root);
             break;
         case STATUS_COL_PREV_BLOCK_HASH:
             statusResultHex(ctx, node->ctx->prevBlockHash);
             break;
-        case STATUS_COL_ROOT_VERSION:            /* how state_root is computed (#9) */
-            sqlite3_result_int(ctx, HPPLITE_ROOT_VERSION);
+        case STATUS_COL_ROOT_VERSION:            /* how state_root is computed (#9; 4: over pages, #146) */
+            sqlite3_result_int(ctx, node->pm ? 4 : HPPLITE_ROOT_VERSION);
             break;
         case STATUS_COL_CHAIN_HASH: {            /* the DA contract's rolling hash as this node tracks it (#33); NULL until known */
             static const unsigned char zero[32];
@@ -268,7 +268,7 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             sqlite3_result_int(ctx, node->follower ? 0 : 1);
             break;
         case STATUS_COL_CAPTURE:              /* what this connection logs: records or statements (#83) */
-            sqlite3_result_text(ctx, node->ctx->bRows ? "rows" : "text", -1, SQLITE_STATIC);
+            sqlite3_result_text(ctx, node->pm ? "pages" : node->ctx->bRows ? "rows" : "text", -1, SQLITE_STATIC);
             break;
         case STATUS_COL_FOREIGN_WRITES:       /* the file changed with no HPPLite write to show for it (#37) */
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nForeignWrites);

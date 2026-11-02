@@ -47,6 +47,7 @@ struct HppliteCtx {
   sqlite3 *db;                /* Application connection: trace + pending log */
   sqlite3 *bkDb;              /* Bookkeeping connection (== db for :memory:) */
   int bEnabled;               /* Tracking enabled flag */
+  int bPages;                 /* page mode (#146): no hooks on the application's connection, the bookkeeping in a sidecar */
   int bInternal;              /* Set while HPPLite runs its own statements */
   int bDbClosed;              /* db is a zombie: no SQLite calls on it any more */
   int bAppFlushing;           /* hpplite_flush() is running on the application thread */
@@ -233,6 +234,11 @@ int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx);
 /* ...for a connection that will capture rows: a SQLite whose sqlite3_expanded_sql()
 ** cuts bound values (better-sqlite3) is accepted, its text statements may bind nothing (#62) */
 int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture);
+/* Page mode (#146): the context for a connection whose commits the VFS captures; the
+** bookkeeping (meta, posted copies) in bkDb, a sidecar file; no hook on db */
+int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx);
+/* a page batch posted at height: the meta row advances, the posted copy is kept (#146) */
+int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *posted, size_t nPosted, const unsigned char *root);
 /* Batches the writer keeps as posted, to post again after a reorg (#49) */
 #define HPPLITE_POSTED_KEEP 32
 /* A statement cut into pieces (#59): what the flag adds to an entry, what an

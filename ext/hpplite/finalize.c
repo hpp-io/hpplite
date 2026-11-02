@@ -520,6 +520,52 @@ void hpplite_chain_hash_next(const unsigned char *pPrev, uint64_t height, const 
   hpplite_keccak256(buf, sizeof(buf), pOut);
 }
 
+/* Page mode (#146): a batch of pages posted at height. The block hash chains
+** the height, the previous hash and the root; the contract's rolling hash
+** advances by the posted bytes as for any batch; the meta row moves; the
+** posted copy is kept for a reorg. No log to prune, no trees. */
+int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *posted, size_t nPosted, const unsigned char *root) {
+  unsigned char blockHash[HPPLITE_HASH_SIZE], chainHash[HPPLITE_HASH_SIZE];
+  sqlite3_stmt *pStmt = NULL;
+  int rc, saved;
+  if (!pCtx || !root) return SQLITE_MISUSE;
+  if (height != pCtx->blockHeight) return SQLITE_MISMATCH;
+  { SHA256_CTX h; unsigned char tag[12] = { 'H', 'P', 'P', 'B' }; int i;
+    for (i = 0; i < 8; i++) tag[4 + i] = (unsigned char)(height >> (56 - 8 * i));
+    hpplite_sha256_init(&h); hpplite_sha256_update(&h, tag, 12); hpplite_sha256_update(&h, pCtx->prevBlockHash, HPPLITE_HASH_SIZE);
+    hpplite_sha256_update(&h, root, HPPLITE_HASH_SIZE); hpplite_sha256_final(&h, blockHash); }
+  if (posted && nPosted) { unsigned char k[HPPLITE_HASH_SIZE]; hpplite_keccak256(posted, nPosted, k); hpplite_chain_hash_next(pCtx->chainHash, height, k, chainHash); }
+  else memcpy(chainHash, pCtx->chainHash, HPPLITE_HASH_SIZE);
+  rc = hppliteBkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) return rc;
+  saved = hppliteBkEnter(pCtx);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, chain_hash=?3, state_root=?4, open_txn=0, frag_id=0, frag_off=0 WHERE id=1", -1, &pStmt, NULL);
+  if (rc == SQLITE_OK) {
+    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(height + 1));
+    sqlite3_bind_blob(pStmt, 2, blockHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(pStmt, 3, chainHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(pStmt, 4, root, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+    rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    sqlite3_finalize(pStmt);
+  }
+  if (rc == SQLITE_OK && posted && nPosted) {
+    rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_posted(height, data) VALUES(?1, ?2)", -1, &pStmt, NULL);
+    if (rc == SQLITE_OK) { sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height); sqlite3_bind_blob(pStmt, 2, posted, (int)nPosted, SQLITE_STATIC); rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR; sqlite3_finalize(pStmt); }
+    if (rc == SQLITE_OK) { rc = sqlite3_prepare_v2(pCtx->bkDb, "DELETE FROM _hpplite_posted WHERE height <= ?1", -1, &pStmt, NULL);
+      if (rc == SQLITE_OK) { sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height - HPPLITE_POSTED_KEEP); rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR; sqlite3_finalize(pStmt); } }
+  }
+  hppliteBkLeave(pCtx, saved);
+  TEST_FAIL_COMMIT(rc);
+  rc = hppliteBkEnd(pCtx, rc);
+  if (rc != SQLITE_OK) { hppliteLoadMeta(pCtx); return rc; }
+  pCtx->blockHeight = height + 1;
+  pCtx->openTxnId = 0; pCtx->fragId = 0; pCtx->fragOff = 0;
+  memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
+  memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
+  memcpy(pCtx->stateRoot, root, HPPLITE_HASH_SIZE);
+  return SQLITE_OK;
+}
+
 int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId) {
   int rc;
   if (!pCtx || !pBatch) return SQLITE_MISUSE;

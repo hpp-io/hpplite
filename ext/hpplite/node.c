@@ -17,6 +17,8 @@
 #include "hpplite_int.h"
 #include "store.h"
 #include "compress.h"
+#include "pagemode.h"
+#include "pages.h"
 #include "da_uri.h"
 #include "capture_rows.h"
 static void node_cap_batch_limit(HppliteNode *node);
@@ -136,6 +138,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.noCompress = config->noCompress;
     node->config.determinismWarn = config->determinismWarn;
     node->config.captureText = config->captureText;
+    node->config.capturePages = config->capturePages;
     node->config.localOnly = config->localOnly;
     node->config.verifyOnly = config->verifyOnly;
     /* the environment chooses for any node whose configuration did not say
@@ -282,6 +285,35 @@ static void node_detect_follower(HppliteNode *node) {
     if (hpplite_find_sequencer(resolved) || !node_take_file_lock(node)) node->follower = 1;
 }
 
+/* Page mode (#146): the application's connection gets no hook; the bookkeeping
+** lives in a sidecar file beside the database (<db>-hpplite.db); the VFS
+** hands the connection's commits to the page mode, started on the file as it
+** is after a checkpoint. */
+static int node_init_pages(HppliteNode *node, const char *zFile) {
+    char *zSide = sqlite3_mprintf("%s-hpplite.db", zFile);
+    char resolved[PATH_MAX];
+    int rc;
+    if (!zSide) return SQLITE_NOMEM;
+    hpplite_internal_open_begin();
+    rc = sqlite3_open_v2(zSide, &node->bkDb, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    hpplite_internal_open_end();
+    sqlite3_free(zSide);
+    if (rc != SQLITE_OK) { if (node->bkDb) sqlite3_close(node->bkDb); node->bkDb = NULL; return rc; }
+    sqlite3_busy_timeout(node->bkDb, 5000);
+    sqlite3_exec(node->bkDb, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    sqlite3_exec(node->bkDb, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
+    rc = hpplite_init_pages(node->db, node->bkDb, &node->ctx);
+    if (rc != SQLITE_OK) return rc;
+    node->ctx->bTrackRoots = node->config.verifyOnly;
+    if (node->config.dbName && node->config.dbName[0]) node->ctx->zDbName = sqlite3_mprintf("%s", node->config.dbName);
+    /* the file holds everything once checkpointed: the page mode reads it once */
+    sqlite3_exec(node->db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
+    if (!realpath(zFile, resolved)) snprintf(resolved, sizeof resolved, "%s", zFile);
+    node->pm = hpplite_pagemode_start(resolved);
+    if (!node->pm) { fprintf(stderr, "hpplite: page mode could not start on %s\n", zFile); return SQLITE_ERROR; }
+    return SQLITE_OK;
+}
+
 static int node_init_tracking(HppliteNode *node) {
     const char *zFile = sqlite3_db_filename(node->db, "main");
     int rc;
@@ -289,6 +321,7 @@ static int node_init_tracking(HppliteNode *node) {
     if (zFile && zFile[0]) {
         sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
         sqlite3_busy_timeout(node->db, 5000);
+        if (node->config.capturePages) return node_init_pages(node, zFile);
     }
 
     /* a SQLite that cuts bound values in expanded SQL serves row capture (#62) */
@@ -725,6 +758,7 @@ void hpplite_node_destroy(HppliteNode *node) {
 
     /* Shutdown HPPLite context */
     if (node->ctx) {
+        if (node->pm) { hpplite_pagemode_stop(node->pm); node->pm = NULL; }
         hpplite_shutdown(node->ctx);
     }
 
@@ -1300,6 +1334,58 @@ static void test_crash_point(const char *zName) {
 #define test_crash_point(zName) ((void)0)
 #endif
 
+/* Page mode (#146): a batch of pages from the queued commits, deflated and
+** sealed as any batch, posted, finalized in the sidecar. */
+static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes) {
+    HppliteCtx *ctx = node->ctx;
+    unsigned char *bytes = NULL, root[32];
+    size_t len = 0;
+    uint64_t height = ctx->blockHeight;
+    const uint8_t *payload; size_t payloadLen;
+    uint8_t *sealed = NULL, *packed = NULL, *framed = NULL;
+    uint8_t encoding = HPPLITE_ENCODING_NONE;
+    int rc, confirmed = 0;
+    rc = hpplite_pagemode_build(node->pm, maxBytes, &bytes, &len, root, pMore);
+    if (rc != SQLITE_OK) { if (rc != SQLITE_DONE) hpplite_error(ctx, "page batch %llu could not be built (rc=%d)", (unsigned long long)height, rc); return 0; }
+    payload = bytes; payloadLen = len;
+    if (!node->config.noCompress) {
+        size_t n = 0;
+        uint8_t *c = hpplite_deflate(payload, payloadLen, &n);
+        if (c && n + HPPLITE_PLAIN_MAGIC_LEN < payloadLen) { packed = c; payload = c; payloadLen = n; encoding = HPPLITE_ENCODING_DEFLATE; } else free(c);
+    }
+    if (node->cipher) {
+        sealed = hpplite_envelope_seal(node->cipher, node->encKey, height, encoding, payload, payloadLen, &payloadLen);
+        payload = sealed;
+    } else if (encoding == HPPLITE_ENCODING_DEFLATE) {
+        framed = malloc(HPPLITE_PLAIN_MAGIC_LEN + payloadLen);
+        if (framed) { memcpy(framed, HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN); memcpy(framed + HPPLITE_PLAIN_MAGIC_LEN, payload, payloadLen); payload = framed; payloadLen += HPPLITE_PLAIN_MAGIC_LEN; }
+    }
+    if (!payload) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); return 0; }
+    if (node->l1) {
+        char *txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
+        if (txHash) { confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1); if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash); if (confirmed && node->onBatchPosted) node->onBatchPosted(node->callbackArg, height, txHash); sqlite3_free(txHash); }
+    } else {
+        confirmed = 1;                          /* l1=local: finalized here, kept nowhere */
+    }
+    if (confirmed) rc = hppliteAdvanceMetaPages(ctx, height, node->l1 ? payload : NULL, node->l1 ? payloadLen : 0, root);
+    if (confirmed && rc == SQLITE_OK) {
+        hpplite_pagemode_finalized(node->pm);
+        node->batchesProduced++;
+        node->batchesSinceCheckpoint++;
+        node->failStreak = 0;
+        node->retryAt = 0;
+        hpplite_error_clear(ctx);
+    } else {
+        hpplite_pagemode_failed(node->pm);
+        if (!confirmed) { node->failStreak < 6 ? node->failStreak++ : 0; node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 0 ? node->config.batchIntervalMs : 5000); hpplite_error(ctx, "page batch %llu not confirmed on L1, kept pending", (unsigned long long)height); }
+        else hpplite_error(ctx, "page batch %llu could not be finalized (rc=%d)", (unsigned long long)height, rc);
+        height = 0;
+        *pMore = 0;
+    }
+    sqlite3_free(bytes); free(packed); free(sealed); free(framed);
+    return height;
+}
+
 static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     HppliteCtx *ctx = node->ctx;
     HppliteBatch *batch;
@@ -1346,6 +1432,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         *pMore = 0;
         return 0;
     }
+
+    if (node->pm) return node_flush_pages(node, pMore, maxBytes);
 
     batch = hpplite_build_batch_limited(ctx, maxBytes, withRoot, &maxId);
     if (!batch) return 0;
@@ -1786,7 +1874,8 @@ static void *node_timer_thread_func(void *arg) {
         int64_t now = node_current_time_ms();
         int64_t elapsed = now - node->lastFlushTime;
         int sizeTrigger = node->config.maxBatchBytes > 0 &&
-            hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2);
+            (node->pm ? hpplite_pagemode_pending_bytes(node->pm) >= node->config.maxBatchBytes / 2
+                      : hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2));
         node_checkpoint_wal(node, now);
 
         if (node->follower) {
@@ -2022,6 +2111,7 @@ int hpplite_node_exec(HppliteNode *node, const char *sql, char **errMsg) {
 */
 int hpplite_node_pending_count(HppliteNode *node) {
     if (!node || !node->ctx) return 0;
+    if (node->pm) return (int)hpplite_pagemode_pending(node->pm);
     return hpplite_pending_count(node->ctx);
 }
 
@@ -2217,6 +2307,7 @@ uint64_t hpplite_node_get_height(HppliteNode *node) {
 */
 void hpplite_node_get_state_root(HppliteNode *node, unsigned char *out) {
     if (!node || !node->ctx || !out) return;
+    if (node->pm) { hpplite_pagemode_root(node->pm, out); return; }
     hpplite_get_state_root(node->ctx, out);
 }
 

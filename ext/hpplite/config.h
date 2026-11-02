@@ -138,6 +138,7 @@ typedef struct HppliteConfig {
     int checkpointInterval;          /* Batches per checkpoint (0 = node default, 100) */
     int determinismWarn;             /* 1: only warn about non-deterministic SQL (default 0: refuse it) */
     int captureText;                 /* 1: capture statements, as v0.1 (default 0: rows, #19) */
+    int capturePages;                /* 1: capture pages through the VFS (#146); captureText is then 0 */
     int captureSource;               /* ...where from: 0 default, 1 environment, 2 URI (the URI wins, #80) */
     int localOnly;                   /* l1=local: finalize batches locally and keep no history (#38) */
     char *dbName;                    /* Its own rollup among the wallet's, by this name (#61);

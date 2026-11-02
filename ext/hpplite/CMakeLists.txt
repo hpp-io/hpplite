@@ -76,6 +76,7 @@ endif()
 set(HPPLITE_SOURCES
     hpplite.c
     pages.c
+    pagemode.c
     sha256.c
     state_hash.c
     capture.c
@@ -237,6 +238,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_vfs_capture hpplite_testlib)
         add_executable(test_pages tests/unit/test_pages.c)
         target_link_libraries(test_pages hpplite_testlib)
+        add_executable(test_pagemode tests/unit/test_pagemode.c)
+        target_link_libraries(test_pagemode hpplite_testlib)
         # the keystore fixtures, for the suites and their capture=text twins alike
         target_compile_definitions(test_keys PRIVATE HPPLITE_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
         target_compile_definitions(test_keystore PRIVATE HPPLITE_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
@@ -380,6 +383,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_keystore COMMAND test_keystore)
         add_test(NAME test_vfs_capture COMMAND test_vfs_capture)
         add_test(NAME test_pages COMMAND test_pages)
+        add_test(NAME test_pagemode COMMAND test_pagemode)
         add_test(NAME test_abuse COMMAND test_abuse)
         add_test(NAME test_foreign_keys COMMAND test_foreign_keys)
         add_test(NAME test_big_txn COMMAND test_big_txn)

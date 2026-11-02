@@ -378,7 +378,7 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
 static void rearmHooks(HppliteCtx *pCtx, int bClosing) {
   void *prevCommit, *prevRollback;
   int lost = 0;
-  if (!pCtx || pCtx->bDbClosed) return;
+  if (!pCtx || pCtx->bDbClosed || pCtx->bPages) return;      /* page mode: no hooks to re-arm */
   /* setting a hook returns the previous argument: not ours means replaced */
   prevCommit = sqlite3_commit_hook(pCtx->db, hppliteCommitHook, pCtx);
   prevRollback = sqlite3_rollback_hook(pCtx->db, hppliteRollbackHook, pCtx);
@@ -459,6 +459,29 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
   sqlite3_free(pCtx);
 }
 
+int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
+  HppliteCtx *pCtx = (HppliteCtx*)sqlite3_malloc(sizeof(HppliteCtx));
+  int rc = SQLITE_OK;
+  if (!pCtx) return SQLITE_NOMEM;
+  memset(pCtx, 0, sizeof(HppliteCtx));
+  gInitError = NULL;
+  pCtx->seenSchema = -1;
+  pCtx->db = db;
+  pCtx->bkDb = bkDb;
+  pCtx->bEnabled = 0;
+  pCtx->bPages = 1;
+  pCtx->vacuumFd = -1;
+  if (!bookkeepingIsCurrent(bkDb)) {
+    rc = hppliteInternalExec(pCtx, bkDb, HPPLITE_SCHEMA);
+    if (rc == SQLITE_OK) rc = hppliteTreeSchema(pCtx, bkDb);
+    if (rc != SQLITE_OK) { gInitError = "cannot create the bookkeeping tables in the sidecar"; sqlite3_free(pCtx); return rc; }
+  }
+  hppliteLoadMeta(pCtx);
+  pCtx->bRootDirty = 0;
+  *ppCtx = pCtx;
+  return SQLITE_OK;
+}
+
 int hpplite_set_bookkeeping_db(HppliteCtx *pCtx, sqlite3 *bkDb) {
   if (!pCtx) return SQLITE_MISUSE;
   pCtx->bkDb = bkDb ? bkDb : pCtx->db;
@@ -471,6 +494,7 @@ void hpplite_enable(HppliteCtx *pCtx, int bEnable) {
 
 void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut) {
   if (!pCtx || !pOut) return;
+  if (pCtx->bPages) { memcpy(pOut, pCtx->stateRoot, HPPLITE_HASH_SIZE); return; }   /* the page root, kept by the node (#146) */
   if (pCtx->bRootDirty) {
     /* the trees take the log in; a write transaction keeps what they took,
     ** a read one computes the root and keeps the work in memory for the
@@ -762,6 +786,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->noCompress = !cfg->compress;
     nc->determinismWarn = cfg->determinismWarn;
     nc->captureText = cfg->captureText;
+    nc->capturePages = cfg->capturePages;
     nc->captureSource = cfg->captureSource;
     nc->localOnly = cfg->localOnly;
     nc->verifyOnly = cfg->role == HPPLITE_CFG_ROLE_VERIFY;
