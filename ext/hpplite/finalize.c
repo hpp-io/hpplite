@@ -521,6 +521,18 @@ int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3
   int rc;
   if (!pCtx || !pBatch) return SQLITE_MISUSE;
   if (pBatch->height != pCtx->blockHeight) return SQLITE_MISMATCH;
+  /* The state trees take the log in here, before the gated transaction
+  ** (#141): hashing every record since the last flush is the long part of
+  ** a finalize, it reads only committed log rows, which never change, and it
+  ** writes nothing. Held under the gate it kept the application waiting for
+  ** the whole of it. hppliteAdvanceMeta() syncs again inside the transaction
+  ** and finds only what arrived meanwhile. */
+  {
+    int saved = hppliteBkEnter(pCtx);
+    rc = hppliteTreeSync(pCtx);
+    hppliteBkLeave(pCtx, saved);
+    if (rc != SQLITE_OK) return rc;
+  }
   rc = hppliteBkBegin(pCtx, 1);
   if (rc != SQLITE_OK) return rc;
   {

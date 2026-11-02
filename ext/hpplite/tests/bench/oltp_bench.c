@@ -15,7 +15,7 @@
 ** Usage: oltp_bench [--ext FILE] [--mode read_write|write_only|read_only]
 **                   [--skip-trx] [--tables N] [--rows M] [--seconds S]
 **                   [--dir DIR] [--seed S] [--label TEXT] [--json FILE]
-**                   [--uri "&param=value..."] [--hist]
+**                   [--uri "&param=value..."] [--hist] [--think MICROSECONDS]
 ** Not part of ctest; tools/bench_versions.sh runs it per tag.
 */
 #include "sqlite3.h"
@@ -36,9 +36,9 @@ typedef enum { MODE_RW, MODE_WO, MODE_RO } Mode;
 static struct {
     const char *ext, *dir, *label, *json, *uriExtra;
     Mode mode;
-    int skipTrx, tables, rows, seconds, hist;
+    int skipTrx, tables, rows, seconds, hist, busyPoll, thinkUs;
     uint64_t seed;
-} opt = { NULL, "/tmp/hpplite_oltp", "", NULL, "", MODE_RW, 0, 4, 10000, 10, 0, 42 };
+} opt = { NULL, "/tmp/hpplite_oltp", "", NULL, "", MODE_RW, 0, 4, 10000, 10, 0, 0, 0, 42 };
 
 static double now_ms(void) {
     struct timespec ts;
@@ -61,6 +61,8 @@ static void rnd_str(char *out, int groups) {
     }
     out[n] = 0;
 }
+
+static int busy_poll(void *arg, int n) { (void)arg; (void)n; usleep(200); return n < 50000; }
 
 static void die(const char *what, sqlite3 *db) {
     fprintf(stderr, "oltp_bench: %s: %s\n", what, db ? sqlite3_errmsg(db) : "?");
@@ -133,12 +135,14 @@ int main(int argc, char **argv) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--skip-trx")) { opt.skipTrx = 1; continue; }
         if (!strcmp(a, "--hist")) { opt.hist = 1; continue; }
+        if (!strcmp(a, "--busy-poll")) { opt.busyPoll = 1; continue; }
         if (!v) { fprintf(stderr, "oltp_bench: %s needs a value\n", a); return 2; }
         if (!strcmp(a, "--ext")) opt.ext = v;
         else if (!strcmp(a, "--dir")) opt.dir = v;
         else if (!strcmp(a, "--label")) opt.label = v;
         else if (!strcmp(a, "--json")) opt.json = v;
         else if (!strcmp(a, "--uri")) opt.uriExtra = v;
+        else if (!strcmp(a, "--think")) opt.thinkUs = atoi(v);
         else if (!strcmp(a, "--tables")) opt.tables = atoi(v);
         else if (!strcmp(a, "--rows")) opt.rows = atoi(v);
         else if (!strcmp(a, "--seconds")) opt.seconds = atoi(v);
@@ -177,6 +181,7 @@ int main(int argc, char **argv) {
     }
     if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) die("open", db);
     run(db, "PRAGMA journal_mode=WAL");
+    if (opt.busyPoll) sqlite3_busy_handler(db, busy_poll, NULL);   /* retry every 200 us instead of SQLite's growing sleeps */
 
     /* ---- prepare: tables, rows, index ---- */
     t0 = now_ms();
@@ -262,6 +267,7 @@ int main(int argc, char **argv) {
         sum += d;
         txns++;
         stmts += stmtsPerTxn;
+        if (opt.thinkUs > 0) usleep((useconds_t)opt.thinkUs);   /* an application does something between transactions */
     }
     t1 = now_ms();
     runMs = t1 - t0;

@@ -114,6 +114,8 @@ struct HppliteCtx {
   volatile int txnGate;       /* 0 free, 1 the application (a statement or transaction open), 2 a
                               ** bookkeeping write: its commit never lands inside the application's */
   int bBkGate;                /* this bookkeeping transaction took the gate */
+  volatile int bBkWantsGate;  /* a bookkeeping write is waiting: the application hands the gate over
+                              ** when it goes idle instead of freeing it (#141) */
   sqlite3_stmt *pSeqStmt;     /* Cached fingerprint of sqlite_sequence (NULL: none yet) */
   int seqTriedGen;            /* nDdlGen + 1 when sqlite_sequence was last found missing */
   int bClockPin;              /* The connection's VFS is the clock VFS: 'now' can be recorded and replayed */
@@ -452,6 +454,9 @@ extern long hpplite_test_rows_hashed;   /* rows read for a state root since the 
 /* called after a VACUUM released the file and before its marker is logged (#75): another connection's turn */
 extern void (*hpplite_test_before_vacuum_log)(void *pArg);
 extern void *hpplite_test_before_vacuum_log_arg;
+/* called as the state trees take in the first log row of a sync (#141) */
+extern void (*hpplite_test_in_tree_sync)(void *pArg);
+extern void *hpplite_test_in_tree_sync_arg;
 #endif
 
 /*

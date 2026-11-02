@@ -10,6 +10,7 @@
 
 #include "hpplite_int.h"
 #include <string.h>
+#include <unistd.h>
 #include <stdio.h>
 
 /*
@@ -17,7 +18,13 @@
 ** never touch the application's transaction. On the shared (:memory:)
 ** connection they are only possible while the application is in autocommit.
 */
+/* How long a bookkeeping write waits for the application to hand the gate
+** over: a few of its transactions, not a timer tick */
+#define HPPLITE_GATE_WAIT_US 20000
+
 int hppliteBkBegin(HppliteCtx *pCtx, int bWrite) {
+  int gated = bWrite && pCtx->bkDb != pCtx->db && !pCtx->bAppFlushing;
+  int acquired = 0;
   if (pCtx->bkDb == pCtx->db && !sqlite3_get_autocommit(pCtx->db)) {
     return SQLITE_BUSY;
   }
@@ -29,32 +36,50 @@ int hppliteBkBegin(HppliteCtx *pCtx, int bWrite) {
   ** does not commit while an application statement is being stepped; the
   ** batch stays on L1 unfinalized and is adopted by a later flush. The
   ** application's own hpplite_flush() is exempt: that statement is the
-  ** flush. */
-  if (bWrite && pCtx->bkDb != pCtx->db && !pCtx->bAppFlushing
-      && pCtx->nAppStmtActive > 0) {
-    return SQLITE_BUSY;
-  }
-  /* The same between statements of an application transaction: a read
+  ** flush.
+  **
+  ** The same between statements of an application transaction: a read
   ** snapshot taken before our commit cannot become a write after it, so the
   ** transaction's next write would fail with "database is locked" (Knex's
   ** deferred BEGIN, Django's atomic(): read, then write). Even the
-  ** application's own hpplite_flush() waits for its COMMIT. */
-  if (bWrite && pCtx->bkDb != pCtx->db && pCtx->bAppTxnOpen) {
-    return SQLITE_BUSY;
-  }
-  /* Only the call that takes the gate ever touches bBkGate, and only once
-  ** its BEGIN went through: a begin that fails inside a transaction already
-  ** open (the application thread asking for the state root while the timer
-  ** thread finalizes, #133) must leave the holder's release alone, or the
-  ** gate stays taken for good and every later statement spins on it. */
-  int acquired = 0;
-  if (bWrite && pCtx->bkDb != pCtx->db && !pCtx->bAppFlushing) {
+  ** application's own hpplite_flush() waits for its COMMIT.
+  **
+  ** With a bookkeeping connection of its own, the gate says all of that: the
+  ** application holds it from a statement's start until no statement runs
+  ** and no transaction is open. A write here takes the gate first and asks
+  ** the application's state after. Only the call that takes the gate ever
+  ** touches bBkGate, and only once its BEGIN went through: a begin that
+  ** fails inside a transaction already open (the application thread asking
+  ** for the state root while the timer thread finalizes, #133) must leave
+  ** the holder's release alone, or the gate stays taken for good and every
+  ** later statement spins on it. */
+  if (gated) {
     int expected = 0;
     if (!__atomic_compare_exchange_n(&pCtx->txnGate, &expected, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-      return SQLITE_BUSY;                 /* the application is between read and write (or the
-                                          ** gate is held: its holder's flag is not ours to clear) */
+      /* The application holds it. Ask for it and wait a little: it hands the
+      ** gate over the next time it goes idle, the end of its transaction
+      ** (#141); an application that never pauses between transactions would
+      ** otherwise never leave a window to take it in. One that stays inside
+      ** a transaction keeps it, and the batch is adopted by a later flush. */
+      int i;
+      __atomic_store_n(&pCtx->bBkWantsGate, 1, __ATOMIC_RELEASE);
+      for (i = 0; i < HPPLITE_GATE_WAIT_US / 200 && __atomic_load_n(&pCtx->txnGate, __ATOMIC_ACQUIRE) != 2; i++) {
+        expected = 0;
+        if (__atomic_compare_exchange_n(&pCtx->txnGate, &expected, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+        usleep(200);
+      }
+      __atomic_store_n(&pCtx->bBkWantsGate, 0, __ATOMIC_RELEASE);
+      if (__atomic_load_n(&pCtx->txnGate, __ATOMIC_ACQUIRE) != 2) {
+        return SQLITE_BUSY;               /* still the application's (or held by a holder whose
+                                          ** flag is not ours to clear) */
+      }
     }
     acquired = 1;
+  }
+  if (bWrite && pCtx->bkDb != pCtx->db
+      && ((!pCtx->bAppFlushing && pCtx->nAppStmtActive > 0) || pCtx->bAppTxnOpen)) {
+    if (acquired) __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
+    return SQLITE_BUSY;
   }
   pCtx->commitsDoneBefore = __atomic_load_n(&pCtx->nCommitDone, __ATOMIC_ACQUIRE);   /* before this look's snapshot (#37) */
   {

@@ -883,7 +883,10 @@ static void gateLeaveAppIfIdle(HppliteCtx *pCtx) {
   if (pCtx->bkDb == pCtx->db) return;
   if (pCtx->nAppStmtActive == 0 && sqlite3_get_autocommit(pCtx->db)
       && __atomic_load_n(&pCtx->txnGate, __ATOMIC_ACQUIRE) == 1) {
-    __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
+    /* a bookkeeping write waiting for this moment gets the gate now (#141):
+    ** an application that never pauses between transactions would
+    ** otherwise never leave it a window */
+    __atomic_store_n(&pCtx->txnGate, __atomic_load_n(&pCtx->bBkWantsGate, __ATOMIC_ACQUIRE) ? 2 : 0, __ATOMIC_RELEASE);
   }
 }
 

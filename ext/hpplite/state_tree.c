@@ -258,10 +258,13 @@ static void touchStatement(HppliteTree *T, const char *zSql) {
   if (gc) T->gc = 1;
 }
 
+void (*hpplite_test_in_tree_sync)(void *pArg) = NULL;
+void *hpplite_test_in_tree_sync_arg = NULL;
+
 int hppliteTreeSync(HppliteCtx *pCtx) {
   HppliteTree *T = treeOf(pCtx);
   sqlite3_stmt *q = NULL;
-  int rc, withRec = 1;
+  int rc, withRec = 1, first = 1;
   if (!T) return SQLITE_NOMEM;
   if ((rc = loadState(T)) != SQLITE_OK) return rc;
   rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT id, sql, op, tbl, rec FROM _hpplite_pending WHERE id > ?1 ORDER BY id", -1, &q, NULL);
@@ -273,6 +276,8 @@ int hppliteTreeSync(HppliteCtx *pCtx) {
   sqlite3_bind_int64(q, 1, T->seq);
   while ((rc = sqlite3_step(q)) == SQLITE_ROW) {
     sqlite3_int64 id = sqlite3_column_int64(q, 0);
+    if (first && hpplite_test_in_tree_sync) hpplite_test_in_tree_sync(hpplite_test_in_tree_sync_arg);
+    first = 0;
     const char *zSql = (const char *)sqlite3_column_text(q, 1);
     int op = withRec ? sqlite3_column_int(q, 2) : 0;
     if (withRec && op && sqlite3_column_type(q, 4) == SQLITE_BLOB) {
