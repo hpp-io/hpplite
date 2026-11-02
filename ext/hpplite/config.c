@@ -103,12 +103,13 @@ const char *hpplite_config_role_str(HppliteConfigRole role) {
 static char gConfigError[160];
 const char *hpplite_config_error(void) { return gConfigError[0] ? gConfigError : NULL; }
 
-/* capture=rows|text, nothing else: a misspelling must not quietly choose (#80) */
+/* capture=auto|rows|text|pages, nothing else: a misspelling must not quietly choose (#80) */
 static void parse_capture(HppliteConfig *cfg, const char *val, int source) {
-    if (strcasecmp(val, "rows") == 0) { cfg->captureText = 0; cfg->capturePages = 0; }
-    else if (strcasecmp(val, "text") == 0) { cfg->captureText = 1; cfg->capturePages = 0; }
-    else if (strcasecmp(val, "pages") == 0) { cfg->captureText = 0; cfg->capturePages = 1; }
-    else { snprintf(gConfigError, sizeof(gConfigError), "capture=%.40s is none of rows, text, pages", val); return; }
+    if (strcasecmp(val, "rows") == 0) { cfg->captureText = 0; cfg->capturePages = 0; cfg->captureAuto = 0; }
+    else if (strcasecmp(val, "text") == 0) { cfg->captureText = 1; cfg->capturePages = 0; cfg->captureAuto = 0; }
+    else if (strcasecmp(val, "pages") == 0) { cfg->captureText = 0; cfg->capturePages = 1; cfg->captureAuto = 0; }
+    else if (strcasecmp(val, "auto") == 0) { cfg->captureText = 0; cfg->capturePages = 0; cfg->captureAuto = 1; }
+    else { snprintf(gConfigError, sizeof(gConfigError), "capture=%.40s is none of auto, rows, text, pages", val); return; }
     cfg->captureSource = source;
 }
 
@@ -126,6 +127,7 @@ HppliteConfig *hpplite_config_create(void) {
     cfg->encrypt = 1;             /* everything posted is public otherwise */
     cfg->compress = 1;            /* smaller batches everywhere they go (#12) */
     cfg->storeFallback = 1;       /* a store that does not answer never holds a batch back (#11) */
+    cfg->captureAuto = 1;         /* pages for a new rollup, the history's mode for an existing one (#146) */
 
     return cfg;
 }

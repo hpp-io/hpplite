@@ -353,7 +353,7 @@ static void test_edge_sql_end_to_end(void) {
     TEST("edge-case SQL and full-size batches: posted on the real contract, replica root matches");
     /* compress=off: this is about batches cut at the DA limit, and the filler
     ** here deflates a thousandfold (#12 would post 200-byte batches) */
-    sqlite3 *w = open_db("e_writer.db", KEY2, "&compress=off");
+    sqlite3 *w = open_db("e_writer.db", KEY2, "&compress=off&capture=rows");      /* what row capture refuses and accepts: rows said */
     if (!w) FAIL("open writer");
     HppliteNode *nw = hpplite_get_node(w);
     if (!nw || !nw->l1 || !nw->ctx) FAIL("writer has no L1");
@@ -452,7 +452,7 @@ static void test_edge_sql_end_to_end(void) {
 ** rebuilt from the chain has all of it and the writer's root. */
 static void test_big_transaction_end_to_end(void) {
     TEST("a transaction larger than a batch spans batches on the real contract; replica root matches");
-    sqlite3 *w = open_db("b_writer.db", KEY3, NULL);
+    sqlite3 *w = open_db("b_writer.db", KEY3, "&capture=rows");                 /* open/cont marks are statements'; a commit cut into pieces: test_pagemode */
     if (!w) FAIL("open writer");
     HppliteNode *nw = hpplite_get_node(w);
     if (!nw || !nw->l1) FAIL("writer has no L1");
@@ -506,7 +506,7 @@ static void anvil_signal(const char *sig) {
 }
 static void test_l1_outage(void) {
     TEST("L1 frozen mid-session: writes stay fast, flush and close return, all posts after recovery");
-    sqlite3 *w = open_db("o_writer.db", KEY4, NULL);
+    sqlite3 *w = open_db("o_writer.db", KEY4, "&capture=rows");                 /* the pending count is rows' */
     if (!w) FAIL("open writer");
     sqlite3_exec(w, "CREATE TABLE o(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
     if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("first batch"); }
@@ -1019,7 +1019,7 @@ static void test_rpc_faults(void) {
     set_proxy_mode(modeFile, "");
     if (start_proxy(port, modeFile) != 0) { printf("SKIP (python3 or tests/l1/rpc_proxy.py not available) "); PASS(); return; }
     setenv("HPPLITE_RPC_TIMEOUT", "2", 1);                   /* read per request: a held answer costs 2 s, not 15 */
-    sqlite3 *w = open_db_at(proxyRpc, "rpc_writer.db", KEY8, "&interval=300ms");
+    sqlite3 *w = open_db_at(proxyRpc, "rpc_writer.db", KEY8, "&interval=300ms&capture=rows");   /* entries on the chain are rows' */
     if (!w) { kill_proxy(); unsetenv("HPPLITE_RPC_TIMEOUT"); FAIL("open through the proxy"); }
     HppliteNode *nw = hpplite_get_node(w);
     sqlite3_exec(w, "CREATE TABLE f(id INTEGER PRIMARY KEY, phase TEXT)", NULL, NULL, NULL);
@@ -1145,7 +1145,9 @@ static void test_power_loss(void) {
     kill(pid, SIGKILL); waitpid(pid, NULL, 0);
     if (txn < 40 || height < 4) FAILF("the writer did not get going (txn %ld, height %ld after 60 s)", txn, height);
     if (access(DIR "/pl.db-wal", F_OK) != 0) FAIL("no -wal beside the file: the test premise (WAL mode, a writer mid-flight) is gone");
-    (void)!system("cp " DIR "/pl.db " DIR "/pl_copy.db && cp " DIR "/pl.db-wal " DIR "/pl_copy.db-wal");
+    (void)!system("cp " DIR "/pl.db " DIR "/pl_copy.db && cp " DIR "/pl.db-wal " DIR "/pl_copy.db-wal"
+                  "; [ -f " DIR "/pl.db-hpplite.db ] && cp " DIR "/pl.db-hpplite.db " DIR "/pl_copy.db-hpplite.db"
+                  "; [ -f " DIR "/pl.db-hpplite.db-wal ] && cp " DIR "/pl.db-hpplite.db-wal " DIR "/pl_copy.db-hpplite.db-wal; true");   /* page mode's sidecar as it lies too (#146) */
     chain_sleep(400);                                       /* the dead process's lease runs out */
 
     sqlite3 *c = open_db("pl_copy.db", KEY9, NULL);
@@ -1165,7 +1167,7 @@ static void test_power_loss(void) {
     if (torn != 0) { sqlite3_close(c); FAIL("a transaction is in the file in part"); }
     if ((uint64_t)hCopy != last + 1) { sqlite3_close(c); FAIL("the copy's height is not right behind the chain after open"); }
     if (scalar(c, "SELECT foreign_writes FROM hpplite_status") != 0) { sqlite3_close(c); FAIL("the copy counts its own rows as foreign writes"); }
-    if (pend % 3 != 0) { sqlite3_close(c); FAIL("the pending log holds part of a transaction"); }
+    if (pend % 3 != 0 && strcmp(status_text(c, "capture"), "pages") != 0) { sqlite3_close(c); FAIL("the pending log holds part of a transaction"); }   /* page capture counts commits (and the file shipped whole), not rows */
     /* it continues: what was pending and a new transaction post; a replica equals the file */
     if (sqlite3_exec(c, "BEGIN; INSERT INTO p VALUES(100000, 1); INSERT INTO p VALUES(100000, 2); INSERT INTO p VALUES(100000, 3); COMMIT", NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(c); FAIL("a write on the copy"); }
     if (scalar(c, "SELECT hpplite_flush()") <= 0) { sqlite3_close(c); FAIL("the copy does not post"); }
@@ -1853,7 +1855,7 @@ static int anvil_signer_sign(void *arg, const unsigned char hash[32], unsigned c
 static void test_signer_posts(void) {
     TEST("a signer instead of a key (#17): on the rollup's contract, the lease and the batch are signed through the callback, the batch sealed with a key given apart");
     char contract[80], uri[1024];
-    sqlite3 *w = open_db("sg_owner.db", KEY0, "&dbname=signed");          /* the rollup exists, made with the key */
+    sqlite3 *w = open_db("sg_owner.db", KEY0, "&dbname=signed&capture=rows");          /* the rollup exists, made with the key; rows: a signer's key given apart cannot open page history, and page mode cannot sequence past a batch it cannot read */
     if (!w) FAIL("open owner");
     snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
     sqlite3_close(w);                                                      /* its lease released */
@@ -1864,7 +1866,7 @@ static void test_signer_posts(void) {
     hpplite_hex_to_bytes(KEY0, raw, 32);
     if (hpplite_crypto_keypair_from_privkey(ts.c, &ts.kp, raw) != 0) FAIL("keypair");
     signer.sign = anvil_signer_sign; signer.arg = &ts; memcpy(signer.address, ts.kp.address, 20);
-    snprintf(uri, sizeof uri, "file:" DIR "/sg_signer.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&datadir=" DIR "&interval=0", RPC, contract);
+    snprintf(uri, sizeof uri, "file:" DIR "/sg_signer.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&datadir=" DIR "&interval=0&capture=rows", RPC, contract);
     sqlite3 *s = NULL;
     if (sqlite3_open_v2(uri, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(s); FAIL("open on the contract without a key"); }
     HppliteNode *n = hpplite_get_node(s);

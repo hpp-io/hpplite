@@ -104,7 +104,10 @@ int main(void) {
         for (int i = 0; i < HPPLITE_HASH_SIZE; i++) {
             if (root[i] != 0) { allZero = 0; break; }
         }
-        if (getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "pages") == 0) allZero = 1;
+        { sqlite3_stmt *q = NULL; const char *cap = NULL;       /* page capture (the default on a new rollup): the root is the file's, a fresh file has its first page */
+          if (sqlite3_prepare_v2(db, "SELECT capture FROM hpplite_status", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) cap = (const char *)sqlite3_column_text(q, 0);
+          if (cap && strcmp(cap, "pages") == 0) allZero = 1;
+          sqlite3_finalize(q); }
         if (!allZero) FAIL("initial state root not zero");
 
         hpplite_close(db);
@@ -115,7 +118,7 @@ int main(void) {
     /* Test 5: State root changes after INSERT */
     tests++;
     TEST("State root changes after INSERT");
-    if (getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "pages") == 0) { printf("skipped (page capture: the root is the posted file's, not the content's)\n"); passed++; } else {
+    if (!(getenv("HPPLITE_CAPTURE") && (strcasecmp(getenv("HPPLITE_CAPTURE"), "rows") == 0 || strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0))) { printf("skipped (page capture, the default: the root is the posted file's, not the content's)\n"); passed++; } else {
         unlink("/tmp/test_simple_open.db");
         const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);

@@ -102,7 +102,7 @@ static void test_truncating_sqlite_rows(void) {
     sqlite3_stmt *st = NULL;
     char longv[301];
     memset(longv, 'x', 300); longv[300] = 0;
-    int rc = sqlite3_open_v2("file:" DIR "/trunc_rows.db?hpplite=on&privkey=" KEY "&datadir=" DIR, &db,
+    int rc = sqlite3_open_v2("file:" DIR "/trunc_rows.db?hpplite=on&capture=rows&privkey=" KEY "&datadir=" DIR, &db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     int created = 0, bound = 0, ftsRefused = 0, ftsLiteral = 0;
     long long recBytes = -1;

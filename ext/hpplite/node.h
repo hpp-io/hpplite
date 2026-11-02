@@ -73,6 +73,7 @@ typedef struct HppliteNodeConfig {
     int captureText;                /* Capture statements, as v0.1 (default 0: rows, #19) */
     int capturePages;               /* Capture pages through the VFS (#146) */
     int captureSource;              /* ...2 when a URI said so: HPPLITE_CAPTURE does not override it (#80) */
+    int captureAuto;                /* no capture given: pages for a new rollup, the history's mode for an existing one (#146) */
     int localOnly;                  /* l1=local: finalize batches locally, keep no history (#38) */
     int verifyOnly;                 /* role=verify: rebuild and compare, never post, claim or create (#5) */
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */

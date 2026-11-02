@@ -70,7 +70,7 @@ from any language whose SQLite binding can load extensions.
 - **Rebuild and check** - an empty file with the same key reconstructs from
   the chain and compares every posted state root along the way
 
-### Page capture (`capture=pages`, v0.4, #146)
+### Page capture (`capture=pages`, the default for new rollups since v0.4, #146)
 
 The capture above records *what* each write changed and replays it. Page
 capture records *which pages* each commit wrote, as Litestream and LiteFS
@@ -160,7 +160,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `compress` | No | `on` (default): the batch JSON is deflated before it is sealed or posted when that shrinks it, five to twelve times for SQL and row records (#12); `off`: posted as is. Every reader takes both forms, and batches from before stay readable. Also `HPPLITE_COMPRESS` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
-| `capture` | No | `rows` (default): log what each write changed (#19, below); `text`: log each write statement, as v0.1; `pages`: the database pages each commit wrote (#146, see Page capture). Also `HPPLITE_CAPTURE` |
+| `capture` | No | `auto` (default): `pages` for a new rollup, and for a file or a rollup whose history is already rows or statements, that; `pages`: the database pages each commit wrote (#146, see Page capture); `rows`: log what each write changed (#19, below); `text`: log each write statement, as v0.1. Also `HPPLITE_CAPTURE` |
 | `dbname` | No | Give the database its own rollup among the wallet's, found by this name (#61): several databases on one key. Names are compared exactly and must be unique per wallet: two files with the same name on one key are one database on chain (the second, if empty, rebuilds the first's data into itself). `{file}` = the file's base name without its directory (`a/x.db` and `b/x.db` are both `x.db`; `:memory:` is `memory`), so one `HPPLITE_PARAMS` serves every file `HPPLITE_FILES` names. A name no rollup has yet creates one (~2.5M gas): a misspelt name on a replica is a new, empty database, and the message says which names the wallet has. Also `HPPLITE_DBNAME` |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.

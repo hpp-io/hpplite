@@ -31,8 +31,8 @@ c.commit()
 # 300 inserted, 42 updated (id % 7 = 0), and the CREATE TABLE
 cap = os.environ.get("HPPLITE_CAPTURE", "").lower()
 pending = c.execute("SELECT pending FROM hpplite_status").fetchone()[0]
-if cap == "pages":
-    assert pending in (3, 4), pending       # three commits, and the file as opened when it had a page (#146)
+if cap in ("pages", "", "auto"):
+    assert pending in (3, 4), pending       # three commits, and the file as opened when it had a page (#146): the default
 else:
     assert pending == (302 if cap == "text" else 343), pending
 h = c.execute("SELECT hpplite_flush()").fetchone()[0]       # the last height posted (40 KB batches: maybe 2)

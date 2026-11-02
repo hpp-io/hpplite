@@ -538,6 +538,71 @@ static void test_death_between_pieces(void) {
 #endif
 }
 
+/* capture=auto, the default (#146): a new rollup is pages; a file that
+** carries HPPLite's tables keeps rows; a fresh file on a rollup whose
+** history is statements switches to rows at its sync */
+static void test_capture_auto(void) {
+    TEST("capture=auto: a new rollup is pages, a file with the log keeps rows, a fresh file on a statement history switches to rows");
+    if (getenv("HPPLITE_CAPTURE")) { printf("SKIP (HPPLITE_CAPTURE says %s: nothing is automatic) ", getenv("HPPLITE_CAPTURE")); PASS(); return; }
+    reset_dir();
+    HppliteL1 *rowsL1 = hpplite_l1_create_mock(), *pagesL1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    char cap[16];
+    /* a rows history, made with capture=rows said */
+    memset(&config, 0, sizeof config);
+    config.nodeId = "rw"; config.dataDir = DIR; config.dbPath = DIR "/auto_rows.db"; config.noEncrypt = 1; config.noCompress = 1;
+    for (int i = 0; i < 32; i++) config.privkey[i] = (unsigned char)(i + 1);
+    config.hasPrivkey = 1;
+    HppliteNode *w = hpplite_node_create(&config);
+    if (!w) FAIL("open the rows writer");
+    hpplite_node_set_l1(w, rowsL1); hpplite_node_sync_from_l1(w, 1); hpplite_node_start(w);
+    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) != 1) FAIL("rows flush");
+    text_of(w->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
+    if (strcmp(cap, "rows") != 0) FAILF("capture=rows said, status says %s", cap);
+    hpplite_node_destroy(w);
+    /* the same file again, nothing said: the log in the file keeps rows */
+    config.captureAuto = 1;
+    w = hpplite_node_create(&config);
+    if (!w) FAIL("reopen the rows file");
+    hpplite_node_set_l1(w, rowsL1); hpplite_node_sync_from_l1(w, 1); hpplite_node_start(w);
+    text_of(w->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
+    if (strcmp(cap, "rows") != 0 || w->pm) FAILF("a file with the log, nothing said: status says %s", cap);
+    hpplite_node_destroy(w);
+    /* a fresh file on that history, nothing said: pages first, rows at the sync */
+    config.nodeId = "rr"; config.dbPath = DIR "/auto_rows_replica.db";
+    HppliteNode *r = hpplite_node_create(&config);
+    if (!r) FAIL("open the replica");
+    hpplite_node_set_l1(r, rowsL1); hpplite_node_sync_from_l1(r, 1); hpplite_node_start(r);
+    text_of(r->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
+    long long rows = scalar(r->db, "SELECT count(*) FROM t");
+    int err = r->state == HPPLITE_STATE_ERROR;
+    printf("(replica of a statement history: capture %s, %lld rows%s%s) ", cap, rows, err ? ", error: " : "", err ? r->ctx->zLastError : "");
+    hpplite_node_destroy(r);
+    if (err || strcmp(cap, "rows") != 0 || rows != 1) FAIL("a fresh file on a statement history should switch to rows and replay");
+    /* a new rollup, nothing said: pages */
+    config.nodeId = "np"; config.dbPath = DIR "/auto_new.db";
+    HppliteNode *n = hpplite_node_create(&config);
+    if (!n) FAIL("open on a new rollup");
+    hpplite_node_set_l1(n, pagesL1); hpplite_node_sync_from_l1(n, 1); hpplite_node_start(n);
+    hpplite_node_exec(n, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(n) != 1) FAIL("pages flush");
+    text_of(n->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
+    if (strcmp(cap, "pages") != 0 || !n->pm) FAILF("a new rollup, nothing said: status says %s", cap);
+    hpplite_node_destroy(n);
+    /* a fresh file on the page history, nothing said: pages */
+    config.nodeId = "nr"; config.dbPath = DIR "/auto_new_replica.db";
+    r = hpplite_node_create(&config);
+    if (!r) FAIL("open the page replica");
+    hpplite_node_set_l1(r, pagesL1); hpplite_node_sync_from_l1(r, 1); hpplite_node_start(r);
+    text_of(r->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
+    rows = scalar(r->db, "SELECT count(*) FROM t");
+    hpplite_node_destroy(r);
+    hpplite_l1_disconnect(rowsL1); hpplite_l1_disconnect(pagesL1);
+    if (strcmp(cap, "pages") != 0 || rows != 1) FAILF("a fresh file on a page history: capture %s, %lld rows", cap, rows);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -557,6 +622,7 @@ int main(void) {
     test_fresh_plain_node_reads_the_applied_pages();
     test_commit_over_the_limit_is_cut_into_pieces();
     test_death_between_pieces();
+    test_capture_auto();
     remove_dir();
     return test_report();
 }

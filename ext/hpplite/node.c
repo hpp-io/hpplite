@@ -28,6 +28,8 @@ static void node_ck_open(HppliteNode *node);
 static void node_ck_close(HppliteNode *node);
 static void node_pins_close(HppliteNode *node);
 static void node_wal_maintenance(void *pArg);
+static int node_switch_to_rows(HppliteNode *node);
+static int node_check_rollup(HppliteNode *node);
 static void node_checkpoint_wal(HppliteNode *node, int64_t now);
 #include "da_uri.h"
 #include "capture_rows.h"
@@ -149,16 +151,18 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.determinismWarn = config->determinismWarn;
     node->config.captureText = config->captureText;
     node->config.capturePages = config->capturePages;
+    node->config.captureAuto = config->captureAuto && !config->capturePages && !config->captureText;
     node->config.localOnly = config->localOnly;
     node->config.verifyOnly = config->verifyOnly;
     /* the environment chooses for any node whose configuration did not say
     ** (every suite runs in both modes); a URI's capture= stands (#80) */
     if (getenv("HPPLITE_CAPTURE") && config->captureSource < 2) {
         const char *z = getenv("HPPLITE_CAPTURE");
-        if (strcasecmp(z, "text") == 0) { node->config.captureText = 1; node->config.capturePages = 0; }
-        else if (strcasecmp(z, "rows") == 0) { node->config.captureText = 0; node->config.capturePages = 0; }
-        else if (strcasecmp(z, "pages") == 0) { node->config.captureText = 0; node->config.capturePages = 1; }
-        else fprintf(stderr, "hpplite: HPPLITE_CAPTURE=%s is none of rows, text, pages; ignored\n", z);
+        if (strcasecmp(z, "text") == 0) { node->config.captureText = 1; node->config.capturePages = 0; node->config.captureAuto = 0; }
+        else if (strcasecmp(z, "rows") == 0) { node->config.captureText = 0; node->config.capturePages = 0; node->config.captureAuto = 0; }
+        else if (strcasecmp(z, "pages") == 0) { node->config.captureText = 0; node->config.capturePages = 1; node->config.captureAuto = 0; }
+        else if (strcasecmp(z, "auto") == 0) { node->config.captureText = 0; node->config.capturePages = 0; node->config.captureAuto = 1; }
+        else fprintf(stderr, "hpplite: HPPLITE_CAPTURE=%s is none of auto, rows, text, pages; ignored\n", z);
     }
 
     /* Generate unique instance ID (a file's sequencer replaces it with the
@@ -322,7 +326,15 @@ static int node_init_pages(HppliteNode *node, const char *zFile) {
     rc = hpplite_init_pages(node->db, node->bkDb, &node->ctx);
     if (rc != SQLITE_OK) return rc;
     node->ctx->bTrackRoots = node->config.verifyOnly;
-    if (node->config.dbName && node->config.dbName[0]) node->ctx->zDbName = sqlite3_mprintf("%s", node->config.dbName);
+    if (node->config.dbName && node->config.dbName[0]) {
+        /* {file}: the file's own name, as the row path reads it (#61) */
+        if (strcmp(node->config.dbName, "{file}") == 0) {
+            const char *slash = strrchr(zFile, '/');
+            node->ctx->zDbName = sqlite3_mprintf("%s", slash ? slash + 1 : zFile);
+        } else {
+            node->ctx->zDbName = sqlite3_mprintf("%s", node->config.dbName);
+        }
+    }
     (void)resolved;
     if (node->config.verifyOnly) {
         /* a replica: pages are written into its file under an exclusive lock and
@@ -387,15 +399,10 @@ static int node_start_pages(HppliteNode *node, const char *zFile) {
     return SQLITE_OK;
 }
 
-static int node_init_tracking(HppliteNode *node) {
-    const char *zFile = sqlite3_db_filename(node->db, "main");
+/* Row or text capture on the application's connection: the hooks, the
+** bookkeeping tables in the file, a bookkeeping connection of its own */
+static int node_init_rows(HppliteNode *node, const char *zFile) {
     int rc;
-
-    if (zFile && zFile[0] && node->config.capturePages) {
-        sqlite3_busy_timeout(node->db, 5000);
-        rc = node_init_pages(node, zFile);
-        if (rc != SQLITE_OK) return rc;
-    } else {
     if (zFile && zFile[0]) {
         sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
         sqlite3_busy_timeout(node->db, 5000);
@@ -443,7 +450,29 @@ static int node_init_tracking(HppliteNode *node) {
             hpplite_set_bookkeeping_db(node->ctx, node->bkDb);
         }
     }
-    }   /* row or text capture */
+    return SQLITE_OK;
+}
+
+/* capture=auto (the default, #146): a file that carries HPPLite's tables
+** keeps row or text capture; any other starts in page mode, and switches
+** to rows at the sync if the rollup's history turns out to be statements */
+static int node_file_has_log(sqlite3 *db) {
+    return sqlite3_table_column_metadata(db, "main", "_hpplite_meta", "next_height", NULL, NULL, NULL, NULL, NULL) == SQLITE_OK;
+}
+
+static int node_init_tracking(HppliteNode *node) {
+    const char *zFile = sqlite3_db_filename(node->db, "main");
+    int rc;
+
+    if (node->config.captureAuto && zFile && zFile[0]) node->config.capturePages = !node_file_has_log(node->db);
+    if (zFile && zFile[0] && node->config.capturePages) {
+        sqlite3_busy_timeout(node->db, 5000);
+        rc = node_init_pages(node, zFile);
+        if (rc != SQLITE_OK) return rc;
+    } else {
+        rc = node_init_rows(node, zFile);
+        if (rc != SQLITE_OK) return rc;
+    }
 
     node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
     memcpy(node->lastCheckpointRoot, node->ctx->lastCheckpointRoot, HPPLITE_HASH_SIZE);
@@ -459,6 +488,34 @@ static int node_init_tracking(HppliteNode *node) {
         rc = node_start_pages(node, zFile);
         if (rc != SQLITE_OK) return rc;
     }
+    return SQLITE_OK;
+}
+
+/* capture=auto: the page mode let go, the sidecar removed, row capture set
+** up on the same connection (the rollup's history is statements) */
+static int node_switch_to_rows(HppliteNode *node) {
+    const char *zFile = sqlite3_db_filename(node->db, "main");
+    char *zSide;
+    int rc;
+    if (!zFile || !zFile[0]) return SQLITE_MISUSE;
+    if (node->pm) { hpplite_pagemode_stop(node->pm); node->pm = NULL; }
+    if (node->pieceDb) { sqlite3_exec(node->pieceDb, "ROLLBACK", NULL, NULL, NULL); sqlite3_close(node->pieceDb); node->pieceDb = NULL; }
+    node_ck_close(node);
+    node_pins_close(node);
+    if (node->ctx) { hpplite_shutdown(node->ctx); node->ctx = NULL; }
+    if (node->bkDb) { sqlite3_close(node->bkDb); node->bkDb = NULL; }
+    zSide = sqlite3_mprintf("%s-hpplite.db", zFile);
+    if (zSide) { unlink(zSide); sqlite3_free(zSide); }
+    node->config.capturePages = 0;
+    node->pagesSnapshotDecided = 0; node->pagesWalSuspended = 0;
+    rc = node_init_rows(node, zFile);
+    if (rc != SQLITE_OK) return rc;
+    node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
+    memcpy(node->lastCheckpointRoot, node->ctx->lastCheckpointRoot, HPPLITE_HASH_SIZE);
+    node->batchesSinceCheckpoint = 0;
+    node_set_stmt_limit(node);
+    node_check_rollup(node);                        /* the fresh context bound to the rollup */
+    fprintf(stderr, "hpplite: the rollup's history is statements: row capture on %s (capture=auto)\n", zFile);
     return SQLITE_OK;
 }
 
@@ -2159,6 +2216,12 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
             }
             node->state = HPPLITE_STATE_ERROR;
             return synced ? synced : -1;
+        }
+        if (!batch->bPages && node->pm && node->config.captureAuto && batch->height == 1 && hpplite_pagemode_captured(node->pm) == 0) {
+            /* capture=auto on a file that started in page mode, and the rollup's
+            ** history is statements: the node switches to rows here, before
+            ** anything of its own was captured, and goes on replaying */
+            if (node_switch_to_rows(node) != SQLITE_OK) { hpplite_batch_free(batch); node->state = HPPLITE_STATE_ERROR; return -1; }
         }
         if (batch->bPages) {
             /* a page batch: applied to the file (a replica), or adopted (the sequencer's own) */
