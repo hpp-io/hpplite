@@ -20,6 +20,7 @@
 ** HPPLITE_SOAK_SECONDS is set (the nightly soak workflow).
 */
 #include "test_lib.h"
+#include "envelope_pk.h"
 #include "l1_interface.h"
 #include "eth/eth_client.h"
 #include "batch.h"
@@ -1928,6 +1929,53 @@ static void test_owner_names_sequencer(void) {
     PASS();
 }
 
+/* 25. A reader with a viewing key (#15): the writer grants its public key,
+** posts; a replica opened on the contract with viewkey= alone, no wallet,
+** rebuilds and equals the writer; a key never granted stops at batch 1. */
+static void test_viewing_key_reads(void) {
+    TEST("a viewing key (#15): granted by the writer, a replica with viewkey= alone rebuilds from the chain; a key never granted is refused");
+    char contract[80], uri[1024], sql[200], pubHex[70];
+    unsigned char priv[32], pub[33];
+    const char *keyR = KEY5, *keyX = KEY6;
+    hpplite_hex_to_bytes(keyR, priv, 32);
+    if (hpplite_pk_pubkey(priv, pub) != 0) FAIL("pubkey");
+    pubHex[0] = '0'; pubHex[1] = 'x'; hpplite_bytes_to_hex(pub, 33, pubHex + 2);
+    sqlite3 *w = open_db("vk_writer.db", KEY0, "&dbname=viewing");
+    if (!w) FAIL("open writer");
+    snprintf(sql, sizeof sql, "SELECT hpplite_grant('%s')", pubHex);
+    if (scalar(w, sql) != 1) { sqlite3_close(w); FAIL("grant"); }
+    sqlite3_exec(w, "CREATE TABLE vk(x); INSERT INTO vk VALUES('for the reader')", NULL, NULL, NULL);
+    long long h1 = scalar(w, "SELECT hpplite_flush()");
+    sqlite3_exec(w, "INSERT INTO vk VALUES('and this')", NULL, NULL, NULL);
+    long long h2 = scalar(w, "SELECT hpplite_flush()");
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    long long readers = status_int(w, "readers");
+    sqlite3_close(w);
+    snprintf(uri, sizeof uri, "file:" DIR "/vk_reader.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&viewkey=%s&role=verify&datadir=" DIR "&interval=0", RPC, contract, keyR);
+    sqlite3 *r = NULL;
+    long long rows = -1;
+    char state[40] = "";
+    if (sqlite3_open_v2(uri, &r, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+        rows = count_rows(r, "vk");
+        snprintf(state, sizeof state, "%s", status_text(r, "state"));
+    }
+    sqlite3_close(r);
+    snprintf(uri, sizeof uri, "file:" DIR "/vk_other.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&viewkey=%s&role=verify&datadir=" DIR "&interval=0", RPC, contract, keyX);
+    sqlite3 *x = NULL;
+    long long rowsX = -1;
+    char errX[200] = "";
+    if (sqlite3_open_v2(uri, &x, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+        rowsX = count_rows(x, "vk");
+        snprintf(errX, sizeof errX, "%s", status_text(x, "last_error"));
+    }
+    sqlite3_close(x);
+    printf("(writer: batches %lld %lld, readers %lld; reader: rows %lld, state %s; other key: rows %lld, '%.60s') ", h1, h2, readers, rows, state, rowsX, errX);
+    if (h1 != 1 || h2 != 2 || readers != 1) FAIL("the writer posts two batches with one reader");
+    if (rows != 2) FAIL("the reader with viewkey= alone should rebuild both batches");
+    if (rowsX != -1 || !strstr(errX, "sealed")) FAIL("a key never granted should be refused at batch 1");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -1963,6 +2011,7 @@ int main(void) {
     if (wanted(22)) test_key_after_open();
     if (wanted(23)) test_signer_posts();
     if (wanted(24)) test_owner_names_sequencer();
+    if (wanted(25)) test_viewing_key_reads();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

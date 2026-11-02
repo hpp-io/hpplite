@@ -46,6 +46,8 @@ typedef struct HppliteNodeConfig {
     char *nodeId;                   /* Human-readable node ID */
     unsigned char privkey[32];      /* Node's private key */
     int hasPrivkey;                 /* Whether privkey is set */
+    unsigned char viewkey[32];      /* A viewing key (#15): opens batches sealed to its public key; signs nothing */
+    int hasViewKey;
 
     /* Paths */
     char *dataDir;                  /* Data directory */
@@ -125,6 +127,13 @@ typedef struct HppliteNode {
     const HppliteCipher *cipher;
     unsigned char encKey[HPPLITE_CIPHER_KEY_SIZE];
     int hasEncKey;
+    unsigned char viewKey[32];      /* a reader's own key (#15) */
+    int hasViewKey;
+    uint8_t *aReaders;              /* the readers granted (#15): 33-byte compressed public keys, from _hpplite_readers */
+    int nReaders;
+    int readersLoaded;              /* ...0: read them again before the next seal (a grant or revoke happened) */
+    uint8_t seriesDek[32];          /* the data key of the batch series in progress (#15) */
+    int seriesDekValid;
     int warnedNoKey;                /* "no key, not posting" said once */
     int wantsL1;                    /* Config named an L1 (contract/factory): local-only flush is not OK */
     char lastBatchTx[80];           /* Transaction hash of the last confirmed batch (status table) */
@@ -300,6 +309,11 @@ void hpplite_node_set_l1(HppliteNode *node, HppliteL1 *l1);
 ** key, or name contract=. */
 int hpplite_node_set_signer(HppliteNode *node, const HppliteSigner *signer);   /* 0; -1; -2 keyed already */
 int hpplite_node_set_batch_key(HppliteNode *node, const unsigned char key[32]);  /* the 256-bit batch cipher key as is */
+
+/* A viewing key (#15): opens batches sealed to its public key; the node signs and posts nothing with it */
+int hpplite_node_set_view_key(HppliteNode *node, const unsigned char privkey[32]);
+/* The readers granted: a grant or revoke happened, read them again before the next seal */
+void hpplite_node_readers_changed(HppliteNode *node);
 
 /* The key given after open (#17): the node signs, seals and pays with it from
 ** here on; a chain the configuration named but could not be reached without

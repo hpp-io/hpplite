@@ -13,6 +13,8 @@
 */
 
 #include "node.h"
+#include "envelope_pk.h"
+#include "hpplite_int.h"
 #include "store.h"
 #include "compress.h"
 #include "da_uri.h"
@@ -100,6 +102,9 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.nodeId = node_strdup(config->nodeId);
     memcpy(node->config.privkey, config->privkey, 32);
     node->config.hasPrivkey = config->hasPrivkey;
+    memcpy(node->config.viewkey, config->viewkey, 32);
+    node->config.hasViewKey = config->hasViewKey;
+    if (config->hasViewKey) { memcpy(node->viewKey, config->viewkey, 32); node->hasViewKey = 1; }
     node->config.dataDir = node_strdup(config->dataDir);
     node->config.dbPath = node_strdup(config->dbPath);
     node->config.dbName = node_strdup(config->dbName);
@@ -191,12 +196,19 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
 */
 /* Tell the capture path how long a statement may be: what fits in one DA
 ** batch after the envelope and the JSON framing. */
+/* What the envelope adds: the symmetric one, or the public-key one when readers are granted (#15) */
+static size_t node_envelope_overhead(HppliteNode *node) {
+    if (!node->cipher) return 0;
+    if (node->nReaders > 0 && node->config.hasPrivkey) return hpplite_envelope_pk_overhead(node->cipher, node->nReaders + 1);
+    return hpplite_envelope_overhead(node->cipher);
+}
+
 static void node_set_stmt_limit(HppliteNode *node) {
     size_t limit = node->config.maxBatchBytes;
     if (!node->ctx) return;
     if (limit > 0) {
         size_t overhead = hpplite_batch_json_overhead();
-        if (node->cipher) overhead += hpplite_envelope_overhead(node->cipher);
+        if (node->cipher) overhead += node_envelope_overhead(node);
         /* capture compares the statement's JSON-escaped size (what is posted)
         ** against this, the same arithmetic the batch builder uses */
         limit = limit > overhead ? (limit - overhead) : 1;
@@ -335,6 +347,7 @@ static void node_learn_batch_limit(HppliteNode *node);
 ** Auto-connect to L1 and sync state.
 */
 static int node_ensure_lease(HppliteNode *node);
+static void node_load_readers(HppliteNode *node);
 
 static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
                                        const uint8_t *data, size_t dataLen);
@@ -749,6 +762,9 @@ void hpplite_node_destroy(HppliteNode *node) {
     sqlite3_free(node->config.dbPath);
     sqlite3_free(node->config.dbName);
     sqlite3_free(node->config.storeUrl);
+    free(node->aReaders);
+    memset(node->viewKey, 0, sizeof node->viewKey);
+    memset(node->seriesDek, 0, sizeof node->seriesDek);
     sqlite3_free(node->config.rpcUrl);
     sqlite3_free(node->canonicalPath);
     if (node->flushMutex) {
@@ -860,7 +876,38 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
     HppliteBatch *batch = NULL;
     node->lastFetchForeign = 0;
     if (!data || dataLen == 0) return NULL;
-    if (hpplite_envelope_is_sealed(data, dataLen)) {
+    if (hpplite_envelope_is_pk(data, dataLen)) {
+        /* sealed to readers' public keys (#15): the wallet's key or a viewing key opens it */
+        uint8_t *plain = NULL;
+        size_t plainLen = 0;
+        int foreign = 0, encoding;
+        if (node->config.hasPrivkey) plain = hpplite_envelope_open_pk(node->config.privkey, height, data, dataLen, &plainLen, &foreign, NULL);
+        if (!plain && node->hasViewKey) plain = hpplite_envelope_open_pk(node->viewKey, height, data, dataLen, &plainLen, &foreign, NULL);
+        if (!plain) {
+            /* the wallet is always among its own batches' readers, so one it is not among was
+            ** posted by another sequencer: foreign, skipped (#39). A viewing key alone proves
+            ** nothing of the kind: revoked or never granted, it stops here. */
+            node->lastFetchForeign = node->config.hasPrivkey ? foreign : 0;
+            hpplite_error(node->ctx, "batch %llu: %s", (unsigned long long)height,
+                    (node->config.hasPrivkey || node->hasViewKey)
+                        ? "sealed to readers this key is not among (revoked, or posted by another sequencer)"
+                        : "sealed to readers' keys and this node has none (privkey= or viewkey=)");
+            return NULL;
+        }
+        encoding = hpplite_envelope_pk_encoding(data, dataLen);
+        if (encoding == HPPLITE_ENCODING_DEFLATE) {
+            uint8_t *inflated = hpplite_inflate(plain, plainLen, NULL);
+            free(plain);
+            if (!inflated) { hpplite_error(node->ctx, "batch %llu: sealed and compressed, but the compressed bytes do not inflate", (unsigned long long)height); return NULL; }
+            plain = inflated;
+        } else if (encoding != HPPLITE_ENCODING_NONE) {
+            free(plain);
+            hpplite_error(node->ctx, "batch %llu uses encoding %d, which this version does not know", (unsigned long long)height, encoding);
+            return NULL;
+        }
+        batch = hpplite_batch_from_json((const char *)plain);
+        free(plain);
+    } else if (hpplite_envelope_is_sealed(data, dataLen)) {
         const HppliteCipher *scheme = NULL;
         uint8_t *plain;
         if (!node->hasEncKey) {
@@ -1263,7 +1310,9 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     /* The DA limit applies to the posted bytes: leave room for the envelope */
     size_t maxBytes = node->config.maxBatchBytes;
     if (node->cipher && maxBytes > 0) {
-        size_t overhead = hpplite_envelope_overhead(node->cipher);
+        size_t overhead;
+        if (!node->readersLoaded) node_load_readers(node);         /* the readers decide the envelope, the envelope the budget (#15) */
+        overhead = node_envelope_overhead(node);
         maxBytes = maxBytes > overhead ? maxBytes - overhead : 1;
     }
     if (!node->l1 && node->wantsL1) {
@@ -1346,7 +1395,21 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                     free(c);
                 }
             }
-            if (node->cipher) {
+            if (node->cipher && node->nReaders > 0 && node->config.hasPrivkey) {
+                /* readers besides the wallet (#15): sealed to every one of them and to
+                ** the wallet, under the series' data key */
+                uint8_t *aTo = malloc((size_t)(node->nReaders + 1) * 33);
+                if (aTo) {
+                    memcpy(aTo, node->keypair.pubkey, 33);
+                    memcpy(aTo + 33, node->aReaders, (size_t)node->nReaders * 33);
+                    if (!node->seriesDekValid) { hpplite_random_bytes(node->seriesDek, 32); node->seriesDekValid = 1; }
+                    sealed = hpplite_envelope_seal_pk(node->cipher, node->seriesDek, aTo, node->nReaders + 1, height,
+                                                      encoding, payload, payloadLen, &payloadLen);
+                    free(aTo);
+                    if (!batch->partial) node->seriesDekValid = 0;       /* the series ends with this batch: a new key next */
+                }
+                payload = sealed;
+            } else if (node->cipher) {
                 sealed = hpplite_envelope_seal(node->cipher, node->encKey, height,
                                                encoding, payload, payloadLen, &payloadLen);
                 payload = sealed;
@@ -1952,6 +2015,44 @@ void hpplite_node_set_l1(HppliteNode *node, HppliteL1 *l1) {
         hpplite_l1_set_signer(l1, node->signer.sign, node->signer.arg, node->signer.address);
     }
     node_learn_batch_limit(node);
+}
+
+int hpplite_node_set_view_key(HppliteNode *node, const unsigned char privkey[32]) {
+    uint8_t pub[33];
+    if (!node || !privkey || hpplite_pk_pubkey(privkey, pub) != 0) return -1;
+    memcpy(node->viewKey, privkey, 32);
+    node->hasViewKey = 1;
+    return 0;
+}
+
+void hpplite_node_readers_changed(HppliteNode *node) {
+    if (node) node->readersLoaded = 0;
+}
+
+/* The readers granted, from _hpplite_readers (#15); the wallet itself comes first */
+static void node_load_readers(HppliteNode *node) {
+    sqlite3 *db = node->ctx ? (node->ctx->bkDb ? node->ctx->bkDb : node->db) : NULL;
+    sqlite3_stmt *q = NULL;
+    int saved;
+    if (!db) return;
+    free(node->aReaders);
+    node->aReaders = NULL;
+    node->nReaders = 0;
+    saved = hppliteBkEnter(node->ctx);
+    if (sqlite3_prepare_v2(db, "SELECT pubkey FROM _hpplite_readers ORDER BY pubkey", -1, &q, NULL) == SQLITE_OK) {
+        while (sqlite3_step(q) == SQLITE_ROW) {
+            if (sqlite3_column_bytes(q, 0) != 33 || node->nReaders >= HPPLITE_PK_MAX_RECIPIENTS - 1) continue;
+            uint8_t *grown = realloc(node->aReaders, (size_t)(node->nReaders + 1) * 33);
+            if (!grown) break;
+            node->aReaders = grown;
+            memcpy(node->aReaders + 33 * node->nReaders, sqlite3_column_blob(q, 0), 33);
+            node->nReaders++;
+        }
+    }
+    sqlite3_finalize(q);
+    hppliteBkLeave(node->ctx, saved);
+    node->readersLoaded = 1;
+    node_set_stmt_limit(node);                     /* the envelope grew or shrank with them */
 }
 
 int hpplite_node_set_batch_key(HppliteNode *node, const unsigned char key[32]) {

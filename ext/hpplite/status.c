@@ -79,6 +79,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_STORE_CALLS      30     /* puts and gets that succeeded */
 #define STATUS_COL_STORE_PRICE      31     /* what the provider charges for a put of the last batch's size; NULL when free */
 #define STATUS_COL_STORE_BALANCE    32     /* the wallet's balance of the store's asset on the chain; NULL when not readable */
+#define STATUS_COL_READERS          33     /* readers granted besides the wallet (#15) */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -93,7 +94,8 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
         " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
-        " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER)");
+        " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
+        " readers INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -319,6 +321,16 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             size_t n = node->store ? hpplite_store_last_bytes(node->store) : 0;
             if (n && hpplite_store_payment(node->store, NULL, NULL, &perByte, &perPin) == 0)
                 sqlite3_result_int64(ctx, (sqlite3_int64)(perPin + perByte * (uint64_t)n));
+            break;
+        }
+        case STATUS_COL_READERS: {
+            sqlite3_stmt *q = NULL;
+            sqlite3 *bk = node->ctx->bkDb ? node->ctx->bkDb : node->ctx->db;
+            int saved = hppliteBkEnter(node->ctx);
+            if (sqlite3_prepare_v2(bk, "SELECT count(*) FROM _hpplite_readers", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
+                sqlite3_result_int(ctx, sqlite3_column_int(q, 0));
+            sqlite3_finalize(q);
+            hppliteBkLeave(node->ctx, saved);
             break;
         }
         case STATUS_COL_STORE_BALANCE: {

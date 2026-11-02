@@ -60,6 +60,11 @@ static const char *HPPLITE_SCHEMA =
   "  now INTEGER NOT NULL DEFAULT 0,"
   "  frag INTEGER NOT NULL DEFAULT 0"
   ");"
+  /* the readers batches are sealed to besides the wallet (#15): compressed public keys */
+  "CREATE TABLE IF NOT EXISTS _hpplite_readers("
+  "  pubkey BLOB PRIMARY KEY,"
+  "  added_height INTEGER NOT NULL DEFAULT 0"
+  ") WITHOUT ROWID;"
   "CREATE TABLE IF NOT EXISTS _hpplite_pending("
   "  id INTEGER PRIMARY KEY,"
   "  txn INTEGER NOT NULL,"
@@ -199,6 +204,7 @@ static int bookkeepingIsCurrent(sqlite3 *db) {
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_carry') WHERE name IN ('now','frag')) = 2"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_posted'))"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_tree'))"
+    "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_readers'))"
     "   AND EXISTS(SELECT 1 FROM _hpplite_meta WHERE id = 1)";
   sqlite3_stmt *q = NULL;
   int ok = 0;
@@ -532,6 +538,7 @@ void hpplite_get_prev_block_hash(HppliteCtx *pCtx, unsigned char *pOut) {
 
 #include "config.h"
 #include "keystore.h"
+#include "envelope_pk.h"
 #include "crypto.h"
 #include "batch.h"
 #include "l1_interface.h"
@@ -609,6 +616,9 @@ static void hpplite_keyfile_func(sqlite3_context *ctx, int argc, sqlite3_value *
 static void hpplite_keystore_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_batch_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_set_sequencer_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_grant_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_revoke_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_viewkey_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 
 
 /*
@@ -670,6 +680,9 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_batch_key_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_set_sequencer", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
                             hpplite_set_sequencer_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_grant", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, hpplite_grant_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_revoke", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, hpplite_revoke_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_viewkey", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, hpplite_viewkey_func, NULL, NULL);
     hppliteStatusRegister(db);
 }
 
@@ -727,6 +740,8 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->rpcUrl = cfg->rpcUrl ? strdup(cfg->rpcUrl) : NULL;
     memcpy(nc->privkey, cfg->privkey, 32);
     nc->hasPrivkey = cfg->hasPrivkey;
+    memcpy(nc->viewkey, cfg->viewkey, 32);
+    nc->hasViewKey = cfg->hasViewKey;
     memcpy(nc->factory, cfg->factory, 20);
     nc->hasFactory = cfg->hasFactory;
     memcpy(nc->contract, cfg->contract, 20);
@@ -924,6 +939,50 @@ static void hpplite_key_func(sqlite3_context *ctx, int argc, sqlite3_value **arg
     keyGiven(ctx, &cfg, "hpplite_key");
     memset(&cfg, 0, sizeof cfg);
 }
+/* SELECT hpplite_grant('0x<33-byte compressed public key>') / hpplite_revoke (#15): the
+** readers the next batch series is sealed to, besides the wallet. A grant covers what is
+** posted from here on; history stays as it was sealed. 1, or an error. */
+static void readerChange(sqlite3_context *ctx, int argc, sqlite3_value **argv, int bGrant) {
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = hppliteFindNode(db);
+    const char *z = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+    unsigned char pub[33];
+    char *sql, hex[67];
+    int rc;
+    if (!node || !node->ctx) { sqlite3_result_error(ctx, "hpplite is not on this connection", -1); return; }
+    if (!z || hpplite_hex_to_bytes(z, pub, 33) != 33 || (pub[0] != 2 && pub[0] != 3)) {
+        sqlite3_result_error(ctx, "a reader is a 33-byte compressed secp256k1 public key in hex (02... or 03...)", -1);
+        return;
+    }
+    hpplite_bytes_to_hex(pub, 33, hex);
+    sql = sqlite3_mprintf(bGrant ? "INSERT OR IGNORE INTO _hpplite_readers(pubkey, added_height) VALUES(x'%s', %llu)"
+                                 : "DELETE FROM _hpplite_readers WHERE pubkey = x'%s'",
+                          hex, (unsigned long long)hpplite_get_block_height(node->ctx));
+    if (!sql) { sqlite3_result_error_nomem(ctx); return; }
+    rc = hppliteInternalExec(node->ctx, db, sql);
+    sqlite3_free(sql);
+    if (rc != SQLITE_OK) { sqlite3_result_error(ctx, bGrant ? "hpplite_grant: not recorded" : "hpplite_revoke: not recorded", -1); return; }
+    hpplite_node_readers_changed(node);
+    sqlite3_result_int(ctx, 1);
+}
+static void hpplite_grant_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) { readerChange(ctx, argc, argv, 1); }
+static void hpplite_revoke_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) { readerChange(ctx, argc, argv, 0); }
+
+/* SELECT hpplite_viewkey('0x...') (#15): a viewing key given after open */
+static void hpplite_viewkey_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = hppliteFindNode(db);
+    const char *z = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+    unsigned char key[32];
+    if (!node) { sqlite3_result_error(ctx, "hpplite is not on this connection", -1); return; }
+    if (!z || hpplite_hex_to_bytes(z, key, 32) != 32 || hpplite_node_set_view_key(node, key) != 0) {
+        sqlite3_result_error(ctx, "hpplite_viewkey: not a 32-byte secp256k1 private key in hex", -1);
+        return;
+    }
+    memset(key, 0, sizeof key);
+    sqlite3_result_int(ctx, 1);
+}
+
 /* SELECT hpplite_set_sequencer('0x...') (#17): the owner names the wallet that may hold
 ** the lease and post, the hot key apart from the owner's; the running lease expires.
 ** The transaction's hash. Only the owner's transaction goes through. */

@@ -202,6 +202,12 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         hpplite_config_load_keystore(cfg, val, NULL);
     }
 
+    /* Viewing key (#15) */
+    val = getenv(HPPLITE_ENV_VIEWKEY);
+    if (val) {
+        hpplite_config_parse_viewkey(cfg, val);
+    }
+
     /* Data dir */
     val = getenv(HPPLITE_ENV_DATA_DIR);
     if (val) {
@@ -431,6 +437,11 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         hpplite_config_load_keystore(cfg, buf, NULL);
     }
 
+    /* Viewing key (#15) */
+    if (get_uri_param(uri, HPPLITE_URI_VIEWKEY, buf, sizeof(buf))) {
+        hpplite_config_parse_viewkey(cfg, buf);
+    }
+
     /* Data dir */
     if (get_uri_param(uri, HPPLITE_URI_DATA_DIR, buf, sizeof(buf))) {
         free(cfg->dataDir);
@@ -590,6 +601,12 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
         hpplite_config_load_keystore(cfg, val, NULL);
     }
 
+    /* Viewing key (#15) */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_VIEWKEY);
+    if (val) {
+        hpplite_config_parse_viewkey(cfg, val);
+    }
+
     /* Data dir */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DATA_DIR);
     if (val) {
@@ -718,6 +735,12 @@ int hpplite_config_load_keystore(HppliteConfig *cfg, const char *path, const cha
     }
     cfg->hasPrivkey = 1;
     return 0;
+}
+
+int hpplite_config_parse_viewkey(HppliteConfig *cfg, const char *hex) {
+    if (!cfg || !hex) return -1;
+    if (hex_to_bytes(hex, cfg->viewkey, 32) == 0) { cfg->hasViewKey = 1; return 0; }
+    return -1;
 }
 
 int hpplite_config_parse_privkey(HppliteConfig *cfg, const char *hex) {

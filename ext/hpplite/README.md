@@ -807,6 +807,7 @@ HPPLite before open, in order of precedence:
 | `privkey=0x...` in the URI | **development only**: SQLite keeps the query string next to the filename, so anyone with the `sqlite3*` can read it back via `sqlite3_uri_parameter()`, and URIs end up in logs |
 | `keystore=/path.json` or `HPPLITE_KEYSTORE`, passphrase in `HPPLITE_KEYSTORE_PASSWORD`; or `SELECT hpplite_keystore('/path.json', 'passphrase')` after open | **an Ethereum keystore V3 file** (#17): what `cast wallet new`, geth and MetaMask exports write; scrypt or PBKDF2-SHA256, AES-128-CTR, the Keccak MAC checked before anything is used (a wrong passphrase is refused as such). Vendored, like the batch cipher. |
 | `hpplite_node_set_signer()` (C API) with `SELECT hpplite_batch_key('0x...')` | **the sequencer key in a KMS or HSM** (#17): a callback signs the lease, batch and checkpoint transactions, the key never in the process; the batch cipher key cannot be derived from it, so it is given apart (32 bytes), or `encrypt=off`. A signer creates no rollup (create it once with the key, or name `contract=`) and pays no store. |
+| `viewkey=0x...`, `HPPLITE_VIEW_KEY`, or `SELECT hpplite_viewkey('0x...')` after open | **a reader's viewing key** (#15): a secp256k1 private key whose public key the writer granted; opens batches sealed to it, rebuilds and verifies, signs nothing. See Privacy. |
 | `SELECT hpplite_key('0x...')` or `hpplite_keyfile('/path')` after open | **applications that hold keys themselves** (#17): the SQLite-extension idiom, nothing in the URI or the environment. Until then the connection captures and posts nothing; with the call the node is keyed, a chain named at open is connected and its rollup resolved, the lease taken, and the next flush posts. The same file rules as `keyfile=`. A different key while keyed is refused (rotation is not this). |
 
 Without a key the database works and keeps capturing, but nothing is posted
@@ -836,10 +837,26 @@ verification work from the same `privkey=`. Each batch is sealed with a fresh
 nonce and bound to its height. `SELECT encryption FROM hpplite_status` shows
 the active scheme; schemes are pluggable (`cipher.h`).
 
-What stays public on L1: heights, batch sizes and timing, batch hashes, and
-the state roots in checkpoints (content hashes that reveal *when* content
-changed, not what). Only key holders can replay and verify; sharing read
-access without the wallet key is the public-key scheme planned for v0.2.
+**Readers and viewing keys** (#15): `SELECT hpplite_grant('0x<33-byte
+compressed public key>')` on the writer names a reader; from the next batch
+series on, batches are sealed to the wallet and to every reader (envelope
+`HPE3`: one random data key per series seals the payload, wrapped once per
+recipient with an ephemeral secp256k1 key, ECDH and HKDF-SHA256; recipients
+are named by a 4-byte fingerprint of their key). A reader opens them with
+its own private key alone, `viewkey=0x...` (or `HPPLITE_VIEW_KEY`, or
+`SELECT hpplite_viewkey('0x...')` after open), and can rebuild and verify
+with `role=verify` but never sign, post or claim: read without the power to
+act. `hpplite_revoke()` ends it at the next series; history stays as it was
+sealed, readable by whoever could read it, and a reader granted later cannot
+read what came before (sealed under the symmetric key). The wallet is always
+a recipient, so `privkey=` alone still rebuilds everything.
+`hpplite_status.readers` counts them. A node whose key lives in a signer
+(#17) seals with its batch key and no readers.
+
+What stays public on L1: heights, batch sizes and timing, batch hashes, the
+state roots in checkpoints (content hashes that reveal *when* content
+changed, not what), and, with readers, how many there are and their
+fingerprints.
 
 ## Durability
 

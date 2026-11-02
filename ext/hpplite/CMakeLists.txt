@@ -90,6 +90,7 @@ set(HPPLITE_SOURCES
     config.c
     cipher.c
     keystore.c
+    envelope_pk.c
     clock.c
     # Web3 integration (eth/ subdirectory)
     eth/cJSON.c
@@ -205,6 +206,10 @@ if(HPPLITE_BUILD_TESTS)
 
     add_executable(test_cipher tests/unit/test_cipher.c)
     target_link_libraries(test_cipher hpplite_testlib)
+    add_executable(test_envelope_pk tests/unit/test_envelope_pk.c)
+    target_link_libraries(test_envelope_pk hpplite_testlib)
+    add_executable(test_readers tests/unit/test_readers.c)
+    target_link_libraries(test_readers hpplite_testlib)
 
     # Tests that use mock L1 - only build when not using real L1
     if(NOT HPPLITE_USE_REAL_L1)
@@ -312,6 +317,8 @@ if(HPPLITE_BUILD_TESTS)
     add_test(NAME test_l1_dir COMMAND test_l1_dir $<TARGET_FILE:hpplite-verify>)
     add_test(NAME test_simple_open COMMAND test_simple_open)
     add_test(NAME test_cipher COMMAND test_cipher)
+    add_test(NAME test_envelope_pk COMMAND test_envelope_pk)
+    add_test(NAME test_readers COMMAND test_readers)
     add_test(NAME test_keccak COMMAND test_keccak)
     add_test(NAME test_rlp COMMAND test_rlp)
     add_test(NAME test_abi COMMAND test_abi)
