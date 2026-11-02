@@ -304,6 +304,8 @@ export HPPLITE_PRIVATE_KEY=0x...
 
 # Microbenchmark (write overhead, flush, replay, root hash); see doc/performance.md
 make bench
+# sysbench-style OLTP through the loadable extension, per version (#140); see doc/performance.md
+sh tools/bench_versions.sh
 
 # Stress: 100 MB through encryption, DA chunking, checkpoints with roots, reconstruction
 make stress            # ./stress_hpplite [--mb N] [--checkpoint N] [--limit BYTES]

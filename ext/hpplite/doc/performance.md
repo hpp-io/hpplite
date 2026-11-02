@@ -100,3 +100,92 @@ showed that SQL-text replay cannot reproduce non-deterministic statements
   (only autocommit failures rolled it back). Capture now removes rows of
   statements with no effect; replay skips statements that fail.
 - The default build was unoptimized; CMake now defaults to Release.
+
+## OLTP benchmark per version (2026-11-02, #140)
+
+`tests/bench/oltp_bench.c` is sysbench's `oltp_*` workload against a plain
+SQLite connection with a loadable extension loaded first, so one harness
+measures every version of HPPLite through its public surface.
+`tools/bench_versions.sh` builds each tag's `hpplite.dylib` in a worktree and
+runs the matrix. Four tables of 10 000 rows (`id`, `k` indexed, `c` 120
+chars, `pad` 60), one writer, WAL, Release, 10 s per run, median of three.
+Every tag is on SQLite 3.54.1, so the differences are HPPLite's. The database
+is opened with `l1=local` (no chain, no network); the default 5 s timer flush
+runs during the measurement, as it would in production. Same machine as
+above. "plain" is the same binary with no extension loaded.
+
+read_write, one transaction each (18 statements: 14 reads, 4 writes):
+
+| version | tps | stmt/s | p50 ms | p95 ms | p99 ms | max ms | batches | flush ms | db MB |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| plain | 4472 | 80501 | 0.187 | 0.208 | 0.247 | 7.1 | 0 | 0 | 7.9 |
+| v0.1.0 | 3692 | 66463 | 0.210 | 0.249 | 0.406 | 9.2 | 112 | 655 | 25.6 |
+| v0.1.1 | 3677 | 66187 | 0.211 | 0.250 | 0.440 | 9.4 | 118 | 640 | 25.3 |
+| v0.2.0 | 3815 | 68669 | 0.204 | 0.242 | 0.289 | 9.4 | 2 | 6448 | 24.5 |
+| v0.3.0 | 3814 | 68648 | 0.205 | 0.242 | 0.290 | 9.6 | 0 | 11277 | 34.5 |
+| tip (c0f39b70c0) | 3812 | 68608 | 0.205 | 0.243 | 0.296 | 9.4 | 0 | 11250 | 34.5 |
+
+write_only, one transaction each (index update, non-index update, delete + insert):
+
+| version | tps | stmt/s | p50 ms | p95 ms | p99 ms | max ms | batches | flush ms | db MB |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| plain | 7836 | 31346 | 0.091 | 0.114 | 0.143 | 9.8 | 0 | 0 | 8.0 |
+| v0.1.0 | 5321 | 21286 | 0.127 | 0.165 | 0.239 | 9.6 | 156 | 1033 | 33.4 |
+| v0.1.1 | 5267 | 21066 | 0.128 | 0.167 | 0.241 | 9.2 | 162 | 1018 | 32.9 |
+| v0.2.0 | 5672 | 22687 | 0.118 | 0.155 | 0.190 | 10.7 | 1 | 13618 | 32.6 |
+| v0.3.0 | 3362 | 13446 | 0.119 | 0.156 | 0.191 | 5749.4 | 1 | 10046 | 38.7 |
+| tip | 3368 | 13471 | 0.119 | 0.155 | 0.191 | 5829.1 | 1 | 9733 | 39.0 |
+
+read_write, autocommit (each statement its own transaction):
+
+| version | tps | stmt/s | p50 ms | p95 ms | p99 ms | max ms | batches | flush ms |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| plain | 2890 | 52022 | 0.307 | 0.337 | 0.381 | 8.1 | 0 | 0 |
+| v0.1.0 | 2315 | 41665 | 0.361 | 0.402 | 5.860 | 8.3 | 78 | 372 |
+| v0.2.0 | 2330 | 41932 | 0.363 | 0.401 | 5.762 | 7.2 | 1 | 2495 |
+| v0.3.0 | 2007 | 36127 | 0.364 | 0.401 | 5.731 | 1364.3 | 1 | 3776 |
+| tip | 1758 | 31644 | 0.364 | 0.401 | 5.761 | 1435.4 | 1 | 1792 |
+
+read_only, one transaction each (14 reads): plain 11 213 tps, every HPPLite
+version 12 600-12 700 tps, p99 0.09 ms. Reads cost nothing; the extension's
+build is in fact 12% faster, reproducibly (re-run plain and tip back to back:
+11 114 vs 12 532). Not explained; the bookkeeping connection keeping the WAL
+index open is the suspect.
+
+What the numbers say:
+
+- **Per-statement write overhead is small and has not moved since v0.2.**
+  Transactions of 18 statements run at 85% of plain SQLite's rate, p99 0.29
+  vs 0.25 ms. Write-only transactions run at 72%. v0.1 was a few percent
+  slower per statement (the per-statement function check #53 and the
+  O(n) size cut #57 came with v0.2).
+- **Since the per-table trees (#9, v0.3), the timer flush stalls the writer
+  for as long as the flush takes.** write_only max latency went from 10 ms
+  (v0.2.0) to 5.7 s (v0.3.0), and throughput fell 40% over a 10 s run
+  because the writer sat out one flush. `git bisect` on the write_only run
+  (max latency < 1 s = good) names ce866fb75a. v0.1 posted as it went (150
+  small batches during the run, 10 ms max); v0.2 flushed once but did not
+  hold the writer. The flush's bookkeeping transaction holds the transaction
+  gate while `hppliteTreeSync` takes the log in. Issue #141.
+- **A flush moves 17 000-19 000 captured rows per second** (v0.2.0: 226 000
+  rows in 13.6 s; tip: 194 000 in 9.7 s), far below the 330 000 stmt/s single
+  batch of the v0.1 table above: the DA size cut (#57) makes ~100 batches per
+  flush, and `sample` shows both halves of each batch (building it in
+  `hpplite_build_batch_limited`, finalizing it in `hpplite_finalize_batch`)
+  in `sqlite3_step` walking the pending log with `pread` underneath, so each
+  batch re-reads log pages that the bookkeeping connection's page cache no
+  longer holds. Compression and encryption are not where the time goes
+  (`compress=off` and `encrypt=off` change the flush rate by less than the
+  run-to-run spread). Issue #142.
+- **The 5.8 ms p99 in autocommit is SQLite's WAL auto-checkpoint, not
+  HPPLite.** The plain run has the same 5-7 ms outliers (59 of 8 355
+  statements in a 2 s run); with the extension each write also inserts its
+  log row, the checkpoint comes twice as often, and the outliers cross the
+  1% line. Transactions show no such p99 because the checkpoint lands on one
+  commit in many.
+- **The file is larger.** 26-39 MB against 8 MB: the pending log lives in the
+  file until a flush, the trees (#9) stay, and freed pages are not returned
+  (no auto_vacuum).
+
+Reproduce: `cmake --build build_mock -t oltp_bench && sh tools/bench_versions.sh`
+(the raw runs land in `build_mock/bench/*.jsonl`).

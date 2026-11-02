@@ -260,6 +260,10 @@ if(HPPLITE_BUILD_TESTS)
         add_executable(bench_hpplite tests/bench/bench_hpplite.c)
         target_link_libraries(bench_hpplite hpplite)
         add_custom_target(bench COMMAND bench_hpplite DEPENDS bench_hpplite USES_TERMINAL)
+        # sysbench-style OLTP through the loadable extension (#140): oltp_bench --ext build/hpplite.dylib
+        add_executable(oltp_bench tests/bench/oltp_bench.c)
+        target_include_directories(oltp_bench PRIVATE ${SQLITE_BUILD_DIR})
+        target_link_libraries(oltp_bench sqlite3 Threads::Threads ${CMAKE_DL_LIBS})
 
         # Stress test (not a test): 100 MB through encryption, DA chunking, checkpoints, reconstruction
         add_executable(stress_hpplite tests/stress/stress_hpplite.c)
