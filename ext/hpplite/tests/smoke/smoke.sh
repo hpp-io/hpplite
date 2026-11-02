@@ -12,6 +12,8 @@ mkdir -p "$dir"
 trap 'rm -rf "$dir"' EXIT
 ran=0
 
+# page capture on a connection HPPLite did not open is #155
+case "${HPPLITE_CAPTURE:-}" in pages|PAGES) echo "SKIP: page capture on a loaded-extension connection (#155)"; exit 77;; esac
 # Python: needs a build with enable_load_extension (macOS system python lacks it)
 for py in python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
     command -v "$py" >/dev/null 2>&1 || continue

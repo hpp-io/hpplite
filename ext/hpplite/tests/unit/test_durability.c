@@ -65,6 +65,7 @@ static void test_reopen_continues(void) {
 /* 2. A process that dies with unflushed commits loses nothing */
 static void test_crash_recovers_pending(void) {
     TEST("unflushed commits survive a crash");
+    SKIP_IF_PAGES("after a crash the file is shipped whole again, one pending snapshot, not the statements (test_pagemode)");
     reset_dir();
     const char *path = DIR "/crash.db";
 
@@ -95,6 +96,7 @@ static void test_crash_recovers_pending(void) {
 /* 3. A failed L1 submission keeps the batch pending; retry uses the same height */
 static void test_submit_failure_retries(void) {
     TEST("failed L1 submit keeps batch pending and retries");
+    SKIP_IF_PAGES("page batches hold pages, not statements; the retry itself: test_pagemode, the fault harness");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/retry.db", l1);
@@ -106,7 +108,7 @@ static void test_submit_failure_retries(void) {
     hpplite_l1_mock_set_fail_submit(l1, 1);
     if (hpplite_node_flush_batch(n) != 0) FAIL("flush should report failure");
     if (hpplite_node_get_height(n) != 1) FAIL("height must not advance on failure");
-    if (hpplite_node_pending_count(n) != 2) FAIL("pending rows must be kept");
+    if (!test_pending_is(hpplite_node_pending_count(n), 2)) FAIL("pending rows must be kept");
 
     hpplite_node_exec(n, "INSERT INTO t VALUES(2)", NULL);  /* more work while L1 is down */
 
@@ -126,6 +128,7 @@ static void test_submit_failure_retries(void) {
 /* 4. Batches replayed from L1 are not logged again as pending SQL */
 static void test_replay_not_relogged(void) {
     TEST("replay from L1 is not re-logged; next batch holds only new SQL");
+    SKIP_IF_PAGES("page batches hold pages, not statements");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
 
@@ -200,6 +203,7 @@ static void test_bound_params_expanded(void) {
 /* 6. The pending log is atomic with the user's transaction */
 static void test_log_atomic_with_txn(void) {
     TEST("pending log rolls back with the user's transaction");
+    SKIP_IF_PAGES("a rolled-back transaction writes no commit frame: nothing to roll back from a log");
     reset_dir();
     HppliteNode *n = open_node(DIR "/atomic.db", NULL);
     if (!n) FAIL("open");
@@ -232,6 +236,7 @@ static void test_log_atomic_with_txn(void) {
 /* 7. State root depends on content only */
 static void test_state_root_is_content(void) {
     TEST("state root is a function of content");
+    SKIP_IF_PAGES("the root is the file's pages, not the content's (test_pagemode)");
     reset_dir();
     HppliteNode *a = open_node(DIR "/ra.db", NULL);
     HppliteNode *b = open_node(DIR "/rb.db", NULL);
@@ -283,7 +288,7 @@ static void test_stale_lease_after_crash(void) {
     if (count_rows(b->db, "t") != 0) FAIL("reconstruction");
     hpplite_node_exec(b, "INSERT INTO t VALUES(1)", NULL);
     if (hpplite_node_flush_batch(b) != 0) FAIL("submit should fail while a's lease is active");
-    if (hpplite_node_pending_count(b) != 1) FAIL("pending must be kept");
+    if (!test_pending_is(hpplite_node_pending_count(b), 1)) FAIL("pending must be kept");
 
     hpplite_l1_mock_advance_time(l1, 10 * 60);   /* lease expires */
     if (hpplite_node_flush_batch(b) != 2) FAIL("submit should succeed after expiry");
@@ -316,6 +321,7 @@ static void test_stale_lease_after_crash(void) {
 /* 9. Confirmation lost after a successful submit: next flush adopts the L1 batch */
 static void test_adopt_after_lost_confirmation(void) {
     TEST("lost confirmation: batch on L1 is adopted, not resubmitted");
+    SKIP_IF_PAGES("the adoption of a page batch: test_pagemode");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/adopt.db", l1);
@@ -345,6 +351,7 @@ static void test_adopt_after_lost_confirmation(void) {
 /* 10. Crash between submit and finalize, then reopen: adopted on open */
 static void test_adopt_on_reopen(void) {
     TEST("crash after submit: reopen adopts the batch from L1");
+    SKIP_IF_PAGES("the adoption of a page batch after a crash: test_pagemode, the crash harness");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/adopt2.db", l1);
@@ -385,6 +392,7 @@ static void test_adopt_on_reopen(void) {
 /* 11. L1 holds a batch at our height that is not ours: refuse to fork */
 static void test_divergence_refused(void) {
     TEST("pending SQL that does not match the L1 batch is refused, not forked");
+    SKIP_IF_PAGES("a page batch that is not what this node would post: test_pagemode");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *a = open_node(DIR "/div_a.db", l1);
@@ -537,6 +545,7 @@ static void test_sync_function(void) {
 /* 16. Pending SQL beyond the DA size limit is submitted as several batches */
 static void test_batch_size_limit(void) {
     TEST("pending SQL over the DA limit is split into batches that each fit");
+    SKIP_IF_PAGES("a commit larger than the limit is #152");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     hpplite_l1_mock_set_batch_size_limit(l1, 3000);
@@ -702,7 +711,7 @@ static void test_encryption_default(void) {
     if (hpplite_batch_from_json((const char *)raw) != NULL) FAIL("sealed bytes parsed as JSON");
     free(raw);
     HppliteBatch *b = hpplite_node_fetch_batch(a, 1);
-    if (!b || b->nTxns != 2) FAIL("owner cannot read its own batch");
+    if (!b || (test_pages_mode() ? !b->bPages : b->nTxns != 2)) FAIL("owner cannot read its own batch");
     hpplite_batch_free(b);
     unsigned char ra[32]; hpplite_node_get_state_root(a, ra);
     hpplite_node_destroy(a);
@@ -794,6 +803,7 @@ static void *writer_thread(void *arg) {
 }
 static void test_flush_thread_never_loses_captures(void) {
     TEST("concurrent flush thread loses no captures (issue #20)");
+    SKIP_IF_PAGES("captures are pages, counted by the file, not statements; the flusher race: the fault harness in page mode");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     hpplite_l1_mock_set_batch_size_limit(l1, 64 * 1024 * 1024);
@@ -948,9 +958,9 @@ static void test_close_busy_keeps_capturing(void) {
     /* the statement is still unfinalized (close would fail again) but its
     ** read transaction is over, so the connection can write */
     sqlite3_reset(leak);
-    int before = hpplite_pending_count(hpplite_context(db));
+    int before = hpplite_node_pending_count(hpplite_get_node(db));
     if (sqlite3_exec(db, "INSERT INTO t VALUES(2)", NULL, NULL, NULL) != SQLITE_OK) FAIL("write after failed close");
-    if (hpplite_pending_count(hpplite_context(db)) != before + 1) FAIL("write after the failed close must be captured");
+    if (hpplite_node_pending_count(hpplite_get_node(db)) != before + 1) FAIL("write after the failed close must be captured");
     sqlite3_finalize(leak);
     if (sqlite3_close(db) != SQLITE_OK) FAIL("close after finalize");
 
@@ -986,6 +996,7 @@ static void test_close_busy_keeps_capturing(void) {
 /* 26. Bookkeeping never commits under an application SELECT (BUSY_SNAPSHOT) */
 static void test_no_commit_under_app_read(void) {
     TEST("flush while the app is mid-SELECT: no bookkeeping commit, app's next write succeeds");
+    SKIP_IF_PAGES("the bookkeeping is a sidecar: a page-mode flush never commits on the application's file");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/snap.db", l1);
@@ -1015,6 +1026,7 @@ static void test_no_commit_under_app_read(void) {
 /* 27. Two hpplite=on connections to one file: one sequencer, one follower, one log */
 static void test_second_connection_is_follower(void) {
     TEST("second connection to the same file captures into the shared log; sequencer posts all");
+    SKIP_IF_PAGES("followers in page mode are #153");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *a = open_node(DIR "/pool.db", l1);
@@ -1290,7 +1302,7 @@ static void test_claim_reverted_on_chain(void) {
     hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
     if (hpplite_node_flush_batch(n) != 0) FAIL("posted without the lease");
     if (n->hasLease) FAIL("the node believed a reverted claim");
-    if (hpplite_node_pending_count(n) != 1) FAIL("pending must be kept");
+    if (!test_pending_is(hpplite_node_pending_count(n), 1)) FAIL("pending must be kept");
     {
         uint64_t last = 0, total = 0;
         hpplite_l1_get_da_state(l1, &last, &total, NULL);
@@ -1322,7 +1334,7 @@ static void test_finalize_commit_fails(void) {
     hpplite_l1_get_da_state(l1, &last, &total, NULL);
     if (h != 0 || last != 1) FAILF("flush %llu, chain %llu: batch 1 should be posted and not finalized", (unsigned long long)h, (unsigned long long)last);
     if (hpplite_node_get_height(n) != 1) FAILF("height in memory %llu after the failed finalize, the file says 1", (unsigned long long)hpplite_node_get_height(n));
-    if (hpplite_node_pending_count(n) != 2) FAIL("the rows should still be pending");
+    if (!test_pending_is(hpplite_node_pending_count(n), 2)) FAIL("the rows should still be pending");
     h = hpplite_node_flush_batch(n);                     /* adopts batch 1 from L1 and finalizes it */
     hpplite_l1_get_da_state(l1, &last, &total, NULL);
     if (last != 1) FAILF("the chain holds %llu batches: the same rows were posted again", (unsigned long long)last);
@@ -1383,7 +1395,7 @@ static void test_full_disk_mid_series(void) {
     printf("(after the full disk: state %s, last_error \"%s\"; then %llu batches on chain, height %llu) ",
            errAfterFull ? "error" : "ok", afterFull, (unsigned long long)last, (unsigned long long)height);
     sqlite3_free(afterFull);
-    if (pending != 0 || h3 < 4) FAILF("the series did not complete: %d pending, last flush %llu", pending, (unsigned long long)h3);
+    if (pending != 0 || (h3 < 4 && !test_pages_mode())) FAILF("the series did not complete: %d pending, last flush %llu", pending, (unsigned long long)h3);   /* page mode: the rows sit in one page, the series is shorter */
     if (last + 1 != height) FAILF("the chain holds %llu batches, the file finalized %llu", (unsigned long long)last, (unsigned long long)(height - 1));
     for (uint64_t h = 1; h <= last; h++) {
         HppliteBatch *b = hpplite_node_fetch_batch(n, h);

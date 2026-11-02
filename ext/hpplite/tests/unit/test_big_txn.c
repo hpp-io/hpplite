@@ -382,6 +382,7 @@ int main(void) {
     printf("=== HPPLite transactions across batches (#57) ===\n");
     test_suite_init("bigtxn", PRIVKEY, DIR);
     test_format();
+    if (test_pages_mode()) { printf("SKIP: a commit larger than the limit cannot be split in page mode yet (#152)\n"); remove_dir(); return test_report(); }
     test_spans_batches();
     test_reader_between_halves();
     test_crash_between_halves();

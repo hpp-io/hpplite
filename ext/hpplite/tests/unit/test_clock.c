@@ -250,6 +250,7 @@ static void test_format(void) {
 int main(void) {
     printf("=== HPPLite clock SQL (#56) ===\n");
     test_suite_init("clock", PRIVKEY, DIR);
+    if (test_pages_mode()) { printf("SKIP: clock values ride statements; page mode captures the pages they produced\n"); remove_dir(); return test_report(); }
     test_format();
     test_defaults_replay();
     test_clock_in_statements();

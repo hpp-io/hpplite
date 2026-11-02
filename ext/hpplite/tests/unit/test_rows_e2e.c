@@ -903,6 +903,7 @@ static void test_lock_contention(void) {
 }
 
 int main(void) {
+    if (test_pages_mode()) { printf("SKIP: records are row capture's; page mode has none (#146)\n"); return 0; }
     printf("=== HPPLite row capture end to end (#19) ===\n");
     test_suite_init("rows", PRIVKEY, DIR);
     srand(1);

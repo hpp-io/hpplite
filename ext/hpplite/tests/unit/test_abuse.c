@@ -565,7 +565,7 @@ static void test_returning_stepped_once(void) {
     }
     sqlite3_finalize(ins);
     sqlite3_finalize(upd);
-    if (hpplite_node_pending_count(n) != 11) { printf("(pending %d) ", hpplite_node_pending_count(n)); FAIL("not every run was captured"); }
+    if (!test_pending_is(hpplite_node_pending_count(n), 11)) { printf("(pending %d) ", hpplite_node_pending_count(n)); FAIL("not every run was captured"); }
     if (n->ctx->nAppStmtActive != 0) FAIL("statements left counted as running");
     if (hpplite_node_flush_batch(n) <= 0) FAIL("flush");
     unsigned char ra[32], rb[32];
@@ -633,6 +633,7 @@ static void test_zero_row_insert_into_autoincrement(void) {
 ** replica. Logged once it has run; replayed outside a transaction. */
 static void test_vacuum_logged(void) {
     TEST("VACUUM runs, is logged once it has run, and rowid-addressed writes after it replay onto the same rows");
+    SKIP_IF_PAGES("VACUUM lands in the file as pages like any other write; nothing is logged");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/vac.db", l1);
@@ -1252,6 +1253,7 @@ static void test_transaction_boundary(void) {
 
 static void test_oversized_transaction(void) {
     TEST("a transaction that outgrows a batch is posted across batches within the limit (#57)");
+    SKIP_IF_PAGES("a commit larger than the limit is #152");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     const size_t LIMIT = 2000;

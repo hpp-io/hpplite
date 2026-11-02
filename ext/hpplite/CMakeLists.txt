@@ -405,6 +405,16 @@ if(HPPLITE_BUILD_TESTS)
             set_tests_properties(${t} ${t}_text PROPERTIES RESOURCE_LOCK ${t})
             set_tests_properties(${t}_text PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=text)
         endforeach()
+        # ...and with page capture (#146): the cases about statements, the log table
+        # or the content root skip there, the rest runs on pages
+        foreach(t test_checkpoint_flow test_durability test_faults test_keys test_abuse test_foreign_keys
+                  test_big_txn test_clock test_big_stmt test_concurrency test_readers test_node test_state_root test_simple_open test_loadable test_env_enable)
+            add_test(NAME ${t}_pages COMMAND ${t})
+            set_tests_properties(${t} ${t}_pages PROPERTIES RESOURCE_LOCK ${t})
+            set_tests_properties(${t}_pages PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=pages)
+        endforeach()
+        add_test(NAME test_crash_pages COMMAND crash_hpplite)
+        set_tests_properties(test_crash_pages PROPERTIES RESOURCE_LOCK test_crash ENVIRONMENT HPPLITE_CAPTURE=pages)
         add_test(NAME test_crash_text COMMAND crash_hpplite)
         # the same harness on the directory backend (l1=file://, #35)
         add_test(NAME test_crash_dir COMMAND crash_hpplite --l1 dir)

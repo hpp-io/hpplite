@@ -17,6 +17,7 @@
 
 static void test_plain_path_enabled(void) {
     TEST("a plain-path open of a file named in HPPLITE_FILES is an HPPLite connection");
+    SKIP_IF_PAGES("page capture on a connection HPPLite did not open: #155");
     reset_dir();
     setenv("HPPLITE_FILES", "*/app*.db:" DIR "/exact.db", 1);
     setenv("HPPLITE_PARAMS", "privkey=" KEY "&datadir=" DIR "&interval=0", 1);
@@ -29,7 +30,7 @@ static void test_plain_path_enabled(void) {
     sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL, NULL, NULL);
     sqlite3_int64 pending = scalar(db, "SELECT pending FROM hpplite_status");
     sqlite3_close(db);
-    if (pending != 2) FAIL("writes not captured");
+    if (!test_pending_is(pending, 2)) FAILF("writes not captured (pending %lld)", (long long)pending);
 
     if (sqlite3_open(DIR "/exact.db", &db) != SQLITE_OK) FAIL("open exact");
     int exact = hpplite_get_node(db) != NULL;
@@ -95,6 +96,7 @@ static void test_truncating_sqlite_refused(void) {
 ** such a SQLite serves it; what it still logs as text may bind nothing */
 static void test_truncating_sqlite_rows(void) {
     TEST("the same SQLite with row capture: opens, records long bound values whole, refuses a bound text-logged write");
+    SKIP_IF_PAGES("records are row capture's");
     reset_dir();
     setenv("HPPLITE_TEST_TRUNCATING_EXPAND", "1", 1);
     sqlite3 *db = NULL;

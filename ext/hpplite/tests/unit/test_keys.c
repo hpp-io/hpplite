@@ -118,6 +118,7 @@ static void test_keyfile_rejections(void) {
 
 static void test_no_key_never_posts(void) {
     TEST("no key: writes captured, nothing posted, status says keyed=0");
+    SKIP_IF_PAGES("a connection HPPLite did not open captures nothing in page mode yet (#155); the guard itself: test_pagemode");
     reset_keys();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNodeConfig config;
@@ -129,7 +130,7 @@ static void test_no_key_never_posts(void) {
     hpplite_node_set_l1(n, l1);
     hpplite_node_exec(n, "CREATE TABLE t(x); INSERT INTO t VALUES('secret');", NULL);
     if (hpplite_node_flush_batch(n) != 0) FAIL("flush must not post without a key");
-    if (hpplite_node_pending_count(n) != 2) FAIL("pending must be kept");
+    if (!test_pending_is(hpplite_node_pending_count(n), 2)) FAIL("pending must be kept");
     size_t len = 0;
     uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
     if (raw) { free(raw); FAIL("a batch reached L1 without a key"); }

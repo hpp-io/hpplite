@@ -339,6 +339,7 @@ static void test_trees_survive_failed_commits(void) {
 int main(void) {
     printf("=== HPPLite State Root Tests ===\n");
     test_suite_init("stateroot", NULL, DIR);
+    if (test_pages_mode()) { printf("SKIP: the content root and its trees are row and text capture's; page mode's root is the file's (test_pagemode)\n"); remove_dir(); return test_report(); }
     test_incremental();
     test_matches_scan();
     test_version_1_history();

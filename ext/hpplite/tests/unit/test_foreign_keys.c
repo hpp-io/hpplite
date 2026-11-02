@@ -396,6 +396,7 @@ static void test_unknown_mode_refused(void) {
 ** rows already there replay with the default state */
 static void test_old_log_migrated(void) {
     TEST("a pending log from before #52 gains the mode column; its rows still post");
+    SKIP_IF_PAGES("no log table in the file");
     reset_dir();
     sqlite3 *raw = NULL;
     if (sqlite3_open(DIR "/old.db", &raw) != SQLITE_OK) FAIL("raw open");
@@ -421,6 +422,7 @@ static void test_old_log_migrated(void) {
 ** the pending rows carry it too, and reopening adopts rather than forks */
 static void test_adopt_with_mode(void) {
     TEST("crash after submitting a foreign_keys=ON batch: reopen adopts it");
+    SKIP_IF_PAGES("the mode travels with statements; page batches carry pages (the adoption itself: test_pagemode)");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/adopt.db", l1);

@@ -204,6 +204,7 @@ int main(void) {
     printf("=== HPPLite statements across batches (#59) ===\n");
     test_suite_init("bigstmt", PRIVKEY, DIR);
     test_format();
+    if (test_pages_mode()) { printf("SKIP: a commit larger than the limit cannot be split in page mode yet (#152)\n"); remove_dir(); return test_report(); }
     test_statement_over_batches();
     test_statement_in_transaction_and_reader_between();
     test_crash_between_pieces();
