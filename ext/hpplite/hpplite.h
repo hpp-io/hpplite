@@ -194,6 +194,12 @@ struct HppliteCtx {
   uint64_t nRootMismatches;   /* ... of which differed */
   uint64_t rootCmpHeight;     /* The last batch whose posted root was compared, and the rebuilt root there (#5) */
   unsigned char rootCmp[32];
+  int bTrackRoots;            /* a verifier: the rebuilt root after each of the last HPPLITE_ROOT_RING batches, so an
+                              ** on-chain checkpoint that lags the last posted root, or sits at a height with no posted
+                              ** root (a retried checkpoint), is still checked (#120) */
+#define HPPLITE_ROOT_RING 64
+  struct { uint64_t height; unsigned char root[32]; } aRootAt[HPPLITE_ROOT_RING];
+  int nRootAt;
   uint64_t nNondeterministic; /* Logged statements using random()/'now'/etc. */
 
   /* Callbacks for external integration */
@@ -263,6 +269,9 @@ void hpplite_enable(HppliteCtx *pCtx, int bEnable);
 ** All zeros for a database with no user schema.
 */
 void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut);
+/* A verifier's rebuilt root after batch height, when it is among the last HPPLITE_ROOT_RING replayed
+** (bTrackRoots) or is the last posted root compared: 0, or -1 when not kept */
+int hpplite_root_at(HppliteCtx *pCtx, uint64_t height, unsigned char out[32]);
 
 /*
 ** Content hash of any connection's main database, same definition as the

@@ -191,6 +191,42 @@ static void test_old_file_gains_trees(void) {
     PASS();
 }
 
+/* 5. A verifier keeps the rebuilt root after every recent batch (#120): the
+** chain's checkpoint may lag the last posted root (the timer still
+** submitting it) or sit at a height with no posted root (a retried one);
+** hpplite-verify checks it at that height instead of saying "not reached". */
+static void test_root_at(void) {
+    TEST("a verifier answers the rebuilt root at any recent height, posted root or not; a writer's roots match (#120)");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_writer(DIR "/ra_w.db", l1, 2);          /* a posted root every other batch */
+    unsigned char want[6][32], got[32];
+    int h;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(a INTEGER PRIMARY KEY, b)", NULL);
+    if (hpplite_node_flush_batch(w) < 1) FAIL("flush 1");
+    hpplite_node_get_state_root(w, want[1]);
+    for (h = 2; h <= 5; h++) {
+        char sql[80];
+        snprintf(sql, sizeof sql, "INSERT INTO t(b) VALUES('row %d')", h);
+        hpplite_node_exec(w, sql, NULL);
+        if (hpplite_node_flush_batch(w) < 1) FAIL("flush");
+        hpplite_node_get_state_root(w, want[h]);
+    }
+    TestNodeOpts ro = { .verifyOnly = 1, .nodeId = "root_at_r" };
+    HppliteNode *r = test_open_node(DIR "/ra_r.db", l1, &ro);
+    if (!r) { hpplite_node_destroy(w); FAIL("open verifier"); }
+    for (h = 1; h <= 5; h++) {
+        if (hpplite_root_at(r->ctx, (uint64_t)h, got) != 0) { printf("(height %d not kept) ", h); r->l1 = NULL; hpplite_node_destroy(r); hpplite_node_destroy(w); FAIL("a recent height's root should be kept"); }
+        if (memcmp(got, want[h], 32) != 0) { printf("(height %d differs) ", h); r->l1 = NULL; hpplite_node_destroy(r); hpplite_node_destroy(w); FAIL("the verifier's root at a height should be the writer's then"); }
+    }
+    if (hpplite_root_at(r->ctx, 99, got) == 0) { r->l1 = NULL; hpplite_node_destroy(r); hpplite_node_destroy(w); FAIL("an unknown height should not answer"); }
+    if (hpplite_root_at(w->ctx, 3, got) == 0) { r->l1 = NULL; hpplite_node_destroy(r); hpplite_node_destroy(w); FAIL("a writer keeps no ring (only verifiers do)"); }
+    r->l1 = NULL; hpplite_node_destroy(r);
+    hpplite_node_destroy(w);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite State Root Tests ===\n");
     test_suite_init("stateroot", NULL, DIR);
@@ -198,6 +234,7 @@ int main(void) {
     test_matches_scan();
     test_version_1_history();
     test_old_file_gains_trees();
+    test_root_at();
     remove_dir();
     return test_report();
 }

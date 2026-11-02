@@ -140,6 +140,25 @@ static int storeCarry(HppliteCtx *pCtx, const ReplayStmt *a, int n) {
   return rc;
 }
 
+
+/* The verifier's ring of rebuilt roots (#120) */
+static void rootAtRecord(HppliteCtx *pCtx, uint64_t height, const unsigned char root[32]) {
+  int i = pCtx->nRootAt % HPPLITE_ROOT_RING;
+  pCtx->aRootAt[i].height = height;
+  memcpy(pCtx->aRootAt[i].root, root, 32);
+  pCtx->nRootAt++;
+}
+int hpplite_root_at(HppliteCtx *pCtx, uint64_t height, unsigned char out[32]) {
+  int i, n;
+  if (!pCtx) return -1;
+  n = pCtx->nRootAt < HPPLITE_ROOT_RING ? pCtx->nRootAt : HPPLITE_ROOT_RING;
+  for (i = 0; i < n; i++) {
+    if (pCtx->aRootAt[i].height == height) { memcpy(out, pCtx->aRootAt[i].root, 32); return 0; }
+  }
+  if (pCtx->rootCmpHeight == height && height > 0) { memcpy(out, pCtx->rootCmp, 32); return 0; }
+  return -1;
+}
+
 /* The replica connection's own TEMP triggers (an application's, replayed as
 ** text): SQLITE_DBCONFIG_ENABLE_TRIGGER leaves TEMP triggers on, so they
 ** are set aside while records apply - their effects are records of their
@@ -419,8 +438,16 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   if (rc != SQLITE_OK) return rc;
 
   /* The seed of `hpplite verify`: does the content match what was posted?
-  ** Only batches that carry a root (checkpoint boundaries) can be checked. */
-  if (!pBatch->hasRoot) return SQLITE_OK;
+  ** Only batches that carry a root (checkpoint boundaries) can be checked.
+  ** A verifier also keeps the rebuilt root after every recent batch, for an
+  ** on-chain checkpoint at a height with no posted root (#120). */
+  if (!pBatch->hasRoot) {
+    if (pCtx->bTrackRoots) {
+      hpplite_get_state_root(pCtx, root);
+      rootAtRecord(pCtx, pBatch->height, root);
+    }
+    return SQLITE_OK;
+  }
   if (pBatch->rootVersion < 2) {
     /* a history from before #9: its roots are one hash over every row */
     int saved = hppliteBkEnter(pCtx);
@@ -432,6 +459,7 @@ int hpplite_replay_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, int useTx
   pCtx->nRootsCompared++;
   pCtx->rootCmpHeight = pBatch->height;        /* for the verifier: compared with the on-chain checkpoint (#5) */
   memcpy(pCtx->rootCmp, root, HPPLITE_HASH_SIZE);
+  if (pCtx->bTrackRoots) rootAtRecord(pCtx, pBatch->height, root);
   if (memcmp(root, pBatch->postStateRoot, HPPLITE_HASH_SIZE) != 0) {
     pCtx->nRootMismatches++;
     hpplite_error(pCtx, "state root mismatch after replaying batch %llu",

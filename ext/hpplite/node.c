@@ -283,6 +283,7 @@ static int node_init_tracking(HppliteNode *node) {
     rc = hpplite_init_ex(node->db, &node->ctx, !node->config.captureText);
     if (rc != SQLITE_OK) return rc;
     node->ctx->bDeterminismWarn = node->config.determinismWarn;
+    node->ctx->bTrackRoots = node->config.verifyOnly;          /* hpplite-verify checks the chain's checkpoint at any recent height (#120) */
     if (node->config.dbName && node->config.dbName[0]) {
         /* {file}: the file's own name, so one setting names every database
         ** of an application (HPPLITE_FILES, #61) */

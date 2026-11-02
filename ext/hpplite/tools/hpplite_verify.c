@@ -230,9 +230,10 @@ int main(int argc, char **argv) {
         if (st && st->lastCheckpointHeight > 0) {
             char want[65], got[65];
             hex(st->lastStateRoot, want);
-            if (node->ctx->rootCmpHeight == st->lastCheckpointHeight) {
-                hex(node->ctx->rootCmp, got);
-                if (memcmp(st->lastStateRoot, node->ctx->rootCmp, 32) == 0) {
+            unsigned char at[32];
+            if (hpplite_root_at(node->ctx, st->lastCheckpointHeight, at) == 0) {
+                hex(at, got);
+                if (memcmp(st->lastStateRoot, at, 32) == 0) {
                     printf("on-chain checkpoint at batch %llu: root %s matches the rebuilt content\n",
                            (unsigned long long)st->lastCheckpointHeight, want);
                 } else {
