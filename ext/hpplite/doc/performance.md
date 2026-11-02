@@ -233,3 +233,49 @@ How to read it:
   ~100 000 rows/s with the extension against 210 000 before #143, for the
   same reason: it is posted as it goes now.
 - Reads are unchanged (and still 12% faster with the extension loaded).
+
+## Page capture (2026-11-03, #146; tip 190b88c53b)
+
+The same harness on `capture=pages`: the extension's VFS captures the pages
+each commit wrote, the flush posts page batches (whole pages the first
+time, XOR diffs after, deflated at level 1), nothing is logged in the file.
+`--ext build_mock/hpplite.dylib --uri "&capture=pages"`, 10 s runs, median
+of three, one transaction each; the extension loaded on a boot connection
+first, so the measured connection is on the VFS (#155). The mock L1, no
+encryption.
+
+| configuration | capture | tps | stmt/s | p50 ms | p99 ms | max ms | batches in 10 s | flush ms | db MB |
+|---|---|---|---|---|---|---|---|---|---|
+| write_only, trx | plain SQLite | 7704 | 30 818 | 0.096 | 0.135 | 7 | | | 8.0 |
+| write_only, trx | pages | 7349 | 29 395 | 0.101 | 0.150 | 7 | 1556 | 39 | 8.0 |
+| write_only, trx | rows | 4143 | 16 570 | 0.132 | 1.615 | 429 | 747 | 623 | 23.9 |
+| read_write, trx | plain SQLite | 4425 | 79 643 | 0.193 | 0.245 | 7 | | | 7.9 |
+| read_write, trx | pages | 4596 | 82 726 | 0.184 | 0.237 | 7 | 977 | 18 | 7.9 |
+| read_write, trx | rows | 2432 | 43 780 | 0.216 | 1.425 | 135 | 525 | 101 | 23.2 |
+
+How to read it:
+
+- **Page capture costs the writer nothing it can measure**: 95% of plain
+  SQLite's write rate, p99 0.15 ms against 0.135 (read_write is within the
+  noise of plain, 4 596 against 4 425). The capture is a copy of each
+  commit's frames on the committing thread; the batch is built and posted
+  on the timer thread from that copy, and the writer never waits for it.
+  Row capture pays 1.4-1.6 ms at p99 and loses 45% of the rate: its log
+  rows are written inside the application's transaction and the trees
+  take each row in afterwards.
+- **The file stays the application's size.** 8 MB with pages against 24
+  MB with rows: no pending log, no trees in the file (the bookkeeping is a
+  sidecar, a few KB).
+- **A flush is a few tens of milliseconds** (39 ms for the biggest batches
+  of a tight write loop) against 100-600 ms with rows, and it holds no
+  gate: the writer's max latency is 7 ms in both modes, the same as plain
+  SQLite's.
+- A page batch of this workload is 50-100 KB deflated (155 batches/s at
+  the 128 KB default limit), where a row batch of the same commits is
+  smaller: pages carry every byte of a touched page, a record only the row.
+  Storage per commit is the trade (doc/architecture.md, #146): for a
+  write-heavy workload on few pages the diffs stay small; for scattered
+  writes each touched page costs a page.
+
+Reproduce: `cmake --build build_mock -t oltp_bench`, then `oltp_bench --ext
+build_mock/hpplite.dylib --uri "&capture=pages" --mode write_only --seconds 10`.
