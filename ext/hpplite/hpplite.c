@@ -481,6 +481,23 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
   pCtx->bEnabled = 0;
   pCtx->bPages = 1;
   pCtx->vacuumFd = -1;
+  {
+    /* a file this SQLite cannot read (not a database; SQLCipher/SEE and not
+    ** keyed, #139): row capture finds out creating its tables in it, page
+    ** mode keeps nothing in the file, so it asks (#149) */
+    sqlite3_stmt *q = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_schema", -1, &q, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(q) == SQLITE_ROW ? SQLITE_OK : sqlite3_errcode(db);
+    sqlite3_finalize(q);
+    if (rc != SQLITE_OK) {
+      static char zWhy[300];
+      snprintf(zWhy, sizeof zWhy, "cannot read the database: %s (the file is not a database, or it is encrypted"
+               " and not yet keyed: see issue #139)", sqlite3_errmsg(db));
+      gInitError = zWhy;
+      sqlite3_free(pCtx);
+      return rc;
+    }
+  }
   if (!bookkeepingIsCurrent(bkDb)) {
     rc = hppliteInternalExec(pCtx, bkDb, HPPLITE_SCHEMA);
     if (rc == SQLITE_OK) rc = hppliteTreeSchema(pCtx, bkDb);

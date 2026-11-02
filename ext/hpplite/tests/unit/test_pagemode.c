@@ -291,6 +291,24 @@ static void test_rules_that_keep_capture_possible(void) {
     PASS();
 }
 
+/* a file SQLite cannot read fails the open with the reason (#149) */
+static void test_unreadable_file_fails_the_open(void) {
+    TEST("page mode fails the open of a file this SQLite cannot read, saying so");
+    reset_dir();
+    unsigned char junk[8192];
+    for (size_t i = 0; i < sizeof junk; i++) junk[i] = (unsigned char)(i * 131 + 7);
+    FILE *f = fopen(DIR "/junk.db", "wb");
+    if (!f) FAIL("write");
+    fwrite(junk, 1, sizeof junk, f);
+    fclose(f);
+    HppliteNode *n = open_pages(DIR "/junk.db", NULL, 1, 1);
+    const char *why = hpplite_init_error();
+    printf("(%s) ", why ? why : "no reason");
+    if (n) { hpplite_node_destroy(n); FAIL("the open should fail: page mode cannot capture a file it cannot read"); }
+    if (!why || !strstr(why, "not a database")) FAIL("the reason does not say the file is not a database");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -301,6 +319,7 @@ int main(void) {
     test_reopen_after_a_submit_the_process_did_not_survive();
     test_file_not_where_its_sidecar_says();
     test_rules_that_keep_capture_possible();
+    test_unreadable_file_fails_the_open();
     remove_dir();
     return test_report();
 }
