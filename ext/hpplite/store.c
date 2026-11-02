@@ -51,6 +51,7 @@ struct HppliteStore {
     unsigned char payTo[20];        /* the receipt domain's verifyingContract */
     uint64_t chainId;
     char error[256];
+    char streamError[200];          /* Kubo's X-Stream-Error trailer of the last request, "" when none */
     HppliteCrypto *crypto;
 };
 
@@ -77,6 +78,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
     char url[1200];
     long status = 0;
     if (!c) return 0;
+    s->streamError[0] = 0;
     snprintf(url, sizeof url, "%s%s", s->base, path);
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
@@ -117,6 +119,11 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
                 const char *v = line + 17;
                 while (*v == ' ') v++;
                 *pzPaymentResponse = sqlite3_mprintf("%.*s", (int)(len - (v - line)), v);
+            } else if (len > 15 && strncasecmp(line, "X-Stream-Error:", 15) == 0) {
+                /* Kubo answers 200 as it starts streaming and reports a failure in this trailer */
+                const char *v = line + 15;
+                while (*v == ' ') v++;
+                snprintf(s->streamError, sizeof s->streamError, "%.*s", (int)(len - (v - line)), v);
             }
         }
         free(headers.p);
@@ -828,8 +835,15 @@ uint8_t *hpplite_store_get(HppliteStore *s, const char *zRef, size_t *pLen) {
         return data;
     }
     if (s->kind == STORE_KUBO) {
-        snprintf(path, sizeof path, "/api/v0/cat?arg=%s", zRef);
+        /* a CID the node does not hold is looked for on the network: bounded, so a
+        ** missing batch is an answer and not a hang */
+        snprintf(path, sizeof path, "/api/v0/cat?arg=%s&timeout=30s", zRef);
         status = storeRequest(s, "POST", path, NULL, 0, NULL, &out, NULL, NULL);
+        if (status == 200 && s->streamError[0]) {
+            snprintf(s->error, sizeof s->error, "Kubo could not read %s: %s", zRef, s->streamError);
+            free(out.p);
+            return NULL;
+        }
     } else {
         snprintf(path, sizeof path, "/get/%s", zRef);
         status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);

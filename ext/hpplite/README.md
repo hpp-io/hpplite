@@ -620,7 +620,9 @@ standard `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_REGION`,
 under the prefix, so the reference committed is the same CID a pin service
 or Kubo would commit and the bytes can be re-pinned anywhere; ctest runs it
 against a stand-in that checks the signature (`s3_mock.py`), and
-`HPPLITE_S3=s3://bucket/prefix` runs the same case against a real bucket.
+`HPPLITE_S3=s3://bucket/prefix` runs the same case against a real bucket;
+CI runs both against Kubo and RustFS (MinIO's drop-in; MinIO publishes no
+public image any more) in containers, which is how #136 was found.
 `tools/topup.sh AMOUNT` tops the wallet up: it bridges that many USDC from
 Ethereum Sepolia to USDC.e on HPP Sepolia through HPP's gateway with `cast`
 (approve, then `outboundTransfer` with a retryable ticket it prices from the
