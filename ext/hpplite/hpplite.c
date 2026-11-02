@@ -249,7 +249,9 @@ static int expandedSqlIsFaithful(sqlite3 *db) {
 #ifdef HPPLITE_TEST_HOOKS
   if (getenv("HPPLITE_TEST_TRUNCATING_EXPAND")) return 0;
 #endif
-  if (sqlite3_prepare_v2(db, "SELECT ?1", -1, &st, NULL) != SQLITE_OK) return 0;
+  /* a prepare that fails says nothing about expansion (a file this SQLite cannot
+  ** read, #139): the schema step reports that; truncation is only what is seen */
+  if (sqlite3_prepare_v2(db, "SELECT ?1", -1, &st, NULL) != SQLITE_OK) return 1;
   sqlite3_bind_text(st, 1, zLong, -1, SQLITE_STATIC);
   z = sqlite3_expanded_sql(st);
   ok = z && strstr(z, zLong) != NULL;
