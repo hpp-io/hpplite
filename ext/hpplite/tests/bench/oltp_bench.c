@@ -36,9 +36,9 @@ typedef enum { MODE_RW, MODE_WO, MODE_RO } Mode;
 static struct {
     const char *ext, *dir, *label, *json, *uriExtra, *pragma;
     Mode mode;
-    int skipTrx, tables, rows, seconds, hist, busyPoll, thinkUs, slow;
+    int skipTrx, tables, rows, seconds, hist, busyPoll, thinkUs, slow, extPlain;
     uint64_t seed;
-} opt = { NULL, "/tmp/hpplite_oltp", "", NULL, "", NULL, MODE_RW, 0, 4, 10000, 10, 0, 0, 0, 0, 42 };
+} opt = { NULL, "/tmp/hpplite_oltp", "", NULL, "", NULL, MODE_RW, 0, 4, 10000, 10, 0, 0, 0, 0, 0, 42 };
 
 static double now_ms(void) {
     struct timespec ts;
@@ -138,7 +138,8 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--skip-trx")) { opt.skipTrx = 1; continue; }
         if (!strcmp(a, "--hist")) { opt.hist = 1; continue; }
         if (!strcmp(a, "--busy-poll")) { opt.busyPoll = 1; continue; }
-        if (!strcmp(a, "--slow")) { opt.slow = 1; continue; }     /* which statement a slow (> 1 ms) write transaction spent its time in */
+        if (!strcmp(a, "--slow")) { opt.slow = 1; continue; }
+        if (!strcmp(a, "--ext-plain")) { opt.extPlain = 1; continue; }   /* the extension is not HPPLite (a VFS, say): open plain, no status, no flush */     /* which statement a slow (> 1 ms) write transaction spent its time in */
         if (!v) { fprintf(stderr, "oltp_bench: %s needs a value\n", a); return 2; }
         if (!strcmp(a, "--ext")) opt.ext = v;
         else if (!strcmp(a, "--dir")) opt.dir = v;
@@ -179,7 +180,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "oltp_bench: load %s: %s\n", opt.ext, err ? err : "?");
             return 1;
         }
-        snprintf(uri, sizeof(uri), "file:%s?hpplite=on&l1=local&privkey=0x" PRIVKEY_HEX "&datadir=%s%s", path, opt.dir, opt.uriExtra);
+        if (opt.extPlain) snprintf(uri, sizeof(uri), "file:%s?%s", path, opt.uriExtra);
+        else snprintf(uri, sizeof(uri), "file:%s?hpplite=on&l1=local&privkey=0x" PRIVKEY_HEX "&datadir=%s%s", path, opt.dir, opt.uriExtra);
     } else {
         snprintf(uri, sizeof(uri), "file:%s?%s", path, opt.uriExtra);
     }
@@ -212,7 +214,7 @@ int main(int argc, char **argv) {
         run(db, sql);
     }
     prepMs = now_ms() - t0;
-    if (opt.ext) {
+    if (opt.ext && !opt.extPlain) {
         /* the loaded rows leave the pending table before the run, so the
         ** run's pending count, batches and flush are the run's own */
         t0 = now_ms();
@@ -235,7 +237,7 @@ int main(int argc, char **argv) {
     }
     if (!opt.skipTrx) { begin = prep(db, "BEGIN%.0d", 0); commit = prep(db, "COMMIT%.0d", 0); }
     stmtsPerTxn = opt.mode == MODE_RW ? 18 : opt.mode == MODE_WO ? 4 : 14;
-    if (opt.ext) heightBefore = status_int(db, "height");
+    if (opt.ext && !opt.extPlain) heightBefore = status_int(db, "height");
 
     /* ---- run ---- */
     t0 = now_ms();
@@ -284,7 +286,7 @@ int main(int argc, char **argv) {
     t1 = now_ms();
     runMs = t1 - t0;
 
-    if (opt.ext) {
+    if (opt.ext && !opt.extPlain) {
         heightAfter = status_int(db, "height");
         pendingAfter = status_int(db, "pending");
         t0 = now_ms();
@@ -311,7 +313,7 @@ int main(int argc, char **argv) {
                opt.tables, opt.rows, opt.seconds, tps, qps, nLat ? sum / (double)nLat : 0,
                pct(lat, nLat, 0.50), pct(lat, nLat, 0.95), pct(lat, nLat, 0.99), nLat ? lat[nLat - 1] : 0,
                (double)opt.tables * opt.rows / (prepMs / 1000.0));
-        if (opt.ext) printf("  prepare-flush=%.0fms batches=%lld pending=%lld flush=%.0fms left=%lld", prepFlushMs, (long long)(heightAfter - heightBefore), (long long)pendingAfter, flushMs, (long long)pendingLeft);
+        if (opt.ext && !opt.extPlain) printf("  prepare-flush=%.0fms batches=%lld pending=%lld flush=%.0fms left=%lld", prepFlushMs, (long long)(heightAfter - heightBefore), (long long)pendingAfter, flushMs, (long long)pendingLeft);
         printf("  db=%.1fMB\n", dbBytes / 1048576.0);
         if (opt.slow) {
             int k;
