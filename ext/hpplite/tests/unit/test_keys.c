@@ -278,6 +278,119 @@ static void test_keystore(void) {
     PASS();
 }
 
+/* #17 step 3: a signer whose key lives elsewhere. The test's signer keeps
+** the key itself and counts the calls; the batch key is given apart. */
+typedef struct { HppliteCrypto *c; HppliteKeypair kp; int calls; } TestSigner;
+static int test_signer_sign(void *arg, const unsigned char hash[32], unsigned char sig[64], int *recid) {
+    TestSigner *t = (TestSigner *)arg;
+    HppliteSignature s;
+    t->calls++;
+    if (hpplite_crypto_sign(t->c, &t->kp, hash, &s) != 0) return -1;
+    memcpy(sig, s.sig, 64);
+    *recid = s.recid;
+    return 0;
+}
+static void test_signer(void) {
+    TEST("a signer instead of a key: keyed, the batch key given apart, the lease taken, a sealed batch posted a replica with the batch key reads; a key after a signer is refused (#17)");
+    reset_keys();
+    TestSigner ts = { hpplite_crypto_init(), {{0}}, 0 };
+    unsigned char raw[32], batchKey[32];
+    HppliteSigner signer;
+    hpplite_hex_to_bytes(KEY_A, raw, 32);
+    if (hpplite_crypto_keypair_from_privkey(ts.c, &ts.kp, raw) != 0) FAIL("keypair");
+    memset(batchKey, 0x42, 32);
+    signer.sign = test_signer_sign; signer.arg = &ts; memcpy(signer.address, ts.kp.address, 20);
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    sqlite3 *db = hpplite_open("file:" DIR "/sg.db?hpplite=on&datadir=" DIR);
+    if (!db) FAIL("open");
+    HppliteNode *n = hpplite_get_node(db);
+    hpplite_node_set_l1(n, l1); hpplite_node_start(n);
+    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES('signed for')", NULL, NULL, NULL);
+    if (hpplite_node_set_signer(n, &signer) != 0) FAIL("set signer");
+    if (status_int(db, "keyed") != 1) FAIL("a signer makes the node keyed");
+    if (hpplite_flush(db) != 0) FAIL("a signer without a batch key posts nothing sealed");
+    if (scalar(db, "SELECT hpplite_batch_key('0x4242424242424242424242424242424242424242424242424242424242424242')") != 1) FAIL("hpplite_batch_key");
+    if (status_int(db, "lease") != 1) FAIL("the lease after the batch key");
+    if (hpplite_flush(db) != 1) FAIL("the flush with signer and batch key should post");
+    {
+        size_t len = 0;
+        uint8_t *rawb = hpplite_l1_get_batch(l1, 1, &len);
+        int ok = rawb && !memmem(rawb, len, "signed for", 10);
+        free(rawb);
+        if (!ok) FAIL("the batch should be posted, sealed with the batch key");
+    }
+    if (hpplite_node_set_key(n, raw) != -2) FAIL("a key after a signer should be refused");
+    {
+        sqlite3 *r = hpplite_open("file:" DIR "/sg_r.db?hpplite=on&datadir=" DIR);
+        HppliteNode *rn = r ? hpplite_get_node(r) : NULL;
+        sqlite3_int64 rows = -1;
+        if (rn) { hpplite_node_set_batch_key(rn, batchKey); hpplite_node_set_l1(rn, l1); hpplite_node_sync_from_l1(rn, 1); rows = scalar(r, "SELECT count(*) FROM t"); rn->l1 = NULL; }
+        if (r) sqlite3_close(r);
+        if (rows != 1) { printf("(replica rows %lld) ", (long long)rows); FAIL("a replica with the batch key should read the batch"); }
+    }
+    printf("(the mock verifies no signature: %d signer calls) ", ts.calls);
+    n->l1 = NULL;
+    sqlite3_close(db);
+    hpplite_l1_disconnect(l1);
+    hpplite_crypto_free(ts.c);
+    PASS();
+}
+
+/* #17 step 4: the owner (cold) names the sequencer (hot). The owner's own
+** node loses the lease; a node with the sequencer key posts, sealing with
+** the batch key the owner hands it; a replica with the owner's key reads. */
+static void test_owner_names_sequencer(void) {
+    TEST("hpplite_set_sequencer: the owner names a hot wallet; the owner's node posts no more, the sequencer's node posts with the batch key given apart, a replica with the owner key reads; a non-owner is refused (#17)");
+    reset_keys();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteCrypto *c = hpplite_crypto_init();
+    HppliteKeypair hot;
+    unsigned char raw[32], batchKey[32];
+    char hotHex[48], sql[200], batchHex[80];
+    hpplite_hex_to_bytes(KEY_B, raw, 32);
+    if (hpplite_crypto_keypair_from_privkey(c, &hot, raw) != 0) FAIL("keypair");
+    hotHex[0] = '0'; hotHex[1] = 'x'; hpplite_bytes_to_hex(hot.address, 20, hotHex + 2);
+    hpplite_hex_to_bytes(KEY_A, raw, 32);
+    hpplite_cipher_derive_key(raw, batchKey);                             /* the owner's batch key, handed to the sequencer */
+    batchHex[0] = '0'; batchHex[1] = 'x'; hpplite_bytes_to_hex(batchKey, 32, batchHex + 2);
+
+    sqlite3 *owner = hpplite_open("file:" DIR "/own.db?hpplite=on&datadir=" DIR "&privkey=" KEY_A);
+    if (!owner) FAIL("open owner");
+    HppliteNode *on = hpplite_get_node(owner);
+    hpplite_node_set_l1(on, l1); hpplite_node_start(on);
+    sqlite3_exec(owner, "CREATE TABLE t(x); INSERT INTO t VALUES('by the owner')", NULL, NULL, NULL);
+    if (hpplite_flush(owner) != 1) FAIL("the owner posts batch 1 (it is the sequencer until it says otherwise)");
+    snprintf(sql, sizeof sql, "SELECT hpplite_set_sequencer('%s')", hotHex);
+    if (exec_sql(owner, sql) != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(owner)); FAIL("the owner should be able to name the sequencer"); }
+    sqlite3_exec(owner, "INSERT INTO t VALUES('after the rotation')", NULL, NULL, NULL);
+    if (hpplite_flush(owner) != 0 || status_int(owner, "lease") != 0) FAIL("the owner's node should post no more: the lease is the hot wallet's");
+
+    sqlite3 *seq = hpplite_open("file:" DIR "/seq.db?hpplite=on&datadir=" DIR "&privkey=" KEY_B);
+    if (!seq) FAIL("open sequencer");
+    HppliteNode *sn = hpplite_get_node(seq);
+    hpplite_node_set_l1(sn, l1);
+    snprintf(sql, sizeof sql, "SELECT hpplite_batch_key('%s')", batchHex);
+    if (scalar(seq, sql) != 1) FAIL("batch key on the sequencer");
+    hpplite_node_start(sn);
+    if (hpplite_node_sync_from_l1(sn, 1) < 0 || scalar(seq, "SELECT count(*) FROM t") != 1) FAIL("the sequencer's node rebuilds batch 1 with the batch key");
+    if (exec_sql(seq, "SELECT hpplite_set_sequencer('0x1111111111111111111111111111111111111111')") == SQLITE_OK) FAIL("a non-owner naming a sequencer should be refused");
+    sqlite3_exec(seq, "INSERT INTO t VALUES('by the sequencer')", NULL, NULL, NULL);
+    if (hpplite_flush(seq) != 2 || status_int(seq, "lease") != 1) { printf("(%s) ", status_text(seq, "last_error")); FAIL("the sequencer's node should take the lease and post batch 2"); }
+    {
+        sqlite3 *r = hpplite_open("file:" DIR "/own_r.db?hpplite=on&datadir=" DIR "&privkey=" KEY_A);
+        HppliteNode *rn = r ? hpplite_get_node(r) : NULL;
+        sqlite3_int64 rows = -1;
+        if (rn) { hpplite_node_set_l1(rn, l1); hpplite_node_sync_from_l1(rn, 1); rows = scalar(r, "SELECT count(*) FROM t"); rn->l1 = NULL; }
+        if (r) sqlite3_close(r);
+        if (rows != 2) { printf("(replica rows %lld) ", (long long)rows); FAIL("a replica with the owner's key should read both batches"); }
+    }
+    sn->l1 = NULL; sqlite3_close(seq);
+    on->l1 = NULL; sqlite3_close(owner);
+    hpplite_l1_disconnect(l1);
+    hpplite_crypto_free(c);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) g_fixtures = argv[1];
     printf("=== HPPLite Key Provisioning Tests ===\n");
@@ -290,6 +403,8 @@ int main(int argc, char **argv) {
     test_encrypt_off_is_explicit();
     test_key_at_runtime();
     test_keystore();
+    test_signer();
+    test_owner_names_sequencer();
     remove_dir();
     return test_report();
 }

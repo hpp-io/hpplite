@@ -607,6 +607,8 @@ static void hpplite_flush_func(sqlite3_context *ctx, int argc, sqlite3_value **a
 static void hpplite_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_keyfile_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_keystore_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_batch_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_set_sequencer_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 
 
 /*
@@ -664,6 +666,10 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_keyfile_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_keystore", 2, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
                             hpplite_keystore_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_batch_key", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
+                            hpplite_batch_key_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_set_sequencer", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
+                            hpplite_set_sequencer_func, NULL, NULL);
     hppliteStatusRegister(db);
 }
 
@@ -918,6 +924,40 @@ static void hpplite_key_func(sqlite3_context *ctx, int argc, sqlite3_value **arg
     keyGiven(ctx, &cfg, "hpplite_key");
     memset(&cfg, 0, sizeof cfg);
 }
+/* SELECT hpplite_set_sequencer('0x...') (#17): the owner names the wallet that may hold
+** the lease and post, the hot key apart from the owner's; the running lease expires.
+** The transaction's hash. Only the owner's transaction goes through. */
+static void hpplite_set_sequencer_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = hppliteFindNode(db);
+    const char *z = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+    unsigned char wallet[20];
+    char *tx;
+    if (!node) { sqlite3_result_error(ctx, "hpplite is not on this connection", -1); return; }
+    if (!node->l1) { sqlite3_result_error(ctx, "hpplite_set_sequencer: no chain on this connection", -1); return; }
+    if (!z || hpplite_hex_to_bytes(z, wallet, 20) != 20) { sqlite3_result_error(ctx, "hpplite_set_sequencer: not a 20-byte hex address", -1); return; }
+    tx = hpplite_l1_set_sequencer(node->l1, wallet);
+    if (!tx) { sqlite3_result_error(ctx, "hpplite_set_sequencer: the chain did not take it (only the rollup's owner may; a wallet of zero is refused)", -1); return; }
+    hpplite_l1_wait_for_tx(node->l1, tx, 60);                  /* mined before anyone reads the lease again */
+    if (node->hasLease) { node->hasLease = 0; node->leaseRecheckAt = 0; }   /* ours expired with the rotation, unless we named ourselves */
+    sqlite3_result_text(ctx, tx, -1, SQLITE_TRANSIENT);
+    sqlite3_free(tx);
+}
+
+/* SELECT hpplite_batch_key('0x...') (#17): the 256-bit batch cipher key as is, for a node
+** whose sequencer key lives in a signer and derives nothing */
+static void hpplite_batch_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = hppliteFindNode(db);
+    const char *z = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+    unsigned char key[32];
+    if (!node) { sqlite3_result_error(ctx, "hpplite is not on this connection", -1); return; }
+    if (!z || hpplite_hex_to_bytes(z, key, 32) != 32) { sqlite3_result_error(ctx, "hpplite_batch_key: not 32 bytes of hex", -1); return; }
+    if (hpplite_node_set_batch_key(node, key) != 0) { sqlite3_result_error(ctx, "hpplite_batch_key: not set", -1); return; }
+    memset(key, 0, sizeof key);
+    sqlite3_result_int(ctx, 1);
+}
+
 /* SELECT hpplite_keystore('/path.json', 'passphrase') (#17): an Ethereum keystore V3 file */
 static void hpplite_keystore_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     HppliteConfig cfg;

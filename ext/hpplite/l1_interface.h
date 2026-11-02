@@ -113,6 +113,9 @@ HppliteL1 *hpplite_l1_connect_config(const HppliteNetworkConfig *config);
 HppliteSystemConfig *hpplite_l1_get_system_config(HppliteL1 *l1);
 /* setCheckpointInterval(uint256): the owner's transaction, its hash (sqlite3_free) or NULL (#44) */
 char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval);
+/* setSequencer(address) (#17): the owner names the wallet that may hold the lease; the running lease expires.
+** The transaction's hash (sqlite3_free) or NULL (not the owner, no such call on this backend) */
+char *hpplite_l1_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]);
 
 /*
 ** Free system config
@@ -124,6 +127,9 @@ void hpplite_l1_system_config_free(HppliteSystemConfig *config);
 ** Must be called before submitting batches or checkpoints.
 */
 int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]);
+/* A signer whose key lives elsewhere (#17): sig r (32) and s (32), recid 0..3; the wallet it signs for */
+typedef int (*HppliteSignFn)(void *arg, const unsigned char hash[32], unsigned char sig[64], int *recid);
+int hpplite_l1_set_signer(HppliteL1 *l1, HppliteSignFn fn, void *arg, const unsigned char address[20]);
 
 /*
 ** Disconnect from L1

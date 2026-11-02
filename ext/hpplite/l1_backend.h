@@ -36,7 +36,9 @@ struct HppliteL1Ops {
     /* Coordinator */
     HppliteSystemConfig *(*get_system_config)(HppliteL1 *l1);
     char *(*set_checkpoint_interval)(HppliteL1 *l1, uint64_t interval);
+    char *(*set_sequencer)(HppliteL1 *l1, const unsigned char wallet[20]);   /* setSequencer(address): the owner's transaction (#17); NULL: no such call */
     int (*set_privkey)(HppliteL1 *l1, const uint8_t privkey[32]);
+    int (*set_signer)(HppliteL1 *l1, HppliteSignFn fn, void *arg, const unsigned char address[20]);   /* NULL: raw keys only */
     HppliteL1State *(*get_state)(HppliteL1 *l1);
     char *(*claim_sequencer)(HppliteL1 *l1, const unsigned char instanceId[32]);
     char *(*renew_lease)(HppliteL1 *l1, const unsigned char instanceId[32]);

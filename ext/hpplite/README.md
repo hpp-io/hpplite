@@ -784,9 +784,21 @@ capture logs as text (schema changes, writes reaching a virtual table).
 
 ## Keys
 
-One wallet key does everything in v0.1: it owns the rollup contracts, posts
-batches (sequencer), and the batch encryption key is derived from it. It
-reaches HPPLite before open, in order of precedence:
+One wallet key does everything by default: it owns the rollup contract, posts
+batches (the sequencer) and the batch cipher key is derived from it. The
+roles can be split (#17): the **owner** (cold: `transferOwnership`,
+`setCheckpointInterval`, `forceExpireLease`, naming the sequencer) names a
+**sequencer** wallet (hot: the lease, batches, checkpoints) with
+`SELECT hpplite_set_sequencer('0x...')` on a connection keyed with the owner's
+key; the running lease expires, the owner's own node posts no more, and a
+node keyed with the sequencer's key (`privkey=`, a keystore, or a signer)
+posts on the rollup named with `contract=`. The sequencer's key derives a
+different batch cipher key, so the owner hands the **batch key** over
+(`SELECT hpplite_batch_key('0x...')` on the sequencer's node, 32 bytes: what
+`hpplite_cipher_derive_key()` gives for the owner's key, or any key chosen
+when the rollup starts) and every replica with the owner's key still reads.
+Viewing keys that read without any power to act are #15. A key reaches
+HPPLite before open, in order of precedence:
 
 | How | Use for |
 |-----|---------|
@@ -794,6 +806,7 @@ reaches HPPLite before open, in order of precedence:
 | `HPPLITE_PRIVATE_KEY` | containers / process managers |
 | `privkey=0x...` in the URI | **development only**: SQLite keeps the query string next to the filename, so anyone with the `sqlite3*` can read it back via `sqlite3_uri_parameter()`, and URIs end up in logs |
 | `keystore=/path.json` or `HPPLITE_KEYSTORE`, passphrase in `HPPLITE_KEYSTORE_PASSWORD`; or `SELECT hpplite_keystore('/path.json', 'passphrase')` after open | **an Ethereum keystore V3 file** (#17): what `cast wallet new`, geth and MetaMask exports write; scrypt or PBKDF2-SHA256, AES-128-CTR, the Keccak MAC checked before anything is used (a wrong passphrase is refused as such). Vendored, like the batch cipher. |
+| `hpplite_node_set_signer()` (C API) with `SELECT hpplite_batch_key('0x...')` | **the sequencer key in a KMS or HSM** (#17): a callback signs the lease, batch and checkpoint transactions, the key never in the process; the batch cipher key cannot be derived from it, so it is given apart (32 bytes), or `encrypt=off`. A signer creates no rollup (create it once with the key, or name `contract=`) and pays no store. |
 | `SELECT hpplite_key('0x...')` or `hpplite_keyfile('/path')` after open | **applications that hold keys themselves** (#17): the SQLite-extension idiom, nothing in the URI or the environment. Until then the connection captures and posts nothing; with the call the node is keyed, a chain named at open is connected and its rollup resolved, the lease taken, and the next flush posts. The same file rules as `keyfile=`. A different key while keyed is refused (rotation is not this). |
 
 Without a key the database works and keeps capturing, but nothing is posted

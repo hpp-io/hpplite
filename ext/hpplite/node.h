@@ -34,6 +34,13 @@ typedef enum {
 /*
 ** Node configuration
 */
+/* A signer whose key lives elsewhere (#17); see hpplite_node_set_signer() */
+typedef struct HppliteSigner {
+    int (*sign)(void *arg, const unsigned char hash[32], unsigned char sig[64], int *recid);
+    void *arg;
+    unsigned char address[20];
+} HppliteSigner;
+
 typedef struct HppliteNodeConfig {
     /* Identity */
     char *nodeId;                   /* Human-readable node ID */
@@ -111,6 +118,8 @@ typedef struct HppliteNode {
     /* Crypto */
     HppliteCrypto *crypto;
     HppliteKeypair keypair;
+    HppliteSigner signer;           /* the sequencer's signer when the key lives elsewhere (#17) */
+    int hasSigner;
 
     /* Batch encryption: key derived from the wallet key, NULL cipher = plaintext */
     const HppliteCipher *cipher;
@@ -281,6 +290,16 @@ char *hpplite_node_submit_checkpoint(HppliteNode *node);
 ** Set the L1 connection for this node.
 */
 void hpplite_node_set_l1(HppliteNode *node, HppliteL1 *l1);
+
+/* A signer whose key lives elsewhere (#17): a KMS, an HSM, another process.
+** It signs the sequencer's transactions (lease, batches, checkpoints); the
+** batch cipher key is not derivable from it, so the node seals nothing until
+** hpplite_node_set_batch_key() (SELECT hpplite_batch_key('0x...')) gives one,
+** or encrypt=off posts plaintext. A store is not paid for (that signs with
+** the raw key). A rollup is not created by a signer: create it once with the
+** key, or name contract=. */
+int hpplite_node_set_signer(HppliteNode *node, const HppliteSigner *signer);   /* 0; -1; -2 keyed already */
+int hpplite_node_set_batch_key(HppliteNode *node, const unsigned char key[32]);  /* the 256-bit batch cipher key as is */
 
 /* The key given after open (#17): the node signs, seals and pays with it from
 ** here on; a chain the configuration named but could not be reached without

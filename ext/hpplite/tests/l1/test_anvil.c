@@ -1821,6 +1821,113 @@ static void test_key_after_open(void) {
     PASS();
 }
 
+/* 23. A signer whose key lives elsewhere (#17): the test's signer holds KEY0
+** and counts its calls; the node opened on the rollup's contract with no key
+** takes the lease and posts through it, the batch key given apart. */
+typedef struct { HppliteCrypto *c; HppliteKeypair kp; int calls; } AnvilSigner;
+static int anvil_signer_sign(void *arg, const unsigned char hash[32], unsigned char sig[64], int *recid) {
+    AnvilSigner *t = (AnvilSigner *)arg;
+    HppliteSignature s;
+    t->calls++;
+    if (hpplite_crypto_sign(t->c, &t->kp, hash, &s) != 0) return -1;
+    memcpy(sig, s.sig, 64);
+    *recid = s.recid;
+    return 0;
+}
+static void test_signer_posts(void) {
+    TEST("a signer instead of a key (#17): on the rollup's contract, the lease and the batch are signed through the callback, the batch sealed with a key given apart");
+    char contract[80], uri[1024];
+    sqlite3 *w = open_db("sg_owner.db", KEY0, "&dbname=signed");          /* the rollup exists, made with the key */
+    if (!w) FAIL("open owner");
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    sqlite3_close(w);                                                      /* its lease released */
+    if (!contract[0]) FAIL("no contract");
+    AnvilSigner ts = { hpplite_crypto_init(), {{0}}, 0 };
+    unsigned char raw[32];
+    HppliteSigner signer;
+    hpplite_hex_to_bytes(KEY0, raw, 32);
+    if (hpplite_crypto_keypair_from_privkey(ts.c, &ts.kp, raw) != 0) FAIL("keypair");
+    signer.sign = anvil_signer_sign; signer.arg = &ts; memcpy(signer.address, ts.kp.address, 20);
+    snprintf(uri, sizeof uri, "file:" DIR "/sg_signer.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&datadir=" DIR "&interval=0", RPC, contract);
+    sqlite3 *s = NULL;
+    if (sqlite3_open_v2(uri, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(s); FAIL("open on the contract without a key"); }
+    HppliteNode *n = hpplite_get_node(s);
+    if (!n || hpplite_node_set_signer(n, &signer) != 0) { sqlite3_close(s); FAIL("set signer"); }
+    sqlite3_exec(s, "CREATE TABLE sg(x); INSERT INTO sg VALUES('through the signer')", NULL, NULL, NULL);
+    long long h0 = scalar(s, "SELECT hpplite_flush()");
+    long long keyed = scalar(s, "SELECT hpplite_batch_key('0x5151515151515151515151515151515151515151515151515151515151515151')");
+    long long h1 = scalar(s, "SELECT hpplite_flush()");
+    printf("(without the batch key: flush %lld; batch key %lld; then flush %lld, lease %lld, state %s, signer calls %d) ",
+           h0, keyed, h1, (long long)scalar(s, "SELECT lease FROM hpplite_status"), status_text(s, "state"), ts.calls);
+    int ok = h0 == 0 && keyed == 1 && h1 >= 1 && scalar(s, "SELECT lease FROM hpplite_status") == 1 && ts.calls >= 2;
+    sqlite3_close(s);
+    hpplite_crypto_free(ts.c);
+    if (!ok) FAIL("the signer should have signed the lease and the batch");
+    PASS();
+}
+
+/* 24. The owner names the sequencer (#17): on the contract, KEY0 (owner,
+** its own named database) hands the lease to KEY1; its own node can post no
+** more, KEY1's node on the contract posts with the batch key handed over,
+** a replica with KEY0 reads both. */
+static void test_owner_names_sequencer(void) {
+    TEST("the owner names a hot sequencer wallet (#17): its own node loses the lease, the hot wallet's node posts with the batch key handed over, a replica with the owner key reads both");
+    char contract[80], uri[1024], sql[300], hotHex[48], batchHex[80];
+    unsigned char raw[32], batchKey[32];
+    HppliteCrypto *c = hpplite_crypto_init();
+    HppliteKeypair hot;
+    hpplite_hex_to_bytes(KEY1, raw, 32);
+    if (hpplite_crypto_keypair_from_privkey(c, &hot, raw) != 0) FAIL("keypair");
+    hotHex[0] = '0'; hotHex[1] = 'x'; hpplite_bytes_to_hex(hot.address, 20, hotHex + 2);
+    hpplite_hex_to_bytes(KEY0, raw, 32);
+    hpplite_cipher_derive_key(raw, batchKey);
+    batchHex[0] = '0'; batchHex[1] = 'x'; hpplite_bytes_to_hex(batchKey, 32, batchHex + 2);
+    sqlite3 *w = open_db("rot_owner.db", KEY0, "&dbname=rotated");
+    if (!w) FAIL("open owner");
+    sqlite3_exec(w, "CREATE TABLE rot(x); INSERT INTO rot VALUES('by the owner')", NULL, NULL, NULL);
+    long long h1 = scalar(w, "SELECT hpplite_flush()");
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    snprintf(sql, sizeof sql, "SELECT hpplite_set_sequencer('%s')", hotHex);
+    int rotated = exec_sql(w, sql) == SQLITE_OK;
+    sqlite3_exec(w, "INSERT INTO rot VALUES('after the rotation')", NULL, NULL, NULL);
+    long long h2 = scalar(w, "SELECT hpplite_flush()");
+    long long ownerLease = scalar(w, "SELECT lease FROM hpplite_status");
+    printf("(owner after the rotation: state %s, last_error '%.90s') ", status_text(w, "state"), status_text(w, "last_error"));
+    {
+        HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
+        HppliteL1State *st = peek ? hpplite_l1_get_state(peek) : NULL;
+        if (st) printf("(chain: leaseExpiry %llu, now %llu, instance %s) ", (unsigned long long)st->leaseExpiry, (unsigned long long)st->currentTimestamp,
+                       memcmp(st->sequencerInstance, hpplite_get_node(w)->instanceId, 32) == 0 ? "ours" : "other");
+        hpplite_l1_state_free(st);
+        hpplite_l1_disconnect(peek);
+    }
+    sqlite3_close(w);
+    snprintf(uri, sizeof uri, "file:" DIR "/rot_seq.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=0", RPC, contract, KEY1);
+    sqlite3 *s = NULL;
+    if (sqlite3_open_v2(uri, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(s); FAIL("open the sequencer's node"); }
+    snprintf(sql, sizeof sql, "SELECT hpplite_batch_key('%s')", batchHex);
+    long long keyed = scalar(s, sql);
+    long long synced = scalar(s, "SELECT hpplite_sync()");
+    long long rowsSeq = scalar(s, "SELECT count(*) FROM rot");
+    sqlite3_exec(s, "INSERT INTO rot VALUES('by the sequencer')", NULL, NULL, NULL);
+    long long h3 = scalar(s, "SELECT hpplite_flush()");
+    long long seqLease = scalar(s, "SELECT lease FROM hpplite_status");
+    printf("(owner: batch %lld, rotated %d, then flush %lld lease %lld; sequencer: batch key %lld, sync %lld, rows %lld, flush %lld lease %lld) ",
+           h1, rotated, h2, ownerLease, keyed, synced, rowsSeq, h3, seqLease);
+    sqlite3_close(s);
+    snprintf(uri, sizeof uri, "file:" DIR "/rot_replica.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&privkey=%s&role=verify&datadir=" DIR "&interval=0", RPC, contract, KEY0);
+    sqlite3 *r = NULL;
+    long long rowsR = -1;
+    if (sqlite3_open_v2(uri, &r, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK) rowsR = scalar(r, "SELECT count(*) FROM rot");
+    sqlite3_close(r);
+    hpplite_crypto_free(c);
+    if (h1 != 1 || !rotated) FAIL("the owner should post batch 1 and name the sequencer");
+    if (h2 != 0 || ownerLease != 0) FAIL("after the rotation the owner's node should post no more");
+    if (keyed != 1 || rowsSeq != 1 || h3 != 2 || seqLease != 1) FAIL("the sequencer's node should rebuild batch 1 with the batch key, take the lease and post batch 2");
+    if (rowsR != 2) FAILF("a replica with the owner key should read both batches, got %lld rows", rowsR);
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -1854,6 +1961,8 @@ int main(void) {
     if (wanted(20)) test_store_paid();
     if (wanted(21)) test_store_fallback();
     if (wanted(22)) test_key_after_open();
+    if (wanted(23)) test_signer_posts();
+    if (wanted(24)) test_owner_names_sequencer();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

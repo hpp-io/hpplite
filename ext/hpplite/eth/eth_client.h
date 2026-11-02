@@ -22,6 +22,9 @@ void eth_client_destroy(EthClient *client);
 
 /* Set private key for signing transactions */
 int eth_client_set_privkey(EthClient *client, const uint8_t privkey[32]);
+/* A signer that holds the key elsewhere (a KMS, an HSM, #17): sig is r (32) and s (32), recid 0..3; 0 signed */
+typedef int (*EthSignFn)(void *arg, const uint8_t hash[32], uint8_t sig[64], int *recid);
+int eth_client_set_signer(EthClient *client, EthSignFn fn, void *arg, const uint8_t address[20]);
 
 /* Get chain ID */
 uint64_t eth_client_chain_id(EthClient *client);

@@ -65,8 +65,16 @@ char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
     return l1 ? l1->ops->set_checkpoint_interval(l1, interval) : NULL;
 }
 
+char *hpplite_l1_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]) {
+    return (l1 && l1->ops->set_sequencer) ? l1->ops->set_sequencer(l1, wallet) : NULL;
+}
+
 int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
     return l1 ? l1->ops->set_privkey(l1, privkey) : -1;
+}
+
+int hpplite_l1_set_signer(HppliteL1 *l1, HppliteSignFn fn, void *arg, const unsigned char address[20]) {
+    return (l1 && l1->ops->set_signer) ? l1->ops->set_signer(l1, fn, arg, address) : -1;
 }
 
 HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {

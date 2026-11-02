@@ -487,6 +487,23 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                 config->rpcUrl, factoryHex, config->privkey);
             node->ownsL1 = (node->l1 != NULL);
         }
+    } else if (config->hasFactory && node->hasSigner) {
+        /* a signer's wallet: its rollup on the factory, found by address; a signer creates none (#17) */
+        char factoryHex[43], rollupHex[43];
+        unsigned char rollup[20];
+        int i;
+        snprintf(factoryHex, sizeof(factoryHex), "0x");
+        for (i = 0; i < 20; i++) snprintf(factoryHex + 2 + i * 2, 3, "%02x", config->factory[i]);
+        if (hpplite_l1_factory_get_rollup(config->rpcUrl, factoryHex, node->signer.address, rollup) == 1) {
+            snprintf(rollupHex, sizeof(rollupHex), "0x");
+            for (i = 0; i < 20; i++) snprintf(rollupHex + 2 + i * 2, 3, "%02x", rollup[i]);
+            node->l1 = hpplite_l1_connect(config->rpcUrl, rollupHex);
+            node->ownsL1 = (node->l1 != NULL);
+            if (node->l1) hpplite_l1_set_signer(node->l1, node->signer.sign, node->signer.arg, node->signer.address);
+        } else {
+            fprintf(stderr, "hpplite: this signer's wallet has no rollup on the factory, and a signer creates none:"
+                            " create it once with the key, or name contract=\n");
+        }
     } else if (config->hasContract) {
         /* Direct contract connection */
         char contractHex[43];
@@ -499,6 +516,8 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
 
         if (node->l1 && config->hasPrivkey) {
             hpplite_l1_set_privkey(node->l1, config->privkey);
+        } else if (node->l1 && node->hasSigner) {
+            hpplite_l1_set_signer(node->l1, node->signer.sign, node->signer.arg, node->signer.address);
         }
     }
 
@@ -1161,6 +1180,8 @@ static int node_ensure_lease(HppliteNode *node) {
         }
     }
 
+    if (getenv("HPPLITE_TRACE_LEASE"))
+        fprintf(stderr, "hpplite: lease check: remaining %llu, ours %d, hasLease %d\n", (unsigned long long)remaining, ours, node->hasLease);
     if (remaining > 0 && !ours) {
         if (!node->warnedForeignLease) {
             hpplite_error(node->ctx, "another sequencer instance holds the lease (%llu s left); "
@@ -1178,8 +1199,24 @@ static int node_ensure_lease(HppliteNode *node) {
         if (hpplite_node_renew_lease(node) == 0) remaining = node->leaseDuration;
     } else if (!ours) {
         if (hpplite_node_claim_lease(node) != 0) {
+            if (getenv("HPPLITE_TRACE_LEASE")) fprintf(stderr, "hpplite: lease check: claim failed\n");
             node->leaseRecheckAt = now + 5000;
             return 0;
+        }
+        if (getenv("HPPLITE_TRACE_LEASE")) fprintf(stderr, "hpplite: lease check: claim ok\n");
+        /* a mined claim can still have reverted (this wallet is not the
+        ** sequencer the owner named, #17): the chain says whose it is */
+        st = hpplite_l1_get_state(node->l1);
+        if (st) {
+            chainNow = st->currentTimestamp ? st->currentTimestamp : (uint64_t)time(NULL);
+            ours = st->leaseExpiry > chainNow && memcmp(st->sequencerInstance, node->instanceId, 32) == 0;
+            hpplite_l1_state_free(st);
+            if (!ours) {
+                hpplite_error(node->ctx, "the lease claim did not take: this wallet is not the rollup's sequencer; batches are kept pending");
+                node->hasLease = 0;
+                node->leaseRecheckAt = now + 30000;
+                return 0;
+            }
         }
         remaining = node->leaseDuration;
     }
@@ -1908,17 +1945,52 @@ void hpplite_node_set_l1(HppliteNode *node, HppliteL1 *l1) {
     node->l1 = l1;
     node->ownsL1 = 0;  /* Externally provided - we don't own it */
 
-    /* Pass our private key to L1 for signing transactions */
+    /* Pass our private key, or our signer, to L1 for signing transactions */
     if (node->config.hasPrivkey) {
         hpplite_l1_set_privkey(l1, node->config.privkey);
+    } else if (node->hasSigner) {
+        hpplite_l1_set_signer(l1, node->signer.sign, node->signer.arg, node->signer.address);
     }
     node_learn_batch_limit(node);
+}
+
+int hpplite_node_set_batch_key(HppliteNode *node, const unsigned char key[32]) {
+    if (!node || !key) return -1;
+    if (node->flushMutex) pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);
+    memcpy(node->encKey, key, HPPLITE_CIPHER_KEY_SIZE);
+    node->hasEncKey = 1;
+    if (!node->config.noEncrypt) node->cipher = hpplite_cipher_default();
+    node->warnedNoKey = 0;
+    if (node->l1 && node->hasSigner && !node->follower && !node->config.verifyOnly) { node->leaseRecheckAt = 0; node_ensure_lease(node); }
+    if (node->flushMutex) pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
+    return 0;
+}
+
+int hpplite_node_set_signer(HppliteNode *node, const HppliteSigner *signer) {
+    int rc = 0;
+    if (!node || !signer || !signer->sign) return -1;
+    if (node->config.hasPrivkey || node->hasSigner) return -2;
+    if (node->flushMutex) pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);
+    node->signer = *signer;
+    node->hasSigner = 1;
+    memcpy(node->keypair.address, signer->address, 20);
+    if (node->ctx) hpplite_error_clear(node->ctx);
+    if (node->l1) {
+        hpplite_l1_set_signer(node->l1, node->signer.sign, node->signer.arg, node->signer.address);
+        if (!node->follower && !node->config.verifyOnly && (node->cipher || node->config.noEncrypt)) { node->leaseRecheckAt = 0; node_ensure_lease(node); }
+    } else if (!node->follower) {
+        node_auto_connect_l1(node, &node->config);
+        if (node->wantsL1 && !node->l1) rc = -1;
+    }
+    if (node->flushMutex) pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
+    return rc;
 }
 
 int hpplite_node_set_key(HppliteNode *node, const unsigned char privkey[32]) {
     HppliteKeypair kp;
     int rc = 0;
     if (!node || !privkey || !node->crypto) return -1;
+    if (node->hasSigner) return -2;
     if (node->config.hasPrivkey) return memcmp(node->config.privkey, privkey, 32) == 0 ? 0 : -2;
     if (hpplite_crypto_keypair_from_privkey(node->crypto, &kp, privkey) != 0) return -1;
     if (node->flushMutex) pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);   /* not under a timer flush */

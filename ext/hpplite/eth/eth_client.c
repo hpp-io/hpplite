@@ -23,7 +23,9 @@ struct EthClient {
     uint64_t chain_id;
     uint8_t privkey[32];
     uint8_t address[20];
-    int has_privkey;
+    int has_privkey;           /* can sign: a raw key, or a signer */
+    EthSignFn signFn;          /* ...the signer, when the key is elsewhere (#17) */
+    void *signArg;
     char error[256];
     CURL *curl;
     secp256k1_context *secp_ctx;
@@ -266,6 +268,8 @@ void eth_client_destroy(EthClient *client) {
 
 int eth_client_set_privkey(EthClient *client, const uint8_t privkey[32]) {
     memcpy(client->privkey, privkey, 32);
+    client->signFn = NULL;
+    client->signArg = NULL;
     
     /* Derive address from private key */
     secp256k1_pubkey pubkey;
@@ -280,6 +284,16 @@ int eth_client_set_privkey(EthClient *client, const uint8_t privkey[32]) {
                                    &pubkey, SECP256K1_EC_UNCOMPRESSED);
     
     eth_address_from_pubkey(pubkey_serialized, client->address);
+    client->has_privkey = 1;
+    return 0;
+}
+
+int eth_client_set_signer(EthClient *client, EthSignFn fn, void *arg, const uint8_t address[20]) {
+    if (!client || !fn || !address) return -1;
+    memset(client->privkey, 0, 32);
+    memcpy(client->address, address, 20);
+    client->signFn = fn;
+    client->signArg = arg;
     client->has_privkey = 1;
     return 0;
 }
@@ -466,18 +480,25 @@ static size_t sign_transaction(EthClient *client,
     keccak256(unsigned_tx, unsigned_tx_len, hash);
     free(unsigned_tx);  /* Done with unsigned tx */
 
-    /* Sign */
-    secp256k1_ecdsa_recoverable_signature sig;
-    if (!secp256k1_ecdsa_sign_recoverable(client->secp_ctx, &sig, hash,
-                                           client->privkey, NULL, NULL)) {
-        free(items);
-        return 0;
-    }
-    
+    /* Sign: the signer when the key is elsewhere (#17), else the raw key */
     uint8_t sig_bytes[64];
     int recid;
-    secp256k1_ecdsa_recoverable_signature_serialize_compact(client->secp_ctx,
-                                                             sig_bytes, &recid, &sig);
+    if (client->signFn) {
+        if (client->signFn(client->signArg, hash, sig_bytes, &recid) != 0 || recid < 0 || recid > 3) {
+            snprintf(client->error, sizeof(client->error), "the signer did not sign");
+            free(items);
+            return 0;
+        }
+    } else {
+        secp256k1_ecdsa_recoverable_signature sig;
+        if (!secp256k1_ecdsa_sign_recoverable(client->secp_ctx, &sig, hash,
+                                               client->privkey, NULL, NULL)) {
+            free(items);
+            return 0;
+        }
+        secp256k1_ecdsa_recoverable_signature_serialize_compact(client->secp_ctx,
+                                                                 sig_bytes, &recid, &sig);
+    }
     
     /* Build signed tx */
     items_len = 0;

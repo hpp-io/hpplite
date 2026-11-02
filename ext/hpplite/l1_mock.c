@@ -286,6 +286,19 @@ static int mock_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
     return 0;
 }
 
+/* A signer (#17): the mock signs nothing, the wallet is what matters here */
+static int mock_set_signer(HppliteL1 *l1, HppliteSignFn fn, void *arg, const unsigned char address[20]) {
+    unsigned char zero[20] = {0};
+    (void)fn; (void)arg;
+    if (!l1 || !address) return -1;
+    memset(self->privkey, 0, 32);
+    memcpy(self->myAddress, address, 20);
+    self->hasPrivkey = 1;
+    if (memcmp(self->owner, zero, 20) == 0) memcpy(self->owner, address, 20);
+    if (memcmp(self->sequencer, zero, 20) == 0) memcpy(self->sequencer, address, 20);
+    return 0;
+}
+
 /*
 ** Disconnect from L1
 */
@@ -649,6 +662,19 @@ static int mock_wait_for_tx(HppliteL1 *l1, const char *tx_hash, int timeout_secs
 void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms) {
     if (!l1 || l1->ops != &hppliteL1MockOps) return;
     if (l1) self->submitDelayMs = ms;
+}
+
+/* setSequencer (#17): onlyOwner; the running lease expires, as the contract does */
+static char *mock_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]) {
+    unsigned char zero[20] = {0};
+    if (!l1 || !wallet || !self->hasPrivkey) return NULL;
+    if (l1 && self->rpcDown) return NULL;
+    if (memcmp(self->owner, self->myAddress, 20) != 0) return NULL;   /* onlyOwner */
+    if (memcmp(wallet, zero, 20) == 0) return NULL;                      /* "Invalid sequencer" */
+    memcpy(self->sequencer, wallet, 20);
+    self->leaseExpiry = self->currentTimestamp;
+    mockSaveState(l1);
+    return sqlite3_mprintf("0x%08xseq", (unsigned int)self->currentBlock);
 }
 
 static char *mock_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
@@ -1072,6 +1098,8 @@ const HppliteL1Ops hppliteL1MockOps = {
     .get_system_config = mock_get_system_config,
     .set_checkpoint_interval = mock_set_checkpoint_interval,
     .set_privkey = mock_set_privkey,
+    .set_signer = mock_set_signer,
+    .set_sequencer = mock_set_sequencer,
     .get_state = mock_get_state,
     .claim_sequencer = mock_claim_sequencer,
     .renew_lease = mock_renew_lease,

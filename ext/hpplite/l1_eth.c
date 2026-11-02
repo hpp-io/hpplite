@@ -24,6 +24,7 @@ typedef struct EthL1 {
     uint64_t version;          /* Coordinator VERSION, learned from getSystemConfig() */
     int has_da_contract;
     uint8_t privkey[32];
+    uint8_t address[20];       /* the wallet: from the key, or the signer's (#17) */
     int has_privkey;
 
     int lastOversized;         /* the last batch submission was too large for the chain */
@@ -68,6 +69,7 @@ static uint8_t TOPIC_BATCH_COMMITTED[32];   /* DA v2: BatchCommitted(uint256 ind
 static uint8_t SEL_GET_ROLLUP[4];
 static uint8_t SEL_HAS_ROLLUP[4];
 static uint8_t SEL_FORCE_EXPIRE_LEASE[4];
+static uint8_t SEL_SET_SEQUENCER[4];        /* setSequencer(address): the owner rotates the hot key (#17) */
 static uint8_t SEL_RELEASE_LEASE[4];
 static uint8_t SEL_GET_OR_CREATE_ROLLUP[4];
 static uint8_t SEL_GET_ROLLUPS_BY_OWNER[4];
@@ -94,6 +96,7 @@ static void init_selectors(void) {
     abi_function_selector("submitCheckpoint(bytes32,uint256,uint256,bytes32)", SEL_SUBMIT_CHECKPOINT);
     abi_function_selector("isLeaseActive()", SEL_IS_LEASE_ACTIVE);
     abi_function_selector("forceExpireLease()", SEL_FORCE_EXPIRE_LEASE);
+    abi_function_selector("setSequencer(address)", SEL_SET_SEQUENCER);
     abi_function_selector("releaseLease(bytes32)", SEL_RELEASE_LEASE);
     abi_function_selector("getSystemConfig()", SEL_GET_SYSTEM_CONFIG);
 
@@ -214,10 +217,32 @@ static char *eth_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
 
 
 /* Set private key for signing transactions */
+static char *eth_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]) {
+    uint8_t calldata[4 + 32];
+    uint8_t *tx_hash;
+    if (!l1 || !wallet) return NULL;
+    init_selectors();
+    memcpy(calldata, SEL_SET_SEQUENCER, 4);
+    memset(calldata + 4, 0, 32);
+    memcpy(calldata + 4 + 12, wallet, 20);
+    tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 80000, 0);
+    if (!tx_hash) return NULL;
+    return txHashString(tx_hash);
+}
+
 static int eth_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
     memcpy(self->privkey, privkey, 32);
     self->has_privkey = 1;
+    eth_address_from_privkey(privkey, self->address);
     return eth_client_set_privkey(self->eth, privkey);
+}
+
+static int eth_set_signer(HppliteL1 *l1, HppliteSignFn fn, void *arg, const unsigned char address[20]) {
+    if (!l1 || !fn || !address) return -1;
+    memset(self->privkey, 0, 32);
+    memcpy(self->address, address, 20);
+    self->has_privkey = 1;
+    return eth_client_set_signer(self->eth, (EthSignFn)fn, arg, address);
 }
 
 static HppliteL1State *eth_get_state(HppliteL1 *l1) {
@@ -501,7 +526,8 @@ static int eth_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
 
 static int eth_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
     if (!l1 || !self->has_privkey) return -1;
-    return eth_address_from_privkey(self->privkey, out);
+    memcpy(out, self->address, 20);
+    return 0;
 }
 
 static int eth_is_lease_active(HppliteL1 *l1) {
@@ -1212,6 +1238,8 @@ const HppliteL1Ops hppliteL1EthOps = {
     .get_system_config = eth_get_system_config,
     .set_checkpoint_interval = eth_set_checkpoint_interval,
     .set_privkey = eth_set_privkey,
+    .set_signer = eth_set_signer,
+    .set_sequencer = eth_set_sequencer,
     .get_state = eth_get_state,
     .claim_sequencer = eth_claim_sequencer,
     .renew_lease = eth_renew_lease,

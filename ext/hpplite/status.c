@@ -227,7 +227,7 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             sqlite3_result_text(ctx, node->cipher ? node->cipher->name : "none", -1, SQLITE_STATIC);
             break;
         case STATUS_COL_KEYED:
-            sqlite3_result_int(ctx, node->config.hasPrivkey ? 1 : 0);
+            sqlite3_result_int(ctx, (node->config.hasPrivkey || node->hasSigner) ? 1 : 0);
             break;
         case STATUS_COL_NONDETERMINISTIC:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nNondeterministic);
