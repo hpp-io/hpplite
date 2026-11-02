@@ -633,13 +633,19 @@ Scope is tied to versions. v0.1.1 is the last of the v0.1 line (end of life:
 upgrade to v0.2; `capture=text` keeps v0.1's capture). **v0.2.0 is tagged**
 (2026-11-01): row capture by default, `hpplite verify`, several writers per
 file, the fault harness as the gate, an inventory of the SQLite behaviours
-the capture relies on with a CI build against SQLite trunk.
+the capture relies on with a CI build against SQLite trunk. **v0.3.0 is
+tagged** (2026-11-02): batches deflated, the state root kept as per-table
+Merkle trees so a checkpoint costs what changed, the bytes of a batch in a
+store (a pin service paid over x402, a Kubo node, an S3 bucket) with the
+commitment on the chain, the status row saying what the store costs, the
+soak running through a store too. Key roles and viewing keys moved to v0.4.
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
 | **v0.1** | Library + loadable extension on stock SQLite, crash-safe local file, reconstruction from L1, batches cut at the DA limit, root at checkpoint cadence, encrypted batches, one writer process | per-tenant / single-tenant, up to ~100 MB | on-chain (contract storage) |
 | v0.2 | Row capture by default (#19), validated on suites and real applications (WordPress, Ghost, Rails 8), several writers per file, `hpplite verify` (#5) | same | same |
-| v0.3 | S3-backed DA with L1 commitments, incremental (Merkle) state root, batch compression (#12), key roles and viewing keys (#17, #15) | GB range | S3 + L1 commitments |
+| v0.3 | Off-chain stores with L1 commitments (#11: pin service over x402, Kubo, S3), incremental (Merkle) state root (#9), batch compression (#12) | GB range | a store + L1 commitments |
+| v0.4 | Key roles and provisioning (#17), viewing keys and the public-key envelope (#15), an HPP-only node by relay (#126) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: the state root is a content hash, O(database size) per
