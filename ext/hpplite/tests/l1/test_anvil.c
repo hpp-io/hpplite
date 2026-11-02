@@ -1282,8 +1282,28 @@ static const char *soak_drain(sqlite3 *w) {
     }
     return "the log did not drain in 60 flushes";
 }
+/* ...and for the checkpoint a root batch owes: the timer thread may still be
+** submitting it when the log reads empty, and hpplite-verify asks the chain */
+static const char *soak_settle(sqlite3 *w) {
+    int i;
+    const char *why = soak_drain(w);
+    if (why) return why;
+    for (i = 0; i < 50; i++) {
+        if (scalar(w, "SELECT height - 1 - last_checkpoint_height FROM hpplite_status") < 5) return NULL;   /* checkpoint=5 */
+        usleep(200000);
+    }
+    return "the owed checkpoint did not land in 10 s";
+}
+static pid_t start_pin_service_free(const char *svc, int port);
+static void soak_stop_store(pid_t pid) {
+    if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); }
+    unsetenv("HPPLITE_STORE");
+}
 static void test_soak(void) {
     long seconds = soak_env("HPPLITE_SOAK_SECONDS", 0), every = soak_env("HPPLITE_SOAK_EVERY", 10);
+    const char *storeMode = getenv("HPPLITE_SOAK_STORE");       /* "pin": the bytes at a free pin service, the chain commits (#11) */
+    pid_t svcPid = -1;
+    char extra[200] = "&interval=2000ms&checkpoint=5", replicaExtra[120] = "&role=verify", storeUrl[64] = "";
     long stmts = 0, txns = 0, checks = 0, failedStmts = 0;
     int cols = 0;
     double start = now_s(), deadline = start + seconds, worstRebuild = 0, worstVerify = 0;
@@ -1292,11 +1312,23 @@ static void test_soak(void) {
     const char *why = NULL;
     TEST("soak: a demo-like workload for hours; every N batches a fresh replica equals the writer and hpplite-verify agrees (#120)");
     printf("\n    %ld s, an oracle pass every %ld batches\n", seconds, every);
-    sqlite3 *w = open_db("soak.db", KEY0, "&interval=2000ms&checkpoint=5");
-    if (!w) FAIL("open writer");
+    if (storeMode && storeMode[0] && strcmp(storeMode, "0") != 0) {
+        const char *svc = getenv("HPPLITE_PIN_SERVICE");
+        int port = 9300 + (int)(getpid() % 200);
+        if (!svc) FAIL("HPPLITE_SOAK_STORE needs HPPLITE_PIN_SERVICE (anvil_test.sh sets it)");
+        svcPid = start_pin_service_free(svc, port);
+        if (svcPid < 0) FAIL("the pin service did not start");
+        snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", port);
+        snprintf(extra, sizeof extra, "&interval=2000ms&checkpoint=5&store=%s", storeUrl);
+        snprintf(replicaExtra, sizeof replicaExtra, "&role=verify&store=%s", storeUrl);
+        setenv("HPPLITE_STORE", storeUrl, 1);                       /* hpplite-verify reads the bytes there too */
+        printf("    the bytes at a pin service (%s); the chain holds the commitments\n", storeUrl);
+    }
+    sqlite3 *w = open_db("soak.db", KEY0, extra);
+    if (!w) { soak_stop_store(svcPid); FAIL("open writer"); }
     if (exec_sql(w, "CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, name TEXT NOT NULL, body TEXT NOT NULL, posted_at INTEGER NOT NULL, kind INTEGER);"
                     "CREATE TABLE IF NOT EXISTS soak_bin(id INTEGER PRIMARY KEY, b BLOB, f REAL);"
-                    "CREATE TABLE IF NOT EXISTS soak_kv(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID") != SQLITE_OK) { sqlite3_close(w); FAIL("schema"); }
+                    "CREATE TABLE IF NOT EXISTS soak_kv(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID") != SQLITE_OK) { sqlite3_close(w); soak_stop_store(svcPid); FAIL("schema"); }
     cols = (int)scalar(w, "SELECT count(*) FROM pragma_table_info('entries') WHERE name LIKE 'extra%'");
     snprintf(verifyCmd, sizeof verifyCmd, "--db " DIR "/soak.db");
     while (now_s() < deadline && !why) {
@@ -1311,10 +1343,10 @@ static void test_soak(void) {
             double t0, tRebuild, tVerify;
             int vrc;
             checks++;
-            if ((why = soak_drain(w)) != NULL) break;
+            if ((why = soak_settle(w)) != NULL) break;
             t0 = now_s();
             unlink(DIR "/soak_replica.db"); unlink(DIR "/soak_replica.db-wal"); unlink(DIR "/soak_replica.db-shm");
-            why = replica_equals_as(w, "soak_replica.db", KEY0, "&role=verify");
+            why = replica_equals_as(w, "soak_replica.db", KEY0, replicaExtra);
             tRebuild = now_s() - t0;
             if (why) break;
             t0 = now_s();
@@ -1334,14 +1366,16 @@ static void test_soak(void) {
     }
     if (!why) {
         HppliteNode *n = hpplite_get_node(w);
-        why = soak_drain(w);
+        why = soak_settle(w);
         if (!why) why = chain_contiguous(n);
-        if (!why) { unlink(DIR "/soak_replica.db"); unlink(DIR "/soak_replica.db-wal"); unlink(DIR "/soak_replica.db-shm"); why = replica_equals_as(w, "soak_replica.db", KEY0, "&role=verify"); }
+        if (!why) { unlink(DIR "/soak_replica.db"); unlink(DIR "/soak_replica.db-wal"); unlink(DIR "/soak_replica.db-shm"); why = replica_equals_as(w, "soak_replica.db", KEY0, replicaExtra); }
         if (!why && run_verify(verifyCmd, out, sizeof out) != 0) why = out;
     }
     printf("    end: height %lld, %ld statements (%ld failed, none refused), %ld transactions, %ld oracle passes, worst rebuild %.1f s, worst verify %.1f s\n",
            (long long)scalar(w, "SELECT height FROM hpplite_status"), stmts, failedStmts, txns, checks, worstRebuild, worstVerify);
+    if (svcPid > 0) printf("    store: %lld puts, state %s\n", (long long)scalar(w, "SELECT store_calls FROM hpplite_status"), status_text(w, "store_state"));
     sqlite3_close(w);
+    soak_stop_store(svcPid);
     if (why) FAIL(why);
     if (checks == 0) FAIL("no oracle pass ran: too short, or the timer never posted");
     PASS();

@@ -25,9 +25,13 @@ env:
 
 jobs:
   soak:
-    name: soak on anvil
+    name: soak on anvil (${{ matrix.store || 'bytes on the chain' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        store: ['', 'pin']          # bytes on the chain; bytes at a pin service with commitments on the chain (#11)
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
@@ -48,6 +52,7 @@ jobs:
           HPPLITE_SOAK_SECONDS: ${{ github.event.inputs.seconds || '3600' }}
           HPPLITE_SOAK_EVERY: ${{ github.event.inputs.every || '10' }}
           HPPLITE_ANVIL_TESTS: '16'
+          HPPLITE_SOAK_STORE: ${{ matrix.store }}
           # states older than 200 blocks are dropped: an hour of blocks would otherwise fill the runner's disk with anvil's state snapshots; block 0 must still be there when forge deploys the factory (a bare --prune-history keeps the latest state only and the deployment fails)
           HPPLITE_ANVIL_ARGS: '--prune-history 200'
         run: sh ext/hpplite/tests/l1/anvil_test.sh ext/hpplite/build_real/test_anvil
@@ -58,6 +63,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: soak-files
+          name: soak-files-${{ matrix.store || 'chain' }}
           path: /tmp/hpplite_anvil
           if-no-files-found: ignore
