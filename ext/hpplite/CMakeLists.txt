@@ -89,6 +89,7 @@ set(HPPLITE_SOURCES
     da_uri.c
     config.c
     cipher.c
+    keystore.c
     clock.c
     # Web3 integration (eth/ subdirectory)
     eth/cJSON.c
@@ -224,6 +225,11 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_faults hpplite_testlib)
         add_executable(test_keys tests/unit/test_keys.c)
         target_link_libraries(test_keys hpplite_testlib)
+        add_executable(test_keystore tests/unit/test_keystore.c)
+        target_link_libraries(test_keystore hpplite_testlib)
+        # the keystore fixtures, for the suites and their capture=text twins alike
+        target_compile_definitions(test_keys PRIVATE HPPLITE_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+        target_compile_definitions(test_keystore PRIVATE HPPLITE_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
         add_executable(test_abuse tests/unit/test_abuse.c)
         target_link_libraries(test_abuse hpplite_testlib)
         add_executable(test_foreign_keys tests/unit/test_foreign_keys.c)
@@ -347,6 +353,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_state_root COMMAND test_state_root)
         add_test(NAME test_faults COMMAND test_faults)
         add_test(NAME test_keys COMMAND test_keys)
+        add_test(NAME test_keystore COMMAND test_keystore)
         add_test(NAME test_abuse COMMAND test_abuse)
         add_test(NAME test_foreign_keys COMMAND test_foreign_keys)
         add_test(NAME test_big_txn COMMAND test_big_txn)

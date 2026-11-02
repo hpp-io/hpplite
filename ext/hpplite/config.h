@@ -45,6 +45,8 @@ extern "C" {
 #define HPPLITE_ENV_FACTORY       "HPPLITE_FACTORY_ADDRESS"
 #define HPPLITE_ENV_PRIVKEY       "HPPLITE_PRIVATE_KEY"
 #define HPPLITE_ENV_PRIVKEY_FILE  "HPPLITE_PRIVATE_KEY_FILE"
+#define HPPLITE_ENV_KEYSTORE      "HPPLITE_KEYSTORE"
+#define HPPLITE_ENV_KEYSTORE_PASSWORD "HPPLITE_KEYSTORE_PASSWORD"
 #define HPPLITE_ENV_DATA_DIR      "HPPLITE_DATA_DIR"
 #define HPPLITE_ENV_NODE_ID       "HPPLITE_NODE_ID"
 #define HPPLITE_ENV_BATCH_INTERVAL "HPPLITE_BATCH_INTERVAL"
@@ -70,6 +72,7 @@ extern "C" {
 #define HPPLITE_URI_CONTRACT      "contract"
 #define HPPLITE_URI_PRIVKEY       "privkey"
 #define HPPLITE_URI_PRIVKEY_FILE  "keyfile"
+#define HPPLITE_URI_KEYSTORE      "keystore"     /* an Ethereum keystore V3 file (#17); passphrase from HPPLITE_KEYSTORE_PASSWORD */
 #define HPPLITE_URI_DATA_DIR      "datadir"
 #define HPPLITE_URI_ENCRYPT       "encrypt"
 #define HPPLITE_URI_COMPRESS      "compress"    /* on (default): deflate the batch when it shrinks; off: as is (#12) */
@@ -204,6 +207,8 @@ const char *hpplite_config_role_str(HppliteConfigRole role);
 ** Returns 0 on success, -1 on error.
 */
 int hpplite_config_load_privkey_file(HppliteConfig *cfg, const char *path);
+/* An Ethereum keystore V3 file (#17); password NULL: HPPLITE_KEYSTORE_PASSWORD. 0 keyed, -1 (said on stderr) */
+int hpplite_config_load_keystore(HppliteConfig *cfg, const char *path, const char *password);
 
 /*
 ** Parse hex private key string.

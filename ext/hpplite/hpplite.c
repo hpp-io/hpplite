@@ -531,6 +531,7 @@ void hpplite_get_prev_block_hash(HppliteCtx *pCtx, unsigned char *pOut) {
 */
 
 #include "config.h"
+#include "keystore.h"
 #include "crypto.h"
 #include "batch.h"
 #include "l1_interface.h"
@@ -605,6 +606,7 @@ static void hpplite_sync_func(sqlite3_context *ctx, int argc, sqlite3_value **ar
 static void hpplite_flush_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_keyfile_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_keystore_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 
 
 /*
@@ -660,6 +662,8 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_key_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_keyfile", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
                             hpplite_keyfile_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_keystore", 2, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
+                            hpplite_keystore_func, NULL, NULL);
     hppliteStatusRegister(db);
 }
 
@@ -912,6 +916,23 @@ static void hpplite_key_func(sqlite3_context *ctx, int argc, sqlite3_value **arg
     memset(&cfg, 0, sizeof cfg);
     if (!z || hpplite_config_parse_privkey(&cfg, z) != 0) { sqlite3_result_error(ctx, "hpplite_key: not a 32-byte hex key", -1); return; }
     keyGiven(ctx, &cfg, "hpplite_key");
+    memset(&cfg, 0, sizeof cfg);
+}
+/* SELECT hpplite_keystore('/path.json', 'passphrase') (#17): an Ethereum keystore V3 file */
+static void hpplite_keystore_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    HppliteConfig cfg;
+    char err[200];
+    const char *z = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+    const char *pw = argc > 1 ? (const char *)sqlite3_value_text(argv[1]) : NULL;
+    memset(&cfg, 0, sizeof cfg);
+    if (!z || hpplite_keystore_load(z, pw, cfg.privkey, err, sizeof err) != 0) {
+        char *msg = sqlite3_mprintf("hpplite_keystore: %s", z ? err : "no path");
+        sqlite3_result_error(ctx, msg ? msg : "hpplite_keystore", -1);
+        sqlite3_free(msg);
+        return;
+    }
+    cfg.hasPrivkey = 1;
+    keyGiven(ctx, &cfg, "hpplite_keystore");
     memset(&cfg, 0, sizeof cfg);
 }
 static void hpplite_keyfile_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {

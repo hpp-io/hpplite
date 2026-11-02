@@ -249,7 +249,37 @@ static void test_key_at_runtime(void) {
     PASS();
 }
 
-int main(void) {
+/* #17 step 2: an Ethereum keystore V3 file, at open (keystore= with the
+** passphrase from HPPLITE_KEYSTORE_PASSWORD) and after it (hpplite_keystore) */
+#ifndef HPPLITE_FIXTURES_DIR
+#define HPPLITE_FIXTURES_DIR "tests/fixtures"
+#endif
+static const char *g_fixtures = HPPLITE_FIXTURES_DIR;
+static void test_keystore(void) {
+    TEST("keystore= with HPPLITE_KEYSTORE_PASSWORD keys the open; without the passphrase it opens unkeyed; hpplite_keystore(path, passphrase) keys it later; a wrong passphrase is an error (#17)");
+    reset_keys();
+    char uri[700], sql[700];
+    unsigned char addr[20];
+    snprintf(uri, sizeof uri, "file:" DIR "/ks.db?hpplite=on&datadir=" DIR "&keystore=%s/keystore_scrypt.json", g_fixtures);
+    setenv("HPPLITE_KEYSTORE_PASSWORD", "test-pass", 1);
+    sqlite3 *db = open_v2(uri);
+    unsetenv("HPPLITE_KEYSTORE_PASSWORD");
+    if (!db || status_int(db, "keyed") != 1) FAIL("keystore= with the passphrase should key the open");
+    memcpy(addr, hpplite_get_node(db)->keypair.address, 20);
+    sqlite3_close(db);
+    if (addr[0] != 0xde || addr[19] != 0x31) FAIL("the key should be cast's 0xDE98...2631");
+    db = open_v2(uri);                                                  /* no passphrase anywhere: unkeyed, said on stderr */
+    if (!db || status_int(db, "keyed") != 0) FAIL("without the passphrase the open should be unkeyed");
+    snprintf(sql, sizeof sql, "SELECT hpplite_keystore('%s/keystore_scrypt.json', 'wrong-pass')", g_fixtures);
+    if (exec_sql(db, sql) == SQLITE_OK) FAIL("a wrong passphrase should be an error");
+    snprintf(sql, sizeof sql, "SELECT hpplite_keystore('%s/keystore_scrypt.json', 'test-pass')", g_fixtures);
+    if (scalar(db, sql) != 1 || status_int(db, "keyed") != 1) FAIL("hpplite_keystore should key the connection");
+    sqlite3_close(db);
+    PASS();
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) g_fixtures = argv[1];
     printf("=== HPPLite Key Provisioning Tests ===\n");
     test_suite_init("keys", NULL, DIR);
     test_uri_key();
@@ -259,6 +289,7 @@ int main(void) {
     test_no_key_never_posts();
     test_encrypt_off_is_explicit();
     test_key_at_runtime();
+    test_keystore();
     remove_dir();
     return test_report();
 }

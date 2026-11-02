@@ -5,6 +5,7 @@
 */
 
 #include "config.h"
+#include "keystore.h"
 #include <sys/stat.h>
 #include <errno.h>
 #include "da_uri.h"
@@ -193,6 +194,12 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_PRIVKEY_FILE);
     if (val) {
         hpplite_config_load_privkey_file(cfg, val);
+    }
+
+    /* Keystore V3 (#17) */
+    val = getenv(HPPLITE_ENV_KEYSTORE);
+    if (val) {
+        hpplite_config_load_keystore(cfg, val, NULL);
     }
 
     /* Data dir */
@@ -419,6 +426,11 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         hpplite_config_load_privkey_file(cfg, buf);
     }
 
+    /* Keystore V3 (#17) */
+    if (get_uri_param(uri, HPPLITE_URI_KEYSTORE, buf, sizeof(buf))) {
+        hpplite_config_load_keystore(cfg, buf, NULL);
+    }
+
     /* Data dir */
     if (get_uri_param(uri, HPPLITE_URI_DATA_DIR, buf, sizeof(buf))) {
         free(cfg->dataDir);
@@ -572,6 +584,12 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
         hpplite_config_load_privkey_file(cfg, val);
     }
 
+    /* Keystore V3 (#17) */
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_KEYSTORE);
+    if (val) {
+        hpplite_config_load_keystore(cfg, val, NULL);
+    }
+
     /* Data dir */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DATA_DIR);
     if (val) {
@@ -686,6 +704,19 @@ int hpplite_config_load_privkey_file(HppliteConfig *cfg, const char *path) {
         }
     }
     memset(buf, 0, sizeof(buf));
+    return 0;
+}
+
+int hpplite_config_load_keystore(HppliteConfig *cfg, const char *path, const char *password) {
+    char err[200];
+    if (!cfg || !path) return -1;
+    if (!password) password = getenv(HPPLITE_ENV_KEYSTORE_PASSWORD);
+    if (hpplite_keystore_load(path, password, cfg->privkey, err, sizeof err) != 0) {
+        memset(cfg->privkey, 0, sizeof cfg->privkey);
+        fprintf(stderr, "hpplite: keystore %s: %s\n", path, err);
+        return -1;
+    }
+    cfg->hasPrivkey = 1;
     return 0;
 }
 
