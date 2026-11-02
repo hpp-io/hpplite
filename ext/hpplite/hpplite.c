@@ -1034,7 +1034,7 @@ static void readerChange(sqlite3_context *ctx, int argc, sqlite3_value **argv, i
                                  : "DELETE FROM _hpplite_readers WHERE pubkey = x'%s'",
                           hex, (unsigned long long)hpplite_get_block_height(node->ctx));
     if (!sql) { sqlite3_result_error_nomem(ctx); return; }
-    rc = hppliteInternalExec(node->ctx, db, sql);
+    rc = hppliteInternalExec(node->ctx, node->ctx->bPages ? node->ctx->bkDb : db, sql);   /* page mode: the readers live in the sidecar (#150) */
     sqlite3_free(sql);
     if (rc != SQLITE_OK) { sqlite3_result_error(ctx, bGrant ? "hpplite_grant: not recorded" : "hpplite_revoke: not recorded", -1); return; }
     hpplite_node_readers_changed(node);

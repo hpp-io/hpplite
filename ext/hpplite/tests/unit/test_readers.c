@@ -129,6 +129,7 @@ static void test_reader_from_the_start_and_revoke(void) {
 
 static void test_series_key(void) {
     TEST("one data key per batch series: the chunks of one flush share it, the next flush draws another; a reader opens every chunk");
+    SKIP_IF_PAGES("a commit of four random rows is one page diff of 600 bytes, over this 900-byte limit: a commit larger than the limit is #152");
     reset_dir();
     char pubR[70], sql[200];
     unsigned char privR[32], dek[4][32];

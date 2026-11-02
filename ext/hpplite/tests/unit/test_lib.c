@@ -18,6 +18,9 @@ int test_pages_mode(void) {
     const char *v = getenv("HPPLITE_CAPTURE");
     return v && strcasecmp(v, "pages") == 0;
 }
+int test_pending_is(long long pending, int n) {
+    return pending == n || (test_pages_mode() && pending == n + 1);
+}
 
 int test_report(void) {
     printf("\n%d/%d passed\n", tests_passed, tests_run);

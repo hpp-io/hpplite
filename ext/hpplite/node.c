@@ -1572,7 +1572,9 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
 static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes) {
     HppliteCtx *ctx = node->ctx;
     unsigned char *bytes = NULL, root[32];
-    size_t len = 0, budget = maxBytes * (node->pageDeflateRatio ? node->pageDeflateRatio : HPPLITE_PAGE_DEFLATE_GUESS);
+    size_t len = 0, budget, overhead = node->cipher ? node_envelope_overhead(node) : HPPLITE_PLAIN_MAGIC_LEN;
+    if (maxBytes > 0) maxBytes = maxBytes > overhead ? maxBytes - overhead : 1;      /* what the envelope adds is posted too (#150) */
+    budget = maxBytes * (node->pageDeflateRatio ? node->pageDeflateRatio : HPPLITE_PAGE_DEFLATE_GUESS);
     uint64_t height = ctx->blockHeight;
     const uint8_t *payload = NULL; size_t payloadLen = 0;
     uint8_t *sealed = NULL, *packed = NULL, *framed = NULL;
@@ -1608,7 +1610,20 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         }
         break;
     }
-    if (node->cipher) {
+    if (node->cipher && node->nReaders > 0 && node->config.hasPrivkey) {
+        /* readers besides the wallet (#15): sealed to every one of them and to
+        ** the wallet, under the series' data key, as the row flush does (#150) */
+        uint8_t *aTo = malloc((size_t)(node->nReaders + 1) * 33);
+        if (aTo) {
+            memcpy(aTo, node->keypair.pubkey, 33);
+            memcpy(aTo + 33, node->aReaders, (size_t)node->nReaders * 33);
+            if (!node->seriesDekValid) { hpplite_random_bytes(node->seriesDek, 32); node->seriesDekValid = 1; }
+            sealed = hpplite_envelope_seal_pk(node->cipher, node->seriesDek, aTo, node->nReaders + 1, height, encoding, payload, payloadLen, &payloadLen);
+            free(aTo);
+            if (!*pMore) node->seriesDekValid = 0;       /* the series ends with this batch: a new key next */
+        }
+        payload = sealed;
+    } else if (node->cipher) {
         sealed = hpplite_envelope_seal(node->cipher, node->encKey, height, encoding, payload, payloadLen, &payloadLen);
         payload = sealed;
     } else if (encoding == HPPLITE_ENCODING_DEFLATE) {

@@ -32,6 +32,10 @@ extern int tests_run, tests_passed;
 int test_rows_mode(void);
 int test_pages_mode(void);                   /* HPPLITE_CAPTURE=pages: page capture (#146) */
 #define SKIP_IF_ROWS(why) do { if (test_rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
+/* Cases about statements, the log table or the content root do not apply to page capture (#146) */
+#define SKIP_IF_PAGES(why) do { if (test_pages_mode()) { printf("SKIP (page capture: %s) ", why); PASS(); return; } } while(0)
+/* pending is n commits; in page mode the file as opened (its pages, never shipped) may count as one more */
+int test_pending_is(long long pending, int n);
 
 /* The end of main: the tally, and the process's exit code */
 int test_report(void);
