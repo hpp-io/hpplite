@@ -164,12 +164,16 @@ static void bkForeignCheck(HppliteCtx *pCtx, int doneBefore) {
 
 #ifdef HPPLITE_TEST_HOOKS
 int hpplite_test_fail_commits;   /* a test makes the next n finalize/adopt COMMITs fail as SQLITE_FULL (a full disk) */
+long hpplite_test_bk_commits;    /* bookkeeping write transactions committed (#145) */
 #endif
 int hppliteBkEnd(HppliteCtx *pCtx, int rc) {
   int bLook = rc == SQLITE_OK && pCtx->bkDb != pCtx->db;
   if (bLook) bkForeignCheck(pCtx, pCtx->commitsDoneBefore);
   if (rc == SQLITE_OK) {
     rc = hppliteInternalExec(pCtx, pCtx->bkDb, "COMMIT");
+#ifdef HPPLITE_TEST_HOOKS
+    if (rc == SQLITE_OK && pCtx->bBkGate) hpplite_test_bk_commits++;
+#endif
   }
   if (bLook && rc == SQLITE_OK) {
     /* the baseline: after our own commit (which moves the version), with

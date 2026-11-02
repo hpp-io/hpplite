@@ -1300,6 +1300,12 @@ static void test_crash_point(const char *zName) {
 #define test_crash_point(zName) ((void)0)
 #endif
 
+/* Further batches one flush call takes from the log beyond the one it set out
+** to post (#145): the gated transaction that writes them stays short, and a
+** backlog is drained over a few ticks. A transaction the size limit splits
+** into a series is posted whole regardless. */
+#define HPPLITE_FLUSH_MAX_BATCHES 32
+
 static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     HppliteCtx *ctx = node->ctx;
     HppliteBatch *batch;
@@ -1535,17 +1541,10 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         }
     }
 
-    if (hpplite_finalize_batch(ctx, batch, maxId) != SQLITE_OK) {
-        /* Typically: an application statement is mid-step, so bookkeeping
-        ** must not commit now (see hppliteBkBegin). The batch is on L1 (when there
-        ** is one) and the next flush adopts it; locally nothing changed. */
-        node->retryAt = 0;        /* not an L1 failure: try again next tick */
-        if (ctx->nAppStmtActive == 0 && !ctx->bAppTxnOpen && ctx->txnGate != 1) {
-            /* not a deferral for an application statement or transaction
-            ** (the gate): something is actually wrong */
-            hpplite_error(node->ctx, "could not finalize batch %llu locally",
-                    (unsigned long long)height);
-        }
+    /* finalized in memory; the call writes its batches in one transaction (#145) */
+    if (hpplite_finalize_batch_deferred(ctx, batch, maxId) != SQLITE_OK) {
+        node->retryAt = 0;
+        hpplite_error(node->ctx, "could not finalize batch %llu locally", (unsigned long long)height);
         height = 0;
         *pMore = 0;
     } else {
@@ -1553,8 +1552,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         node->batchesSinceCheckpoint++;
         node->failStreak = 0;
         node->retryAt = 0;
-        hpplite_error_clear(ctx);          /* posted and finalized: whatever was wrong is not now (#32) */
-        test_crash_point(*pMore ? "mid_series" : "after_finalize");
+        hpplite_error_clear(ctx);          /* posted: whatever was wrong is not now (#32) */
+        if (*pMore) test_crash_point("mid_series");
     }
 
     hpplite_batch_free(batch);
@@ -1600,12 +1599,41 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     }
     hpplite_rows_seq_flush(node->ctx);   /* busy now: the next flush */
 
-    /* One batch per call normally; several when the size limit splits them */
-    do {
-        h = node_flush_one(node, &more);
-        if (h == 0) break;
-        height = h;
-    } while (more);
+    /* The call posts what is pending: a transaction the size limit splits
+    ** into several batches, and every further batch's worth the log holds,
+    ** up to a cap; then writes them all in one bookkeeping transaction (#145) */
+    {
+        int n = 0, since = node->batchesSinceCheckpoint;
+        uint64_t produced = node->batchesProduced;
+        do {
+            h = node_flush_one(node, &more);
+            if (h == 0) break;
+            height = h;
+            n++;
+            if (!more && n < HPPLITE_FLUSH_MAX_BATCHES && node->config.maxBatchBytes > 0
+                && hpplite_pending_bytes_from(node->ctx, node->ctx->flushFromId) >= (sqlite3_int64)(node->config.maxBatchBytes / 2)) {
+                more = 1;
+            }
+        } while (more);                  /* a split transaction's series runs to its end, whatever the cap */
+        if (node->ctx->nDeferred > 0) {
+            int rc = hpplite_finalize_deferred(node->ctx);
+            if (rc != SQLITE_OK) {
+                /* Typically: the application keeps a transaction open, so bookkeeping
+                ** must not commit now (see hppliteBkBegin). The batches are on L1
+                ** (when there is one) and the next flush adopts them; locally the
+                ** memory went back to the file's. */
+                node->retryAt = 0;        /* not an L1 failure: try again next tick */
+                node->batchesSinceCheckpoint = since;
+                node->batchesProduced = produced;
+                if (node->ctx->nAppStmtActive == 0 && !node->ctx->bAppTxnOpen && node->ctx->txnGate != 1) {
+                    hpplite_error(node->ctx, "could not finalize %d batches locally (rc=%d)", n, rc);
+                }
+                height = 0;
+            } else {
+                test_crash_point("after_finalize");
+            }
+        }
+    }
 
     /* Anchor the state root on L1 once an interval of batches is complete */
     if (height && node->l1 && hpplite_node_should_checkpoint(node)) {
@@ -1736,6 +1764,9 @@ static void node_checkpoint_wal(HppliteNode *node, int64_t now) {
     node->walCheckAt = now + 1000;
     if (sqlite3_wal_checkpoint_v2(node->bkDb, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt) == SQLITE_OK) {
         node->walPages = nCkpt >= nLog ? 0 : nLog;       /* all of it in the database: the next writer restarts the WAL */
+        /* the restart that follows moves SQLite's data version with no commit
+        ** behind it: not a write past the log (#37); the next look re-baselines */
+        if (node->ctx) node->ctx->bBkDataVersionValid = 0;
     }
 }
 

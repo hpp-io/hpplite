@@ -64,6 +64,22 @@ int hpplite_rows_seq_flush(HppliteCtx *pCtx) {
   sqlite3_stmt *q = NULL;
   const char *z;
   if (!pCtx || !pCtx->bRows || pCtx->bkDb == pCtx->db) return SQLITE_OK;
+  /* Usually nothing moved: a read transaction says so without a write
+  ** transaction's commit (and its gate) on every flush call (#145) */
+  if (hppliteBkBegin(pCtx, 0) != SQLITE_OK) return SQLITE_BUSY;
+  saved = hppliteBkEnter(pCtx);
+  zMoved = hpplite_rows_seq_changed(pCtx, pCtx->bkDb, &n, &zNow);
+  hppliteBkLeave(pCtx, saved);
+  rc = hppliteBkEnd(pCtx, zMoved ? SQLITE_OK : SQLITE_NOMEM);
+  if (rc != SQLITE_OK || n == 0) {
+    sqlite3_free(zMoved);
+    if (rc == SQLITE_OK) hpplite_rows_seq_install(pCtx, zNow); else sqlite3_free(zNow);
+    return rc;
+  }
+  sqlite3_free(zMoved);
+  sqlite3_free(zNow);
+  zNow = NULL;
+  /* something moved: read again inside the write transaction (#91) and log it */
   if (hppliteBkBegin(pCtx, 1) != SQLITE_OK) return SQLITE_BUSY;
   saved = hppliteBkEnter(pCtx);
   zMoved = hpplite_rows_seq_changed(pCtx, pCtx->bkDb, &n, &zNow);
@@ -116,13 +132,14 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
   int overLimit = 0;
   /* a log some connection has row capture on for has records in it (#19) */
   rc = sqlite3_prepare_v2(pCtx->bkDb,
-    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode, now, op, tbl, rec FROM _hpplite_pending ORDER BY id",
+    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode, now, op, tbl, rec FROM _hpplite_pending WHERE id > ?1 ORDER BY id",
     -1, &pStmt, NULL);
   if (rc != SQLITE_OK) rc = sqlite3_prepare_v2(pCtx->bkDb,
-    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode, now FROM _hpplite_pending ORDER BY id",
+    "SELECT id, CASE WHEN txn = 0 THEN id ELSE txn END, sql, mode, now FROM _hpplite_pending WHERE id > ?1 ORDER BY id",
     -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     char *zEntry = NULL;
+    sqlite3_bind_int64(pStmt, 1, pCtx->flushFromId);     /* within a flush call: past what the call posted (#145) */
     while (sqlite3_step(pStmt) == SQLITE_ROW) {
       sqlite3_int64 id = sqlite3_column_int64(pStmt, 0);
       sqlite3_int64 txn = sqlite3_column_int64(pStmt, 1);
@@ -333,19 +350,22 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
 ** not in sql (#143: counted as nothing, the size-triggered flush never
 ** fired and a busy writer posted only on the interval). A log from before
 ** row capture has no rec column: its text alone. */
-sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx) {
+sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx) { return hpplite_pending_bytes_from(pCtx, 0); }
+
+sqlite3_int64 hpplite_pending_bytes_from(HppliteCtx *pCtx, sqlite3_int64 afterId) {
   sqlite3_stmt *pStmt = NULL;
   sqlite3_int64 n = 0;
   if (!pCtx) return 0;
   int saved = hppliteBkEnter(pCtx);
   if (sqlite3_prepare_v2(pCtx->bkDb,
-        "SELECT COALESCE(SUM(length(sql) + COALESCE(length(rec), 0)), 0) FROM _hpplite_pending",
+        "SELECT COALESCE(SUM(length(sql) + COALESCE(length(rec), 0)), 0) FROM _hpplite_pending WHERE id > ?1",
         -1, &pStmt, NULL) != SQLITE_OK) {
     pStmt = NULL;
-    sqlite3_prepare_v2(pCtx->bkDb, "SELECT COALESCE(SUM(length(sql)), 0) FROM _hpplite_pending",
+    sqlite3_prepare_v2(pCtx->bkDb, "SELECT COALESCE(SUM(length(sql)), 0) FROM _hpplite_pending WHERE id > ?1",
                        -1, &pStmt, NULL);
   }
   if (pStmt) {
+    sqlite3_bind_int64(pStmt, 1, afterId);
     if (sqlite3_step(pStmt) == SQLITE_ROW) n = sqlite3_column_int64(pStmt, 0);
     sqlite3_finalize(pStmt);
   }
@@ -357,6 +377,73 @@ sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx) {
 ** Advance _hpplite_meta past pBatch and optionally delete pending rows.
 ** Caller holds a bookkeeping write transaction.
 */
+/* the contract's rolling hash advances by the posted bytes (#33); a batch
+** with none (l1=local) leaves it where it was */
+static void chainHashAfter(HppliteCtx *pCtx, const HppliteBatch *pBatch, unsigned char *out) {
+  if (pBatch->pPosted && pBatch->nPosted > 0) {
+    unsigned char k[HPPLITE_HASH_SIZE];
+    hpplite_keccak256(pBatch->pPosted, pBatch->nPosted, k);
+    hpplite_chain_hash_next(pCtx->chainHash, pBatch->height, k, out);
+  } else {
+    memcpy(out, pCtx->chainHash, HPPLITE_HASH_SIZE);
+  }
+}
+
+/* what a finalized batch leaves in memory: the next height, the hashes, the
+** group it leaves open and the piece it ends (writer) */
+static void advanceMemory(HppliteCtx *pCtx, const HppliteBatch *pBatch, int bWriter,
+                          const unsigned char *blockHash, const unsigned char *chainHash) {
+  pCtx->blockHeight = pBatch->height + 1;
+  pCtx->openTxnId = (bWriter && pBatch->openTxn) ? pBatch->openGroup : 0;
+  pCtx->fragId = bWriter ? pBatch->fragRow : 0;
+  pCtx->fragOff = bWriter ? pBatch->fragOff : 0;
+  memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
+  memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
+  if (pBatch->hasRoot) memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+}
+
+/* the meta row, inside a bookkeeping write transaction */
+static int metaWrite(HppliteCtx *pCtx, sqlite3_int64 nextHeight, const unsigned char *blockHash,
+                     const unsigned char *chainHash, sqlite3_int64 openTxn, sqlite3_int64 fragId,
+                     sqlite3_int64 fragOff, const unsigned char *root) {
+  sqlite3_stmt *pStmt;
+  int rc = sqlite3_prepare_v2(pCtx->bkDb,
+    root
+      ? "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6, chain_hash=?7,"
+        " state_root=?3 WHERE id=1"
+      : "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6, chain_hash=?7 WHERE id=1",
+    -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) return rc;
+  sqlite3_bind_int64(pStmt, 1, nextHeight);
+  sqlite3_bind_blob(pStmt, 2, blockHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+  sqlite3_bind_blob(pStmt, 7, chainHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+  if (root) sqlite3_bind_blob(pStmt, 3, root, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(pStmt, 4, openTxn);     /* writer: the group this batch leaves open, continued by the next one */
+  sqlite3_bind_int64(pStmt, 5, fragId);      /* writer: the statement this batch ends a piece of, and how far it is posted */
+  sqlite3_bind_int64(pStmt, 6, fragOff);
+  rc = sqlite3_step(pStmt);
+  sqlite3_finalize(pStmt);
+  return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+/* keep the last HPPLITE_POSTED_KEEP batches as posted (a reorg re-posts them) */
+static int postedWrite(HppliteCtx *pCtx, uint64_t height, const unsigned char *p, size_t n) {
+  sqlite3_stmt *pStmt;
+  int rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_posted(height, data) VALUES(?1, ?2)", -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) return rc;
+  sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height);
+  sqlite3_bind_blob(pStmt, 2, p, (int)n, SQLITE_STATIC);
+  rc = sqlite3_step(pStmt);
+  sqlite3_finalize(pStmt);
+  if (rc != SQLITE_DONE) return rc;
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "DELETE FROM _hpplite_posted WHERE height <= ?1", -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) return rc;
+  sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height - HPPLITE_POSTED_KEEP);
+  rc = sqlite3_step(pStmt);
+  sqlite3_finalize(pStmt);
+  return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
 int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId, int bWriter) {
   unsigned char blockHash[HPPLITE_HASH_SIZE];
   sqlite3_stmt *pStmt;
@@ -389,21 +476,8 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
   }
 
   if (bWriter && pBatch->pPosted && pBatch->nPosted) {
-    /* keep the last HPPLITE_POSTED_KEEP batches as posted */
-    rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_posted(height, data) VALUES(?1, ?2)",
-                            -1, &pStmt, NULL);
+    rc = postedWrite(pCtx, pBatch->height, pBatch->pPosted, pBatch->nPosted);
     if (rc != SQLITE_OK) return rc;
-    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)pBatch->height);
-    sqlite3_bind_blob(pStmt, 2, pBatch->pPosted, (int)pBatch->nPosted, SQLITE_STATIC);
-    rc = sqlite3_step(pStmt);
-    sqlite3_finalize(pStmt);
-    if (rc != SQLITE_DONE) return rc;
-    rc = sqlite3_prepare_v2(pCtx->bkDb, "DELETE FROM _hpplite_posted WHERE height <= ?1", -1, &pStmt, NULL);
-    if (rc != SQLITE_OK) return rc;
-    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)pBatch->height - HPPLITE_POSTED_KEEP);
-    rc = sqlite3_step(pStmt);
-    sqlite3_finalize(pStmt);
-    if (rc != SQLITE_DONE) return rc;
   }
   if (maxId > 0 && pCtx->nNoClock > 0 && pCtx->pNoClockMutex) {
     int i, k = 0;
@@ -421,49 +495,118 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     pCtx->nCarry = 0;
   }
 
-  /* the contract's rolling hash advances by the posted bytes (#33); a batch
-  ** with none (l1=local) leaves it where it was */
-  unsigned char chainHash[HPPLITE_HASH_SIZE];
-  if (pBatch->pPosted && pBatch->nPosted > 0) {
-    unsigned char k[HPPLITE_HASH_SIZE];
-    hpplite_keccak256(pBatch->pPosted, pBatch->nPosted, k);
-    hpplite_chain_hash_next(pCtx->chainHash, pBatch->height, k, chainHash);
-  } else {
-    memcpy(chainHash, pCtx->chainHash, HPPLITE_HASH_SIZE);
-  }
-
-  rc = sqlite3_prepare_v2(pCtx->bkDb,
-    pBatch->hasRoot
-      ? "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6, chain_hash=?7,"
-        " state_root=?3 WHERE id=1"
-      : "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, open_txn=?4, frag_id=?5, frag_off=?6, chain_hash=?7 WHERE id=1",
-    -1, &pStmt, NULL);
-  if (rc != SQLITE_OK) return rc;
-  sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(pBatch->height + 1));
-  sqlite3_bind_blob(pStmt, 2, blockHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
-  sqlite3_bind_blob(pStmt, 7, chainHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
-  if (pBatch->hasRoot) {
-    sqlite3_bind_blob(pStmt, 3, pBatch->postStateRoot, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
-  }
-  /* writer: the group this batch leaves open, continued by the next one */
-  sqlite3_bind_int64(pStmt, 4, (bWriter && pBatch->openTxn) ? pBatch->openGroup : 0);
-  /* writer: the statement this batch ends a piece of, and how far it is posted */
-  sqlite3_bind_int64(pStmt, 5, bWriter ? pBatch->fragRow : 0);
-  sqlite3_bind_int64(pStmt, 6, bWriter ? (sqlite3_int64)pBatch->fragOff : 0);
-  rc = sqlite3_step(pStmt);
-  sqlite3_finalize(pStmt);
-  if (rc != SQLITE_DONE) return rc;
-
-  pCtx->blockHeight = pBatch->height + 1;
-  pCtx->openTxnId = (bWriter && pBatch->openTxn) ? pBatch->openGroup : 0;
-  pCtx->fragId = bWriter ? pBatch->fragRow : 0;
-  pCtx->fragOff = bWriter ? pBatch->fragOff : 0;
-  memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
-  memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
-  if (pBatch->hasRoot) {
-    memcpy(pCtx->stateRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+  {
+    unsigned char chainHash[HPPLITE_HASH_SIZE];
+    chainHashAfter(pCtx, pBatch, chainHash);
+    rc = metaWrite(pCtx, (sqlite3_int64)(pBatch->height + 1), blockHash, chainHash,
+                   (bWriter && pBatch->openTxn) ? pBatch->openGroup : 0,
+                   bWriter ? pBatch->fragRow : 0, bWriter ? (sqlite3_int64)pBatch->fragOff : 0,
+                   pBatch->hasRoot ? pBatch->postStateRoot : NULL);
+    if (rc != SQLITE_OK) return rc;
+    advanceMemory(pCtx, pBatch, bWriter, blockHash, chainHash);
   }
   return SQLITE_OK;
+}
+
+/* ---- a flush call's batches, written once (#145) ---- */
+
+int hpplite_finalize_batch_deferred(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId) {
+  unsigned char blockHash[HPPLITE_HASH_SIZE], chainHash[HPPLITE_HASH_SIZE];
+  if (!pCtx || !pBatch) return SQLITE_MISUSE;
+  if (pBatch->height != pCtx->blockHeight) return SQLITE_MISMATCH;
+  if (pBatch->pPosted && pBatch->nPosted > 0) {
+    int n = (int)(sizeof(pCtx->aDeferredPosted) / sizeof(pCtx->aDeferredPosted[0]));
+    unsigned char *copy = malloc(pBatch->nPosted);
+    if (!copy) return SQLITE_NOMEM;
+    memcpy(copy, pBatch->pPosted, pBatch->nPosted);
+    if (pCtx->nDeferredPosted == n) {          /* the oldest leaves: the file keeps the last HPPLITE_POSTED_KEEP anyway */
+      free(pCtx->aDeferredPosted[0].p);
+      memmove(&pCtx->aDeferredPosted[0], &pCtx->aDeferredPosted[1], (size_t)(n - 1) * sizeof(pCtx->aDeferredPosted[0]));
+      pCtx->nDeferredPosted--;
+    }
+    pCtx->aDeferredPosted[pCtx->nDeferredPosted].height = pBatch->height;
+    pCtx->aDeferredPosted[pCtx->nDeferredPosted].p = copy;
+    pCtx->aDeferredPosted[pCtx->nDeferredPosted].n = pBatch->nPosted;
+    pCtx->nDeferredPosted++;
+  }
+  if (pBatch->hasRoot) {
+    pCtx->deferredHasRoot = 1;
+    memcpy(pCtx->deferredRoot, pBatch->postStateRoot, HPPLITE_HASH_SIZE);
+  }
+  if (maxId > pCtx->deferredMaxId) pCtx->deferredMaxId = maxId;
+  if (maxId > pCtx->flushFromId) pCtx->flushFromId = maxId;
+  if (maxId > 0 && pCtx->nNoClock > 0 && pCtx->pNoClockMutex) {
+    int i, k = 0;
+    sqlite3_mutex_enter(pCtx->pNoClockMutex);
+    for (i = 0; i < pCtx->nNoClock; i++) if (pCtx->aNoClock[i].id > maxId) pCtx->aNoClock[k++] = pCtx->aNoClock[i];
+    pCtx->nNoClock = k;
+    sqlite3_mutex_leave(pCtx->pNoClockMutex);
+  }
+  if (pCtx->nCarry > 0) {
+    pCtx->deferredDropCarry = 1;
+    pCtx->nTxnsDropped++;
+    pCtx->nCarry = 0;
+  }
+  hpplite_block_hash(pBatch, pCtx->prevBlockHash, blockHash);
+  chainHashAfter(pCtx, pBatch, chainHash);
+  advanceMemory(pCtx, pBatch, 1, blockHash, chainHash);
+  pCtx->nDeferred++;
+  return SQLITE_OK;
+}
+
+void hpplite_finalize_deferred_drop(HppliteCtx *pCtx) {
+  int i;
+  for (i = 0; i < pCtx->nDeferredPosted; i++) free(pCtx->aDeferredPosted[i].p);
+  pCtx->nDeferredPosted = 0;
+  pCtx->nDeferred = 0;
+  pCtx->deferredMaxId = 0;
+  pCtx->flushFromId = 0;
+  pCtx->deferredHasRoot = 0;
+  pCtx->deferredDropCarry = 0;
+}
+
+int hpplite_finalize_deferred(HppliteCtx *pCtx) {
+  int rc, saved, i;
+  if (!pCtx || pCtx->nDeferred == 0) return SQLITE_OK;
+  /* the trees take the call's rows in before the gated transaction (#141) */
+  saved = hppliteBkEnter(pCtx);
+  rc = hppliteTreeSync(pCtx);
+  hppliteBkLeave(pCtx, saved);
+  if (rc == SQLITE_OK) rc = hppliteBkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) {
+    /* no transaction: the call's batches stand on the chain, the file does not
+    ** know them yet; the memory follows the file and the next call adopts them */
+    hppliteLoadMeta(pCtx);
+    hpplite_finalize_deferred_drop(pCtx);
+    return rc;
+  }
+  saved = hppliteBkEnter(pCtx);
+  rc = hppliteTreeSyncUpTo(pCtx, pCtx->deferredMaxId);
+  if (rc == SQLITE_OK) {
+    sqlite3_stmt *pStmt;
+    rc = sqlite3_prepare_v2(pCtx->bkDb, "DELETE FROM _hpplite_pending WHERE id <= ?1", -1, &pStmt, NULL);
+    if (rc == SQLITE_OK) {
+      sqlite3_bind_int64(pStmt, 1, pCtx->deferredMaxId);
+      rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+      sqlite3_finalize(pStmt);
+    }
+  }
+  if (rc == SQLITE_OK) rc = hppliteTreeKeep(pCtx, pCtx->deferredHasRoot, pCtx->deferredMaxId);
+  for (i = 0; rc == SQLITE_OK && i < pCtx->nDeferredPosted; i++) {
+    rc = postedWrite(pCtx, pCtx->aDeferredPosted[i].height, pCtx->aDeferredPosted[i].p, pCtx->aDeferredPosted[i].n);
+  }
+  if (rc == SQLITE_OK && pCtx->deferredDropCarry) rc = sqlite3_exec(pCtx->bkDb, "DELETE FROM _hpplite_carry", NULL, NULL, NULL);
+  if (rc == SQLITE_OK) {
+    rc = metaWrite(pCtx, (sqlite3_int64)pCtx->blockHeight, pCtx->prevBlockHash, pCtx->chainHash,
+                   pCtx->openTxnId, pCtx->fragId, (sqlite3_int64)pCtx->fragOff,
+                   pCtx->deferredHasRoot ? pCtx->deferredRoot : NULL);
+  }
+  hppliteBkLeave(pCtx, saved);
+  TEST_FAIL_COMMIT(rc);
+  rc = hppliteBkEnd(pCtx, rc);
+  if (rc != SQLITE_OK) hppliteLoadMeta(pCtx);
+  hpplite_finalize_deferred_drop(pCtx);
+  return rc;
 }
 
 int hpplite_bind_rollup(HppliteCtx *pCtx, const char *zRollup) {

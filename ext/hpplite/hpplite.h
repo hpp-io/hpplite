@@ -116,6 +116,16 @@ struct HppliteCtx {
   int bBkGate;                /* this bookkeeping transaction took the gate */
   volatile int bBkWantsGate;  /* a bookkeeping write is waiting: the application hands the gate over
                               ** when it goes idle instead of freeing it (#141) */
+  /* A flush call's batches are finalized in memory as they are posted and
+  ** written to the file in one bookkeeping transaction at the call's end (#145) */
+  sqlite3_int64 flushFromId;  /* the builder reads the log past this id within the call */
+  sqlite3_int64 deferredMaxId;/* the last posted row: pruned at the call's end */
+  int nDeferred;              /* batches finalized in memory, not yet in the file */
+  int deferredHasRoot;        /* one of them closed a checkpoint interval: its root goes to the meta row */
+  int deferredDropCarry;      /* _hpplite_carry is dropped at the call's end */
+  unsigned char deferredRoot[32];
+  struct { uint64_t height; unsigned char *p; size_t n; } aDeferredPosted[32];   /* the call's posted copies, the last 32 */
+  int nDeferredPosted;
   sqlite3_stmt *pSeqStmt;     /* Cached fingerprint of sqlite_sequence (NULL: none yet) */
   int seqTriedGen;            /* nDdlGen + 1 when sqlite_sequence was last found missing */
   int bClockPin;              /* The connection's VFS is the clock VFS: 'now' can be recorded and replayed */
@@ -355,6 +365,7 @@ struct HppliteBatch *hpplite_build_batch_limited(HppliteCtx *pCtx, size_t maxByt
 ** Total bytes of pending SQL text (cheap size estimate for early flushing).
 */
 sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx);
+sqlite3_int64 hpplite_pending_bytes_from(HppliteCtx *pCtx, sqlite3_int64 afterId);   /* the log past an id */
 
 /*
 ** Mark a batch confirmed: delete its pending rows (id <= maxId) and advance
@@ -362,6 +373,13 @@ sqlite3_int64 hpplite_pending_bytes(HppliteCtx *pCtx);
 ** state root advances only when the batch carries one.
 */
 int hpplite_finalize_batch(HppliteCtx *pCtx, const struct HppliteBatch *pBatch, sqlite3_int64 maxId);
+/* The same in two halves for a flush call (#145): each posted batch advances the
+** height and the hashes in memory and queues its pruning; the call writes it all
+** in one bookkeeping transaction. A failed write puts the memory back to the file's
+** (the batches stand on the chain and are adopted by the next call). */
+int hpplite_finalize_batch_deferred(HppliteCtx *pCtx, const struct HppliteBatch *pBatch, sqlite3_int64 maxId);
+int hpplite_finalize_deferred(HppliteCtx *pCtx);
+void hpplite_finalize_deferred_drop(HppliteCtx *pCtx);   /* forget the queue without writing (close, a failed write) */
 
 /*
 ** Build and immediately finalize a batch (no L1). Returns NULL if nothing
@@ -451,6 +469,7 @@ void hpplite_refresh_meta(HppliteCtx *pCtx);
 #ifdef HPPLITE_TEST_HOOKS
 extern int hpplite_test_fail_commits;   /* mock builds: the next n bookkeeping COMMITs fail as SQLITE_FULL */
 extern long hpplite_test_rows_hashed;   /* rows read for a state root since the counter was last zeroed (#9) */
+extern long hpplite_test_bk_commits;    /* bookkeeping write transactions committed since zeroed (#145) */
 /* called after a VACUUM released the file and before its marker is logged (#75): another connection's turn */
 extern void (*hpplite_test_before_vacuum_log)(void *pArg);
 extern void *hpplite_test_before_vacuum_log_arg;

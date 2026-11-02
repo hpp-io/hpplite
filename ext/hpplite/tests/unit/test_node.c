@@ -687,6 +687,59 @@ static void test_wal_checkpoint_on_the_timer(void) {
     cleanup_test_files("/tmp/hpplite_test_wal");
 }
 
+/* A flush call that posts several batches commits its bookkeeping once, at
+** the end, not once per batch (#145): each commit on the shared WAL is a
+** collision with the application's own commit fsync. */
+static void test_one_bookkeeping_commit_per_flush_call(void) {
+    HppliteNodeConfig config;
+    HppliteNode *node;
+    char *err = NULL;
+    int i;
+    uint64_t before, after;
+
+    TEST("one_bookkeeping_commit_per_flush_call");
+#ifndef HPPLITE_TEST_HOOKS
+    printf("SKIP (no test hooks in this build)\n"); tests_passed++; return;
+#else
+    cleanup_test_files("/tmp/hpplite_test_group");
+    ensure_test_dir("/tmp/hpplite_test_group");
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "test-group";
+    memcpy(config.privkey, SEQ_PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = "/tmp/hpplite_test_group";
+    config.dbPath = "/tmp/hpplite_test_group/test.db";
+    config.localOnly = 1;
+    config.maxBatchBytes = 8 * 1024;             /* small batches: the rows below make several */
+    node = hpplite_node_create(&config);
+    if (!node) { FAIL("create"); return; }
+    hpplite_node_start(node);
+    if (hpplite_node_exec(node, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &err) != 0) { FAIL(err); hpplite_node_destroy(node); return; }
+    hpplite_node_flush_batch(node);
+    for (i = 0; i < 400; i++) {
+        if (hpplite_node_exec(node, "INSERT INTO t(v) VALUES('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')", &err) != 0) { FAIL(err); hpplite_node_destroy(node); return; }
+    }
+    before = hpplite_node_get_height(node);
+    hpplite_test_bk_commits = 0;
+    hpplite_node_flush_batch(node);                /* one call: everything pending, in several batches */
+    after = hpplite_node_get_height(node);
+    if (after - before < 3) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "expected several batches from one call, got %llu", (unsigned long long)(after - before));
+        FAIL(msg);
+    } else if (hpplite_test_bk_commits != 1) {
+        char msg[120];
+        snprintf(msg, sizeof(msg), "%llu batches in one call took %ld bookkeeping commits, expected 1", (unsigned long long)(after - before), hpplite_test_bk_commits);
+        FAIL(msg);
+    } else {
+        printf("(%llu batches, 1 commit) ", (unsigned long long)(after - before));
+        PASS();
+    }
+    hpplite_node_destroy(node);
+    cleanup_test_files("/tmp/hpplite_test_group");
+#endif
+}
+
 int main(void) {
     printf("\n=== HPPLite Node Tests (Singleton Sequencer Model) ===\n\n");
 
@@ -700,6 +753,7 @@ int main(void) {
     test_flush_gets_the_gate_from_a_busy_writer();
     test_bookkeeping_commits_without_fsync();
     test_wal_checkpoint_on_the_timer();
+    test_one_bookkeeping_commit_per_flush_call();
 
     printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
 
