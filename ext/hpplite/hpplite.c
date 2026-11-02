@@ -385,11 +385,16 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
   return SQLITE_OK;
 }
 
+static int pagesTrace(unsigned mask, void *pArg, void *pS, void *pX);
 static void rearmHooks(HppliteCtx *pCtx, int bClosing) {
   void *prevCommit, *prevRollback;
   int lost = 0;
   if (!pCtx || pCtx->bDbClosed) return;
-  if (pCtx->bPages) { sqlite3_set_authorizer(pCtx->db, hppliteAuthorizer, pCtx); return; }   /* page mode: the authorizer is its only hook (#148) */
+  if (pCtx->bPages) {   /* page mode: the authorizer and the VACUUM marker (#148) */
+    sqlite3_set_authorizer(pCtx->db, hppliteAuthorizer, pCtx);
+    sqlite3_trace_v2(pCtx->db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, pagesTrace, pCtx);
+    return;
+  }
   /* setting a hook returns the previous argument: not ours means replaced */
   prevCommit = sqlite3_commit_hook(pCtx->db, hppliteCommitHook, pCtx);
   prevRollback = sqlite3_rollback_hook(pCtx->db, hppliteRollbackHook, pCtx);
@@ -470,6 +475,22 @@ void hpplite_shutdown(HppliteCtx *pCtx) {
   sqlite3_free(pCtx);
 }
 
+/* Page mode's trace: VACUUM attaches a database to copy through, which the
+** authorizer lets pass while a VACUUM runs (row mode marks it from its own
+** trace); nothing else is read from the statements (#148) */
+static int pagesTrace(unsigned mask, void *pArg, void *pS, void *pX) {
+  HppliteCtx *pCtx = (HppliteCtx*)pArg;
+  if (!pCtx) return 0;
+  if (mask == SQLITE_TRACE_STMT) {
+    const char *z = (const char*)pX;
+    while (z && (*z == ' ' || *z == '\t' || *z == '\n' || *z == '\r')) z++;
+    if (z && sqlite3_strnicmp(z, "VACUUM", 6) == 0 && !isalnum((unsigned char)z[6]) && z[6] != '_') pCtx->pVacuumStmt = pS;
+  } else if (mask == SQLITE_TRACE_PROFILE && pS == pCtx->pVacuumStmt) {
+    pCtx->pVacuumStmt = NULL;
+  }
+  return 0;
+}
+
 int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
   HppliteCtx *pCtx = (HppliteCtx*)sqlite3_malloc(sizeof(HppliteCtx));
   int rc = SQLITE_OK;
@@ -519,6 +540,7 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
   ** watched), ATTACH is refused (another file is not captured), the prefix is
   ** reserved (#148) */
   sqlite3_set_authorizer(db, hppliteAuthorizer, pCtx);
+  sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, pagesTrace, pCtx);
   *ppCtx = pCtx;
   return SQLITE_OK;
 }

@@ -586,6 +586,10 @@ static int hppliteAuthorizerInner(HppliteCtx *pCtx, int op, const char *z1, cons
       if (isHppliteTable(z1)) { pCtx->zDenyWhy = "the _hpplite_ prefix is reserved"; pCtx->nAuthDenied++; return SQLITE_DENY; }
       return SQLITE_OK;
     case SQLITE_ATTACH:
+      /* page mode: VACUUM attaches an unnamed temporary database to copy
+      ** through; the copy lands in the file as pages like any other write,
+      ** and no trace hook marks the VACUUM as row mode's does (#148) */
+      if (pCtx->bPages && (!z1 || !z1[0])) return SQLITE_OK;
       pCtx->nNondeterministic++;
       if (pCtx->bDeterminismWarn) return SQLITE_OK;
       pCtx->zDenyWhy = "ATTACH: writes to another file are not captured";

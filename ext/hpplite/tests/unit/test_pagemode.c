@@ -332,6 +332,33 @@ static void test_every_page_batch_carries_its_root(void) {
     PASS();
 }
 
+/* VACUUM and VACUUM INTO run in page mode (#148): the authorizer lets VACUUM's
+** own attach through; the pages it rewrote replicate like any others */
+static void test_vacuum_runs(void) {
+    TEST("VACUUM and VACUUM INTO run in page mode, and a replica equals the vacuumed file");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/v.db", l1, 1, 1);
+    if (!s) FAIL("open");
+    hpplite_node_exec(s, "CREATE TABLE t(x); INSERT INTO t VALUES(randomblob(3000)); INSERT INTO t VALUES(randomblob(3000)); DELETE FROM t WHERE rowid = 1", NULL);
+    int vac = sqlite3_exec(s->db, "VACUUM", NULL, NULL, NULL);
+    int into = sqlite3_exec(s->db, "VACUUM INTO '" DIR "/copy.db'", NULL, NULL, NULL);
+    int att = sqlite3_exec(s->db, "ATTACH '" DIR "/other.db' AS o", NULL, NULL, NULL);
+    hpplite_node_exec(s, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush");
+    exec_sql(s->db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    HppliteNode *r = open_pages_role(DIR "/vr.db", l1, 1, 1, 1);
+    int same = r && files_equal_masked(DIR "/v.db", DIR "/vr.db", NULL);
+    long long rows = r ? scalar(r->db, "SELECT count(*) FROM t") : -1;
+    if (r) hpplite_node_destroy(r);
+    hpplite_node_destroy(s); hpplite_l1_disconnect(l1);
+    if (vac != SQLITE_OK) FAILF("VACUUM: rc %d", vac);
+    if (into != SQLITE_OK) FAILF("VACUUM INTO: rc %d", into);
+    if (att != SQLITE_AUTH) FAILF("ATTACH after a VACUUM: rc %d, want SQLITE_AUTH still", att);
+    if (!same || rows != 2) FAIL("the replica differs from the vacuumed file");
+    PASS();
+}
+
 /* an L1 configured and not connected keeps everything pending (#156) */
 static void test_no_local_finalize_with_an_l1_configured(void) {
     TEST("with l1= configured and no connection, a page-mode flush keeps the batch pending instead of finalizing locally");
@@ -383,6 +410,7 @@ int main(void) {
     test_rules_that_keep_capture_possible();
     test_unreadable_file_fails_the_open();
     test_every_page_batch_carries_its_root();
+    test_vacuum_runs();
     test_no_local_finalize_with_an_l1_configured();
     test_open_fails_when_wal_cannot_be_set();
     remove_dir();
