@@ -295,6 +295,14 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
   rc = SQLITE_OK;
   if (!bookkeepingIsCurrent(db)) {
     rc = hppliteInternalExec(pCtx, db, HPPLITE_SCHEMA);
+    if (rc != SQLITE_OK) {
+      /* a file this SQLite cannot read: not a database, or encrypted at the page
+      ** level (SQLCipher, SEE) and not keyed before HPPLite started (#139) */
+      static char zWhy[300];
+      snprintf(zWhy, sizeof zWhy, "cannot create the bookkeeping tables: %s (the file is not a database, or it is encrypted"
+               " and not yet keyed: see issue #139)", sqlite3_errmsg(db));
+      gInitError = zWhy;
+    }
     if (rc == SQLITE_OK) {
       /* files from before #52: the log has no mode column yet (rows already
       ** in it ran with the default state, which DEFAULT 0 records) */

@@ -391,6 +391,30 @@ static void test_owner_names_sequencer(void) {
     PASS();
 }
 
+/* A file this SQLite cannot read - encrypted by SQLCipher or SEE and not yet
+** keyed, or not a database at all - must fail the open and say so, not open
+** and fail at the first flush (#17, step 5 deferred). */
+static void test_unreadable_file_fails_open(void) {
+    TEST("a file this SQLite cannot read fails the open with a message that says the file is not readable, not a generic one");
+    reset_keys();
+    unsigned char junk[8192];
+    for (size_t i = 0; i < sizeof junk; i++) junk[i] = (unsigned char)(i * 131 + 7);
+    FILE *f = fopen(DIR "/junk.db", "wb");
+    if (!f) FAIL("write");
+    fwrite(junk, 1, sizeof junk, f);
+    fclose(f);
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2("file:" DIR "/junk.db?hpplite=on&datadir=" DIR "&privkey=" KEY_A, &db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    char msg[300];
+    snprintf(msg, sizeof msg, "%s", db ? sqlite3_errmsg(db) : "");
+    if (db) sqlite3_close(db);
+    printf("(rc %d: '%s') ", rc, msg);
+    if (rc == SQLITE_OK) FAIL("the open should fail: HPPLite cannot keep a log in a file it cannot read");
+    if (!strstr(msg, "not a database") && !strstr(msg, "encrypted")) FAIL("the message should say the file is unreadable (encrypted, or not a database)");
+    PASS();
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) g_fixtures = argv[1];
     printf("=== HPPLite Key Provisioning Tests ===\n");
@@ -405,6 +429,7 @@ int main(int argc, char **argv) {
     test_keystore();
     test_signer();
     test_owner_names_sequencer();
+    test_unreadable_file_fails_open();
     remove_dir();
     return test_report();
 }

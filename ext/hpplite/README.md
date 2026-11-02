@@ -821,7 +821,11 @@ key at all: the directory is the chain, and `encrypt=off` posts plaintext
 there, or a key seals the batches as on chain. `encrypt=off`
 is the only way to post plaintext and must be explicit. A URI with
 `hpplite=on` that cannot be honoured (unreadable key file, malformed key)
-makes `sqlite3_open_v2()` fail rather than open without capture. Keys can
+makes `sqlite3_open_v2()` fail rather than open without capture, and so does
+a file this SQLite cannot read: one encrypted at the page level (SQLCipher,
+SEE) is refused at open with a message that says so (#139 is the support
+for keying HPPLite's own connection; until then, HPPLite runs on files the
+library it is loaded into can read). Keys can
 also be given after open (`hpplite_key()`, `hpplite_keyfile()`, above). v0.4
 splits the roles (owner / sequencer / data / viewing keys) and adds Ethereum
 keystore V3 files and KMS-held signers - see issues #17 and #15.
