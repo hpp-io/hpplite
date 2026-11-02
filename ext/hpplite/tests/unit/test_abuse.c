@@ -14,6 +14,7 @@
 */
 
 #include "test_lib.h"
+#include "hpplite_int.h"
 #include "cipher.h"
 #include "batch.h"
 
@@ -821,6 +822,29 @@ static void test_no_op_rows_vs_adoption(void) {
 /* A transaction that reads, then writes (Knex's deferred BEGIN, Django's
 ** atomic(): the usual shape) must not be broken by a bookkeeping commit in
 ** between: in WAL mode the read snapshot could no longer become a write */
+/* #133: a bookkeeping begin in read mode that fails inside a write
+** transaction of bookkeeping's (the application thread asks for the state
+** root while the timer thread finalizes) must not erase the write's hold on
+** the transaction gate: the gate then stayed taken for the connection's
+** life and every later application statement spun on it (the suite hang). */
+static void test_gate_survives_nested_begin(void) {
+    TEST("the transaction gate is released by the write that took it even after a failed read-mode begin inside it (#133)");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/gate.db", l1);
+    if (!n) FAIL("open");
+    HppliteCtx *c = n->ctx;
+    if (c->bkDb == c->db) { hpplite_node_destroy(n); FAIL("premise: bookkeeping has its own connection"); }
+    if (hppliteBkBegin(c, 1) != SQLITE_OK) { hpplite_node_destroy(n); FAIL("the write begin"); }
+    if (c->txnGate != 2) { hpplite_node_destroy(n); FAIL("the write holds the gate"); }
+    if (hppliteBkBegin(c, 0) == SQLITE_OK) { hpplite_node_destroy(n); FAIL("premise: a begin inside a transaction fails"); }
+    hppliteBkEnd(c, SQLITE_OK);
+    int gate = c->txnGate;
+    hpplite_node_destroy(n);
+    if (gate != 0) FAILF("the gate is still %d after the write ended: the failed read begin erased its hold", gate);
+    PASS();
+}
+
 static void test_bookkeeping_waits_for_app_transaction(void) {
     TEST("a flush during an application's read-then-write transaction does not lock it out");
     reset_dir();
@@ -1287,6 +1311,7 @@ int main(void) {
     test_returning_stepped_once();
     test_last_insert_rowid_is_the_applications();
     test_bookkeeping_waits_for_app_transaction();
+    test_gate_survives_nested_begin();
     test_zero_row_insert_into_autoincrement();
     test_vacuum_logged();
     test_count_changes();

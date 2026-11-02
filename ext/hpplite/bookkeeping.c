@@ -42,22 +42,26 @@ int hppliteBkBegin(HppliteCtx *pCtx, int bWrite) {
   if (bWrite && pCtx->bkDb != pCtx->db && pCtx->bAppTxnOpen) {
     return SQLITE_BUSY;
   }
+  /* Only the call that takes the gate ever touches bBkGate, and only once
+  ** its BEGIN went through: a begin that fails inside a transaction already
+  ** open (the application thread asking for the state root while the timer
+  ** thread finalizes, #133) must leave the holder's release alone, or the
+  ** gate stays taken for good and every later statement spins on it. */
+  int acquired = 0;
   if (bWrite && pCtx->bkDb != pCtx->db && !pCtx->bAppFlushing) {
     int expected = 0;
     if (!__atomic_compare_exchange_n(&pCtx->txnGate, &expected, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
       return SQLITE_BUSY;                 /* the application is between read and write (or the
                                           ** gate is held: its holder's flag is not ours to clear) */
     }
-    pCtx->bBkGate = 1;
-  } else {
-    pCtx->bBkGate = 0;
+    acquired = 1;
   }
   pCtx->commitsDoneBefore = __atomic_load_n(&pCtx->nCommitDone, __ATOMIC_ACQUIRE);   /* before this look's snapshot (#37) */
   {
     int rc = hppliteInternalExec(pCtx, pCtx->bkDb, bWrite ? "BEGIN IMMEDIATE" : "BEGIN");
-    if (rc != SQLITE_OK && pCtx->bBkGate) {
-      pCtx->bBkGate = 0;
-      __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
+    if (acquired) {
+      if (rc == SQLITE_OK) pCtx->bBkGate = 1;
+      else __atomic_store_n(&pCtx->txnGate, 0, __ATOMIC_RELEASE);
     }
     return rc;
   }
