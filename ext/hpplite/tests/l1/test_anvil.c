@@ -1998,6 +1998,44 @@ static void test_viewing_key_reads(void) {
     PASS();
 }
 
+/* 26. Page capture (#146) on the real contract: a rollup of its own beside
+** the wallet's first (a named database), batches of pages on chain, the
+** checkpoint anchored; a replica rebuilds the file page by page; the verify
+** tool finds the history is pages by itself and verifies it */
+static void test_page_mode_end_to_end(void) {
+    char out[4096] = "", params[600];
+    int rc;
+    TEST("page capture on the real contract: batches of pages, checkpoint anchored, replica equal, hpplite-verify finds the page history by itself");
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    sqlite3 *db = open_db("pg.db", KEY0, "&dbname=pages&capture=pages&checkpoint=1");
+    if (!db) FAIL("open");
+    HppliteNode *n = hpplite_get_node(db);
+    if (!n || !n->l1 || !n->pm) { sqlite3_close(db); FAIL("no L1 or no page mode after open with capture=pages"); }
+    sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('one'), ('two')", NULL, NULL, NULL);
+    if (scalar(db, "SELECT hpplite_flush()") < 1) { printf("(%s) ", status_text(db, "last_error")); sqlite3_close(db); FAIL("flush should post the pages"); }
+    sqlite3_exec(db, "UPDATE t SET v = 'three' WHERE id = 2; INSERT INTO t(v) VALUES('four')", NULL, NULL, NULL);
+    if (scalar(db, "SELECT hpplite_flush()") < 2) { sqlite3_close(db); FAIL("second flush"); }
+    long long height = scalar(db, "SELECT height FROM hpplite_status"), cp = scalar(db, "SELECT last_checkpoint_height FROM hpplite_status");
+    if (strcmp(status_text(db, "capture"), "pages") != 0) { sqlite3_close(db); FAIL("hpplite_status.capture is not pages"); }
+    if (cp < 1) { sqlite3_close(db); FAILF("checkpoint not anchored (last_checkpoint_height %lld, height %lld)", cp, height); }
+    unsigned char rootW[32]; hpplite_node_get_state_root(n, rootW);
+    /* a replica: the file written page by page from the chain */
+    sqlite3 *r = open_db("pg_r.db", KEY0, "&dbname=pages&capture=pages&role=verify");
+    if (!r) { sqlite3_close(db); FAIL("open the replica"); }
+    HppliteNode *rn = hpplite_get_node(r);
+    long long rows = scalar(r, "SELECT count(*) FROM t"), three = scalar(r, "SELECT count(*) FROM t WHERE v = 'three'"), mism = scalar(r, "SELECT root_mismatches FROM hpplite_status");
+    unsigned char rootR[32]; if (rn) hpplite_node_get_state_root(rn, rootR);
+    int same = rn && memcmp(rootW, rootR, 32) == 0;
+    sqlite3_close(r);
+    if (rows != 3 || three != 1 || mism != 0 || !same) { sqlite3_close(db); FAILF("replica: %lld rows, %lld 'three', %lld mismatches, roots %s", rows, three, mism, same ? "equal" : "differ"); }
+    /* the verify tool, told nothing about pages: it finds out from the first batch */
+    snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=pages", RPC, FACTORY, KEY0);
+    rc = run_verify_with(params, NULL, out, sizeof out);
+    sqlite3_close(db);
+    if (rc != 0 || !strstr(out, "matches the rebuilt content") || !strstr(out, "\nverified")) FAILF("hpplite-verify on the page history: exit %d, output:\n%s", rc, out);
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2034,6 +2072,7 @@ int main(void) {
     if (wanted(23)) test_signer_posts();
     if (wanted(24)) test_owner_names_sequencer();
     if (wanted(25)) test_viewing_key_reads();
+    if (wanted(26)) test_page_mode_end_to_end();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

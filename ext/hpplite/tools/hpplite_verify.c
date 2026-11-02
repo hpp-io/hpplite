@@ -173,9 +173,13 @@ int main(int argc, char **argv) {
     }
 
     /* the verifier's own datadir, first so it wins over one in the parameters */
-    char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&datadir=%s&%s", dir, dir, params);
-    sqlite3 *db = uri ? hpplite_open(uri) : NULL;
-    sqlite3_free(uri);
+    const char *zCapture = "";
+    int triedPages = 0;
+    sqlite3 *db;
+open_again:
+    { char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&datadir=%s&%s%s", dir, dir, params, zCapture);
+      db = uri ? hpplite_open(uri) : NULL;
+      sqlite3_free(uri); }
     if (!db) {
         fprintf(stderr, "hpplite-verify: cannot open with these parameters (%s)\n", hpplite_config_error() ? hpplite_config_error() : "see above");
         rc = 2;
@@ -201,6 +205,19 @@ int main(int argc, char **argv) {
     }
     const char *zState = status_text(db, "state");
     const char *zErr = status_text(db, "last_error");
+    if (!triedPages && strstr(zErr, "capture=pages")) {
+        /* a page history (#146): the rebuild is a file written page by page,
+        ** in page mode; the parameters did not say so, the first batch did */
+        char path[1100];
+        triedPages = 1;
+        sqlite3_close(db);
+        snprintf(path, sizeof path, "%s/rebuilt.db", dir); unlink(path);
+        snprintf(path, sizeof path, "%s/rebuilt.db-wal", dir); unlink(path);
+        snprintf(path, sizeof path, "%s/rebuilt.db-shm", dir); unlink(path);
+        snprintf(path, sizeof path, "%s/rebuilt.db-hpplite.db", dir); unlink(path);
+        zCapture = "&capture=pages";
+        goto open_again;
+    }
     sqlite3_int64 compared = scalar(db, "SELECT roots_compared FROM hpplite_status");
     sqlite3_int64 mismatches = scalar(db, "SELECT root_mismatches FROM hpplite_status");
     sqlite3_int64 skipped = scalar(db, "SELECT replay_skipped FROM hpplite_status");

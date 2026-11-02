@@ -564,6 +564,8 @@ int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned ch
   memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
   memcpy(pCtx->stateRoot, root, HPPLITE_HASH_SIZE);
   pCtx->inflightHeight = 0;
+  { int i = pCtx->nRootAt % HPPLITE_ROOT_RING;        /* the root at this height, for hpplite_root_at (the verifier's checkpoint check) */
+    pCtx->aRootAt[i].height = height; memcpy(pCtx->aRootAt[i].root, root, 32); pCtx->nRootAt++; }
   return SQLITE_OK;
 }
 
