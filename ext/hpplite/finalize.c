@@ -364,8 +364,11 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
 
   hpplite_block_hash(pBatch, pCtx->prevBlockHash, blockHash);
 
-  /* the state trees take the log in before it is pruned, and are kept (#9) */
-  rc = hppliteTreeSync(pCtx);
+  /* the state trees take the log in before it is pruned, and are kept (#9):
+  ** here only up to this batch's rows; the sync before the transaction took
+  ** them in already, and rows that arrived since are the next batch's, taken
+  ** in outside the gate (#142) */
+  rc = hppliteTreeSyncUpTo(pCtx, maxId);
   if (rc != SQLITE_OK) {
     hpplite_error(pCtx, "the state trees could not take the log in (rc=%d: %s)", rc, sqlite3_errmsg(pCtx->bkDb));
     return rc;
@@ -379,7 +382,7 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     sqlite3_finalize(pStmt);
     if (rc != SQLITE_DONE) return rc;
   }
-  rc = hppliteTreeFlush(pCtx);
+  rc = hppliteTreeKeep(pCtx, pBatch->hasRoot, maxId);     /* written at the checkpoint, kept in memory between (#142) */
   if (rc != SQLITE_OK) {
     hpplite_error(pCtx, "the state trees could not be kept (rc=%d: %s)", rc, sqlite3_errmsg(pCtx->bkDb));
     return rc;

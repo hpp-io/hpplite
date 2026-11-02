@@ -392,7 +392,7 @@ something is pending, so an idle database costs nothing.
 | `replay.c` | Applying batches from the chain; adopt, skipped heights, checkpoints |
 | `state_hash.c` | The state root (version 2: schema plus per-table tree roots; version 1 kept for old histories) and the block hash (`sha256.c`) |
 | `smt.c` | The sparse Merkle tree of a table's rows (#9): a store interface, set/clear/root, build from a sorted list |
-| `state_tree.c` | The maintained trees: `_hpplite_tree`, the log taken in by key, the overlay flushed with the batch, stale trees rebuilt from a scan |
+| `state_tree.c` | The maintained trees: `_hpplite_tree`, the log taken in by key, the overlay written at the checkpoint (#142), stale trees rebuilt from a scan |
 | `status.c` | `hpplite_status` table and the close sentinel |
 | `capture_rows.c` | Row capture (#19): the TEMP triggers, the record format, what stays text, `sqlite_sequence`, applying records on a replica |
 | `cipher.c` | Batch encryption: ChaCha20-Poly1305, HKDF-SHA256 key derivation, envelope format, pluggable schemes |
@@ -491,7 +491,11 @@ rowid or primary key, its value the row's columns as a row record carries
 them). It is a pure function of the file's content, which is why anyone can
 recompute it from a rebuilt file, and the node keeps the trees in
 `_hpplite_tree`, taking each batch's touched rows in from the log, so a
-checkpoint costs what changed and not a scan of the database. A checkpoint
+checkpoint costs what changed and not a scan of the database. The trees are
+written to the file at the checkpoint (or once a large number of touched
+nodes waits in memory), not with every batch; between writes the file says
+they are behind the log (`tree_stale`), and a node that opens such a file,
+after a crash, rebuilds them from a scan (#142). A checkpoint
 batch says which version its root is (`root_v`); histories written before
 carry version 1 roots (one hash over every row) and are compared with
 version 1 still, `hpplite_status.root_version` says what a live node

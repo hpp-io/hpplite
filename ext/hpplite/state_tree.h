@@ -17,13 +17,25 @@ struct HppliteBatch;
 int hppliteTreeSchema(struct HppliteCtx *pCtx, sqlite3 *db);
 /* Take in the pending log since the trees' seq (inside a bookkeeping transaction, or on the shared connection) */
 int hppliteTreeSync(struct HppliteCtx *pCtx);
+/* The same up to a log id: inside the gated transaction only the batch's own rows (#142);
+** what arrived after them waits for the next batch's sync outside it */
+int hppliteTreeSyncUpTo(struct HppliteCtx *pCtx, sqlite3_int64 maxId);
 /* The version 2 root as the file is now (syncs first) */
 int hppliteTreeRoot(struct HppliteCtx *pCtx, unsigned char out[32]);
 /* Inside a bookkeeping write transaction: the overlay to _hpplite_tree, stale trees rebuilt, the seq advanced */
 int hppliteTreeFlush(struct HppliteCtx *pCtx);
+int hppliteTreeFlushUpTo(struct HppliteCtx *pCtx, sqlite3_int64 upTo);   /* the same, syncing only up to a log id (0: all) */
+/* After a batch pruned the log, inside the same transaction (#142): the trees
+** are written when the batch closes a checkpoint interval (bPersist), when they
+** are stale or the overlay is large; otherwise kept in memory and the file
+** marked stale until the next write */
+int hppliteTreeKeep(struct HppliteCtx *pCtx, int bPersist, sqlite3_int64 upTo);
 /* A replica, inside the write transaction after a batch was applied: the
 ** entries it ran (carried ones included), each by xEntry(pArg, i) */
 int hppliteTreeTouchEntries(struct HppliteCtx *pCtx, int n,
                             void (*xEntry)(void *pArg, int i, const char **pzSql, int *pMode), void *pArg);
 void hppliteTreeFree(struct HppliteCtx *pCtx);
+/* A bookkeeping transaction the trees took part in rolled back: reload from the file next */
+void hppliteTreeRolledBack(struct HppliteCtx *pCtx);
+
 #endif

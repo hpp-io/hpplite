@@ -227,6 +227,115 @@ static void test_root_at(void) {
     PASS();
 }
 
+/* #142: the trees are written once per checkpoint interval, not with every
+** batch (a write of every touched node held the writer for hundreds of
+** milliseconds per flush). Between writes the file says the trees are
+** stale, so a copy taken then (a crash) rebuilds the same root from a scan. */
+static void test_trees_written_per_checkpoint(void) {
+    TEST("the trees are written at the checkpoint, not at every batch; between, the file is marked stale and a copy of it rebuilds the same root");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_writer(DIR "/w.db", l1, 4);          /* a root every 4 batches */
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", NULL);
+    hpplite_node_exec(w, "BEGIN; WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 200)"
+                         " INSERT INTO t SELECT i, 'row ' || i FROM s; COMMIT", NULL);
+    if (hpplite_node_flush_batch(w) != 1) FAIL("batch 1");
+    sqlite3_int64 nodes1 = scalar(w->ctx->bkDb, "SELECT count(*) FROM _hpplite_tree");
+    sqlite3_int64 seq1 = scalar(w->ctx->bkDb, "SELECT tree_seq FROM _hpplite_meta WHERE id = 1");
+    hpplite_node_exec(w, "UPDATE t SET b = 'two' WHERE a <= 50", NULL);
+    if (hpplite_node_flush_batch(w) != 2) FAIL("batch 2");
+    hpplite_node_exec(w, "DELETE FROM t WHERE a > 150", NULL);
+    if (hpplite_node_flush_batch(w) != 3) FAIL("batch 3");
+    sqlite3_int64 nodes3 = scalar(w->ctx->bkDb, "SELECT count(*) FROM _hpplite_tree");
+    sqlite3_int64 seq3 = scalar(w->ctx->bkDb, "SELECT tree_seq FROM _hpplite_meta WHERE id = 1");
+    sqlite3_int64 stale3 = scalar(w->ctx->bkDb, "SELECT tree_stale FROM _hpplite_meta WHERE id = 1");
+    printf("(tree nodes after batch 1: %lld, after batch 3: %lld; tree_seq %lld -> %lld; stale %lld) ",
+           (long long)nodes1, (long long)nodes3, (long long)seq1, (long long)seq3, (long long)stale3);
+    if (nodes3 != nodes1 || seq3 != seq1) FAIL("batches 2 and 3 wrote the trees");
+    if (stale3 != 1) FAIL("the file does not say the trees are behind the log");
+    if (!root_matches_scan(w, "writer between checkpoints")) FAIL("writer root");
+
+    /* a copy of the file as it is now: what a crash would leave */
+    {
+        sqlite3 *copy = NULL;
+        sqlite3_backup *bk;
+        if (sqlite3_open(DIR "/copy.db", &copy) != SQLITE_OK) FAIL("open copy");
+        bk = sqlite3_backup_init(copy, "main", w->db, "main");
+        if (!bk || sqlite3_backup_step(bk, -1) != SQLITE_DONE) FAIL("backup");
+        sqlite3_backup_finish(bk);
+        sqlite3_close(copy);
+    }
+    hpplite_test_rows_hashed = 0;
+    HppliteNode *c = open_writer(DIR "/copy.db", NULL, 4);     /* no chain: the file alone */
+    if (!c) FAIL("open the copy");
+    if (!root_matches_scan(c, "copy")) FAIL("copy root");
+    if (!same_root(w, c)) FAIL("the copy's root differs from the writer's");
+    printf("(the copy rebuilt its trees from %ld rows) ", hpplite_test_rows_hashed);
+    if (hpplite_test_rows_hashed == 0) FAIL("the copy did not rebuild its trees from a scan");
+    hpplite_node_destroy(c);
+
+    hpplite_node_exec(w, "INSERT INTO t(a, b) VALUES(1000, 'four')", NULL);
+    if (hpplite_node_flush_batch(w) != 4) FAIL("batch 4");       /* closes the interval: a root, the trees written */
+    sqlite3_int64 nodes4 = scalar(w->ctx->bkDb, "SELECT count(*) FROM _hpplite_tree");
+    if (scalar(w->ctx->bkDb, "SELECT tree_stale FROM _hpplite_meta WHERE id = 1") != 0) FAIL("still stale after the checkpoint");
+    if (nodes4 == nodes3) FAIL("the checkpoint did not write the trees");
+    printf("(after the checkpoint: %lld nodes) ", (long long)nodes4);
+    if (!root_matches_scan(w, "writer at the checkpoint")) FAIL("writer root at the checkpoint");
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* #142, the other way round: a bookkeeping commit that fails (a full disk)
+** rolls back the stale mark and whatever the trees wrote; the in-memory
+** trees must not believe any of it, or the maintained root drifts from the
+** file. A short fault loop like test_faults', with the commit failures at
+** every kind of batch: deferred, at the checkpoint, at the retry. */
+static void test_trees_survive_failed_commits(void) {
+    TEST("bookkeeping commits that fail while the trees wait in memory: the maintained root still equals the scan, and a replica agrees");
+#ifndef HPPLITE_TEST_HOOKS
+    printf("SKIP (no test hooks) "); PASS(); return;
+#else
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = open_writer(DIR "/f.db", l1, 3);
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)", NULL);
+    hpplite_node_exec(w, "BEGIN; WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 300)"
+                         " INSERT INTO t SELECT i, 'row ' || i FROM s; COMMIT", NULL);
+    if (hpplite_node_flush_batch(w) != 1) FAIL("batch 1");
+    unsigned x = 12345;
+    int failed = 0, step;
+    for (step = 0; step < 24; step++) {
+        char sql[200];
+        x = x * 1103515245u + 12345u;
+        switch ((x >> 16) % 3) {
+            case 0: snprintf(sql, sizeof sql, "UPDATE t SET b = 'step %d' WHERE a %% 7 = %d", step, step % 7); break;
+            case 1: snprintf(sql, sizeof sql, "DELETE FROM t WHERE a = %d", 1 + step * 11); break;
+            default: snprintf(sql, sizeof sql, "INSERT OR REPLACE INTO t(a, b) VALUES(%d, 'new %d')", 400 + step, step); break;
+        }
+        hpplite_node_exec(w, sql, NULL);
+        x = x * 1103515245u + 12345u;
+        if ((x >> 16) % 2) { hpplite_test_fail_commits = 1; failed++; }
+        hpplite_node_flush_batch(w);
+        hpplite_test_fail_commits = 0;
+        x = x * 1103515245u + 12345u;
+        if ((x >> 16) % 2) hpplite_node_flush_batch(w);
+        if (!root_matches_scan(w, "writer")) { printf("(step %d, %d commits failed so far) ", step, failed); FAIL("writer root"); break; }
+    }
+    for (int i = 0; i < 5 && hpplite_node_pending_count(w) > 0; i++) hpplite_node_flush_batch(w);
+    if (hpplite_node_pending_count(w) != 0) FAIL("rows still pending after the retries");
+    printf("(%d of %d commits failed) ", failed, step);
+    if (!root_matches_scan(w, "writer at the end")) FAIL("writer root at the end");
+    const char *why = test_replica_check(w, l1, DIR "/f_r.db", NULL, 0, 2, 0);
+    if (why) FAIL(why);
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    PASS();
+#endif
+}
+
 int main(void) {
     printf("=== HPPLite State Root Tests ===\n");
     test_suite_init("stateroot", NULL, DIR);
@@ -235,6 +344,8 @@ int main(void) {
     test_version_1_history();
     test_old_file_gains_trees();
     test_root_at();
+    test_trees_written_per_checkpoint();
+    test_trees_survive_failed_commits();
     remove_dir();
     return test_report();
 }

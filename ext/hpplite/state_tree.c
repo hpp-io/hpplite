@@ -261,19 +261,23 @@ static void touchStatement(HppliteTree *T, const char *zSql) {
 void (*hpplite_test_in_tree_sync)(void *pArg) = NULL;
 void *hpplite_test_in_tree_sync_arg = NULL;
 
-int hppliteTreeSync(HppliteCtx *pCtx) {
+int hppliteTreeSync(HppliteCtx *pCtx) { return hppliteTreeSyncUpTo(pCtx, 0); }
+
+int hppliteTreeSyncUpTo(HppliteCtx *pCtx, sqlite3_int64 maxId) {
   HppliteTree *T = treeOf(pCtx);
   sqlite3_stmt *q = NULL;
   int rc, withRec = 1, first = 1;
   if (!T) return SQLITE_NOMEM;
   if ((rc = loadState(T)) != SQLITE_OK) return rc;
-  rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT id, sql, op, tbl, rec FROM _hpplite_pending WHERE id > ?1 ORDER BY id", -1, &q, NULL);
+  if (maxId > 0 && T->seq >= maxId) return SQLITE_OK;      /* the sync before the transaction took these in */
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT id, sql, op, tbl, rec FROM _hpplite_pending WHERE id > ?1 AND (?2 = 0 OR id <= ?2) ORDER BY id", -1, &q, NULL);
   if (rc != SQLITE_OK) {
     withRec = 0;                          /* a log without row capture's columns */
-    rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT id, sql FROM _hpplite_pending WHERE id > ?1 ORDER BY id", -1, &q, NULL);
+    rc = sqlite3_prepare_v2(pCtx->bkDb, "SELECT id, sql FROM _hpplite_pending WHERE id > ?1 AND (?2 = 0 OR id <= ?2) ORDER BY id", -1, &q, NULL);
     if (rc != SQLITE_OK) return rc;
   }
   sqlite3_bind_int64(q, 1, T->seq);
+  sqlite3_bind_int64(q, 2, maxId);
   while ((rc = sqlite3_step(q)) == SQLITE_ROW) {
     sqlite3_int64 id = sqlite3_column_int64(q, 0);
     if (first && hpplite_test_in_tree_sync) hpplite_test_in_tree_sync(hpplite_test_in_tree_sync_arg);
@@ -391,11 +395,13 @@ static int rebuildAll(HppliteTree *T) {
   return rc == SQLITE_DONE ? SQLITE_OK : rc;
 }
 
-int hppliteTreeFlush(HppliteCtx *pCtx) {
+int hppliteTreeFlush(HppliteCtx *pCtx) { return hppliteTreeFlushUpTo(pCtx, 0); }
+
+int hppliteTreeFlushUpTo(HppliteCtx *pCtx, sqlite3_int64 upTo) {
   HppliteTree *T;
   sqlite3_stmt *q = NULL;
   sqlite3_int64 maxId = 0, newSeq;
-  int rc = hppliteTreeSync(pCtx);
+  int rc = hppliteTreeSyncUpTo(pCtx, upTo);
   if (rc != SQLITE_OK) return rc;
   T = pCtx->pTree;
   if (T->stale) {
@@ -425,4 +431,41 @@ int hppliteTreeFlush(HppliteCtx *pCtx) {
   T->stale = 0;
   T->gc = 0;
   return SQLITE_OK;
+}
+
+/* Touched nodes that may wait in memory before the trees are written (#142) */
+#define HPPLITE_TREE_PERSIST_NODES 65536
+
+int hppliteTreeKeep(HppliteCtx *pCtx, int bPersist, sqlite3_int64 upTo) {
+  HppliteTree *T = treeOf(pCtx);
+  sqlite3_stmt *q = NULL;
+  sqlite3_int64 maxId = 0;
+  int rc;
+  if (!T) return SQLITE_NOMEM;
+  if ((rc = loadState(T)) != SQLITE_OK) return rc;
+  if (bPersist || T->stale || hpplite_smt_mem_store_count(T->pMem) >= HPPLITE_TREE_PERSIST_NODES) {
+    return hppliteTreeFlushUpTo(pCtx, T->stale ? 0 : upTo);   /* a rebuild from a scan reflects every row applied, so it takes the whole log */
+  }
+  /* Kept in memory. The log's ids restart when it empties: the seq can
+  ** never be above its last id, or the next rows would be missed. */
+  if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT COALESCE(MAX(id), 0) FROM _hpplite_pending", -1, &q, NULL) == SQLITE_OK) {
+    if (sqlite3_step(q) == SQLITE_ROW) maxId = sqlite3_column_int64(q, 0);
+  }
+  sqlite3_finalize(q);
+  if (T->seq > maxId) T->seq = maxId;
+  /* The file says the trees are behind the log: a process that dies before
+  ** the next write finds them stale and rebuilds from a scan, never a
+  ** wrong root. In the transaction that prunes the log, every time: a mark
+  ** remembered in memory would be lost with a rolled-back transaction. */
+  return hppliteInternalExec(pCtx, pCtx->bkDb, "UPDATE _hpplite_meta SET tree_stale = 1 WHERE id = 1 AND tree_stale = 0");
+}
+
+/* A bookkeeping transaction rolled back: whatever the trees did inside it
+** (nodes written, the seq, the overlay dropped at a flush) is not in the
+** file. The next use reloads from the file; log rows the transaction would
+** have pruned are still there to take in, and rows pruned by earlier
+** transactions were marked stale by them (#142). */
+void hppliteTreeRolledBack(HppliteCtx *pCtx) {
+  HppliteTree *T = (HppliteTree *)pCtx->pTree;
+  if (T) T->loaded = 0;
 }

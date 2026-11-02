@@ -11,6 +11,7 @@
 #include "hpplite_int.h"
 #include <string.h>
 #include <unistd.h>
+#include "state_tree.h"
 #include <stdio.h>
 
 /*
@@ -179,6 +180,7 @@ int hppliteBkEnd(HppliteCtx *pCtx, int rc) {
   }
   if (rc != SQLITE_OK) {
     hppliteInternalExec(pCtx, pCtx->bkDb, "ROLLBACK");
+    hppliteTreeRolledBack(pCtx);
   }
   if (pCtx->bBkGate) {
     pCtx->bBkGate = 0;

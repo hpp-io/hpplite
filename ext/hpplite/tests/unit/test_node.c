@@ -474,10 +474,13 @@ static void test_size_trigger_with_row_capture(void) {
 
 static int g_syncGate = -1;         /* the gate's state when the trees took in a row */
 static int g_syncBkInTxn = -1;      /* and whether the bookkeeping connection was inside a transaction */
+static int g_syncsUnderGate = 0;    /* syncs that took rows in while the bookkeeping write held the gate */
 static void in_tree_sync(void *arg) {
     HppliteNode *node = (HppliteNode *)arg;
+    int gate = __atomic_load_n(&node->ctx->txnGate, __ATOMIC_ACQUIRE);
+    if (gate == 2) g_syncsUnderGate++;
     if (g_syncGate >= 0) return;    /* the first take-in of the flush is the long one */
-    g_syncGate = __atomic_load_n(&node->ctx->txnGate, __ATOMIC_ACQUIRE);
+    g_syncGate = gate;
     g_syncBkInTxn = !sqlite3_get_autocommit(node->ctx->bkDb);
 }
 
@@ -569,12 +572,22 @@ static void test_flush_gets_the_gate_from_a_busy_writer(void) {
     if (!node) { FAIL("create"); return; }
     hpplite_node_start(node);
     if (hpplite_node_exec(node, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &err) != 0) { FAIL(err); hpplite_node_destroy(node); return; }
+    if (hpplite_node_flush_batch(node) != 1) { FAIL("first flush"); hpplite_node_destroy(node); return; }   /* the trees built: what follows is the steady state */
     memset(&w, 0, sizeof(w));
     w.node = node;
     pthread_create(&th, NULL, writer_main, &w);
     usleep(200000);                                   /* a few thousand transactions in */
     before = hpplite_node_get_height(node);
+#ifdef HPPLITE_TEST_HOOKS
+    g_syncGate = -1; g_syncsUnderGate = 0;
+    hpplite_test_in_tree_sync = in_tree_sync;
+    hpplite_test_in_tree_sync_arg = node;
+#endif
     after = hpplite_node_flush_batch(node);           /* one try, as the timer would */
+#ifdef HPPLITE_TEST_HOOKS
+    hpplite_test_in_tree_sync = NULL;
+    hpplite_test_in_tree_sync_arg = NULL;
+#endif
     w.stop = 1;
     pthread_join(th, NULL);
     if (after == 0 || hpplite_node_get_height(node) == before) {
@@ -585,12 +598,38 @@ static void test_flush_gets_the_gate_from_a_busy_writer(void) {
         char msg[120];
         snprintf(msg, sizeof(msg), "the writer waited %.0f ms for the flush", w.worstMs);
         FAIL(msg);
+    } else if (g_syncsUnderGate > 0) {
+        char msg[160];
+        snprintf(msg, sizeof(msg), "the trees took rows in under the gate %d times: rows written during the flush belong to the next batch", g_syncsUnderGate);
+        FAIL(msg);
     } else {
         printf("(writer: %d transactions, worst %.1f ms) ", w.txns, w.worstMs);
         PASS();
     }
     hpplite_node_destroy(node);
     cleanup_test_files("/tmp/hpplite_test_busy");
+}
+
+/* The bookkeeping connection commits without an fsync of its own (#142):
+** 3 ms per batch under the gate, for commits the chain can replace. */
+static void test_bookkeeping_commits_without_fsync(void) {
+    HppliteNode *node;
+    sqlite3_stmt *st = NULL;
+    int sync = -1;
+
+    TEST("bookkeeping_commits_without_fsync");
+    node = open_local_node("/tmp/hpplite_test_sync_normal", "test-sync-normal");
+    if (!node) { FAIL("create"); return; }
+    if (!node->bkDb) { FAIL("no bookkeeping connection"); hpplite_node_destroy(node); return; }
+    if (sqlite3_prepare_v2(node->bkDb, "PRAGMA synchronous", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) sync = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (sync != 1) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "bookkeeping connection: PRAGMA synchronous = %d, expected 1 (NORMAL)", sync);
+        FAIL(msg);
+    } else PASS();
+    hpplite_node_destroy(node);
+    cleanup_test_files("/tmp/hpplite_test_sync_normal");
 }
 
 int main(void) {
@@ -604,6 +643,7 @@ int main(void) {
     test_size_trigger_with_row_capture();
     test_tree_sync_outside_gate();
     test_flush_gets_the_gate_from_a_busy_writer();
+    test_bookkeeping_commits_without_fsync();
 
     printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);
 

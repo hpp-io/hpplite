@@ -324,6 +324,12 @@ static int node_init_tracking(HppliteNode *node) {
             node->bkDb = NULL;
         } else {
             sqlite3_busy_timeout(node->bkDb, 5000);
+            /* No fsync per bookkeeping commit (#142): in WAL mode the file stays
+            ** consistent, and a power loss can lose only the last bookkeeping
+            ** commits, which the next flush adopts from the chain (#90, #119).
+            ** The application's own setting is its own; its next fsync carries
+            ** the bookkeeping frames before it. */
+            sqlite3_exec(node->bkDb, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
             hpplite_set_bookkeeping_db(node->ctx, node->bkDb);
         }
     }
