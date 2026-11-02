@@ -329,6 +329,27 @@ static void test_every_page_batch_carries_its_root(void) {
     PASS();
 }
 
+/* an L1 configured and not connected keeps everything pending (#156) */
+static void test_no_local_finalize_with_an_l1_configured(void) {
+    TEST("with l1= configured and no connection, a page-mode flush keeps the batch pending instead of finalizing locally");
+    reset_dir();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof config);
+    config.nodeId = "nol1"; config.dataDir = DIR; config.dbPath = DIR "/nol1.db";
+    config.capturePages = 1; config.noEncrypt = 1;
+    config.rpcUrl = "http://127.0.0.1:9"; config.hasFactory = 1;          /* an L1 named, no key: no connection comes of it */
+    HppliteNode *n = hpplite_node_create(&config);
+    if (!n) FAIL("open");
+    hpplite_node_start(n);
+    hpplite_node_exec(n, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    uint64_t h = hpplite_node_flush_batch(n);
+    long long height = scalar(n->db, "SELECT height FROM hpplite_status"), pending = hpplite_node_pending_count(n);
+    hpplite_node_destroy(n);
+    printf("(flush %llu, height %lld, pending %lld) ", (unsigned long long)h, height, pending);
+    if (h != 0 || height != 1 || pending == 0) FAIL("nothing may be finalized locally");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -341,6 +362,7 @@ int main(void) {
     test_rules_that_keep_capture_possible();
     test_unreadable_file_fails_the_open();
     test_every_page_batch_carries_its_root();
+    test_no_local_finalize_with_an_l1_configured();
     remove_dir();
     return test_report();
 }

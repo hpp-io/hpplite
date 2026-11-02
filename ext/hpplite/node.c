@@ -1585,6 +1585,16 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     uint8_t encoding = HPPLITE_ENCODING_NONE;
     int rc, confirmed = 0, tries;
     node_pages_decide_snapshot(node);                   /* if nothing decided it yet */
+    if (!node->l1 && node->wantsL1) {
+        /* l1=/contract=/factory= was given but no connection came of it (no key,
+        ** bad RPC): finalizing locally would move the height past batches the
+        ** chain never saw; everything stays pending, as the row flush keeps it (#156) */
+        if (!node->warnedNoL1) {
+            hpplite_error(ctx, "L1 was configured but is not connected; batches are kept pending (check the key and the RPC endpoint)");
+            node->warnedNoL1 = 1;
+        }
+        *pMore = 0; return 0;
+    }
     if (node->l1) {
         if (!node->cipher && !node->config.noEncrypt) {
             if (!node->warnedNoKey) { hpplite_error(ctx, "no private key: batches are kept pending and not posted (set privkey=/keyfile=/HPPLITE_PRIVATE_KEY, or encrypt=off to post plaintext)"); node->warnedNoKey = 1; }
