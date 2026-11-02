@@ -43,6 +43,10 @@ struct PcDb {
   unsigned char *aDirty; unsigned nDirtyAlloc;
   unsigned commitsInBatch;
   unsigned long long nBatches, batchPages, batchRaw, batchDiffZ;
+  unsigned salt1, salt2;        /* the WAL header's salts, read at each commit: the generation */
+  unsigned commitFrame;
+  sqlite3_int64 nTruncAtCommit;
+  sqlite3_file *pWalReal;       /* to read the header back at a commit */
   PcDb *pNext;
 };
 
@@ -59,6 +63,7 @@ static sqlite3_vfs g_vfs;
 static PcDb *g_dbs;
 static int g_nowork;
 static unsigned g_batch;
+static FILE *g_spool;              /* PAGECAP_SPOOL=path: every commit's pages, for pagecap_apply.py */
 
 static uint64_t now_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 static unsigned be32(const unsigned char *p) { return ((unsigned)p[0] << 24) | ((unsigned)p[1] << 16) | ((unsigned)p[2] << 8) | p[3]; }
@@ -105,10 +110,21 @@ static void batchClose(PcDb *d) {
   d->commitsInBatch = 0;
 }
 
+static void put32(FILE *f, unsigned v) { unsigned char b[4] = { (unsigned char)(v >> 24), (unsigned char)(v >> 16), (unsigned char)(v >> 8), (unsigned char)v }; fwrite(b, 1, 4, f); }
+static void put64(FILE *f, uint64_t v) { put32(f, (unsigned)(v >> 32)); put32(f, (unsigned)v); }
+
 /* the commit: measure the transaction's pages, remember them as previous */
 static void txnCommit(PcDb *d) {
   unsigned i;
   uint64_t t0 = now_ns();
+  if (g_spool) {
+    unsigned char hdr[32];
+    if (d->pWalReal && d->pWalReal->pMethods->xRead(d->pWalReal, hdr, 32, 0) == SQLITE_OK) { d->salt1 = be32(hdr + 16); d->salt2 = be32(hdr + 20); }
+    put64(g_spool, t0); put32(g_spool, d->salt1); put32(g_spool, d->salt2); put32(g_spool, d->commitFrame);
+    put32(g_spool, (unsigned)d->nTruncAtCommit); put32(g_spool, (unsigned)d->pageSize); put32(g_spool, d->nTxn);
+    for (i = 0; i < d->nTxn; i++) { put32(g_spool, d->aTxnPgno[i]); fwrite(d->aTxnImg[i], 1, (size_t)d->pageSize, g_spool); }
+    fflush(g_spool);
+  }
   size_t ps = (size_t)d->pageSize;
   unsigned char *raw = NULL, *diff = NULL, *zbuf = NULL;
   size_t rawLen = (size_t)d->nTxn * ps;
@@ -195,12 +211,13 @@ static void walWrite(PcDb *d, const unsigned char *p, int amt, sqlite3_int64 off
       d->aFramePgno[idx] = pg;
       if (amt >= 24 + d->pageSize) {                 /* header and page in one write */
         txnAddPage(d, pg, p + 24);
-        if (nTrunc) txnCommit(d);
+        if (nTrunc) { d->commitFrame = idx; d->nTruncAtCommit = nTrunc; txnCommit(d); }
         p += 24 + d->pageSize; amt -= 24 + d->pageSize; off += 24 + d->pageSize;
         continue;
       }
       /* header alone: the page follows in the next write; commit decided then */
       d->aFramePgno[idx] = pg | (nTrunc ? 0x80000000u : 0);
+      if (nTrunc) { d->commitFrame = idx; d->nTruncAtCommit = nTrunc; }
       p += 24; amt -= 24; off += 24;
       continue;
     }
@@ -261,6 +278,7 @@ static int pcOpen(sqlite3_vfs *vfs, sqlite3_filename zName, sqlite3_file *f, int
       if (n > 4 && strcmp(zName + n - 4, "-wal") == 0) {
         char *zDb = sqlite3_mprintf("%.*s", (int)(n - 4), zName);
         p->pDb = dbFor(zDb, 1);
+        p->pDb->pWalReal = p->pReal;
         sqlite3_free(zDb);
         p->isWal = 1;
       }
@@ -329,6 +347,7 @@ int sqlite3_pagecap_init(sqlite3 *db, char **pzErr, const sqlite3_api_routines *
     sqlite3_vfs_register(&g_vfs, 1);
     g_nowork = getenv("PAGECAP_NOWORK") != NULL;
     g_batch = getenv("PAGECAP_BATCH") ? (unsigned)atoi(getenv("PAGECAP_BATCH")) : 0;
+    if (getenv("PAGECAP_SPOOL")) g_spool = fopen(getenv("PAGECAP_SPOOL"), "wb");
     if (getenv("PAGECAP_STATS")) atexit(printStats);
   }
   sqlite3_create_function(db, "pagecap_stats", 0, SQLITE_UTF8, NULL, statsFunc, NULL, NULL);
