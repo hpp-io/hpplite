@@ -791,6 +791,7 @@ reaches HPPLite before open, in order of precedence:
 | `keyfile=/path` or `HPPLITE_PRIVATE_KEY_FILE` | **production**: a file with the hex key, mode `0600`; group/world-readable files are refused (like ssh) |
 | `HPPLITE_PRIVATE_KEY` | containers / process managers |
 | `privkey=0x...` in the URI | **development only**: SQLite keeps the query string next to the filename, so anyone with the `sqlite3*` can read it back via `sqlite3_uri_parameter()`, and URIs end up in logs |
+| `SELECT hpplite_key('0x...')` or `hpplite_keyfile('/path')` after open | **applications that hold keys themselves** (#17): the SQLite-extension idiom, nothing in the URI or the environment. Until then the connection captures and posts nothing; with the call the node is keyed, a chain named at open is connected and its rollup resolved, the lease taken, and the next flush posts. The same file rules as `keyfile=`. A different key while keyed is refused (rotation is not this). |
 
 Without a key the database works and keeps capturing, but nothing is posted
 (`hpplite_status.keyed = 0`): with an L1 configured the batches stay pending
@@ -803,9 +804,10 @@ key at all: the directory is the chain, and `encrypt=off` posts plaintext
 there, or a key seals the batches as on chain. `encrypt=off`
 is the only way to post plaintext and must be explicit. A URI with
 `hpplite=on` that cannot be honoured (unreadable key file, malformed key)
-makes `sqlite3_open_v2()` fail rather than open without capture. v0.2 splits the roles (owner / sequencer / data /
-viewing keys), accepts keys at runtime (`hpplite_key()`), Ethereum keystore V3
-files and KMS-held signers - see issues #17 and #15.
+makes `sqlite3_open_v2()` fail rather than open without capture. Keys can
+also be given after open (`hpplite_key()`, `hpplite_keyfile()`, above). v0.4
+splits the roles (owner / sequencer / data / viewing keys) and adds Ethereum
+keystore V3 files and KMS-held signers - see issues #17 and #15.
 
 ## Privacy
 

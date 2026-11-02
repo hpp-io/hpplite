@@ -1915,6 +1915,33 @@ void hpplite_node_set_l1(HppliteNode *node, HppliteL1 *l1) {
     node_learn_batch_limit(node);
 }
 
+int hpplite_node_set_key(HppliteNode *node, const unsigned char privkey[32]) {
+    HppliteKeypair kp;
+    int rc = 0;
+    if (!node || !privkey || !node->crypto) return -1;
+    if (node->config.hasPrivkey) return memcmp(node->config.privkey, privkey, 32) == 0 ? 0 : -2;
+    if (hpplite_crypto_keypair_from_privkey(node->crypto, &kp, privkey) != 0) return -1;
+    if (node->flushMutex) pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);   /* not under a timer flush */
+    node->keypair = kp;
+    memcpy(node->config.privkey, privkey, 32);
+    node->config.hasPrivkey = 1;
+    hpplite_cipher_derive_key(privkey, node->encKey);          /* the batch key: whoever can write the rollup can read it */
+    node->hasEncKey = 1;
+    if (!node->config.noEncrypt) node->cipher = hpplite_cipher_default();
+    if (node->store) hpplite_store_set_key(node->store, privkey);
+    node->warnedNoKey = 0;
+    if (node->ctx) hpplite_error_clear(node->ctx);
+    if (node->l1) {
+        hpplite_l1_set_privkey(node->l1, privkey);
+        if (!node->follower && !node->config.verifyOnly) { node->leaseRecheckAt = 0; node_ensure_lease(node); }
+    } else if (!node->follower) {
+        node_auto_connect_l1(node, &node->config);              /* named at open, unreachable without a key: now */
+        if (node->wantsL1 && !node->l1) rc = -1;
+    }
+    if (node->flushMutex) pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
+    return rc;
+}
+
 /*
 ** Create and submit checkpoint to L1.
 */

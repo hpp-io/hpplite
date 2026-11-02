@@ -282,6 +282,12 @@ char *hpplite_node_submit_checkpoint(HppliteNode *node);
 */
 void hpplite_node_set_l1(HppliteNode *node, HppliteL1 *l1);
 
+/* The key given after open (#17): the node signs, seals and pays with it from
+** here on; a chain the configuration named but could not be reached without
+** a key is connected now, the rollup resolved, the lease taken. 0 keyed;
+** -1 not a key; -2 keyed already with another key (rotation is not this). */
+int hpplite_node_set_key(HppliteNode *node, const unsigned char privkey[32]);
+
 /*
 ** Get current block height.
 */

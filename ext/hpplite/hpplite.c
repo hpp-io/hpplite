@@ -603,6 +603,8 @@ void hppliteRemoveNode(sqlite3 *db) {
 /* Forward declarations for SQL functions */
 static void hpplite_sync_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_flush_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_keyfile_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 
 
 /*
@@ -654,6 +656,10 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_sync_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
                             hpplite_flush_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_key", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
+                            hpplite_key_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_keyfile", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
+                            hpplite_keyfile_func, NULL, NULL);
     hppliteStatusRegister(db);
 }
 
@@ -883,6 +889,40 @@ static void hpplite_sync_func(
 ** SQL function: hpplite_flush()
 ** Triggers a batch flush for sequencer nodes.
 */
+/* SELECT hpplite_key('0x...') / hpplite_keyfile('/path') (#17): the key given
+** to the connection after open, the SQLite-extension idiom - nothing is in
+** the URI. 1 when the node is keyed; an error with the reason otherwise. */
+static void keyGiven(sqlite3_context *ctx, const HppliteConfig *cfg, const char *what) {
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = hppliteFindNode(db);
+    int rc;
+    if (!node) { sqlite3_result_error(ctx, "hpplite is not on this connection", -1); return; }
+    rc = hpplite_node_set_key(node, cfg->privkey);
+    if (rc == 0) sqlite3_result_int(ctx, 1);
+    else if (rc == -2) sqlite3_result_error(ctx, "this connection is keyed already with another key", -1);
+    else {
+        char *z = sqlite3_mprintf("%s: %s", what, node->ctx && node->ctx->zLastError[0] ? node->ctx->zLastError : "not a usable key");
+        sqlite3_result_error(ctx, z ? z : what, -1);
+        sqlite3_free(z);
+    }
+}
+static void hpplite_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    HppliteConfig cfg;
+    const char *z = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+    memset(&cfg, 0, sizeof cfg);
+    if (!z || hpplite_config_parse_privkey(&cfg, z) != 0) { sqlite3_result_error(ctx, "hpplite_key: not a 32-byte hex key", -1); return; }
+    keyGiven(ctx, &cfg, "hpplite_key");
+    memset(&cfg, 0, sizeof cfg);
+}
+static void hpplite_keyfile_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    HppliteConfig cfg;
+    const char *z = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+    memset(&cfg, 0, sizeof cfg);
+    if (!z || hpplite_config_load_privkey_file(&cfg, z) != 0) { sqlite3_result_error(ctx, "hpplite_keyfile: the file is not a usable key (missing, readable by others, or not a 32-byte hex key)", -1); return; }
+    keyGiven(ctx, &cfg, "hpplite_keyfile");
+    memset(&cfg, 0, sizeof cfg);
+}
+
 static void hpplite_flush_func(
     sqlite3_context *ctx,
     int argc,

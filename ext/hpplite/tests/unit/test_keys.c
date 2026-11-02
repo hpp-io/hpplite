@@ -198,6 +198,57 @@ static void test_encrypt_off_is_explicit(void) {
     PASS();
 }
 
+/* #17 step 1: the key given to the connection after open, the SQLite-extension
+** idiom: nothing posts until then; then the node is keyed, the lease taken,
+** batches sealed and posted; a different key while keyed is refused. */
+static void test_key_at_runtime(void) {
+    TEST("hpplite_key()/hpplite_keyfile() after open: keyed, lease, sealed batches posted; another key while keyed, a malformed key, a loose key file refused (#17)");
+    reset_keys();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    sqlite3 *db = hpplite_open("file:" DIR "/rt.db?hpplite=on&datadir=" DIR);          /* no key anywhere */
+    if (!db) FAIL("open");
+    HppliteNode *n = hpplite_get_node(db);
+    hpplite_node_set_l1(n, l1); hpplite_node_start(n);
+    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES('before the key')", NULL, NULL, NULL);
+    if (hpplite_flush(db) != 0) FAIL("nothing may post without a key");
+    if (status_int(db, "keyed") != 0) FAIL("keyed should be 0 before the key");
+    if (exec_sql(db, "SELECT hpplite_key('0xnothex')") == SQLITE_OK) FAIL("a malformed key should be an error");
+    if (scalar(db, "SELECT hpplite_key('" KEY_A "')") != 1) { printf("(%s) ", sqlite3_errmsg(db)); FAIL("hpplite_key should answer 1"); }
+    if (status_int(db, "keyed") != 1 || status_int(db, "lease") != 1) FAIL("keyed and the lease after hpplite_key");
+    if (hpplite_flush(db) != 1) FAIL("the flush after the key should post");
+    {
+        size_t len = 0;
+        uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
+        int ok = raw && !memmem(raw, len, "before the key", 14);
+        free(raw);
+        if (!ok) FAIL("the batch should be posted, sealed with the key");
+    }
+    if (exec_sql(db, "SELECT hpplite_key('" KEY_B "')") == SQLITE_OK) FAIL("another key while keyed should be refused");
+    if (scalar(db, "SELECT hpplite_key('" KEY_A "')") != 1) FAIL("the same key again should be fine");
+    {
+        /* a replica with the key reads what was posted */
+        sqlite3 *r = hpplite_open("file:" DIR "/rt_r.db?hpplite=on&datadir=" DIR "&privkey=" KEY_A);
+        HppliteNode *rn = r ? hpplite_get_node(r) : NULL;
+        sqlite3_int64 rows = -1;
+        if (rn) { hpplite_node_set_l1(rn, l1); hpplite_node_sync_from_l1(rn, 1); rows = scalar(r, "SELECT count(*) FROM t"); rn->l1 = NULL; }
+        if (r) sqlite3_close(r);
+        if (rows != 1) { printf("(replica rows %lld) ", (long long)rows); FAIL("a replica with the key should read the batch"); }
+    }
+    n->l1 = NULL;
+    sqlite3_close(db);
+
+    write_file(DIR "/rtkey", KEY_B "\n", 0600);
+    write_file(DIR "/rtloose", KEY_B "\n", 0644);
+    sqlite3 *db2 = hpplite_open("file:" DIR "/rt2.db?hpplite=on&datadir=" DIR);
+    if (!db2) FAIL("open 2");
+    if (exec_sql(db2, "SELECT hpplite_keyfile('" DIR "/rtloose')") == SQLITE_OK) FAIL("a world-readable key file should be refused");
+    if (status_int(db2, "keyed") != 0) FAIL("still unkeyed after the refusal");
+    if (scalar(db2, "SELECT hpplite_keyfile('" DIR "/rtkey')") != 1 || hpplite_get_node(db2)->config.privkey[0] != 0x20) FAIL("hpplite_keyfile should key the node from a 0600 file");
+    sqlite3_close(db2);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Key Provisioning Tests ===\n");
     test_suite_init("keys", NULL, DIR);
@@ -207,6 +258,7 @@ int main(void) {
     test_keyfile_rejections();
     test_no_key_never_posts();
     test_encrypt_off_is_explicit();
+    test_key_at_runtime();
     remove_dir();
     return test_report();
 }

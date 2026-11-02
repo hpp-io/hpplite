@@ -634,6 +634,13 @@ int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char
     return 0;
 }
 
+int hpplite_store_set_key(HppliteStore *s, const uint8_t privkey[32]) {
+    if (!s || !privkey || !s->crypto) return -1;
+    if (hpplite_crypto_keypair_from_privkey(s->crypto, &s->kp, privkey) != 0) return -1;
+    memcpy(s->address, s->kp.address, 20);
+    s->hasKey = 1;
+    return 0;
+}
 const char *hpplite_store_error(HppliteStore *s) { return s ? s->error : "no store"; }
 const char *hpplite_store_url(HppliteStore *s) { return s ? s->url : NULL; }
 uint64_t hpplite_store_spent(HppliteStore *s, int *pCalls) { if (pCalls) *pCalls = s ? s->calls : 0; return s ? s->spent : 0; }

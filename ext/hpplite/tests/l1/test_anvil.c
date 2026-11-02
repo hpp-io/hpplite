@@ -1792,6 +1792,35 @@ static void test_store_fallback(void) {
     PASS();
 }
 
+/* 22. The key given after open (#17): opened with the factory and no key,
+** the node is disconnected and keeps the log; hpplite_key() connects it,
+** resolves its rollup on the factory, takes the lease and posts. KEY0, a
+** named database of its own. */
+static void test_key_after_open(void) {
+    TEST("a key given after open (#17): disconnected and keeping the log until hpplite_key(); then the rollup resolved, the lease taken, the batch posted");
+    char uri[1024];
+    sqlite3 *w = NULL;
+    snprintf(uri, sizeof uri, "file:" DIR "/rtkey.db?hpplite=on&rpc=%s&factory=%s&chainid=31337&dbname=runtimekey&datadir=" DIR "&interval=0", RPC, FACTORY);
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(w); FAIL("open without a key"); }
+    sqlite3_exec(w, "CREATE TABLE k(x); INSERT INTO k VALUES('kept')", NULL, NULL, NULL);
+    long long h0 = scalar(w, "SELECT hpplite_flush()");
+    char state0[40];
+    snprintf(state0, sizeof state0, "%s", status_text(w, "state"));
+    long long pending0 = scalar(w, "SELECT pending FROM hpplite_status");
+    char sql[200];
+    snprintf(sql, sizeof sql, "SELECT hpplite_key('%s')", KEY0);
+    long long keyed = scalar(w, sql);
+    long long h1 = scalar(w, "SELECT hpplite_flush()");
+    printf("(before: flush %lld, state %s, pending %lld; hpplite_key %lld; after: flush %lld, state %s, lease %lld, contract %.10s...) ",
+           h0, state0, pending0, keyed, h1, status_text(w, "state"), (long long)scalar(w, "SELECT lease FROM hpplite_status"), status_text(w, "contract"));
+    int ok = h0 == 0 && strcmp(state0, "disconnected") == 0 && pending0 == 2 && keyed == 1 && h1 == 1
+             && strcmp(status_text(w, "state"), "sequencing") == 0 && scalar(w, "SELECT lease FROM hpplite_status") == 1
+             && status_text(w, "contract")[0] != 0;
+    sqlite3_close(w);
+    if (!ok) FAIL("the key after open should connect, resolve, take the lease and post");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -1824,6 +1853,7 @@ int main(void) {
     if (wanted(19)) test_store_commit();
     if (wanted(20)) test_store_paid();
     if (wanted(21)) test_store_fallback();
+    if (wanted(22)) test_key_after_open();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

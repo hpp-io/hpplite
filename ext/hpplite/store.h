@@ -40,6 +40,8 @@ char *hpplite_store_put(HppliteStore *store, const uint8_t *data, size_t len, ch
 /* Get the bytes a reference names: malloc'd, terminated, *pLen set; NULL when not there */
 uint8_t *hpplite_store_get(HppliteStore *store, const char *zRef, size_t *pLen);
 
+/* The key given after open (#17): pays from here on. 0, or -1 when it is not a key */
+int hpplite_store_set_key(HppliteStore *store, const uint8_t privkey[32]);
 const char *hpplite_store_error(HppliteStore *store);
 const char *hpplite_store_url(HppliteStore *store);
 
