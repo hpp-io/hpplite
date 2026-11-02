@@ -316,9 +316,9 @@ static int node_init_pages(HppliteNode *node, const char *zFile) {
         /* a replica: pages are written into its file under an exclusive lock and
         ** its readers see them by the change counter, which rollback-journal
         ** mode checks at every transaction and WAL mode does not */
-        sqlite3_exec(node->db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL);
+        hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=DELETE");
     } else {
-        sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+        hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=WAL");
     }
     return SQLITE_OK;
 }
@@ -1455,7 +1455,7 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
         sqlite3_finalize(q);
         if (strcasecmp(mode, "wal") == 0) {
             hpplite_pagemode_pause(node->pm);
-            if (sqlite3_exec(node->db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL) != SQLITE_OK) {
+            if (hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=DELETE") != SQLITE_OK) {
                 hpplite_pagemode_resume(node->pm);
                 hpplite_pagebatch_free(b);
                 hpplite_error(node->ctx, "batch %llu: pages cannot be applied while other connections hold the file in WAL mode", (unsigned long long)batch->height);
@@ -2085,7 +2085,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     if (node->pagesWalSuspended) {
         /* the pages applied: back to WAL for this node's own writes, the file as
         ** it is now the base the page mode diffs against */
-        sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+        hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=WAL");
         hpplite_pagemode_resume(node->pm);
         node->pagesWalSuspended = 0;
     }

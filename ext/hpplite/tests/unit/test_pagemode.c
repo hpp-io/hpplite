@@ -263,6 +263,34 @@ static void test_file_not_where_its_sidecar_says(void) {
     PASS();
 }
 
+/* the rules that keep page capture possible (#148): the file stays in WAL
+** (the frames are what is watched), ATTACH is refused; a write after a
+** refused PRAGMA is still captured */
+static void test_rules_that_keep_capture_possible(void) {
+    TEST("page mode refuses leaving WAL and ATTACH with the reason, and captures what follows");
+    reset_dir();
+    HppliteNode *n = open_pages(DIR "/rules.db", NULL, 1, 1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
+    int walRc = sqlite3_exec(n->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    int offRc = sqlite3_exec(n->db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL);
+    int attRc = sqlite3_exec(n->db, "ATTACH DATABASE '" DIR "/other.db' AS o", NULL, NULL, NULL);
+    char why[256]; text_of(n->db, "SELECT last_refusal FROM hpplite_status", why, sizeof why);
+    char mode[16]; text_of(n->db, "PRAGMA journal_mode", mode, sizeof mode);
+    int before = hpplite_node_pending_count(n);
+    hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
+    int after = hpplite_node_pending_count(n);
+    printf("(mode %s, refusal: %s) ", mode, why);
+    hpplite_node_destroy(n);
+    if (walRc != SQLITE_OK) FAIL("setting WAL again must be fine");
+    if (offRc != SQLITE_AUTH) FAILF("leaving WAL: rc %d, want SQLITE_AUTH", offRc);
+    if (attRc != SQLITE_AUTH) FAILF("ATTACH: rc %d, want SQLITE_AUTH", attRc);
+    if (strcasecmp(mode, "wal") != 0) FAIL("the file left WAL");
+    if (!strstr(why, "ATTACH")) FAIL("last_refusal does not say why");
+    if (after != before + 1) FAIL("the write after the refusals was not captured");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -272,6 +300,7 @@ int main(void) {
     test_sequencer_adopts_its_own_page_batch();
     test_reopen_after_a_submit_the_process_did_not_survive();
     test_file_not_where_its_sidecar_says();
+    test_rules_that_keep_capture_possible();
     remove_dir();
     return test_report();
 }

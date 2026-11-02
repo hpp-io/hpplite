@@ -387,7 +387,8 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
 static void rearmHooks(HppliteCtx *pCtx, int bClosing) {
   void *prevCommit, *prevRollback;
   int lost = 0;
-  if (!pCtx || pCtx->bDbClosed || pCtx->bPages) return;      /* page mode: no hooks to re-arm */
+  if (!pCtx || pCtx->bDbClosed) return;
+  if (pCtx->bPages) { sqlite3_set_authorizer(pCtx->db, hppliteAuthorizer, pCtx); return; }   /* page mode: the authorizer is its only hook (#148) */
   /* setting a hook returns the previous argument: not ours means replaced */
   prevCommit = sqlite3_commit_hook(pCtx->db, hppliteCommitHook, pCtx);
   prevRollback = sqlite3_rollback_hook(pCtx->db, hppliteRollbackHook, pCtx);
@@ -495,6 +496,11 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
   }
   hppliteLoadMeta(pCtx);
   pCtx->bRootDirty = 0;
+  /* no commit or trace hook (the VFS sees the commits), but the rules that keep
+  ** the capture possible stand: the file stays in WAL (the frames are what is
+  ** watched), ATTACH is refused (another file is not captured), the prefix is
+  ** reserved (#148) */
+  sqlite3_set_authorizer(db, hppliteAuthorizer, pCtx);
   *ppCtx = pCtx;
   return SQLITE_OK;
 }

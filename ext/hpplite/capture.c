@@ -630,7 +630,7 @@ int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const 
     if (op == SQLITE_FUNCTION && z2 && pCtx->collectKind != TEXT_FUNCTION) collectFunction(pCtx, z2);
     return SQLITE_OK;
   }
-  if (pCtx->bInternal || !pCtx->bEnabled) return SQLITE_OK;
+  if (pCtx->bInternal || (!pCtx->bEnabled && !pCtx->bPages)) return SQLITE_OK;   /* page mode has no enable: its rules stand (#148) */
   if (pCtx->pRefusedStmt) {
     /* the reprepare of a refused statement whose first run failed stale:
     ** SQLite reruns it with the interrupt cleared and no trace, so it is
