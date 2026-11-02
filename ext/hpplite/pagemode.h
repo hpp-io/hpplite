@@ -25,6 +25,8 @@ void hpplite_pagemode_resume(HpplitePageMode *pm);
 int hpplite_pagemode_snapshot(HpplitePageMode *pm);
 /* commits waiting to be posted (queued, or in the batch being settled) */
 unsigned hpplite_pagemode_pending(HpplitePageMode *pm);
+uint64_t hpplite_pagemode_captured(HpplitePageMode *pm);   /* commits the sink saw since the start (the file as opened not among them) */
+void hpplite_pagemode_discard(HpplitePageMode *pm);        /* the queue dropped: the file is about to be rebuilt from the chain */
 size_t hpplite_pagemode_pending_bytes(HpplitePageMode *pm);
 /* Take queued commits into a batch of at most maxBytes of page records (at
 ** least one commit). *ppBytes (sqlite3_free) are the batch's bytes, root the

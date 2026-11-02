@@ -1565,9 +1565,13 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
         hpplite_pagebatch_free(b);
         return rc;
     }
-    if (hpplite_pagemode_pending(node->pm) == 0) {
-        /* not this node's: it is behind the chain (a file resumed elsewhere, a
-        ** fresh file): the batch is applied, as a replica would */
+    if (hpplite_pagemode_captured(node->pm) == 0) {
+        /* nothing of this node's own was captured: it is behind the chain (a
+        ** fresh file, a file resumed elsewhere), whatever the file as opened
+        ** holds; the batch is applied, as a replica would, and the file as
+        ** opened (queued whole in case it was ahead) is dropped: the chain
+        ** rebuilds it */
+        hpplite_pagemode_discard(node->pm);
         hpplite_pagebatch_free(b);
         return node_apply_pages(node, batch);
     }

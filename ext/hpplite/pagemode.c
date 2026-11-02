@@ -27,6 +27,7 @@ struct HpplitePageMode {
   size_t queuedBytes;
   unsigned maxPgQueued;       /* the highest page number among queued commits: the build's arrays, without a scan of the queue */
   uint64_t nCommits;          /* captured since start */
+  uint64_t nCaptured;         /* ...of which the sink's: the file as opened (a snapshot) is not one */
   uint64_t nFinalized;        /* in batches finalized */
   /* the flush thread's: the state after the last finalized batch */
   HpplitePageRoot *pRoot;
@@ -59,7 +60,7 @@ static void sink(void *pArg, const HppliteVfsCommit *c) {
   for (i = 0; i < c->nPages; i++) if (c->aPgno[i] > pm->maxPgQueued) pm->maxPgQueued = c->aPgno[i];
   if (pm->pageSize == 0) pm->pageSize = c->pageSize;
   if (pm->pTail) pm->pTail->pNext = q; else pm->pHead = q;
-  pm->pTail = q; pm->nQueued++; pm->queuedBytes += (size_t)c->nPages * (size_t)c->pageSize; pm->nCommits++;
+  pm->pTail = q; pm->nQueued++; pm->queuedBytes += (size_t)c->nPages * (size_t)c->pageSize; pm->nCommits++; pm->nCaptured++;
   pthread_mutex_unlock(&pm->mu);
 }
 
@@ -174,6 +175,18 @@ unsigned hpplite_pagemode_pending(HpplitePageMode *pm) {
   if (!pm) return 0;
   pthread_mutex_lock(&pm->mu); n = pm->nQueued + pm->nBuilding; pthread_mutex_unlock(&pm->mu);
   return n;
+}
+uint64_t hpplite_pagemode_captured(HpplitePageMode *pm) {
+  uint64_t n;
+  if (!pm) return 0;
+  pthread_mutex_lock(&pm->mu); n = pm->nCaptured; pthread_mutex_unlock(&pm->mu);
+  return n;
+}
+void hpplite_pagemode_discard(HpplitePageMode *pm) {
+  if (!pm || pm->pBuilding) return;
+  pthread_mutex_lock(&pm->mu);
+  qfree(pm->pHead); pm->pHead = pm->pTail = NULL; pm->nQueued = 0; pm->queuedBytes = 0; pm->maxPgQueued = 0;
+  pthread_mutex_unlock(&pm->mu);
 }
 size_t hpplite_pagemode_pending_bytes(HpplitePageMode *pm) {
   size_t n;
