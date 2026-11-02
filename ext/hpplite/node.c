@@ -21,6 +21,7 @@
 #include "pages.h"
 
 static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch);
+static int node_start_pages(HppliteNode *node, const char *zFile);
 static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch);
 #include "da_uri.h"
 #include "capture_rows.h"
@@ -148,9 +149,10 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     ** (every suite runs in both modes); a URI's capture= stands (#80) */
     if (getenv("HPPLITE_CAPTURE") && config->captureSource < 2) {
         const char *z = getenv("HPPLITE_CAPTURE");
-        if (strcasecmp(z, "text") == 0) node->config.captureText = 1;
-        else if (strcasecmp(z, "rows") == 0) node->config.captureText = 0;
-        else fprintf(stderr, "hpplite: HPPLITE_CAPTURE=%s is neither rows nor text; ignored\n", z);
+        if (strcasecmp(z, "text") == 0) { node->config.captureText = 1; node->config.capturePages = 0; }
+        else if (strcasecmp(z, "rows") == 0) { node->config.captureText = 0; node->config.capturePages = 0; }
+        else if (strcasecmp(z, "pages") == 0) { node->config.captureText = 0; node->config.capturePages = 1; }
+        else fprintf(stderr, "hpplite: HPPLITE_CAPTURE=%s is none of rows, text, pages; ignored\n", z);
     }
 
     /* Generate unique instance ID (a file's sequencer replaces it with the
@@ -309,29 +311,48 @@ static int node_init_pages(HppliteNode *node, const char *zFile) {
     if (rc != SQLITE_OK) return rc;
     node->ctx->bTrackRoots = node->config.verifyOnly;
     if (node->config.dbName && node->config.dbName[0]) node->ctx->zDbName = sqlite3_mprintf("%s", node->config.dbName);
-    if (!realpath(zFile, resolved)) snprintf(resolved, sizeof resolved, "%s", zFile);
+    (void)resolved;
     if (node->config.verifyOnly) {
         /* a replica: pages are written into its file under an exclusive lock and
         ** its readers see them by the change counter, which rollback-journal
         ** mode checks at every transaction and WAL mode does not */
         sqlite3_exec(node->db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL);
+    } else {
+        sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    }
+    return SQLITE_OK;
+}
+
+/* Once, with the chain seen: a new rollup's first batch is the file as it is;
+** a sequencer back on a file whose root is not the last it posted (commits
+** captured and lost with the process, a file changed while it was away)
+** ships the file whole again: the chain can always rebuild it. Decided here
+** so the file counts as pending before any flush asks. */
+static void node_pages_decide_snapshot(HppliteNode *node) {
+    unsigned char have[32];
+    if (!node->pm || node->pagesSnapshotDecided || node->config.verifyOnly || node->follower) return;
+    hpplite_pagemode_root(node->pm, have);
+    if (node->ctx->blockHeight <= 1 || memcmp(have, node->ctx->stateRoot, 32) != 0) hpplite_pagemode_snapshot(node->pm);
+    node->pagesSnapshotDecided = 1;
+}
+
+/* The page mode on this node's file: a sequencer's (its commits watched), or
+** a verifier's (applying what it is sent). A follower has none: its commits
+** go through the same VFS to the same file, and the sequencer's watch sees
+** them; a follower that takes over starts its own then. */
+static int node_start_pages(HppliteNode *node, const char *zFile) {
+    char resolved[PATH_MAX];
+    if (node->pm) return SQLITE_OK;
+    if (!realpath(zFile, resolved)) snprintf(resolved, sizeof resolved, "%s", zFile);
+    if (node->config.verifyOnly) {
         node->pm = hpplite_pagemode_start(resolved, 0);
     } else {
-        /* the sequencer: WAL, its commits watched; the file holds everything once checkpointed */
-        sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+        /* the file holds everything once checkpointed: the page mode reads it once */
         sqlite3_exec(node->db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
         node->pm = hpplite_pagemode_start(resolved, 1);
-        if (node->pm) {
-            /* a new rollup's first batch is the file as it starts; a sequencer back
-            ** on a file whose root is not the last one it posted (commits captured
-            ** and lost with the process, a file changed while it was away) ships
-            ** the file whole again: the chain can always rebuild it */
-            unsigned char have[32];
-            hpplite_pagemode_root(node->pm, have);
-            if (node->ctx->blockHeight <= 1 || memcmp(have, node->ctx->stateRoot, 32) != 0) hpplite_pagemode_snapshot(node->pm);
-        }
     }
     if (!node->pm) { fprintf(stderr, "hpplite: page mode could not start on %s\n", zFile); return SQLITE_ERROR; }
+    if (node->config.localOnly) node_pages_decide_snapshot(node);      /* no chain to sync from: decided now */
     return SQLITE_OK;
 }
 
@@ -339,8 +360,12 @@ static int node_init_tracking(HppliteNode *node) {
     const char *zFile = sqlite3_db_filename(node->db, "main");
     int rc;
 
+    if (zFile && zFile[0] && node->config.capturePages) {
+        sqlite3_busy_timeout(node->db, 5000);
+        rc = node_init_pages(node, zFile);
+        if (rc != SQLITE_OK) return rc;
+    } else {
     if (zFile && zFile[0]) {
-        if (node->config.capturePages) { sqlite3_busy_timeout(node->db, 5000); return node_init_pages(node, zFile); }
         sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
         sqlite3_busy_timeout(node->db, 5000);
     }
@@ -387,6 +412,7 @@ static int node_init_tracking(HppliteNode *node) {
             hpplite_set_bookkeeping_db(node->ctx, node->bkDb);
         }
     }
+    }   /* row or text capture */
 
     node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
     memcpy(node->lastCheckpointRoot, node->ctx->lastCheckpointRoot, HPPLITE_HASH_SIZE);
@@ -398,6 +424,10 @@ static int node_init_tracking(HppliteNode *node) {
     node->lastFlushTime = node_current_time_ms();
     node_set_stmt_limit(node);
     node_detect_follower(node);
+    if (node->config.capturePages && zFile && zFile[0] && !node->follower) {
+        rc = node_start_pages(node, zFile);
+        if (rc != SQLITE_OK) return rc;
+    }
     return SQLITE_OK;
 }
 
@@ -635,6 +665,10 @@ static int node_try_promote(HppliteNode *node) {
     if (node->lockFd < 0 && !node_take_file_lock(node)) return 0;
     if (node->lockFd < 0) return 0;
     node->follower = 0;
+    if (node->config.capturePages && !node->pm) {
+        hppliteLoadMeta(node->ctx);                   /* the sidecar as the sequencer left it */
+        node_start_pages(node, sqlite3_db_filename(node->db, "main"));
+    }
     hpplite_set_bookkeeping_db(node->ctx, node->bkDb);
     node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
     memcpy(node->lastCheckpointRoot, node->ctx->lastCheckpointRoot, HPPLITE_HASH_SIZE);
@@ -1397,6 +1431,39 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     int rc;
     if (!b) { hpplite_error(node->ctx, "batch %llu: page batch that does not decode", (unsigned long long)batch->height); return SQLITE_CORRUPT; }
     if (!node->pm) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu is a page batch and this node is not in page mode (capture=pages)", (unsigned long long)batch->height); return SQLITE_MISMATCH; }
+    if (batch->height > 1 && batch->height == node->ctx->blockHeight) {
+        /* the file must be where the sidecar says the last batch left it: a
+        ** file deleted or restored while its sidecar stayed would take diffs
+        ** onto the wrong pages (the root check below catches that, this says why) */
+        hpplite_pagemode_root(node->pm, root);
+        if (memcmp(root, node->ctx->stateRoot, 32) != 0) {
+            hpplite_pagebatch_free(b);
+            hpplite_error(node->ctx, "the database file is not at the root its bookkeeping (%s-hpplite.db) recorded at height %llu: remove the sidecar with the file, or restore the file", zFile, (unsigned long long)node->ctx->blockHeight);
+            return SQLITE_MISMATCH;
+        }
+    }
+    if (!node->config.verifyOnly) {
+        /* a node that may post later keeps WAL for its own writes; pages are
+        ** applied in rollback-journal mode (its readers check the change
+        ** counter, and no WAL shadows the file), so for the sync it switches:
+        ** possible only while its connection is the file's only one, which
+        ** the open is */
+        char mode[16];
+        sqlite3_stmt *q = NULL;
+        mode[0] = 0;
+        if (sqlite3_prepare_v2(node->db, "PRAGMA journal_mode", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) snprintf(mode, sizeof mode, "%s", sqlite3_column_text(q, 0));
+        sqlite3_finalize(q);
+        if (strcasecmp(mode, "wal") == 0) {
+            hpplite_pagemode_pause(node->pm);
+            if (sqlite3_exec(node->db, "PRAGMA journal_mode=DELETE", NULL, NULL, NULL) != SQLITE_OK) {
+                hpplite_pagemode_resume(node->pm);
+                hpplite_pagebatch_free(b);
+                hpplite_error(node->ctx, "batch %llu: pages cannot be applied while other connections hold the file in WAL mode", (unsigned long long)batch->height);
+                return SQLITE_BUSY;
+            }
+            node->pagesWalSuspended = 1;
+        }
+    }
     hpplite_internal_open_begin();
     rc = sqlite3_open_v2(zFile, &adb, SQLITE_OPEN_READWRITE, NULL);
     hpplite_internal_open_end();
@@ -1461,6 +1528,29 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
     int more = 0, rc;
     if (!b) return SQLITE_CORRUPT;
     if (!node->pm || b->lastCommit < b->firstCommit) { hpplite_pagebatch_free(b); return SQLITE_MISMATCH; }
+    if (node->ctx->inflightHeight == batch->height && memcmp(node->ctx->inflightRoot, b->root, 32) == 0) {
+        /* the sidecar says this node posted it and died before finalizing: the
+        ** file is at or past it (it is where the pages came from), so it is taken
+        ** as posted; whatever the file holds beyond it, the first flush sees in
+        ** the root and ships the file whole again. The queue, if the process is
+        ** the same, holds the commits it was built from: settled too. */
+        rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root);
+        if (rc == SQLITE_OK && hpplite_pagemode_pending(node->pm) > 0) {
+            unsigned char r2[32]; int more2 = 0; unsigned char *bytes2 = NULL; size_t len2 = 0;
+            if (hpplite_pagemode_build_n(node->pm, (unsigned)(b->lastCommit - b->firstCommit + 1), &bytes2, &len2, r2, &more2) == SQLITE_OK) {
+                if (memcmp(r2, b->root, 32) == 0) hpplite_pagemode_finalized(node->pm); else hpplite_pagemode_failed(node->pm);
+                sqlite3_free(bytes2);
+            }
+        }
+        hpplite_pagebatch_free(b);
+        return rc;
+    }
+    if (hpplite_pagemode_pending(node->pm) == 0) {
+        /* not this node's: it is behind the chain (a file resumed elsewhere, a
+        ** fresh file): the batch is applied, as a replica would */
+        hpplite_pagebatch_free(b);
+        return node_apply_pages(node, batch);
+    }
     rc = hpplite_pagemode_build_n(node->pm, (unsigned)(b->lastCommit - b->firstCommit + 1), &bytes, &len, root, &more);
     if (rc != SQLITE_OK) { hpplite_pagebatch_free(b); return rc == SQLITE_DONE ? SQLITE_MISMATCH : rc; }
     if (memcmp(root, b->root, 32) != 0) {
@@ -1484,6 +1574,15 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     uint8_t *sealed = NULL, *packed = NULL, *framed = NULL;
     uint8_t encoding = HPPLITE_ENCODING_NONE;
     int rc, confirmed = 0, tries;
+    node_pages_decide_snapshot(node);                   /* if nothing decided it yet */
+    if (node->l1) {
+        if (!node->cipher && !node->config.noEncrypt) {
+            if (!node->warnedNoKey) { hpplite_error(ctx, "no private key: batches are kept pending and not posted (set privkey=/keyfile=/HPPLITE_PRIVATE_KEY, or encrypt=off to post plaintext)"); node->warnedNoKey = 1; }
+            *pMore = 0; return 0;
+        }
+        if (!node_ensure_lease(node)) { *pMore = 0; return 0; }          /* only the lease holder posts */
+        if (node_check_rollup(node) < 0) { *pMore = 0; return 0; }
+    }
     for (tries = 0; ; tries++) {
         rc = hpplite_pagemode_build(node->pm, budget, &bytes, &len, root, pMore);
         if (rc != SQLITE_OK) { if (rc != SQLITE_DONE) hpplite_error(ctx, "page batch %llu could not be built (rc=%d)", (unsigned long long)height, rc); return 0; }
@@ -1514,23 +1613,45 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     }
     if (!payload) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); return 0; }
     if (node->l1) {
-        char *txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
+        char *txHash;
+        /* the sidecar knows the batch before the chain does: a process that dies
+        ** between the submit and the finalize finds it its own on reopen */
+        if (hppliteMarkInflightPages(ctx, height, root) != SQLITE_OK) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); free(sealed); free(framed); *pMore = 0; return 0; }
+        txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
         if (txHash) { confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1); if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash); if (confirmed && node->onBatchPosted) node->onBatchPosted(node->callbackArg, height, txHash); sqlite3_free(txHash); }
+        if (confirmed) test_crash_point("after_submit");
     } else {
         confirmed = 1;                          /* l1=local: finalized here, kept nowhere */
     }
-    if (confirmed) rc = hppliteAdvanceMetaPages(ctx, height, node->l1 ? payload : NULL, node->l1 ? payloadLen : 0, root);
-    if (confirmed && rc == SQLITE_OK) {
+    if (!confirmed) {
+        /* the transaction may have landed despite the lost answer (#49): the
+        ** commits back in the queue, then what the chain holds at our height,
+        ** which the adoption rebuilds from them and compares */
+        int adopted;
+        hpplite_pagemode_failed(node->pm);
+        adopted = node_adopt_existing(node);
+        if (adopted == 1) { sqlite3_free(bytes); free(packed); free(sealed); free(framed); return height; }
+        if (node->failStreak < 6) node->failStreak++;
+        node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 0 ? node->config.batchIntervalMs : 5000);
+        hpplite_error(ctx, "page batch %llu not confirmed on L1, kept pending", (unsigned long long)height);
+        sqlite3_free(bytes); free(packed); free(sealed); free(framed);
+        *pMore = 0;
+        return 0;
+    }
+    rc = hppliteAdvanceMetaPages(ctx, height, node->l1 ? payload : NULL, node->l1 ? payloadLen : 0, root);
+    if (rc == SQLITE_OK) {
         hpplite_pagemode_finalized(node->pm);
         node->batchesProduced++;
         node->batchesSinceCheckpoint++;
         node->failStreak = 0;
         node->retryAt = 0;
         hpplite_error_clear(ctx);
+        test_crash_point(*pMore ? "mid_series" : "after_finalize");
     } else {
+        /* on the chain, not finalized here: the next flush adopts it (#90) */
         hpplite_pagemode_failed(node->pm);
-        if (!confirmed) { node->failStreak < 6 ? node->failStreak++ : 0; node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 0 ? node->config.batchIntervalMs : 5000); hpplite_error(ctx, "page batch %llu not confirmed on L1, kept pending", (unsigned long long)height); }
-        else hpplite_error(ctx, "page batch %llu could not be finalized (rc=%d)", (unsigned long long)height, rc);
+        node->retryAt = 0;
+        hpplite_error(ctx, "page batch %llu could not be finalized (rc=%d); adopted at the next flush", (unsigned long long)height, rc);
         height = 0;
         *pMore = 0;
     }
@@ -1910,7 +2031,8 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
         if (batch->bPages) {
             /* a page batch: applied to the file (a replica), or adopted (the sequencer's own) */
-            rc = (node->pm && hpplite_pagemode_pending(node->pm) > 0 && !node->config.verifyOnly) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
+            /* a sequencer (its file is where the pages come from) adopts; a verifier applies */
+            rc = (node->pm && !node->config.verifyOnly && !node->follower && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
             if (rc != SQLITE_OK) { hpplite_batch_free(batch); node->state = HPPLITE_STATE_ERROR; return -1; }
             node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
             hpplite_batch_free(batch);
@@ -1959,6 +2081,14 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
+    node_pages_decide_snapshot(node);               /* the chain seen: is the file ahead of it? */
+    if (node->pagesWalSuspended) {
+        /* the pages applied: back to WAL for this node's own writes, the file as
+        ** it is now the base the page mode diffs against */
+        sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+        hpplite_pagemode_resume(node->pm);
+        node->pagesWalSuspended = 0;
+    }
     return synced;
 }
 

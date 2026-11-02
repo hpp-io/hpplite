@@ -113,6 +113,8 @@ typedef struct HppliteNode {
     HppliteCtx *ctx;
     struct HpplitePageMode *pm;     /* page mode (#146): the commits queued and the batches built from them */
     unsigned pageDeflateRatio;      /* raw page bytes per posted byte seen on the last page batch: the next build's budget */
+    int pagesSnapshotDecided;       /* the first flush decided whether the file goes whole first */
+    int pagesWalSuspended;          /* a WAL node in rollback-journal mode while chain pages are applied */
 
     /* L1 connection */
     HppliteL1 *l1;

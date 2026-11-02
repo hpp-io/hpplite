@@ -48,6 +48,8 @@ struct HppliteCtx {
   sqlite3 *bkDb;              /* Bookkeeping connection (== db for :memory:) */
   int bEnabled;               /* Tracking enabled flag */
   int bPages;                 /* page mode (#146): no hooks on the application's connection, the bookkeeping in a sidecar */
+  uint64_t inflightHeight;    /* page mode: a batch posted and not yet finalized (0: none), with its root; survives the process */
+  unsigned char inflightRoot[32];
   int bInternal;              /* Set while HPPLite runs its own statements */
   int bDbClosed;              /* db is a zombie: no SQLite calls on it any more */
   int bAppFlushing;           /* hpplite_flush() is running on the application thread */
@@ -239,6 +241,8 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture);
 int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx);
 /* a page batch posted at height: the meta row advances, the posted copy is kept (#146) */
 int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *posted, size_t nPosted, const unsigned char *root);
+/* before a page batch is submitted: the sidecar remembers it, so a process that dies after the submit knows the batch is its own */
+int hppliteMarkInflightPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *root);
 /* Batches the writer keeps as posted, to post again after a reorg (#49) */
 #define HPPLITE_POSTED_KEEP 32
 /* A statement cut into pieces (#59): what the flag adds to an entry, what an

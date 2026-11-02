@@ -5,6 +5,7 @@
 #include "test_lib.h"
 #include "pages.h"
 #include <sys/stat.h>
+#include <unistd.h>
 
 #define DIR "/tmp/hpplite_test_pagemode"
 
@@ -47,7 +48,7 @@ static void test_no_hooks_sidecar_and_roots(void) {
     hpplite_node_exec(n, "BEGIN; INSERT INTO t(v) VALUES('a'); INSERT INTO t(v) VALUES('b'); COMMIT", NULL);
     hpplite_node_exec(n, "INSERT INTO t(v) VALUES('c')", NULL);
     int pending = hpplite_node_pending_count(n);
-    if (pending != 4) FAILF("pending = %d commits, expected 4 (the file as it started, and three)", pending);
+    if (pending != 4) FAILF("pending = %d, expected 4: the file as opened (its first page, never shipped) and three commits", pending);
     uint64_t h = hpplite_node_flush_batch(n);
     if (h != 1) FAILF("flush posted height %llu, expected 1", (unsigned long long)h);
     if (hpplite_node_pending_count(n) != 0) FAIL("commits still pending after the flush");
@@ -194,6 +195,74 @@ static void test_sequencer_adopts_its_own_page_batch(void) {
 #endif
 }
 
+/* the process dies after the submit (the sidecar knows the batch, the queue is
+** gone); the file is reopened, more is written, posted, and a verifier agrees */
+static void test_reopen_after_a_submit_the_process_did_not_survive(void) {
+    TEST("a sequencer reopened after dying between submit and finalize takes its batch as posted, re-ships what the file holds beyond it, and a verifier agrees");
+#ifndef HPPLITE_TEST_HOOKS
+    printf("SKIP (no test hooks) "); PASS(); return;
+#else
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/c.db", l1, 1, 1);
+    if (!s) FAIL("open");
+    hpplite_node_exec(s, "CREATE TABLE t(x); INSERT INTO t VALUES(1); INSERT INTO t VALUES(2)", NULL);
+    hpplite_test_fail_commits = 1;
+    hpplite_node_flush_batch(s);                      /* batch 1 on the chain; the finalize's commit fails */
+    hpplite_test_fail_commits = 0;
+    hpplite_node_exec(s, "INSERT INTO t VALUES(3)", NULL);          /* after the "crash point", before the process dies */
+    unsigned char rootFile1[32];
+    { exec_sql(s->db, "PRAGMA wal_checkpoint(TRUNCATE)"); HpplitePageRoot *pr = hpplite_pageroot_from_file(DIR "/c.db", NULL); hpplite_pageroot_get(pr, rootFile1); hpplite_pageroot_free(pr); }
+    hpplite_node_destroy(s);                          /* the queue dies with the process; the file and the sidecar stay */
+    HppliteNode *s2 = open_pages(DIR "/c.db", l1, 1, 1);
+    if (!s2) FAIL("reopen");
+    long long h = scalar(s2->db, "SELECT height FROM hpplite_status");
+    printf("(height after reopen %lld, pending %d) ", h, hpplite_node_pending_count(s2));
+    if (hpplite_node_pending_count(s2) != 1) FAILF("after the reopen the file beyond the posted batch should count as one pending snapshot, not %d", hpplite_node_pending_count(s2));
+    if (h != 2) FAILF("expected height 2 after adopting batch 1, got %lld", h);
+    hpplite_node_exec(s2, "INSERT INTO t VALUES(4)", NULL);
+    if (hpplite_node_flush_batch(s2) < 2) FAIL("flush after reopen");
+    unsigned char rootS[32]; hpplite_node_get_state_root(s2, rootS);
+    { exec_sql(s2->db, "PRAGMA wal_checkpoint(TRUNCATE)"); HpplitePageRoot *pr = hpplite_pageroot_from_file(DIR "/c.db", NULL); unsigned char rf[32]; hpplite_pageroot_get(pr, rf); hpplite_pageroot_free(pr); if (memcmp(rf, rootS, 32) != 0) FAIL("the sequencer's kept root is not its file's"); }
+    HppliteNode *r = open_pages_role(DIR "/cr.db", l1, 1, 1, 0);        /* a plain node catching up, as a second machine would: applies, then may post */
+    if (!r) FAIL("open the second node");
+    if (r->state == HPPLITE_STATE_ERROR) FAILF("the second node is in error: %s", r->ctx->zLastError);
+    long long rowsS = scalar(s2->db, "SELECT count(*) FROM t"), rowsR = scalar(r->db, "SELECT count(*) FROM t");
+    printf("(rows %lld vs %lld, mismatches %lld) ", rowsS, rowsR, scalar(r->db, "SELECT root_mismatches FROM hpplite_status"));
+    if (rowsS != 4 || rowsR != 4) FAIL("rows");
+    if (!same_root(s2, r)) FAIL("roots differ");
+    hpplite_node_destroy(r); hpplite_node_destroy(s2); hpplite_l1_disconnect(l1);
+    PASS();
+#endif
+}
+
+/* a replica's file deleted (or restored from elsewhere) while its sidecar
+** stayed: the next batch's diffs would land on the wrong pages; the node
+** says so, naming the sidecar, instead of a bare root mismatch */
+static void test_file_not_where_its_sidecar_says(void) {
+    TEST("a replica whose file is gone but whose sidecar stayed refuses the next batch, naming the sidecar");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/s.db", l1, 1, 1);
+    if (!s) FAIL("open the sequencer");
+    hpplite_node_exec(s, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 1");
+    HppliteNode *r = open_pages_role(DIR "/r.db", l1, 1, 1, 1);
+    if (!r) FAIL("open the replica");
+    if (r->state == HPPLITE_STATE_ERROR) FAILF("the replica is in error after batch 1: %s", r->ctx->zLastError);
+    hpplite_node_destroy(r);
+    unlink(DIR "/r.db"); unlink(DIR "/r.db-wal"); unlink(DIR "/r.db-shm");     /* the file goes, r.db-hpplite.db stays */
+    hpplite_node_exec(s, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 2");
+    r = open_pages_role(DIR "/r.db", l1, 1, 1, 1);
+    if (!r) FAIL("reopen the replica");
+    printf("(%s) ", r->ctx->zLastError);
+    if (r->state != HPPLITE_STATE_ERROR) FAIL("the replica took batch 2 onto a file that is not at batch 1");
+    if (!strstr(r->ctx->zLastError, "-hpplite.db")) FAIL("the error does not name the sidecar");
+    hpplite_node_destroy(r); hpplite_node_destroy(s); hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -201,6 +270,8 @@ int main(void) {
     test_posted_bytes_are_page_batches();
     test_replica_applies_pages();
     test_sequencer_adopts_its_own_page_batch();
+    test_reopen_after_a_submit_the_process_did_not_survive();
+    test_file_not_where_its_sidecar_says();
     remove_dir();
     return test_report();
 }

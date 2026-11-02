@@ -109,6 +109,13 @@ HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch) {
   return pm;
 }
 
+void hpplite_pagemode_pause(HpplitePageMode *pm) {
+  if (pm && pm->bWatch && pm->zPath) hpplite_vfs_unwatch(pm->zPath);
+}
+void hpplite_pagemode_resume(HpplitePageMode *pm) {
+  if (pm && pm->bWatch && pm->zPath) hpplite_vfs_watch(pm->zPath, sink, pm);
+}
+
 int hpplite_pagemode_snapshot(HpplitePageMode *pm) {
   QCommit *q;
   unsigned i, n;

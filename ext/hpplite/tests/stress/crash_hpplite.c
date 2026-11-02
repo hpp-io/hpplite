@@ -97,12 +97,16 @@ static void writer(const char *mode, int rows, int intervalMs, size_t limit) {
     sqlite3_exec(n->db, "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v)", NULL, NULL, NULL);
     sqlite3_int64 next = scalar(n->db, "SELECT COALESCE(MAX(id),0)+1 FROM t");
     char sql[256];
+    /* page mode (#146): a row nearly a page, 300 random characters in it, so
+    ** every ten rows dirty ten pages that deflate past the 1 KB limit of the
+    ** series scenario, and a flush is a series of batches there as well */
+    const char *pad = n->config.capturePages ? " || hex(randomblob(150)) || printf('%2700c', 'x')" : "";
     for (int i = 0; i < rows; i++) {
-        snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%lld,'row-%lld-%s')", (long long)(next + i), (long long)(next + i), mode);
+        snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%lld,'row-%lld-%s'%s)", (long long)(next + i), (long long)(next + i), mode, pad);
         if (i % 7 == 3) {
             sqlite3_exec(n->db, "BEGIN", NULL, NULL, NULL);
             sqlite3_exec(n->db, sql, NULL, NULL, NULL);
-            snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%lld,'row-%lld-%s')", (long long)(next + i + 1), (long long)(next + i + 1), mode);
+            snprintf(sql, sizeof(sql), "INSERT INTO t VALUES(%lld,'row-%lld-%s'%s)", (long long)(next + i + 1), (long long)(next + i + 1), mode, pad);
             sqlite3_exec(n->db, sql, NULL, NULL, NULL);
             sqlite3_exec(n->db, "COMMIT", NULL, NULL, NULL);
             i++;
@@ -134,11 +138,14 @@ static void check(const char *what) {
     if (!n) { hpplite_l1_disconnect(l1); return; }
     CHECK(n->state != HPPLITE_STATE_ERROR, "%s: node in error state after reopen", what);
 
-    /* every captured statement exactly once in L1 (after adopt) or pending */
+    /* every captured statement exactly once in L1 (after adopt) or pending.
+    ** Page mode (#146) has no statements: what a crash loses from the queue
+    ** the reopened node ships again as the file it is, and the rebuild below
+    ** is the check */
     sqlite3_int64 rows = rows_of_t(n->db);
     uint64_t height = hpplite_node_get_height(n);
     sqlite3_int64 onL1 = 0;
-    for (uint64_t h = 1; h < height; h++) {
+    for (uint64_t h = 1; !n->config.capturePages && h < height; h++) {
         HppliteBatch *b = hpplite_node_fetch_batch(n, h);
         CHECK(b != NULL, "%s: batch %llu missing or unreadable (heights not contiguous)", what, (unsigned long long)h);
         if (!b) break;
@@ -157,11 +164,13 @@ static void check(const char *what) {
     }
     /* one INSERT per row; the CREATE TABLE IF NOT EXISTS of every restart is
     ** kept too (an autocommit no-op stays logged), so it is not counted */
+    if (!n->config.capturePages) {
     sqlite3_int64 pending = scalar(n->db, "SELECT count(*) FROM _hpplite_pending WHERE sql LIKE 'INSERT%'");
     if (!n->config.captureText)
         pending += scalar(n->db, "SELECT count(*) FROM _hpplite_pending WHERE op = 1 AND tbl = 't'");
     CHECK(onL1 + pending == rows, "%s: INSERTs on L1 (%lld) + pending (%lld) != rows (%lld)",
           what, (long long)onL1, (long long)pending, (long long)rows);
+    }
 
     /* a final flush drains pending; a reader rebuilt from L1 matches */
     while (hpplite_node_pending_count(n) > 0) {
@@ -174,14 +183,14 @@ static void check(const char *what) {
     hpplite_node_destroy(n);
 
     HppliteL1 *l1r = open_l1();
-    unlink(DIR "/r.db"); unlink(DIR "/r.db-wal"); unlink(DIR "/r.db-shm");
+    unlink(DIR "/r.db"); unlink(DIR "/r.db-wal"); unlink(DIR "/r.db-shm"); unlink(DIR "/r.db-hpplite.db");   /* the page-mode sidecar goes with the file (#146) */
     HppliteNode *r = open_node(DIR "/r.db", l1r, 0, 0);
     CHECK(r != NULL, "%s: reader open", what);
     if (r) {
         hpplite_node_get_state_root(r, rootR);
         CHECK(hpplite_node_get_height(r) == height, "%s: reader height %llu != %llu", what,
               (unsigned long long)hpplite_node_get_height(r), (unsigned long long)height);
-        CHECK(rows_of_t(r->db) == rows, "%s: reader rows", what);
+        CHECK(rows_of_t(r->db) == rows, "%s: reader rows %lld != writer rows %lld (writer height %llu, reader height %llu, roots %s)", what, (long long)rows_of_t(r->db), (long long)rows, (unsigned long long)height, (unsigned long long)hpplite_node_get_height(r), memcmp(rootW, rootR, 32) == 0 ? "equal" : "differ");
         CHECK(memcmp(rootW, rootR, 32) == 0, "%s: content root differs after rebuild from L1", what);
         CHECK(r->ctx->nReplaySkipped == 0, "%s: statements skipped on replay", what);
         hpplite_node_destroy(r);          /* releases the lease it claimed on start */

@@ -539,7 +539,7 @@ int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned ch
   rc = hppliteBkBegin(pCtx, 1);
   if (rc != SQLITE_OK) return rc;
   saved = hppliteBkEnter(pCtx);
-  rc = sqlite3_prepare_v2(pCtx->bkDb, "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, chain_hash=?3, state_root=?4, open_txn=0, frag_id=0, frag_off=0 WHERE id=1", -1, &pStmt, NULL);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, chain_hash=?3, state_root=?4, open_txn=0, frag_id=0, frag_off=0, inflight_height=0, inflight_root=NULL WHERE id=1", -1, &pStmt, NULL);
   if (rc == SQLITE_OK) {
     sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(height + 1));
     sqlite3_bind_blob(pStmt, 2, blockHash, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
@@ -563,7 +563,22 @@ int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned ch
   memcpy(pCtx->prevBlockHash, blockHash, HPPLITE_HASH_SIZE);
   memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
   memcpy(pCtx->stateRoot, root, HPPLITE_HASH_SIZE);
+  pCtx->inflightHeight = 0;
   return SQLITE_OK;
+}
+
+int hppliteMarkInflightPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *root) {
+  sqlite3_stmt *pStmt = NULL;
+  int rc, saved;
+  rc = hppliteBkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) return rc;
+  saved = hppliteBkEnter(pCtx);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "UPDATE _hpplite_meta SET inflight_height=?1, inflight_root=?2 WHERE id=1", -1, &pStmt, NULL);
+  if (rc == SQLITE_OK) { sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height); sqlite3_bind_blob(pStmt, 2, root, 32, SQLITE_TRANSIENT); rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR; sqlite3_finalize(pStmt); }
+  hppliteBkLeave(pCtx, saved);
+  rc = hppliteBkEnd(pCtx, rc);
+  if (rc == SQLITE_OK) { pCtx->inflightHeight = height; memcpy(pCtx->inflightRoot, root, 32); }
+  return rc;
 }
 
 int hpplite_finalize_batch(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId) {

@@ -16,6 +16,10 @@ typedef struct HpplitePageMode HpplitePageMode;
 ** caller has checkpointed it, so the file holds everything. */
 HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch);   /* bWatch 0: a replica, applying what it is sent */
 void hpplite_pagemode_stop(HpplitePageMode *pm);
+/* a sequencer-to-be applying the chain's pages: its own watch off meanwhile (what the
+** apply and the journal-mode switches write is not a commit of its own), on again after */
+void hpplite_pagemode_pause(HpplitePageMode *pm);
+void hpplite_pagemode_resume(HpplitePageMode *pm);
 /* The file as it is, whole, as the next batch (every page full): a new rollup's
 ** first batch, or a sequencer back on a file the chain does not have all of */
 int hpplite_pagemode_snapshot(HpplitePageMode *pm);

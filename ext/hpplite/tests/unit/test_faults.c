@@ -170,7 +170,7 @@ static const char *run_seed(unsigned seed, int two) {
     }
     uint64_t last = 0, total = 0;
     hpplite_l1_get_da_state(l1, &last, &total, NULL);
-    uint64_t heightW = (uint64_t)scalar(w->db, "SELECT next_height FROM _hpplite_meta");   /* the file's */
+    uint64_t heightW = (uint64_t)scalar(w->ctx->bkDb, "SELECT next_height FROM _hpplite_meta");   /* the file's (the sidecar's, in page mode) */
     uint64_t statusW = (uint64_t)scalar(w->db, "SELECT height FROM hpplite_status");       /* what the connection says */
     if (last + 1 != heightW) {
         snprintf(why, sizeof why, "seed %u: the chain holds %llu batches, the file says %llu finalized", seed,
@@ -227,7 +227,7 @@ int main(void) {
     snprintf(g_rdb, sizeof g_rdb, "%s", tpath("r.db"));
     unsigned nSeeds = many ? (unsigned)atoi(many) : 60, failed = 0;
     printf("=== HPPLite under injected faults (#98), %s capture ===\n",
-           getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0 ? "statement" : "row");
+           test_pages_mode() ? "page" : getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0 ? "statement" : "row");
     if (one) {
         g_verbose = 1;
         const char *why = run_seed((unsigned)atoi(one), 0);

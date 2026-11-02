@@ -30,6 +30,7 @@ extern int tests_run, tests_passed;
 /* Row capture (#19) is the default; cases about statement capture run with
 ** HPPLITE_CAPTURE=text (the _text tests) and skip otherwise */
 int test_rows_mode(void);
+int test_pages_mode(void);                   /* HPPLITE_CAPTURE=pages: page capture (#146) */
 #define SKIP_IF_ROWS(why) do { if (test_rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
 
 /* The end of main: the tally, and the process's exit code */
@@ -73,6 +74,7 @@ typedef struct TestNodeOpts {
     int verifyOnly;                          /* role=verify (#5) */
     int determinismWarn;                     /* warn about non-deterministic SQL instead of refusing it */
     int captureText;                         /* statement capture, as v0.1 */
+    int capturePages;                        /* page capture (#146); also from HPPLITE_CAPTURE=pages */
     int noSync;                              /* attach the L1 without syncing from it first */
     int start;                               /* start the node even without an L1 */
     const char *nodeId;                      /* NULL: the suite's */

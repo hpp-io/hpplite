@@ -14,6 +14,10 @@ int test_rows_mode(void) {
     const char *v = getenv("HPPLITE_CAPTURE");
     return !(v && strcasecmp(v, "text") == 0);
 }
+int test_pages_mode(void) {
+    const char *v = getenv("HPPLITE_CAPTURE");
+    return v && strcasecmp(v, "pages") == 0;
+}
 
 int test_report(void) {
     printf("\n%d/%d passed\n", tests_passed, tests_run);
@@ -152,6 +156,7 @@ HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpt
     config.verifyOnly = o->verifyOnly;
     config.determinismWarn = o->determinismWarn;
     config.captureText = o->captureText;
+    config.capturePages = o->capturePages || (!o->captureText && test_pages_mode());   /* HPPLITE_CAPTURE=pages runs a suite in page mode (#146) */
     config.storeUrl = (char *)o->storeUrl;
     config.storeCap = o->storeCap;
     config.storeFallback = !o->storeFallbackOff;

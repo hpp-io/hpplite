@@ -137,6 +137,15 @@ int hppliteLoadMeta(HppliteCtx *pCtx) {
   sqlite3_stmt *pStmt;
   int rc;
   int saved = hppliteBkEnter(pCtx);
+  if (pCtx->bPages) {
+    sqlite3_stmt *q = NULL;
+    pCtx->inflightHeight = 0;
+    if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT inflight_height, inflight_root FROM _hpplite_meta WHERE id = 1", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
+      pCtx->inflightHeight = (uint64_t)sqlite3_column_int64(q, 0);
+      if (sqlite3_column_bytes(q, 1) == 32) memcpy(pCtx->inflightRoot, sqlite3_column_blob(q, 1), 32); else pCtx->inflightHeight = 0;
+    }
+    sqlite3_finalize(q);
+  }
   rc = sqlite3_prepare_v2(pCtx->bkDb,
     "SELECT next_height, prev_block_hash, state_root,"
     "       last_checkpoint_height, last_checkpoint_root, open_txn,"
@@ -475,6 +484,14 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
     rc = hppliteInternalExec(pCtx, bkDb, HPPLITE_SCHEMA);
     if (rc == SQLITE_OK) rc = hppliteTreeSchema(pCtx, bkDb);
     if (rc != SQLITE_OK) { gInitError = "cannot create the bookkeeping tables in the sidecar"; sqlite3_free(pCtx); return rc; }
+  }
+  {
+    /* the in-flight batch (a submit the process may not survive) */
+    sqlite3_stmt *q = NULL;
+    int has = 0;
+    if (sqlite3_prepare_v2(bkDb, "SELECT 1 FROM pragma_table_info('_hpplite_meta') WHERE name = 'inflight_height'", -1, &q, NULL) == SQLITE_OK) has = (sqlite3_step(q) == SQLITE_ROW);
+    sqlite3_finalize(q);
+    if (!has) hppliteInternalExec(pCtx, bkDb, "ALTER TABLE _hpplite_meta ADD COLUMN inflight_height INTEGER NOT NULL DEFAULT 0; ALTER TABLE _hpplite_meta ADD COLUMN inflight_root BLOB");
   }
   hppliteLoadMeta(pCtx);
   pCtx->bRootDirty = 0;
