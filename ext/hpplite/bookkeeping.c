@@ -87,9 +87,10 @@ int hppliteBkBegin(HppliteCtx *pCtx, int bWrite) {
 ** same commits were visible in both.
 */
 static sqlite3_int64 fnv(sqlite3_int64 h, const unsigned char *z, int n) {
+  uint64_t u = (uint64_t)h;                      /* FNV-1a: unsigned arithmetic, the overflow is the point (#138) */
   int i;
-  for (i = 0; i < n; i++) h = (h ^ z[i]) * 1099511628211LL;
-  return h;
+  for (i = 0; i < n; i++) u = (u ^ z[i]) * 1099511628211ULL;
+  return (sqlite3_int64)u;
 }
 static int bkFingerprint(HppliteCtx *pCtx, sqlite3_int64 out[3]) {
   sqlite3_stmt *q = NULL;
