@@ -110,6 +110,7 @@ typedef struct HppliteNode {
     /* Database and context */
     sqlite3 *db;
     sqlite3 *bkDb;                  /* Bookkeeping connection (NULL for :memory:) */
+    sqlite3 *ckDb;                  /* page mode: a plain connection to the file for the timer's WAL checkpoint, the bookkeeping being a sidecar (#151) */
     HppliteCtx *ctx;
     struct HpplitePageMode *pm;     /* page mode (#146): the commits queued and the batches built from them */
     unsigned pageDeflateRatio;      /* raw page bytes per posted byte seen on the last page batch: the next build's budget */

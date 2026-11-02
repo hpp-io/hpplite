@@ -23,6 +23,8 @@
 static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch);
 static int node_start_pages(HppliteNode *node, const char *zFile);
 static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch);
+static void node_ck_open(HppliteNode *node);
+static void node_ck_close(HppliteNode *node);
 #include "da_uri.h"
 #include "capture_rows.h"
 static void node_cap_batch_limit(HppliteNode *node);
@@ -817,6 +819,7 @@ void hpplite_node_destroy(HppliteNode *node) {
         hpplite_shutdown(node->ctx);
     }
 
+    node_ck_close(node);
     if (node->bkDb) {
         sqlite3_close(node->bkDb);
     }
@@ -1458,6 +1461,7 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
         if (sqlite3_prepare_v2(node->db, "PRAGMA journal_mode", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) snprintf(mode, sizeof mode, "%s", sqlite3_column_text(q, 0));
         sqlite3_finalize(q);
         if (strcasecmp(mode, "wal") == 0) {
+            node_ck_close(node);
             hpplite_pagemode_pause(node->pm);
             if (hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=DELETE") != SQLITE_OK) {
                 hpplite_pagemode_resume(node->pm);
@@ -2107,6 +2111,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=WAL");
         hpplite_pagemode_resume(node->pm);
         node->pagesWalSuspended = 0;
+        node_ck_open(node);                         /* the timer's checkpoint connection again, if the timer runs */
     }
     return synced;
 }
@@ -2127,12 +2132,41 @@ static int node_wal_hook(void *pArg, sqlite3 *db, const char *zDb, int nFrames) 
     return SQLITE_OK;
 }
 
+/* The connection the timer checkpoints the file's WAL on: the bookkeeping
+** one, a second connection to the same file; in page mode that one is the
+** sidecar, so a plain connection of its own is opened (#151). None while the
+** file is being applied to in rollback-journal mode: the switch out of WAL
+** needs the file to itself. */
+static void node_ck_open(HppliteNode *node) {
+    const char *zFile;
+    if (node->ckDb || !node->pm || node->config.verifyOnly || !node->timerRunning) return;
+    zFile = sqlite3_db_filename(node->db, "main");
+    if (!zFile || !zFile[0]) return;
+    hpplite_internal_open_begin();
+    if (sqlite3_open_v2(zFile, &node->ckDb, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) { if (node->ckDb) sqlite3_close(node->ckDb); node->ckDb = NULL; }
+    hpplite_internal_open_end();
+    if (node->ckDb) {
+        sqlite3_busy_timeout(node->ckDb, 5000);
+        /* a connection learns the file is in WAL mode on its first read; until
+        ** then a checkpoint on it does nothing (and says -1 frames) */
+        sqlite3_exec(node->ckDb, "PRAGMA journal_mode", NULL, NULL, NULL);
+    }
+}
+static void node_ck_close(HppliteNode *node) {
+    if (!node->ckDb) return;
+    sqlite3_wal_hook(node->ckDb, NULL, NULL);
+    sqlite3_close(node->ckDb);
+    node->ckDb = NULL;
+}
+static sqlite3 *node_ck_conn(HppliteNode *node) { return node->pm ? node->ckDb : node->bkDb; }
+
 static void node_checkpoint_wal(HppliteNode *node, int64_t now) {
     int nLog = 0, nCkpt = 0;
-    if (!node->bkDb) return;
+    sqlite3 *ck = node_ck_conn(node);
+    if (!ck) return;
     if (node->walPages < 1000 && now < node->walCheckAt) return;
     node->walCheckAt = now + 1000;
-    if (sqlite3_wal_checkpoint_v2(node->bkDb, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt) == SQLITE_OK) {
+    if (sqlite3_wal_checkpoint_v2(ck, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt) == SQLITE_OK) {
         node->walPages = nCkpt >= nLog ? 0 : nLog;       /* all of it in the database: the next writer restarts the WAL */
     }
 }
@@ -2247,7 +2281,7 @@ void hpplite_node_start_timer(HppliteNode *node) {
     node->timerThread = thread;
     /* the WAL's checkpoint is this thread's now (#144); the application's
     ** commits stop doing it. interval=0 (no timer) leaves SQLite's own. */
-    sqlite3_wal_hook(node->bkDb, node_wal_hook, node);
+    if (node->pm) node_ck_open(node); else sqlite3_wal_hook(node->bkDb, node_wal_hook, node);
     if (node->ctx) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=0");
 }
 
@@ -2260,7 +2294,7 @@ void hpplite_node_stop_timer(HppliteNode *node) {
     /* Signal thread to stop, and wake it */
     pthread_mutex_lock((pthread_mutex_t *)node->timerWakeMutex);
     node->timerRunning = 0;
-    if (node->bkDb) sqlite3_wal_hook(node->bkDb, NULL, NULL);
+    if (node->pm) node_ck_close(node); else if (node->bkDb) sqlite3_wal_hook(node->bkDb, NULL, NULL);
     if (node->ctx && node->db) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=1000");   /* SQLite's own again */
     pthread_cond_signal((pthread_cond_t *)node->timerWake);
     pthread_mutex_unlock((pthread_mutex_t *)node->timerWakeMutex);
