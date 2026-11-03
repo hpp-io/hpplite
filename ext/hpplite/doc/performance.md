@@ -254,6 +254,8 @@ numbers, on the VFS watch it replaced, were within 3% of these).
 | read_write, trx | pages | 4506 | 81 108 | 0.216 | 0.273 | 13 | 957 | 12 | 7.9 |
 | read_write, trx | rows | 2441 | 43 944 | 0.216 | 1.328 | 137 | 528 | 47 | 23.4 |
 
+Rerun before the v0.4.0 tag (2026-11-03, 86b85963d9, same harness, median of three): write_only plain 7757 tps, pages 7592, rows 3835; read_write plain 4385, pages 4600, rows 2373. Every figure within 3% of the table.
+
 How to read it:
 
 - **Page capture costs the writer about 30 µs per transaction** (p50 0.127

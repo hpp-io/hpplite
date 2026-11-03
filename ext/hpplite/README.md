@@ -699,8 +699,14 @@ Merkle trees so a checkpoint costs what changed, the bytes of a batch in a
 store (a pin service paid over x402, a Kubo node, an S3 bucket) with the
 commitment on the chain, the status row saying what the store costs, the
 soak running through a store too. Key roles and viewing keys moved to v0.4.
-v0.4 is keys, viewing keys and page capture; the HPP-only node and the
-multi-put payments (#126, #135) wait on HPP's side and are v0.5.
+**v0.4.0 is tagged** (2026-11-03): key roles and provisioning (#17),
+viewing keys and the public-key envelope (#15), page capture (#146) as the
+default for a new rollup, the application suites (WordPress, Ghost, Rails 8,
+Home Assistant) in containers and run under it, the OLTP benchmark per
+version (#140) and the three writer stalls it found, fixed. v0.5 is HPP
+economics: store-based persistence and soft commitment with the chain's
+hard commitment at HPP's 30-minute cadence (#162), then the HPP-only node
+and the multi-put payments (#126, #135), which wait on HPP's side.
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
@@ -708,7 +714,7 @@ multi-put payments (#126, #135) wait on HPP's side and are v0.5.
 | v0.2 | Row capture by default (#19), validated on suites and real applications (WordPress, Ghost, Rails 8), several writers per file, `hpplite verify` (#5) | same | same |
 | v0.3 | Off-chain stores with L1 commitments (#11: pin service over x402, Kubo, S3), incremental (Merkle) state root (#9), batch compression (#12) | GB range | a store + L1 commitments |
 | v0.4 | Key roles and provisioning (#17), viewing keys and the public-key envelope (#15), page capture (#146: the pages each commit wrote, a Merkle root over the file's pages, the default for a new rollup) | same | same |
-| v0.5 | HPP economics: an HPP-only node, commitments and the lease by relay over x402 and pinning priced in HPP (#126); one payment authorization for many puts (#135) | same | same |
+| v0.5 | HPP economics: store-based persistence and soft commitment, chain-based hard commitment every 30 minutes (#162); an HPP-only node, commitments and the lease by relay over x402 and pinning priced in HPP (#126); one payment authorization for many puts (#135) | same | a store (soft) + one L1 commitment per 30 min (hard) |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: the state root is a content hash, O(database size) per
