@@ -60,6 +60,9 @@ int hpplite_store_calls(HppliteStore *store);
 size_t hpplite_store_last_bytes(HppliteStore *store);
 /* What the provider charges, from its /status: the asset, its chain, the price per byte and per
 ** pin (a put costs perPin + perByte * bytes). -1 when it charges nothing or said nothing. */
+/* What a put of nbytes costs at this provider, as its 402 will ask, in
+** atomic units of its asset; 0 when it charges nothing (#172) */
+uint64_t hpplite_store_quote(HppliteStore *store, size_t nbytes);
 int hpplite_store_payment(HppliteStore *store, unsigned char asset[20], uint64_t *pChainId, uint64_t *pPerByte, uint64_t *pPerPin);
 
 /* Seconds a payment authorization stays valid (default 120; a test chain whose clock ran ahead needs more) */

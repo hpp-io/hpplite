@@ -155,6 +155,10 @@ if(HPPLITE_BUILD_EXTENSION)
         ${CURL_INCLUDE_DIRS}
     )
     target_compile_definitions(hpplite_ext PRIVATE HPPLITE_EXTENSION)
+    # the store's price per MiB-month rounds with ceil() (#172): libm, separate from libc outside Apple
+    if(NOT APPLE)
+        target_link_libraries(hpplite_ext PRIVATE m)
+    endif()
     target_link_libraries(hpplite_ext PRIVATE
         Threads::Threads
         ${CMAKE_DL_LIBS}

@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <math.h>
 
 #define STORE_PIN  0                /* http(s)://host:port: a pin service (examples/pin_service) */
 #define STORE_KUBO 1                /* kubo://host:port: a Kubo node's own RPC (#11); no receipts, no payment */
@@ -45,6 +46,8 @@ struct HppliteStore {
     unsigned char asset[20];
     uint64_t payChainId;
     uint64_t pricePerByte, pricePerPin;
+    double pricePerMiBMonth;        /* per MiB per 30 days, fractions allowed (#172) */
+    uint64_t retentionSeconds;      /* what a put buys */
     int lastFailure;                /* HPPLITE_STORE_FAIL_* */
     int hasSigner;                  /* the provider's /status named its receipt signer and domain */
     unsigned char signer[20];
@@ -564,13 +567,16 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
             if (pay && cJSON_IsObject(pay)) {
                 /* what it charges, for the status row: asset, chain, the price of a put */
                 cJSON *asset = cJSON_GetObjectItem(pay, "asset"), *network = cJSON_GetObjectItem(pay, "network"),
-                      *perByte = cJSON_GetObjectItem(pay, "pricePerByte"), *perPin = cJSON_GetObjectItem(pay, "pricePerPin");
+                      *perByte = cJSON_GetObjectItem(pay, "pricePerByte"), *perPin = cJSON_GetObjectItem(pay, "pricePerPin"),
+                      *perMiB = cJSON_GetObjectItem(pay, "pricePerMiBMonth"), *retention = cJSON_GetObjectItem(pay, "retentionSeconds");
                 if (asset && cJSON_IsString(asset) && strlen(asset->valuestring) == 42
                     && hpplite_hex_to_bytes(asset->valuestring + 2, s->asset, 20) >= 0
                     && network && cJSON_IsString(network) && strncmp(network->valuestring, "eip155:", 7) == 0) {
                     s->payChainId = strtoull(network->valuestring + 7, NULL, 10);
                     s->pricePerByte = (perByte && cJSON_IsNumber(perByte)) ? (uint64_t)perByte->valuedouble : 0;
                     s->pricePerPin = (perPin && cJSON_IsNumber(perPin)) ? (uint64_t)perPin->valuedouble : 0;
+                    s->pricePerMiBMonth = (perMiB && cJSON_IsNumber(perMiB) && perMiB->valuedouble > 0) ? perMiB->valuedouble : 0;
+                    s->retentionSeconds = (retention && cJSON_IsNumber(retention) && retention->valuedouble > 0) ? (uint64_t)retention->valuedouble : 0;
                     s->hasPayment = 1;
                 }
             }
@@ -665,6 +671,15 @@ const char *hpplite_store_url(HppliteStore *s) { return s ? s->url : NULL; }
 uint64_t hpplite_store_spent(HppliteStore *s, int *pCalls) { if (pCalls) *pCalls = s ? s->calls : 0; return s ? s->spent : 0; }
 int hpplite_store_calls(HppliteStore *s) { return s ? s->nOk : 0; }
 size_t hpplite_store_last_bytes(HppliteStore *s) { return s ? s->lastBytes : 0; }
+
+uint64_t hpplite_store_quote(HppliteStore *s, size_t nbytes) {
+    double storage;
+    if (!s || !s->hasPayment) return 0;
+    /* as the reference service computes it (examples/pin_service price_put), in the same order:
+    ** the storage for the retention bought, rounded up to a whole unit */
+    storage = s->pricePerMiBMonth * (double)nbytes / (1024.0 * 1024.0) * ((double)s->retentionSeconds / (30.0 * 24 * 3600));
+    return s->pricePerPin + s->pricePerByte * (uint64_t)nbytes + (uint64_t)ceil(storage - 1e-9);
+}
 
 int hpplite_store_payment(HppliteStore *s, unsigned char asset[20], uint64_t *pChainId, uint64_t *pPerByte, uint64_t *pPerPin) {
     if (!s || !s->hasPayment) return -1;

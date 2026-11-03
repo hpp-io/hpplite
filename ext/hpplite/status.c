@@ -324,10 +324,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             if (node->store) sqlite3_result_int(ctx, hpplite_store_calls(node->store));
             break;
         case STATUS_COL_STORE_PRICE: {
-            uint64_t perByte = 0, perPin = 0;
             size_t n = node->store ? hpplite_store_last_bytes(node->store) : 0;
-            if (n && hpplite_store_payment(node->store, NULL, NULL, &perByte, &perPin) == 0)
-                sqlite3_result_int64(ctx, (sqlite3_int64)(perPin + perByte * (uint64_t)n));
+            uint64_t price = n ? hpplite_store_quote(node->store, n) : 0;
+            if (price) sqlite3_result_int64(ctx, (sqlite3_int64)price);
             break;
         }
         case STATUS_COL_READERS: {

@@ -233,6 +233,58 @@ static void test_node_status(const char *url) {
 /* 5. A Kubo node as the store (#11): kubo://host:port speaks Kubo's own RPC
 ** (add with cid-version 1 and raw leaves, cat). No receipts, no payment:
 ** the chain commits (hash, CID) and nothing else. */
+/* #172: the node's quote of a put (store_price) is the price the store's 402
+** asks: per put, per MiB-month for the retention bought, rounded up to a
+** whole unit. A paid service (the mock facilitator: its 402s need no chain) */
+static void test_quote(const char *dir) {
+    TEST("the node quotes a put as the store's 402 does (#172): per put + per MiB-month x retention, rounded up to a whole unit");
+    int port = test_free_port();
+    char portStr[16], script[600], url[64], keyPath[600];
+    static const size_t sizes[] = { 183, 40000, 3 * 1048576 + 17 };
+    snprintf(portStr, sizeof portStr, "%d", port);
+    snprintf(script, sizeof script, "%s/pin_service.py", dir);
+    snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
+    pid_t pid = fork();
+    if (pid == 0) {
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", tpath("quote_pins"), "--signer-key", keyPath,
+               "--pay-to", "0x1111111111111111111111111111111111111111", "--facilitator", "mock", "--rpc", "http://127.0.0.1:1",
+               "--settle-key", "0x01", "--price-per-mib-month", "30.5", "--price-per-pin", "10", "--retention", "5184000", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        char cmd[200];
+        if (!test_child_alive(pid)) break;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status 2>/dev/null | grep -q pricePerPin", port);
+        up = system(cmd) == 0;
+        if (!up) usleep(200 * 1000);
+    }
+    if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the paid pin service did not start"); }
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    HppliteStore *st = hpplite_store_open(url, (const uint8_t *)"0123456789abcdef0123456789abcdef", 0);
+    const char *why = st ? NULL : "open";
+    for (size_t k = 0; !why && k < sizeof sizes / sizeof sizes[0]; k++) {
+        char cmd[400], out[2000], *p;
+        snprintf(cmd, sizeof cmd, "head -c %zu /dev/urandom > %s && curl -s -m 10 -X POST --data-binary @%s http://127.0.0.1:%d/put",
+                 sizes[k], tpath("quote.bin"), tpath("quote.bin"), port);
+        FILE *f = popen(cmd, "r");
+        size_t n = f ? fread(out, 1, sizeof out - 1, f) : 0;
+        if (f) pclose(f);
+        out[n] = 0;
+        p = strstr(out, "\"amount\": \"");
+        long long asked = p ? atoll(p + 11) : -1;
+        long long quoted = (long long)hpplite_store_quote(st, sizes[k]);
+        printf("(%zu bytes: 402 asks %lld, node quotes %lld) ", sizes[k], asked, quoted);
+        if (asked <= 0 || asked != quoted) why = "the node's quote is not the store's price";
+    }
+    if (st) hpplite_store_close(st);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (why) FAIL(why);
+    PASS();
+}
+
 static void test_kubo(const char *url, const char *tag) {   /* tag: the files' suffix, so a stand-in run and a live one do not share them */
     TEST("kubo://: put pins the bytes and names their CIDv1, get reads them back, no receipt; a node on it posts and a replica rebuilds from the commitment");
     HppliteStore *s = hpplite_store_open(url, NULL, 0);
@@ -676,6 +728,7 @@ int main(int argc, char **argv) {
     hpplite_store_close(s);
     test_named(url);
     test_node_status(url);
+    test_quote(dir);
     test_ranges(url);
     test_ranges_restart(url);
     test_anchor_timer(url);

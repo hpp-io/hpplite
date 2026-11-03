@@ -22,7 +22,7 @@ this order and verifies every receipt before it believes it.
 
 | Call | Paid | Answer |
 |---|---|---|
-| `POST /put` with the bytes | yes: `pricePerPin + pricePerByte × size` buys `retentionSeconds` | `{cid, bytes, expires, receipt, held}` |
+| `POST /put` with the bytes | yes: `pricePerPin` + `pricePerMiBMonth` × size in MiB × retention in 30-day months, rounded up to a whole unit (+ `pricePerByte` × size, 0 by default), buys `retentionSeconds` (#172) | `{cid, bytes, expires, receipt, held}` |
 | `POST /pin/<cid>` | yes, the same price | retention extended, a new `receipt` |
 | `GET /get/<cid>` | no (`--paid-get` to charge) | the bytes |
 | `POST /name/<da>-<height>` with the bytes, then the sequencer instance (32 bytes) and its 65-byte EIP-712 `Batch` signature appended (#165) | no | `{name, bytes, signer}`; 403 when another signer holds the rollup's names, or (with `--rpc`) when the signer is not the coordinator's `sequencerWallet()` |
@@ -43,6 +43,25 @@ this order and verifies every receipt before it believes it.
   verifies the receipt (`buyer.receipt_ok`), keeps it, and commits it with
   the batch (`commitBatch`, #33), so anyone can later show what the provider
   undertook to hold until when.
+
+## What it charges (#172)
+
+`--price-per-mib-month` (default 30 atomic units, so $0.03 per GiB-month:
+R2's $0.015 plus 100%) prices the storage, with fractions allowed; each put
+is rounded up to a whole unit. `--price-per-pin` (default 10 units,
+$0.00001) is per put, whatever its size. `--price-per-byte` (default 0) is
+the price before #172, kept for anyone who set it; the old default of 1
+unit per byte made a megabyte cost $1 and a gigabyte $1,000.
+
+At the defaults, a 2 KB batch kept 30 days costs 11 units: 10 for the put
+and 1 for the storage, rounded up. A database flushing every 5 seconds
+puts 17,280 batches a day, about $6 a month, nearly all of it the per-put
+part. That is the real cost of a payment per put: each `exact` payment is
+a settlement transaction for the facilitator. #135 (x402's
+`batch-settlement`, which HPP's facilitator supports) is what removes it,
+with one deposit and signed vouchers instead of a settlement per put. The
+node's `store_price` quotes a put exactly as the 402 will
+(`hpplite_store_quote`), so `storecap=` can be set from it.
 
 ## The x402 seller side, written out
 

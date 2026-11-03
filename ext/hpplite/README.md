@@ -775,7 +775,11 @@ public image any more) in containers, which is how #136 was found.
 Ethereum Sepolia to USDC.e on HPP Sepolia through HPP's gateway with `cast`
 (approve, then `outboundTransfer` with a retryable ticket it prices from the
 chain; `--dry-run` prints the two transactions and sends nothing, `--to`
-sends to a node's wallet). Not here yet: `upto` and payment channels.
+sends to a node's wallet). Its price is per MiB-month (default $0.03 per GiB-month)
+plus a small fee per put, and the node's `store_price` is exactly what the next
+402 will ask (#172; the costs in [its README](examples/pin_service/README.md)).
+Not here yet: one payment for many puts (#135: HPP's facilitator supports
+x402's `batch-settlement`).
 
 ## Versions
 

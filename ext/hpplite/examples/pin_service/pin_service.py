@@ -14,8 +14,10 @@ only; eth.py beside it does keccak, secp256k1 and EIP-712.
 
 Endpoints
   POST /put            bytes in; {cid, bytes, expires, receipt} out. Paid: the 402 quotes
-                       price-per-byte * size + price-per-pin for `retention` seconds. A CID already
-                       held answers 200 with its receipt and no 402 (idempotent by CID).
+                       price-per-pin + price-per-mib-month * size in MiB * retention in 30-day
+                       months (+ price-per-byte * size, 0 by default), rounded up to a whole unit,
+                       for `retention` seconds (#172). A CID already held answers 200 with its
+                       receipt and no 402 (idempotent by CID).
   POST /pin/<cid>      extend retention by `retention`; paid; a new receipt.
   GET  /get/<cid>      the bytes; free unless --paid-get.
   GET  /status         prices, retention, pinned count, the signer address and the receipt's
@@ -45,6 +47,7 @@ import hashlib
 import http.client
 import http.server
 import json
+import math
 import os
 import secrets
 import socketserver
@@ -353,6 +356,9 @@ class Payments:
         return r
 
 
+MIB = 1024 * 1024
+MONTH = 30 * 24 * 3600
+
 # ============ The HTTP service ============
 
 NAME_RE = re.compile(r"^[0-9a-f]{40}-[0-9]{1,18}$")
@@ -397,7 +403,10 @@ class Service:
         self.started = int(time.time())
 
     def price_put(self, nbytes):
-        return self.args.price_per_pin + self.args.price_per_byte * nbytes
+        """Whole units: the per-put fee, the storage for the retention bought, the legacy per-byte price (#172)."""
+        months = self.args.retention / MONTH
+        storage = self.args.price_per_mib_month * nbytes / MIB * months
+        return self.args.price_per_pin + self.args.price_per_byte * nbytes + math.ceil(storage - 1e-9)
 
     def status(self):
         return {
@@ -407,6 +416,7 @@ class Service:
                                                         "type": RECEIPT_TYPE},
             "payment": {"scheme": "exact", "network": self.args.network, "asset": self.args.asset, "payTo": self.args.pay_to,
                         "pricePerByte": self.args.price_per_byte, "pricePerPin": self.args.price_per_pin,
+                        "pricePerMiBMonth": self.args.price_per_mib_month,
                         "retentionSeconds": self.args.retention, "paidGet": bool(self.args.paid_get),
                         "facilitator": self.args.facilitator or "none (free)"} if self.payments.enabled else None,
             "pinned": self.store.count(), "settled": self.payments.settled, "uptime": int(time.time()) - self.started,
@@ -588,8 +598,11 @@ def main():
     ap.add_argument("--asset-version", default="2")
     ap.add_argument("--rpc", default=None, help="mock facilitator: the chain to verify and settle on")
     ap.add_argument("--settle-key", default=None, help="mock facilitator: the key that submits transferWithAuthorization")
-    ap.add_argument("--price-per-byte", type=int, default=1, help="atomic units (USDC.e: 1e-6)")
-    ap.add_argument("--price-per-pin", type=int, default=1000)
+    ap.add_argument("--price-per-mib-month", type=float, default=30.0,
+                    help="atomic units (USDC.e: 1e-6) per MiB per 30 days, fractions allowed; the default, $0.03 per GiB-month,"
+                         " is R2's $0.015 plus 100%% (#172)")
+    ap.add_argument("--price-per-pin", type=int, default=10, help="atomic units per put or pin, whatever its size: the settlement")
+    ap.add_argument("--price-per-byte", type=int, default=0, help="atomic units per byte on top (before #172 the only size price: 1)")
     ap.add_argument("--retention", type=int, default=30 * 24 * 3600, help="seconds a put or a pin buys")
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--paid-get", action="store_true")
