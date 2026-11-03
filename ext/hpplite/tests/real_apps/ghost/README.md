@@ -34,6 +34,20 @@ final flush on close never runs: before stopping it, wait until the file's
 left is not lost - it stays in the file and the next open posts it - but the
 lease the dead instance held must expire first (minutes).
 
+## In a container (2026-11-03, anvil; Node 24 and pnpm 11 image, Debian trixie; page capture, the default)
+
+`tests/real_apps/docker/ghost.sh`: Ghost installed by ghost-cli in the image
+(`docker/Dockerfile.ghost`), better-sqlite3 rebuilt at run time against the
+build volume's amalgamation, the Linux `hpplite.so` from `docker/so.sh`,
+anvil and the factory on the host, the Admin API session inside, the replica
+check on the host.
+
+- Ghost up 4 s after its migrations and fixtures; the session: 60 posts, 150
+  members, every call succeeded, no HPPLite message in Ghost's log. 11 page
+  batches.
+- The replica rebuilt from the chain equals Ghost's database: 102 tables,
+  2208 rows, the same root at height 12.
+
 ## Results (2026-10-30, anvil)
 
 - First boot, all of Ghost's migrations and fixtures (106 tables): clean,
