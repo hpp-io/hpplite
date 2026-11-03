@@ -34,6 +34,7 @@ the same binary with `HPPLITE_CAPTURE=text`.
 | 9 | `sqlite3_expanded_sql()` truncates bound values in some builds | test_env_enable | ok |
 | 10 | A schema reset is immediate even while another statement of the connection is running | test_rows, test_concurrency(+_text), test_faults(+_text), test_rows_e2e | handled (#108) |
 | 11 | The wal hook runs only when `sqlite3_step()` returns SQLITE_DONE in autocommit; a statement reset after a row commits without it | test_abuse_pages | handled (#155) |
+| 12 | A read transaction pinned at a WAL frame bounds every checkpoint there; the frames past it can be cut off the WAL file | test_wal_pin | ok (2026-11-02 trunk) |
 
 Entry 10 was not on the list in #105: it is the one trunk broke, found by the
 first run of the trunk build (2026-11-01; details under 10). HPPLite no
@@ -414,6 +415,47 @@ having run, polls the WAL reader with no frame hint (`walread.c`
 **Pinned by.** test_abuse_pages, `TEST("INSERT/UPDATE ... RETURNING stepped
 once and reset, then run again: every run captured")`: 11 commits captured
 (2 without the fallback).
+
+## 12. A read transaction pinned at a WAL frame bounds every checkpoint there, and the frames past it can be cut off the WAL file
+
+**To be relied on (#166).** The soft replica applies batches the chain has
+not anchored yet as ordinary commits and keeps them discardable: a read
+transaction opened at the hard height (the pin) stops every checkpoint
+there, so the main file never holds a soft page; when the next range
+commitment agrees with what was applied, the pin moves and the checkpoint
+runs; when it disagrees, every connection closes without a checkpoint, the
+WAL file is truncated at the pin's frame and the first opener rebuilds the
+wal-index from what is left: the database is at the hard state, intact.
+Spiked 2026-11-03 on 3.54.1 and trunk 3.55.0 (2026-11-02 20:14:49), stock
+SQLite alone.
+
+Two things the spike found that the design must respect. A partial
+checkpoint under the pin copies a page only when its latest WAL frame is
+within the safe range, so a page the soft commits rewrote is not copied
+even at its hard version: the main file alone is a mix and never "the hard
+state"; the WAL up to the pin is. And the wal-index is rebuilt only by the
+first opener, the one that gets the exclusive DMS lock, so the cut needs
+every process off the file (the lock-file barrier of #75), after which the
+stale -shm is harmless. The pin costs WAL growth for as long as it is held
+(3000 commits: 6030 frames, 25 MB) and nothing else: the release lets the
+next checkpoint take everything.
+
+**SQLite source.** `wal.c` `walCheckpoint()`: `mxSafeFrame` is lowered to
+each reader's `aReadMark[i]` the checkpoint cannot take the lock of, and
+the copy loop skips `iFrame>mxSafeFrame` (over an iterator that yields each
+page's last frame, hence the mix); `sqlite3WalClose()` runs no checkpoint
+and deletes nothing when `sqlite3PagerClose()` passes it no buffer, which
+`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` makes it do; `walIndexRecover()` is run
+by `walIndexReadHdr()` when the connection holds the exclusive DMS lock
+(`walLockShared`/`WAL_RECOVER_LOCK`), the WAL file's salts and checksums
+deciding which frames are valid.
+
+**HPPLite code.** None yet: #166 (the pin is `node.c` `pinDb[]` of the
+page-mode maintenance, the frame arithmetic `walread.c`).
+
+**Pinned by.** test_wal_pin: `TEST("a reader pinned at a frame bounds every
+checkpoint there...")`, `TEST("the frames past the pin cut off the WAL
+file...")`, `TEST("a pin held under 3000 commits...")`.
 
 ## Adding an entry
 
