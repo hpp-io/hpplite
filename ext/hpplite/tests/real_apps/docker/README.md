@@ -22,7 +22,18 @@ built on the same Debian the runtime images stand on.
 tests/real_apps/docker/wordpress.sh
 ```
 
-Ghost (Node 24, pnpm 11) and Rails (Ruby 3.3) follow the same shape: one
-Dockerfile per app from the runtime's official image, the module from the
-shared volume, the app's own session script inside, the replica check on the
-host.
+- `Dockerfile.rails`, `rails.sh`, `rails_inner.sh`: Ruby 3.3, the rails gem
+  and the app `rails/setup.sh` generates, in the image; inside, `db:prepare`,
+  Puma with two workers, Solid Queue and the 16-client session
+  (`rails/drive.py`); then the four databases copied out and a replica of
+  each rebuilt on the host by its name (`dbname={file}`).
+- `Dockerfile.ghost`, `ghost.sh`, `ghost_inner.sh`: Node 24 and pnpm 11, Ghost
+  installed by ghost-cli as the image's node user; at run time better-sqlite3
+  is rebuilt against the volume's SQLite amalgamation (the bundled one
+  truncates bound strings in expanded SQL), then Ghost's Admin API session
+  (`ghost/drive.py`) and the replica check on the host.
+
+```bash
+tests/real_apps/docker/rails.sh
+tests/real_apps/docker/ghost.sh
+```

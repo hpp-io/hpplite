@@ -27,6 +27,21 @@ HPPLITE_ANVIL_KEY0=0x... HPPLITE_ORM_EXTRA="&dbname=production_queue.sqlite3" \
   HPPLITE_ORM_DIR=/tmp/rails/shop/storage ... python $HPP/tests/orm/orm_common.py production_queue.sqlite3
 ```
 
+## In a container (2026-11-03, anvil; Ruby 3.3 image, Debian trixie; page capture, the default)
+
+`tests/real_apps/docker/rails.sh` runs the same session with Ruby, Rails and
+the generated app in a container (`docker/Dockerfile.rails`, the Linux
+`hpplite.so` from `docker/so.sh`), anvil and the factory on the host, and
+the four replica checks on the host, each database found by its name.
+
+- `db:prepare` on the four databases, each getting its own rollup by name;
+  Puma with two workers and Solid Queue's processes writing at once; 16
+  clients x 50 operations, every request through. No HPPLite message but the
+  four "creating one" of the named rollups.
+- Replicas rebuilt from the chain equal the writers: primary 5 tables, 380
+  rows; Solid Cache 6 rows; Solid Queue 16 tables, 327 rows; Action Cable 3
+  rows. Page batches: 6, 3, 8 and 1.
+
 ## Results (2026-10-31, anvil, `capture=rows`; Rails 8.1.4, Ruby 4.0.9, sqlite3 gem 2.10.2 / SQLite 3.54.1)
 
 - `db:prepare`: every migration and schema load on the four databases, captured.

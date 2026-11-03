@@ -1,0 +1,17 @@
+# Ghost on HPPLite, in a container (tests/real_apps/docker/ghost.sh).
+# Node 24 and pnpm 11 (Ghost 6.73's requirements) on the Debian the module
+# is built for (trixie, so.sh), the runtime libraries the module links, the
+# toolchain node-gyp needs to rebuild better-sqlite3 against a stock SQLite
+# amalgamation at run time (the bundled one truncates bound strings in
+# expanded SQL), and Ghost installed by ghost-cli as the image's node user.
+FROM node:24-trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsecp256k1-2 libcurl4t64 zlib1g python3 build-essential ca-certificates curl sqlite3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && corepack enable && corepack prepare pnpm@latest --activate
+RUN mkdir -p /ghost /out && chown node:node /ghost /out
+USER node
+WORKDIR /ghost
+RUN npx -y ghost-cli@latest install 6.73.0 --local --no-start --no-prompt
+COPY --chown=node:node ghost/run.sh ghost/drive.py /suite/
