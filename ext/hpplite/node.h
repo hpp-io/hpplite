@@ -80,6 +80,7 @@ typedef struct HppliteNodeConfig {
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
     int storeFallback;              /* storefallback=: a store that does not answer lets the chain carry the bytes (default on) */
+    int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;
 
@@ -130,6 +131,16 @@ typedef struct HppliteNode {
     uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
     int storeBalanceOk;
     long storeBalanceAt;            /* seconds (time()) */
+
+    /* Ranges (#164): the store holds the batches, the chain one commitment per anchor */
+    int64_t anchorAt;               /* the timer anchors at this time (ms, monotonic); 0 = not yet decided */
+    uint64_t anchoredHeight;        /* the chain's last height as last read: above it, the store alone holds the batches */
+    char lastAnchorTx[80];
+    HppliteAnchorRow anchorRow;     /* the commitment of the batch being finalized, for _hpplite_unanchored */
+    char *zAnchorRef;
+    unsigned char anchorReceipt[114];   /* HPPLITE_RECEIPT_SIZE */
+    struct cJSON *manifest;         /* a replica: the manifest of the range it is reading */
+    uint64_t manifestFrom, manifestTo;
 
     /* Crypto */
     HppliteCrypto *crypto;
@@ -302,6 +313,9 @@ int hpplite_node_pending_count(HppliteNode *node);
 ** Returns 1 if checkpoint interval reached.
 */
 int hpplite_node_should_checkpoint(HppliteNode *node);
+
+/* Anchor every batch the store holds since the last anchor (#164): the last height anchored, 0 when nothing was or the chain refused */
+uint64_t hpplite_node_anchor(HppliteNode *node);
 
 /*
 ** Create and submit checkpoint to L1.

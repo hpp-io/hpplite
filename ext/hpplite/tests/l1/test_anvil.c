@@ -710,7 +710,7 @@ static void test_resume_elsewhere(void) {
     if (scalar(c, "SELECT count(*) FROM m") != 1) FAIL("c did not rebuild from the chain");
     /* the old machine writes once more, then sleeps before its timer posts it */
     sqlite3_exec(a, "INSERT INTO m VALUES(2, 'written on the old machine, never posted')", NULL, NULL, NULL);
-    chain_sleep(400);                                       /* its lease runs out while it sleeps */
+    chain_sleep(3700);                                      /* its lease runs out while it sleeps (an hour on VERSION 9, #164) */
 
     /* the new machine: an empty file, the same key */
     sqlite3 *b = open_db("mig_b.db", KEY6, NULL);
@@ -1148,7 +1148,7 @@ static void test_power_loss(void) {
     (void)!system("cp " DIR "/pl.db " DIR "/pl_copy.db && cp " DIR "/pl.db-wal " DIR "/pl_copy.db-wal"
                   "; [ -f " DIR "/pl.db-hpplite.db ] && cp " DIR "/pl.db-hpplite.db " DIR "/pl_copy.db-hpplite.db"
                   "; [ -f " DIR "/pl.db-hpplite.db-wal ] && cp " DIR "/pl.db-hpplite.db-wal " DIR "/pl_copy.db-hpplite.db-wal; true");   /* page mode's sidecar as it lies too (#146) */
-    chain_sleep(400);                                       /* the dead process's lease runs out */
+    chain_sleep(3700);                                      /* the dead process's lease runs out (an hour on VERSION 9, #164) */
 
     sqlite3 *c = open_db("pl_copy.db", KEY9, NULL);
     if (!c) FAIL("the copy did not open");
@@ -1605,13 +1605,13 @@ static pid_t start_pin_service_free(const char *svc, int port) {
     return -1;
 }
 static void test_store_commit(void) {
-    TEST("a store for the bytes (#11): commitments on chain and bytes at the pin service; a replica with the store rebuilds, one without says so; the commit is cheap");
+    TEST("a store for the bytes (#11, #164): batches at the pin service, nothing on the chain until the anchor, then one range with the root and the manifest's receipt; a replica with the store rebuilds, one without says so; the anchor is cheap");
     const char *svc = getenv("HPPLITE_PIN_SERVICE");
     if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
     int port = 8800 + (int)(getpid() % 200);
     pid_t pid = start_pin_service_free(svc, port);
     if (pid < 0) FAIL("the pin service did not come up");
-    char extra[200], big[1001], sql[1200], contract[80], want[80];
+    char extra[200], big[1001], sql[1200], contract[80], want[80], out[4096] = "";
     snprintf(extra, sizeof extra, "&dbname=stored&store=http://127.0.0.1:%d", port);
     sqlite3 *w = open_db("st_writer.db", KEY2, extra);
     if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open writer"); }
@@ -1621,51 +1621,106 @@ static void test_store_commit(void) {
     snprintf(sql, sizeof sql, "INSERT INTO s(v) VALUES('%s')", big);
     sqlite3_exec(w, sql, NULL, NULL, NULL);
     if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 2 through the store"); }
-    long gas = receipt_gas(status_text(w, "last_batch_tx"));
-    printf("(commit of a 1 KB batch: %ld gas) ", gas);
     snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    if (scalar(w, "SELECT anchored FROM hpplite_status") != 0 || scalar(w, "SELECT height FROM hpplite_status") != 3 || status_text(w, "last_batch_tx")[0]) {
+        printf("(anchored %lld, height %lld, last_batch_tx '%s') ", (long long)scalar(w, "SELECT anchored FROM hpplite_status"), (long long)scalar(w, "SELECT height FROM hpplite_status"), status_text(w, "last_batch_tx"));
+        sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("two batches at the store, no transaction yet");
+    }
+    if (scalar(w, "SELECT hpplite_anchor()") != 2 || scalar(w, "SELECT anchored FROM hpplite_status") != 2 || scalar(w, "SELECT last_checkpoint_height FROM hpplite_status") != 2) {
+        printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor should commit the range 1-2 and be the checkpoint");
+    }
+    long gasFirst = receipt_gas(status_text(w, "last_anchor_tx"));
+    /* the first anchor of a rollup writes its slots for the first time (three fresh slots, ~20k each); the cost of an anchor is the second one's */
+    sqlite3_exec(w, "INSERT INTO s(v) VALUES('three')", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 3 through the store"); }
+    if (scalar(w, "SELECT hpplite_anchor()") != 3) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the second anchor, range 3-3"); }
+    long gas = receipt_gas(status_text(w, "last_anchor_tx"));
+    printf("(first anchor, fresh slots: %ld gas; second anchor, root inside, 114-byte receipt: %ld gas) ", gasFirst, gas);
     snprintf(want, sizeof want, "%s", status_text(w, "chain_hash"));
     {
-        /* what the chain holds: a commitment with the CID and the receipt, and no bytes */
+        /* what the chain holds: one range, no per-height commitment, the manifest's digest and the store's receipt for it */
         HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
-        uint8_t hash[32], *receipt = NULL;
-        char *zRef = NULL;
-        size_t n = 0, nReceipt = 0;
-        unsigned char signer[20];
-        uint64_t expires = 0;
+        HppliteRange r;
+        uint8_t hash[32], *receipt = NULL, *mbytes = NULL;
+        char *zRef = NULL, cid[64];
+        size_t n = 0, nReceipt = 0, mlen = 0;
+        unsigned char signer[20], k[32];
+        uint64_t expires = 0, h = 0;
+        uint8_t chain[32];
         uint8_t *bytes = peek ? hpplite_l1_get_batch(peek, 2, &n) : NULL;
-        int ok = peek && hpplite_l1_get_commitment(peek, 2, hash, &zRef, &receipt, &nReceipt) == 0
-                 && zRef && strncmp(zRef, "bafkrei", 7) == 0 && !bytes
-                 && hpplite_store_receipt_decode(receipt, nReceipt, signer, NULL, &expires, NULL) == 0 && expires > (uint64_t)time(NULL)
-                 && hpplite_store_receipt_verify(receipt, nReceipt, hash, zRef, 31337, NULL) == 0;
-        if (!ok) printf("(commitment: ref %s, receipt %zu bytes, bytes on chain %zu) ", zRef ? zRef : "(none)", nReceipt, n);
-        free(bytes);
+        int perHeight = peek && hpplite_l1_get_commitment(peek, 2, hash, &zRef, &receipt, &nReceipt) == 0;
+        HppliteRange r3;
+        int ok = peek && !bytes && !perHeight && hpplite_l1_get_range(peek, 2, &r) == 0 && r.fromHeight == 1 && r.toHeight == 2 && r.nReceipt > 0
+                 && hpplite_l1_get_range(peek, 3, &r3) == 0 && r3.fromHeight == 3 && r3.toHeight == 3
+                 && hpplite_l1_get_chain_hash(peek, &h, chain) == 0 && h == 3 && memcmp(chain, r3.chainHashAfter, 32) == 0;
+        if (peek && r3.fromHeight) hpplite_l1_range_clear(&r3);
+        if (ok) {
+            /* the manifest at the store under the digest's CID; the receipt is the store's promise over it */
+            HppliteStore *st;
+            char url[64];
+            snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+            st = hpplite_store_open(url, NULL, 0);
+            hpplite_store_cid_from_sha256(r.manifestDigest, cid);
+            mbytes = st ? hpplite_store_get(st, cid, &mlen) : NULL;
+            if (mbytes) hpplite_keccak256(mbytes, mlen, k);
+            ok = mbytes && strstr((const char *)mbytes, "\"batches\"") && strstr((const char *)mbytes, "\"from\":1") && strstr((const char *)mbytes, "\"to\":2")
+                 && hpplite_store_receipt_decode(r.receipt, r.nReceipt, signer, NULL, &expires, NULL) == 0 && expires > (uint64_t)time(NULL)
+                 && hpplite_store_receipt_verify(r.receipt, r.nReceipt, k, cid, 31337, NULL) == 0;
+            if (!ok) printf("(manifest %s: %zu bytes, receipt %zu bytes) ", cid, mlen, r.nReceipt);
+            if (st) hpplite_store_close(st);
+            hpplite_l1_range_clear(&r);
+        } else {
+            printf("(bytes on chain %zu, per-height commitment %d, range %s) ", n, perHeight, peek ? "not found or wrong" : "no connection");
+        }
+        free(bytes); free(mbytes);
         sqlite3_free(zRef); sqlite3_free(receipt);
         hpplite_l1_disconnect(peek);
-        if (!ok) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the chain should hold a commitment with the CID and the receipt, and no bytes"); }
+        if (!ok) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the chain should hold one range 1-2 with the manifest's digest and the store's receipt, and nothing per height"); }
     }
-    if (gas <= 0 || gas >= 90000) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("a commitment should cost a fraction of posting 1 KB"); }
+    if (gas <= 0 || gas >= 90000) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("an anchor should cost under 90k gas, about what one commitBatch did (%ld)", gas); }
 
     snprintf(extra, sizeof extra, "&dbname=stored&role=verify&store=http://127.0.0.1:%d", port);
     sqlite3 *r = open_db("st_replica.db", KEY2, extra);
     if (!r) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open replica"); }
-    if (strcmp(status_text(r, "state"), "verify") != 0 || scalar(r, "SELECT count(*) FROM s") != 1
-        || strcasecmp(strip0x(status_text(r, "chain_hash")), strip0x(want)) != 0) {
-        printf("(replica state %s, last_error '%s', rows %lld) ", status_text(r, "state"), status_text(r, "last_error"), (long long)scalar(r, "SELECT count(*) FROM s"));
+    if (strcmp(status_text(r, "state"), "verify") != 0 || scalar(r, "SELECT count(*) FROM s") != 2
+        || strcasecmp(strip0x(status_text(r, "chain_hash")), strip0x(want)) != 0 || scalar(r, "SELECT anchored FROM hpplite_status") != 3) {
+        printf("(replica state %s, last_error '%s', rows %lld, anchored %lld) ", status_text(r, "state"), status_text(r, "last_error"), (long long)scalar(r, "SELECT count(*) FROM s"), (long long)scalar(r, "SELECT anchored FROM hpplite_status"));
         sqlite3_close(r); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0);
-        FAIL("a replica with the store should rebuild equal");
+        FAIL("a replica with the store should rebuild equal from the range");
     }
     sqlite3_close(r);
+    {
+        /* hpplite-verify says what the chain anchored */
+        char params[300];
+        snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=stored&store=http://127.0.0.1:%d", RPC, FACTORY, KEY2, port);
+        int rc = run_verify_with(params, NULL, out, sizeof out);
+        if (rc != 0 || !strstr(out, "anchored to 3: the last range 3-3")) {
+            printf("(hpplite-verify rc %d: %.300s) ", rc, out);
+            sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+            FAIL("hpplite-verify should report the range the chain anchored");
+        }
+    }
 
     /* without the store the bytes are out of reach: nothing rebuilt, and the reason says so */
     sqlite3 *r2 = open_db("st_replica2.db", KEY2, "&dbname=stored&role=verify");
     char err2[300];
     snprintf(err2, sizeof err2, "%s", r2 ? status_text(r2, "last_error") : "");
     long long rows2 = r2 ? (long long)scalar(r2, "SELECT count(*) FROM s") : -2;
-    int refused = !r2 || (rows2 != 1 && strstr(err2, "store") != NULL);
+    int refused = !r2 || (rows2 != 2 && strstr(err2, "store") != NULL);
     printf("(without a store: rows %lld, last_error '%.60s') ", rows2, err2);
     if (r2) sqlite3_close(r2);
+    /* the close anchors what the store holds since */
+    sqlite3_exec(w, "INSERT INTO s(v) VALUES('four')", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 4 through the store"); }
     sqlite3_close(w);
+    {
+        HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
+        HppliteRange r4;
+        int closed = peek && hpplite_l1_get_range(peek, 4, &r4) == 0 && r4.fromHeight == 4 && r4.toHeight == 4;
+        if (closed) hpplite_l1_range_clear(&r4);
+        hpplite_l1_disconnect(peek);
+        if (!closed) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the close should anchor batch 4 as a range of one"); }
+    }
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     if (!refused) FAIL("a replica without a store should rebuild nothing and say why");
     PASS();
@@ -1740,6 +1795,9 @@ static void test_store_paid(void) {
     printf("(status: spent %lld over %lld calls, price %lld, balance %lld vs cast %ld, state %s) ", spent, calls, price, balance, first_number(myBal), state);
     int statusOk = spent == gained && calls == 2 && price > 1000 && balance == (long long)first_number(myBal) && strcmp(state, "ok") == 0;
     sqlite3_close(w);
+    /* the close anchors the two batches (#164): one more paid put, the manifest's; the cap check below starts from here */
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, payTo, RPC);
+    run_cmd(cmd, after, sizeof after);
     if (gained <= 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("the node did not pay the store"); }
     if (!statusOk) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("hpplite_status should say what the store cost and what the wallet holds (#11)"); }
 

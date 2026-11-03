@@ -212,3 +212,23 @@ int hpplite_l1_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32], 
     if (pnReceipt) *pnReceipt = 0;
     return (l1 && l1->ops->get_commitment) ? l1->ops->get_commitment(l1, height, hash, pzRef, pReceipt, pnReceipt) : -1;
 }
+
+char *hpplite_l1_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const HppliteRange *r) {
+    return (l1 && r && l1->ops->commit_range) ? l1->ops->commit_range(l1, instanceId, r) : NULL;
+}
+
+int hpplite_l1_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
+    if (out) memset(out, 0, sizeof *out);
+    return (l1 && out && l1->ops->get_range) ? l1->ops->get_range(l1, height, out) : -1;
+}
+
+int hpplite_l1_has_ranges(HppliteL1 *l1) {
+    return (l1 && l1->ops->has_ranges) ? l1->ops->has_ranges(l1) : 0;
+}
+
+void hpplite_l1_range_clear(HppliteRange *r) {
+    if (!r) return;
+    sqlite3_free(r->receipt);
+    r->receipt = NULL;
+    r->nReceipt = 0;
+}

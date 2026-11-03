@@ -408,6 +408,32 @@ char *hpplite_l1_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint6
                               const char *zRef, const uint8_t *receipt, size_t nReceipt);
 int hpplite_l1_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32], char **pzRef, uint8_t **pReceipt, size_t *pnReceipt);
 
+/*
+** A range commitment (#164, DA v3): one transaction anchoring every batch a
+** store holds since the last commitment. The chain hash after the range is
+** the node's fold over its batches (hpplite_chain_hash_next), the state
+** root the one after toHeight (the anchor is the checkpoint), the manifest
+** digest the sha-256 of the manifest at the store that names every batch in
+** the range, the receipt the store's promise to hold the manifest.
+** commit_range returns the transaction hash, NULL when refused or when the
+** contract has no ranges (DA v2 and before). get_range fills the range a
+** height is inside: 0, or -1 when it is inside none (a per-batch
+** commitment: get_batch / get_commitment) or the backend keeps none.
+** hpplite_l1_range_clear frees what get_range allocated (the receipt).
+*/
+typedef struct HppliteRange {
+    uint64_t fromHeight, toHeight;
+    uint8_t chainHashAfter[32];
+    uint8_t stateRoot[32];
+    uint8_t manifestDigest[32];
+    uint8_t *receipt;        /* sqlite3_malloc'd, NULL when none */
+    size_t nReceipt;
+} HppliteRange;
+char *hpplite_l1_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const HppliteRange *r);
+int hpplite_l1_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out);
+void hpplite_l1_range_clear(HppliteRange *r);
+int hpplite_l1_has_ranges(HppliteL1 *l1);   /* 1 when the chain takes range commitments */
+
 /* === Mock-specific functions for testing === */
 
 /*

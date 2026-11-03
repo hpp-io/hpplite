@@ -142,6 +142,8 @@ typedef struct HppliteConfig {
     int captureSource;               /* ...where from: 0 default, 1 environment, 2 URI (the URI wins, #80) */
     int captureAuto;                 /* no capture given (the default, #146): pages for a new rollup, the history's mode for an existing one */
     int intervalGiven;               /* interval= was said: a chain alias's own cadence does not apply */
+    int anchorIntervalMs;            /* anchor=: how often a store node anchors its batches on the chain (#164); default 30 min, the chain's cadence */
+    int anchorGiven;
     int aliasIntervalMs;             /* the cadence of the chain l1= named (0: none) */
     int localOnly;                   /* l1=local: finalize batches locally and keep no history (#38) */
     char *dbName;                    /* Its own rollup among the wallet's, by this name (#61);

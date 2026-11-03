@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <time.h>
 
+int hppliteKeepUnanchored(HppliteCtx *pCtx, uint64_t height, const unsigned char *chainAfter, const unsigned char *root);
+
+
 struct HppliteBatch *hpplite_build_batch(HppliteCtx *pCtx, sqlite3_int64 *pMaxId) {
   return hpplite_build_batch_limited(pCtx, 0, 1, pMaxId);
 }
@@ -388,6 +391,14 @@ int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int
     return rc;
   }
 
+  if (bWriter && pCtx->pAnchorRow && pBatch->pPosted && pBatch->nPosted) {
+    /* at a store, not yet anchored (#164): the row the next anchor names */
+    unsigned char k[HPPLITE_HASH_SIZE], after[HPPLITE_HASH_SIZE];
+    hpplite_keccak256(pBatch->pPosted, pBatch->nPosted, k);
+    hpplite_chain_hash_next(pCtx->chainHash, pBatch->height, k, after);
+    rc = hppliteKeepUnanchored(pCtx, pBatch->height, after, NULL);
+    if (rc != SQLITE_OK) return rc;
+  }
   if (bWriter && pBatch->pPosted && pBatch->nPosted) {
     /* keep the last HPPLITE_POSTED_KEEP batches as posted */
     rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_posted(height, data) VALUES(?1, ?2)",
@@ -509,6 +520,26 @@ uint8_t *hpplite_posted_batch(HppliteCtx *pCtx, uint64_t height, size_t *pLen) {
   return out;
 }
 
+/* The row of _hpplite_unanchored for a batch a store holds (#164), inside the finalize's transaction */
+int hppliteKeepUnanchored(HppliteCtx *pCtx, uint64_t height, const unsigned char *chainAfter, const unsigned char *root) {
+  const HppliteAnchorRow *a = pCtx->pAnchorRow;
+  sqlite3_stmt *pStmt = NULL;
+  int rc;
+  if (!a || !a->zRef) return SQLITE_MISUSE;
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_unanchored(height, hash, ref, receipt, chain_before, chain_after, root) VALUES(?1, ?2, ?3, ?4, ?7, ?5, ?6)", -1, &pStmt, NULL);
+  if (rc != SQLITE_OK) return rc;
+  sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height);
+  sqlite3_bind_blob(pStmt, 2, a->hash, HPPLITE_HASH_SIZE, SQLITE_STATIC);
+  sqlite3_bind_text(pStmt, 3, a->zRef, -1, SQLITE_STATIC);
+  if (a->receipt && a->nReceipt) sqlite3_bind_blob(pStmt, 4, a->receipt, (int)a->nReceipt, SQLITE_STATIC); else sqlite3_bind_null(pStmt, 4);
+  sqlite3_bind_blob(pStmt, 5, chainAfter, HPPLITE_HASH_SIZE, SQLITE_STATIC);
+  if (root) sqlite3_bind_blob(pStmt, 6, root, HPPLITE_HASH_SIZE, SQLITE_STATIC); else sqlite3_bind_null(pStmt, 6);
+  sqlite3_bind_blob(pStmt, 7, pCtx->chainHash, HPPLITE_HASH_SIZE, SQLITE_STATIC);   /* the mirror still holds the hash before this batch */
+  rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  sqlite3_finalize(pStmt);
+  return rc;
+}
+
 void hpplite_chain_hash_next(const unsigned char *pPrev, uint64_t height, const unsigned char *pBatchKeccak, unsigned char *pOut) {
   /* abi.encode(bytes32 prev, uint256 height, bytes32 batchHash): three 32-byte words */
   unsigned char buf[96];
@@ -551,6 +582,7 @@ int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned ch
     rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
     sqlite3_finalize(pStmt);
   }
+  if (rc == SQLITE_OK && pCtx->pAnchorRow && posted && nPosted) rc = hppliteKeepUnanchored(pCtx, height, chainHash, root);   /* at a store, not yet anchored (#164) */
   if (rc == SQLITE_OK && posted && nPosted) {
     rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_posted(height, data) VALUES(?1, ?2)", -1, &pStmt, NULL);
     if (rc == SQLITE_OK) { sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height); sqlite3_bind_blob(pStmt, 2, posted, (int)nPosted, SQLITE_STATIC); rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR; sqlite3_finalize(pStmt); }

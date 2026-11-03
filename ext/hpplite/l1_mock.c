@@ -76,6 +76,9 @@ typedef struct MockL1 {
     /* a height whose bytes live in a store (#11): the chain's commitment to them.
     ** batchData is NULL there. In memory only: a directory-backed mock forgets them */
     struct MockCommit { uint8_t hash[32]; char *ref; uint8_t *receipt; size_t nReceipt; } *commits[MAX_BATCHES];
+    /* ranges (#164): one commitment for every batch a store holds since the last; in memory only */
+    HppliteRange *ranges;
+    int nRanges, nRangesAlloc;
 
     char *dir;                   /* Directory-backed: every change is written here */
     unsigned char address[20];   /* the rollup's identity (from the directory when backed by one) */
@@ -321,6 +324,8 @@ static void mock_disconnect(HppliteL1 *l1) {
             free(self->commits[i]);
         }
     }
+    for (int i = 0; i < self->nRanges; i++) sqlite3_free(self->ranges[i].receipt);
+    free(self->ranges);
 
     /* Free crypto */
     if (self->crypto) {
@@ -1057,6 +1062,68 @@ static int mock_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32],
     return 0;
 }
 
+/* commitRange (#164): the same gate as commitBatch, then the range recorded, the height moved to its end,
+** and the anchor taken as the checkpoint (the root, the time, the lease renewed) as HPPLiteDA does */
+static char *mock_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const HppliteRange *r) {
+    HppliteRange *k;
+    uint64_t h;
+    if (l1 && self->rpcDown) return NULL;
+    if (!l1 || !instanceId || !r || r->fromHeight == 0 || r->toHeight < r->fromHeight || r->toHeight > MAX_BATCHES) return NULL;
+    if (self->failSubmit || self->failAfterPlus1 == 1) return NULL;
+    if (r->fromHeight != self->nBatches + 1) return NULL;
+    if (!self->hasPrivkey || memcmp(self->sequencerWallet, self->myAddress, 20) != 0) return NULL;
+    if (memcmp(instanceId, self->sequencerInstance, 32) != 0) return NULL;
+    if (self->leaseExpiry <= self->currentTimestamp) return NULL;
+    if (self->nRanges == self->nRangesAlloc) {
+        int n = self->nRangesAlloc ? self->nRangesAlloc * 2 : 16;
+        HppliteRange *grown = realloc(self->ranges, (size_t)n * sizeof(HppliteRange));
+        if (!grown) return NULL;
+        self->ranges = grown;
+        self->nRangesAlloc = n;
+    }
+    k = &self->ranges[self->nRanges];
+    *k = *r;
+    k->receipt = NULL; k->nReceipt = 0;
+    if (r->receipt && r->nReceipt) {
+        k->receipt = sqlite3_malloc((int)r->nReceipt);
+        if (k->receipt) { memcpy(k->receipt, r->receipt, r->nReceipt); k->nReceipt = r->nReceipt; }
+    }
+    self->nRanges++;
+    for (h = r->fromHeight; h <= r->toHeight; h++) {
+        size_t idx = h - 1;
+        free(self->batchData[idx]); self->batchData[idx] = NULL; self->batchLen[idx] = 0;
+        if (self->commits[idx]) { sqlite3_free(self->commits[idx]->ref); sqlite3_free(self->commits[idx]->receipt); free(self->commits[idx]); self->commits[idx] = NULL; }
+    }
+    if (self->failAfterPlus1 > 1) self->failAfterPlus1--;
+    self->nBatches = r->toHeight;
+    self->lastCheckpointHeight = r->toHeight;
+    self->lastCheckpointTime = self->currentTimestamp;
+    memcpy(self->lastStateRoot, r->stateRoot, 32);
+    self->leaseExpiry = self->currentTimestamp + self->leaseDuration;
+    mockSaveState(l1);
+    if (self->loseConfirmation) return NULL;
+    return sqlite3_mprintf("0x%016llx", (unsigned long long)r->toHeight);
+}
+
+static int mock_has_ranges(HppliteL1 *l1) { return l1 != NULL; }
+
+static int mock_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
+    int i;
+    if (!l1 || !out || self->rpcDown || height == 0) return -1;
+    for (i = self->nRanges - 1; i >= 0; i--) {
+        const HppliteRange *k = &self->ranges[i];
+        if (height < k->fromHeight || height > k->toHeight) continue;
+        *out = *k;
+        out->receipt = NULL; out->nReceipt = 0;
+        if (k->receipt && k->nReceipt) {
+            out->receipt = sqlite3_malloc((int)k->nReceipt);
+            if (out->receipt) { memcpy(out->receipt, k->receipt, k->nReceipt); out->nReceipt = k->nReceipt; }
+        }
+        return 0;
+    }
+    return -1;
+}
+
 static int mock_get_da_state(
     HppliteL1 *l1,
     uint64_t *last_batch_height,
@@ -1128,4 +1195,7 @@ const HppliteL1Ops hppliteL1MockOps = {
     .get_chain_hash = mock_get_chain_hash,
     .commit_batch = mock_commit_batch,
     .get_commitment = mock_get_commitment,
+    .commit_range = mock_commit_range,
+    .get_range = mock_get_range,
+    .has_ranges = mock_has_ranges,
 };

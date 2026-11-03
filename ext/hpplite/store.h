@@ -66,6 +66,10 @@ void hpplite_store_set_valid_for(HppliteStore *store, uint64_t seconds);
 ** and verification.
 */
 #define HPPLITE_RECEIPT_SIZE 114
+/* The name a store gives bytes whose sha-256 is `digest`: CIDv1, raw, base32 (what put returns for them);
+** a reader that holds a digest (#164: the manifest's, from the chain) asks the store for this */
+void hpplite_store_cid_from_sha256(const uint8_t digest[32], char out[64]);
+void hpplite_store_sha256(const uint8_t *data, size_t len, uint8_t out[32]);
 /* version 1 | signer (20) | payTo (20, the receipt domain's verifyingContract) | expires (8) | signature (65) */
 int hpplite_store_receipt_compact(const char *zReceiptJson, const unsigned char payTo[20], uint8_t out[HPPLITE_RECEIPT_SIZE]);
 int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char signer[20], unsigned char payTo[20],

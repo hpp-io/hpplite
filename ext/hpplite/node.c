@@ -28,11 +28,16 @@ static void node_ck_open(HppliteNode *node);
 static void node_ck_close(HppliteNode *node);
 static void node_pins_close(HppliteNode *node);
 static void node_wal_maintenance(void *pArg);
+static int node_ranges(HppliteNode *node);
+static int node_anchor(HppliteNode *node);
+static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch);
+static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
 static int node_switch_to_rows(HppliteNode *node);
 static int node_check_rollup(HppliteNode *node);
 static void node_checkpoint_wal(HppliteNode *node, int64_t now);
 #include "da_uri.h"
 #include "capture_rows.h"
+#include "cJSON.h"
 static void node_cap_batch_limit(HppliteNode *node);
 static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
 static int node_check_rollup(HppliteNode *node);
@@ -137,6 +142,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeUrl = node_strdup(config->storeUrl);
     node->config.storeCap = config->storeCap;
     node->config.storeFallback = config->storeFallback;
+    node->config.anchorIntervalMs = config->anchorIntervalMs;
     if (node->config.storeUrl) {
         /* the batch bytes' store (#11): the chain will hold commitments only */
         node->store = hpplite_store_open(node->config.storeUrl, config->hasPrivkey ? config->privkey : NULL, config->storeCap);
@@ -885,6 +891,16 @@ void hpplite_node_destroy(HppliteNode *node) {
         hpplite_node_stop(node);
     }
 
+    /* the batches the store holds since the last anchor get theirs (#164) */
+    if (node->l1 && node->ctx && !node->ctx->bDbClosed && node->flushMutex && node_ranges(node)) {
+        pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);
+        node_anchor(node);
+        pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
+    }
+    if (node->manifest) { cJSON_Delete(node->manifest); node->manifest = NULL; }
+    free(node->zAnchorRef);
+    node->zAnchorRef = NULL;
+
     /* Let go of the sequencer lease so a restart need not wait it out (a
     ** database rebuilt into a fresh file, another host) - unless another
     ** connection to this file is still open: it takes over as the same
@@ -1244,7 +1260,7 @@ static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t heig
     uint8_t *receipt = NULL;
     size_t nReceipt = 0;
     if (data) return data;
-    if (hpplite_l1_get_commitment(l1, height, hash, &zRef, &receipt, &nReceipt) != 0) return NULL;
+    if (hpplite_l1_get_commitment(l1, height, hash, &zRef, &receipt, &nReceipt) != 0) return node_fetch_from_range(node, l1, height, pLen);   /* inside an anchored range (#164)? */
     sqlite3_free(receipt);                        /* verified where it is reported (hpplite-verify); the hash is the check here */
     if (!node->store) {
         hpplite_error(node->ctx, "batch %llu is in a store (%s) and no store= names one", (unsigned long long)height, zRef);
@@ -1355,9 +1371,13 @@ static int node_adopt_existing(HppliteNode *node) {
     int rc;
 
     if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
-    if (lastBatch + 1 < node->ctx->blockHeight) {
-        node_repost_lost(node, lastBatch);
-        return 0;                  /* the batch at our height is still to post */
+    {
+        /* the batches the store holds above the chain's height are not lost: they wait for the anchor (#164) */
+        uint64_t floor = lastBatch + node_unanchored_above(node, lastBatch);
+        if (floor + 1 < node->ctx->blockHeight) {
+            node_repost_lost(node, lastBatch);
+            return 0;                  /* the batch at our height is still to post */
+        }
     }
     if (lastBatch < node->ctx->blockHeight) return 0;
 
@@ -1694,6 +1714,289 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
     return rc;
 }
 
+
+/*
+** ============================================================================
+** Ranges (#164): the store holds the batches, the chain one commitment per
+** anchor interval. A sequencer with a store on a chain that takes ranges
+** (DA v3) does not commit each batch: the batch is finalized once the store
+** has it (a row in _hpplite_unanchored), and the anchor, on its own timer,
+** at close, or on hpplite_anchor(), writes a manifest naming every batch
+** since the last anchor to the store and commits the range: the chain hash
+** after it, the state root (the anchor is the checkpoint), the manifest's
+** digest, the store's receipt. A replica reaching a height inside a range
+** fetches the manifest by the digest's CID, checks that it folds to the
+** anchored chain hash, and the batch by the manifest's reference.
+** ============================================================================
+*/
+
+/* a sequencer whose batches go to a store on a chain with ranges */
+static int node_ranges(HppliteNode *node) {
+    return node && node->store && node->l1 && !node->config.verifyOnly && hpplite_l1_has_ranges(node->l1);
+}
+
+/* the commitment of the batch being flushed, kept for the finalize's row */
+static void node_anchor_row(HppliteNode *node, const unsigned char hash[32], const char *zRef, const uint8_t *receipt, size_t nReceipt) {
+    free(node->zAnchorRef);
+    node->zAnchorRef = strdup(zRef);
+    memcpy(node->anchorRow.hash, hash, 32);
+    node->anchorRow.zRef = node->zAnchorRef;
+    node->anchorRow.receipt = NULL;
+    node->anchorRow.nReceipt = 0;
+    if (receipt && nReceipt && nReceipt <= sizeof node->anchorReceipt) {
+        memcpy(node->anchorReceipt, receipt, nReceipt);
+        node->anchorRow.receipt = node->anchorReceipt;
+        node->anchorRow.nReceipt = nReceipt;
+    }
+}
+
+/* how many batches above the chain's height the store holds (rows of _hpplite_unanchored) */
+static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch) {
+    sqlite3_stmt *q = NULL;
+    uint64_t n = 0;
+    int saved;
+    if (!node->ctx || !node->ctx->bkDb) return 0;
+    saved = hppliteBkEnter(node->ctx);
+    if (sqlite3_prepare_v2(node->ctx->bkDb, "SELECT count(*) FROM _hpplite_unanchored WHERE height > ?1", -1, &q, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(q, 1, (sqlite3_int64)lastBatch);
+        if (sqlite3_step(q) == SQLITE_ROW) n = (uint64_t)sqlite3_column_int64(q, 0);
+    }
+    sqlite3_finalize(q);
+    hppliteBkLeave(node->ctx, saved);
+    return n;
+}
+
+static void hex32(const unsigned char *b, char out[67]) { out[0] = '0'; out[1] = 'x'; hpplite_bytes_to_hex(b, 32, out + 2); }
+
+/*
+** The anchor: every row of _hpplite_unanchored above the chain's height,
+** in one manifest at the store and one commitment on the chain. 1 anchored,
+** 0 nothing to anchor, -1 the chain or the store refused (the rows stay;
+** the next tick tries again).
+*/
+static int node_anchor(HppliteNode *node) {
+    uint64_t lastBatch = 0, total = 0, from = 0, to = 0, expect;
+    unsigned char latest[32], chainAfter[32], root[32], digest[32], payTo[20];
+    uint8_t compact[HPPLITE_RECEIPT_SIZE];
+    cJSON *m = NULL, *batches;
+    sqlite3_stmt *q = NULL;
+    char *text = NULL, *zRef = NULL, *zReceipt = NULL, *txHash = NULL, cid[64], hx[67];
+    HppliteRange r;
+    int saved, rc = -1, nCompact = -1, hasRoot = 0, confirmed = 0;
+    HppliteCtx *ctx = node->ctx;
+    if (!node_ranges(node) || !ctx || !ctx->bkDb) return 0;
+    if (hpplite_l1_get_da_state(node->l1, &lastBatch, &total, latest) != 0) { hpplite_error(ctx, "anchor: the chain's state could not be read"); return -1; }
+    node->anchoredHeight = lastBatch;
+    /* rows the chain already covers (an anchor confirmed after the delete failed, or a restart);
+    ** a bookkeeping transaction, so the write is not taken for a foreign one (#37) */
+    if (node_unanchored_above(node, 0) > node_unanchored_above(node, lastBatch)) {
+        int trc = hppliteBkBegin(ctx, 1);
+        if (trc == SQLITE_OK) {
+            saved = hppliteBkEnter(ctx);
+            if (sqlite3_prepare_v2(ctx->bkDb, "DELETE FROM _hpplite_unanchored WHERE height <= ?1", -1, &q, NULL) == SQLITE_OK) { sqlite3_bind_int64(q, 1, (sqlite3_int64)lastBatch); trc = sqlite3_step(q) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR; }
+            sqlite3_finalize(q); q = NULL;
+            hppliteBkLeave(ctx, saved);
+            hppliteBkEnd(ctx, trc);
+        }
+    }
+    saved = hppliteBkEnter(ctx);
+    m = cJSON_CreateObject();
+    batches = cJSON_AddArrayToObject(m, "batches");
+    cJSON_AddNumberToObject(m, "v", 1);
+    hex32(node->instanceId, hx); cJSON_AddStringToObject(m, "instance", hx);
+    expect = lastBatch + 1;
+    if (sqlite3_prepare_v2(ctx->bkDb, "SELECT height, hash, ref, receipt, chain_after, root, chain_before FROM _hpplite_unanchored ORDER BY height", -1, &q, NULL) == SQLITE_OK) {
+        while (sqlite3_step(q) == SQLITE_ROW) {
+            uint64_t h = (uint64_t)sqlite3_column_int64(q, 0);
+            cJSON *b;
+            if (h != expect) {
+                hpplite_error(ctx, "anchor: batch %llu is at the store but %llu is not: the batches since the chain's height %llu are not whole",
+                              (unsigned long long)h, (unsigned long long)expect, (unsigned long long)lastBatch);
+                hppliteBkLeave(ctx, saved); sqlite3_finalize(q); cJSON_Delete(m); return -1;
+            }
+            if (from == 0) { from = h; if (sqlite3_column_bytes(q, 6) == 32) { hex32(sqlite3_column_blob(q, 6), hx); cJSON_AddStringToObject(m, "chain_before", hx); } }
+            to = h; expect = h + 1;
+            b = cJSON_CreateObject();
+            cJSON_AddNumberToObject(b, "h", (double)h);
+            if (sqlite3_column_bytes(q, 1) == 32) { hex32(sqlite3_column_blob(q, 1), hx); cJSON_AddStringToObject(b, "hash", hx); }
+            cJSON_AddStringToObject(b, "ref", (const char *)sqlite3_column_text(q, 2));
+            if (sqlite3_column_type(q, 3) == SQLITE_BLOB && sqlite3_column_bytes(q, 3) > 0) {
+                char *rx = malloc((size_t)sqlite3_column_bytes(q, 3) * 2 + 3);
+                if (rx) { rx[0] = '0'; rx[1] = 'x'; hpplite_bytes_to_hex(sqlite3_column_blob(q, 3), (size_t)sqlite3_column_bytes(q, 3), rx + 2); cJSON_AddStringToObject(b, "receipt", rx); free(rx); }
+            }
+            if (sqlite3_column_bytes(q, 4) == 32) memcpy(chainAfter, sqlite3_column_blob(q, 4), 32);
+            if (sqlite3_column_bytes(q, 5) == 32) { memcpy(root, sqlite3_column_blob(q, 5), 32); hasRoot = 1; } else hasRoot = 0;
+            cJSON_AddItemToArray(batches, b);
+        }
+    }
+    sqlite3_finalize(q);
+    hppliteBkLeave(ctx, saved);
+    if (from == 0) { cJSON_Delete(m); return 0; }
+    if (!hasRoot) hpplite_get_state_root(ctx, root);     /* row capture: the trees give the root after the last finalized batch */
+    cJSON_AddNumberToObject(m, "from", (double)from);
+    cJSON_AddNumberToObject(m, "to", (double)to);
+    hex32(chainAfter, hx); cJSON_AddStringToObject(m, "chain_after", hx);
+    hex32(root, hx); cJSON_AddStringToObject(m, "root", hx);
+    text = cJSON_PrintUnformatted(m);
+    cJSON_Delete(m);
+    if (!text) return -1;
+    hpplite_store_sha256((const uint8_t *)text, strlen(text), digest);
+    hpplite_store_cid_from_sha256(digest, cid);
+    zRef = hpplite_store_put(node->store, (const uint8_t *)text, strlen(text), &zReceipt);
+    node->storeBalanceOk = 0;
+    if (!zRef) {
+        hpplite_error(ctx, "anchor: the store did not take the manifest of batches %llu-%llu: %s", (unsigned long long)from, (unsigned long long)to, hpplite_store_error(node->store));
+        free(text); sqlite3_free(zReceipt); return -1;
+    }
+    if (strcmp(zRef, cid) != 0) {
+        /* a replica finds the manifest by the digest the chain carries: the store must name it so */
+        hpplite_error(ctx, "anchor: the store names the manifest %s, not its digest's CID %s: replicas could not find it; not anchored", zRef, cid);
+        free(text); sqlite3_free(zRef); sqlite3_free(zReceipt); return -1;
+    }
+    nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0) ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
+    memset(&r, 0, sizeof r);
+    r.fromHeight = from; r.toHeight = to;
+    memcpy(r.chainHashAfter, chainAfter, 32);
+    memcpy(r.stateRoot, root, 32);
+    memcpy(r.manifestDigest, digest, 32);
+    if (nCompact > 0) { r.receipt = compact; r.nReceipt = (size_t)nCompact; }
+    if (!node_ensure_lease(node)) { free(text); sqlite3_free(zRef); sqlite3_free(zReceipt); return -1; }
+    txHash = hpplite_l1_commit_range(node->l1, node->instanceId, &r);
+    if (txHash) {
+        confirmed = hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1;
+        if (confirmed) snprintf(node->lastAnchorTx, sizeof node->lastAnchorTx, "%s", txHash);
+        sqlite3_free(txHash);
+    }
+    if (!confirmed) {
+        /* the transaction may have landed despite the lost answer: the chain's height says */
+        uint64_t nowLast = 0;
+        if (hpplite_l1_get_da_state(node->l1, &nowLast, &total, latest) == 0 && nowLast >= to) confirmed = 1;
+    }
+    if (confirmed) {
+        int trc = hppliteBkBegin(ctx, 1);
+        if (trc == SQLITE_OK) {
+            saved = hppliteBkEnter(ctx);
+            if (sqlite3_prepare_v2(ctx->bkDb, "DELETE FROM _hpplite_unanchored WHERE height <= ?1", -1, &q, NULL) == SQLITE_OK) { sqlite3_bind_int64(q, 1, (sqlite3_int64)to); trc = sqlite3_step(q) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR; }
+            sqlite3_finalize(q); q = NULL;
+            hppliteBkLeave(ctx, saved);
+            trc = hppliteBkEnd(ctx, trc);
+        }
+        if (trc != SQLITE_OK) hpplite_error(ctx, "anchor: batches %llu-%llu are anchored but their rows could not be cleared (rc=%d); cleared at the next anchor", (unsigned long long)from, (unsigned long long)to, trc);
+        node->anchoredHeight = to;
+        /* the anchor is the checkpoint */
+        hpplite_set_checkpoint(ctx, to, root);
+        node->lastCheckpointHeight = to;
+        memcpy(node->lastCheckpointRoot, root, HPPLITE_HASH_SIZE);
+        node->batchesSinceCheckpoint = 0;
+        if (node->onCheckpointSubmitted) node->onCheckpointSubmitted(node->callbackArg, from, to, node->lastAnchorTx);
+        hpplite_error_clear(ctx);
+        rc = 1;
+    } else {
+        hpplite_error(ctx, "anchor: the chain did not take the commitment of batches %llu-%llu; tried again at the next anchor", (unsigned long long)from, (unsigned long long)to);
+        rc = -1;
+    }
+    free(text); sqlite3_free(zRef); sqlite3_free(zReceipt);
+    return rc;
+}
+
+uint64_t hpplite_node_anchor(HppliteNode *node) {
+    pthread_mutex_t *mutex;
+    int rc;
+    uint64_t h = 0;
+    if (!node) return 0;
+    mutex = (pthread_mutex_t *)node->flushMutex;
+    if (mutex) pthread_mutex_lock(mutex);
+    if (node->state == HPPLITE_STATE_INIT) hpplite_node_start(node);
+    rc = node_anchor(node);
+    if (rc == 1) h = node->anchoredHeight;
+    if (node->config.anchorIntervalMs > 0) node->anchorAt = node_current_time_ms() + node->config.anchorIntervalMs;
+    if (mutex) pthread_mutex_unlock(mutex);
+    return h;
+}
+
+/* a replica: the bytes of a height inside an anchored range, by the manifest the chain's digest names */
+static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen) {
+    HppliteRange r;
+    uint8_t *data = NULL;
+    cJSON *b = NULL, *e;
+    unsigned char want[32], got[32];
+    const char *zRef = NULL;
+    if (hpplite_l1_get_range(l1, height, &r) != 0) return NULL;
+    if (!node->store) {
+        hpplite_error(node->ctx, "batch %llu is in a store (anchored in range %llu-%llu) and no store= names one",
+                      (unsigned long long)height, (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight);
+        hpplite_l1_range_clear(&r);
+        return NULL;
+    }
+    if (!node->manifest || node->manifestFrom != r.fromHeight || node->manifestTo != r.toHeight) {
+        /* the manifest, by its digest's CID; it must be the bytes the chain named, and its batches must fold to the anchored chain hash */
+        char cid[64], hx[67];
+        size_t n = 0;
+        uint8_t *text, digest[32];
+        unsigned char chain[32], hash[32];
+        cJSON *m, *arr;
+        const cJSON *cb;
+        uint64_t h = r.fromHeight;
+        hpplite_store_cid_from_sha256(r.manifestDigest, cid);
+        text = hpplite_store_get(node->store, cid, &n);
+        if (!text) { hpplite_error(node->ctx, "range %llu-%llu: the store has no manifest %s: %s", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, cid, hpplite_store_error(node->store)); hpplite_l1_range_clear(&r); return NULL; }
+        hpplite_store_sha256(text, n, digest);
+        if (memcmp(digest, r.manifestDigest, 32) != 0) { hpplite_error(node->ctx, "range %llu-%llu: the store's manifest is not the one the chain anchored", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight); free(text); hpplite_l1_range_clear(&r); return NULL; }
+        m = cJSON_ParseWithLength((const char *)text, n);
+        free(text);
+        arr = m ? cJSON_GetObjectItemCaseSensitive(m, "batches") : NULL;
+        cb = m ? cJSON_GetObjectItemCaseSensitive(m, "chain_before") : NULL;
+        if (!arr || !cJSON_IsArray(arr) || !cJSON_IsString(cb) || hpplite_hex_to_bytes(cb->valuestring + 2, chain, 32) != 32) {
+            hpplite_error(node->ctx, "range %llu-%llu: the manifest is malformed", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight);
+            cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
+        }
+        if (h == node->ctx->blockHeight && memcmp(chain, node->ctx->chainHash, 32) != 0) {
+            unsigned char zero[32] = {0};
+            if (memcmp(node->ctx->chainHash, zero, 32) != 0) {
+                hpplite_error(node->ctx, "range %llu-%llu: the manifest starts from a chain hash that is not this history's at %llu", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, (unsigned long long)(h - 1));
+                cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
+            }
+        }
+        cJSON_ArrayForEach(e, arr) {
+            const cJSON *hh = cJSON_GetObjectItemCaseSensitive(e, "h"), *hs = cJSON_GetObjectItemCaseSensitive(e, "hash");
+            if (!cJSON_IsNumber(hh) || (uint64_t)hh->valuedouble != h || !cJSON_IsString(hs) || hpplite_hex_to_bytes(hs->valuestring + 2, hash, 32) != 32) {
+                hpplite_error(node->ctx, "range %llu-%llu: the manifest does not name batch %llu in order", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, (unsigned long long)h);
+                cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
+            }
+            hpplite_chain_hash_next(chain, h, hash, got);
+            memcpy(chain, got, 32);
+            h++;
+        }
+        if (h != r.toHeight + 1 || memcmp(chain, r.chainHashAfter, 32) != 0) {
+            hex32(r.chainHashAfter, hx);
+            hpplite_error(node->ctx, "range %llu-%llu: the manifest's batches do not fold to the anchored chain hash %s", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, hx);
+            cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
+        }
+        if (node->manifest) cJSON_Delete(node->manifest);
+        node->manifest = m;
+        node->manifestFrom = r.fromHeight;
+        node->manifestTo = r.toHeight;
+    }
+    node->anchoredHeight = r.toHeight > node->anchoredHeight ? r.toHeight : node->anchoredHeight;
+    b = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(node->manifest, "batches"), (int)(height - r.fromHeight));
+    e = b ? cJSON_GetObjectItemCaseSensitive(b, "ref") : NULL;
+    zRef = cJSON_IsString(e) ? e->valuestring : NULL;
+    e = b ? cJSON_GetObjectItemCaseSensitive(b, "hash") : NULL;
+    if (!zRef || !cJSON_IsString(e) || hpplite_hex_to_bytes(e->valuestring + 2, want, 32) != 32) { hpplite_l1_range_clear(&r); return NULL; }
+    data = hpplite_store_get(node->store, zRef, pLen);
+    if (!data) {
+        hpplite_error(node->ctx, "batch %llu: the store has no %s: %s", (unsigned long long)height, zRef, hpplite_store_error(node->store));
+    } else {
+        hpplite_keccak256(data, *pLen, got);
+        if (memcmp(got, want, 32) != 0) {
+            hpplite_error(node->ctx, "batch %llu: the store's bytes for %s are not what the manifest names", (unsigned long long)height, zRef);
+            free(data); data = NULL; *pLen = 0;
+        }
+    }
+    hpplite_l1_range_clear(&r);
+    return data;
+}
+
 static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes) {
     HppliteCtx *ctx = node->ctx;
     unsigned char *bytes = NULL, root[32];
@@ -1706,6 +2009,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     uint8_t encoding = HPPLITE_ENCODING_NONE;
     int rc, confirmed = 0, tries;
     char zStoreWhy[240];
+    int storedOnly = 0;
     zStoreWhy[0] = 0;
     node_wal_maintenance(node);                         /* frames another connection or process committed since (#153); the pins moved */
     node_pages_decide_snapshot(node);                   /* if nothing decided it yet */
@@ -1781,7 +2085,8 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
             char *zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
             node->storeBalanceOk = 0;
             if (!zRef) {
-                if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE) {
+                if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
+                    && !(node_ranges(node) && node_unanchored_above(node, node->anchoredHeight))) {      /* not past batches waiting for their anchor (#164) */
                     txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
                     if (!node->warnedStoreDown) {
                         fprintf(stderr, "hpplite: store %s does not answer (%s): page batch %llu %s on the chain instead\n",
@@ -1798,8 +2103,14 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
                 int nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0) ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
                 node->warnedStoreDown = 0;
                 hpplite_keccak256(payload, payloadLen, h);
-                txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
-                if (!txHash) hpplite_error(ctx, "the chain did not take the commitment of page batch %llu (ref %s)", (unsigned long long)height, zRef);
+                if (node_ranges(node)) {
+                    node_anchor_row(node, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);   /* the chain's commitment comes with the anchor (#164) */
+                    txHash = NULL;
+                    storedOnly = 1;
+                } else {
+                    txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                    if (!txHash) hpplite_error(ctx, "the chain did not take the commitment of page batch %llu (ref %s)", (unsigned long long)height, zRef);
+                }
             }
             sqlite3_free(zRef);
             sqlite3_free(zReceipt);
@@ -1807,6 +2118,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
             txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
         }
         if (txHash) { confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1); if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash); if (confirmed && node->onBatchPosted) node->onBatchPosted(node->callbackArg, height, txHash); sqlite3_free(txHash); }
+        if (storedOnly) confirmed = 1;
         if (confirmed) test_crash_point("after_submit");
     } else {
         confirmed = 1;                          /* l1=local: finalized here, kept nowhere */
@@ -1827,7 +2139,9 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         *pMore = 0;
         return 0;
     }
+    ctx->pAnchorRow = storedOnly ? &node->anchorRow : NULL;
     rc = hppliteAdvanceMetaPages(ctx, height, node->l1 ? payload : NULL, node->l1 ? payloadLen : 0, root, hpplite_pagemode_piece_more(node->pm));
+    ctx->pAnchorRow = NULL;
     if (rc == SQLITE_OK) {
         hpplite_pagemode_finalized(node->pm);
         node->batchesProduced++;
@@ -1850,11 +2164,13 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
 
 static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     HppliteCtx *ctx = node->ctx;
+    int frc;
     HppliteBatch *batch;
     sqlite3_int64 maxId = 0;
     uint64_t height;
     int confirmed = 0;
     char zStoreWhy[240];               /* why the store did not take the batch (#11): the reason the error keeps */
+    int storedOnly = 0;                /* the store has it and the chain's commitment comes with the anchor (#164) */
 
     *pMore = 0;
     zStoreWhy[0] = 0;
@@ -1989,9 +2305,12 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                     char *zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
                     node->storeBalanceOk = 0;                 /* a put may have paid: the status row reads the balance again */
                     if (!zRef) {
-                        if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE) {
+                        if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
+                            && !(node_ranges(node) && node_unanchored_above(node, node->anchoredHeight))) {
                             /* the store does not answer: the chain carries the bytes meanwhile, as
-                            ** before the store (#11); availability never waits on a provider */
+                            ** before the store (#11); availability never waits on a provider.
+                            ** Not past batches waiting for their anchor (#164): the chain takes
+                            ** only the next height, and the anchor needs the store */
                             txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
                             if (!node->warnedStoreDown) {
                                 fprintf(stderr, "hpplite: store %s does not answer (%s): batch %llu %s on the chain instead\n",
@@ -2010,10 +2329,17 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                                        ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
                         node->warnedStoreDown = 0;
                         hpplite_keccak256(payload, payloadLen, h);
-                        txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef,
-                                                         nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
-                        if (!txHash) hpplite_error(node->ctx, "the chain did not take the commitment of batch %llu (ref %s)",
-                                                   (unsigned long long)height, zRef);
+                        if (node_ranges(node)) {
+                            /* the store has it: the chain gets one commitment per anchor (#164) */
+                            node_anchor_row(node, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                            txHash = NULL;
+                            storedOnly = 1;
+                        } else {
+                            txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef,
+                                                             nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                            if (!txHash) hpplite_error(node->ctx, "the chain did not take the commitment of batch %llu (ref %s)",
+                                                       (unsigned long long)height, zRef);
+                        }
                     }
                     sqlite3_free(zRef);
                     sqlite3_free(zReceipt);
@@ -2047,6 +2373,11 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                         node->onBatchPosted(node->callbackArg, height, txHash);
                     }
                     sqlite3_free(txHash);
+                }
+                if (storedOnly) {
+                    confirmed = 1;
+                    if ((postedCopy = malloc(payloadLen)) != NULL) { memcpy(postedCopy, payload, payloadLen); postedLen = payloadLen; }
+                    if (node->onBatchPosted) node->onBatchPosted(node->callbackArg, height, "stored");
                 }
             }
             free(sealed);
@@ -2085,7 +2416,10 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         }
     }
 
-    if (hpplite_finalize_batch(ctx, batch, maxId) != SQLITE_OK) {
+    ctx->pAnchorRow = storedOnly ? &node->anchorRow : NULL;
+    frc = hpplite_finalize_batch(ctx, batch, maxId);
+    ctx->pAnchorRow = NULL;
+    if (frc != SQLITE_OK) {
         /* Typically: an application statement is mid-step, so bookkeeping
         ** must not commit now (see hppliteBkBegin). The batch is on L1 (when there
         ** is one) and the next flush adopts it; locally nothing changed. */
@@ -2158,7 +2492,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     } while (more);
 
     /* Anchor the state root on L1 once an interval of batches is complete */
-    if (height && node->l1 && hpplite_node_should_checkpoint(node)) {
+    if (height && node->l1 && !node_ranges(node) && hpplite_node_should_checkpoint(node)) {
         char *txHash = hpplite_node_submit_checkpoint(node);
         if (txHash) {
             sqlite3_free(txHash);
@@ -2199,6 +2533,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     if (!node || !node->l1 || !node->ctx) return 0;
     if (node_check_rollup(node) < 0) return -1;
     if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
+    node->anchoredHeight = lastBatch;
 
     while (node->ctx->blockHeight <= lastBatch) {
         HppliteBatch *batch = node_fetch_batch(node, node->ctx->blockHeight);
@@ -2452,6 +2787,20 @@ static void *node_timer_thread_func(void *arg) {
                     node_flush_unlocked(node);
                 }
                 pthread_mutex_unlock(mutex);
+            }
+        }
+        /* the anchor, on the chain's cadence (#164); a refused one is tried again within a minute */
+        if (node->config.anchorIntervalMs > 0 && node->store && node->l1 && now >= node->anchorAt) {
+            pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
+            if (node->anchorAt == 0) {
+                /* decided at the first tick: what a previous run left at the store is anchored soon, the rest on the cadence */
+                node->anchorAt = now + (node_unanchored_above(node, node->anchoredHeight) ? 2000 : node->config.anchorIntervalMs);
+            } else if (mutex) {
+                int rc = 0;
+                pthread_mutex_lock(mutex);
+                if (node->timerRunning && node_ranges(node)) rc = node_anchor(node);
+                pthread_mutex_unlock(mutex);
+                node->anchorAt = now + (rc < 0 && node->config.anchorIntervalMs > 60000 ? 60000 : node->config.anchorIntervalMs);
             }
         }
     }

@@ -43,8 +43,8 @@ contract HPPLiteTest is Test {
         assertEq(hpplite.sequencerInstance(), bytes32(0));
         assertEq(hpplite.checkpointInterval(), 100);
         assertEq(hpplite.daContract(), address(da));
-        assertEq(hpplite.VERSION(), 8);
-        assertEq(da.VERSION(), 2);
+        assertEq(hpplite.VERSION(), 9);
+        assertEq(da.VERSION(), 3);
     }
 
     function test_ClaimSequencer() public {
@@ -71,7 +71,7 @@ contract HPPLiteTest is Test {
         hpplite.claimSequencer(instanceId1);
 
         // Fast forward past lease duration
-        vm.warp(block.timestamp + 6 minutes);
+        vm.warp(block.timestamp + 61 minutes);
         assertFalse(hpplite.isLeaseActive());
 
         // Only the sequencer wallet can re-take it (a new instance of the same wallet)
@@ -95,7 +95,7 @@ contract HPPLiteTest is Test {
         vm.expectRevert("Not the sequencer");
         hpplite.claimSequencer(instanceId2);
         // and after expiry - the hole external review found
-        vm.warp(block.timestamp + 6 minutes);
+        vm.warp(block.timestamp + 61 minutes);
         vm.prank(stranger);
         vm.expectRevert("Not the sequencer");
         hpplite.claimSequencer(instanceId2);
@@ -236,7 +236,7 @@ contract HPPLiteTest is Test {
         hpplite.claimSequencer(instanceId1);
 
         // Fast forward past lease
-        vm.warp(block.timestamp + 6 minutes);
+        vm.warp(block.timestamp + 61 minutes);
 
         vm.prank(sequencer);
         vm.expectRevert("Lease expired");
@@ -297,9 +297,9 @@ contract HPPLiteTest is Test {
 
         assertEq(daScheme, "hppda");
         assertEq(daContract, address(da));
-        assertEq(version, 8);
+        assertEq(version, 9);
         assertEq(checkpointInterval, 100);
-        assertEq(leaseDuration, 5 minutes);
+        assertEq(leaseDuration, 1 hours);
     }
 
     function test_TransferOwnership() public {
@@ -331,8 +331,10 @@ contract HPPLiteDATest is Test {
         hpplite.claimSequencer(instanceId);
     }
 
-    event BatchSubmitted(uint256 indexed height, bytes32 indexed batchHash, bytes data);
-    event BatchCommitted(uint256 indexed height, bytes32 indexed batchHash, bytes ref, bytes receipt);
+    event BatchSubmitted(uint256 indexed height, bytes32 indexed batchHash, bytes data, uint256 prevBlock);
+    event BatchCommitted(uint256 indexed height, bytes32 indexed batchHash, bytes ref, bytes receipt, uint256 prevBlock);
+    event RangeCommitted(uint256 indexed fromHeight, uint256 indexed toHeight, bytes32 chainHashAfter, bytes32 stateRoot, bytes32 manifestDigest, bytes receipt, uint256 prevBlock);
+    event CheckpointSubmitted(uint256 indexed fromHeight, uint256 indexed toHeight, bytes32 stateRoot);
 
     function chain(bytes32 prev, uint256 height, bytes memory data) internal pure returns (bytes32) {
         return keccak256(abi.encode(prev, height, keccak256(data)));
@@ -349,15 +351,13 @@ contract HPPLiteDATest is Test {
 
         vm.roll(1234);
         vm.expectEmit(true, true, false, true, address(da));
-        emit BatchSubmitted(1, keccak256(batchData), batchData);
+        emit BatchSubmitted(1, keccak256(batchData), batchData, 0);
         vm.prank(sequencer);
         da.submitBatch(instanceId, 1, batchData);
 
         assertEq(da.lastBatchHeight(), 1);
         assertEq(da.chainHash(), chain(bytes32(0), 1, batchData));
-        assertEq(da.blockOf(1), 1234);
-        vm.expectRevert("No such batch");
-        da.blockOf(2);
+        assertEq(da.lastBlock(), 1234);
     }
 
     /* On an Arbitrum-style chain block.number is the parent chain's block; the
@@ -369,7 +369,7 @@ contract HPPLiteDATest is Test {
         vm.roll(99);                                      // what block.number says: the parent chain's
         vm.prank(sequencer);
         da.submitBatch(instanceId, 1, "on an L2");
-        assertEq(da.blockOf(1), 7654321);
+        assertEq(da.lastBlock(), 7654321);
     }
 
     /* The cost cut this issue is for: a 1 KB batch below 100 k gas (storage took ~700 k) */
@@ -395,7 +395,7 @@ contract HPPLiteDATest is Test {
             da.submitBatch(instanceId, i, data);
             h = chain(h, i, data);
             assertEq(da.chainHash(), h);
-            assertEq(da.blockOf(i), 100 + i);
+            assertEq(da.lastBlock(), 100 + i);
         }
         vm.stopPrank();
         (uint256 last, uint256 total, bytes32 ch) = da.getDAState();
@@ -439,7 +439,7 @@ contract HPPLiteDATest is Test {
 
     function test_SubmitBatchFor_LeaseExpired() public {
         bytes memory sig = sign(sequencerKey, da.batchDigest(instanceId, 1, keccak256("x")));
-        vm.warp(block.timestamp + 6 minutes);
+        vm.warp(block.timestamp + 61 minutes);
         vm.expectRevert("Lease expired");
         da.submitBatchFor(instanceId, 1, "x", sig);
     }
@@ -447,7 +447,7 @@ contract HPPLiteDATest is Test {
     function test_CommitBatch_OffChainStore() public {
         bytes32 h = keccak256("bytes held elsewhere");
         vm.expectEmit(true, true, false, true, address(da));
-        emit BatchCommitted(1, h, "bafkreiabc", "receipt");
+        emit BatchCommitted(1, h, "bafkreiabc", "receipt", 0);
         vm.prank(sequencer);
         da.commitBatch(instanceId, 1, h, "bafkreiabc", "receipt");
         assertEq(da.lastBatchHeight(), 1);
@@ -503,7 +503,7 @@ contract HPPLiteDATest is Test {
 
     function test_SubmitBatch_LeaseExpired() public {
         // Fast forward past lease
-        vm.warp(block.timestamp + 6 minutes);
+        vm.warp(block.timestamp + 61 minutes);
 
         vm.prank(sequencer);
         vm.expectRevert("Lease expired");
@@ -588,6 +588,157 @@ contract HPPLiteDATest is Test {
         bytes memory sig2 = sign(sequencerKey, hpplite.checkpointDigest(instanceId, 3, 3, root));
         vm.expectRevert("Not the sequencer");
         hpplite.submitCheckpointFor(instanceId, 3, 3, keccak256("other"), sig2);
+    }
+
+    function foldRange(bytes32 prev, uint256 from, uint256 to) internal pure returns (bytes32 h) {
+        h = prev;
+        for (uint256 i = from; i <= to; i++) h = keccak256(abi.encode(h, i, keccak256(abi.encodePacked("batch", i))));
+    }
+
+    /* #164: one transaction anchors a range of batches whose bytes and hashes are at the store: the chain hash the
+    ** node folded over them, the state root after the last, the manifest's digest, the store's receipt for it.
+    ** The anchor is the checkpoint, and renews the lease. */
+    function test_CommitRange() public {
+        bytes32 after5 = foldRange(bytes32(0), 1, 5);
+        bytes32 root = keccak256("root after 5");
+        bytes32 digest = keccak256("manifest 1-5");
+        vm.roll(100);
+        vm.expectEmit(true, true, false, true, address(hpplite));
+        emit CheckpointSubmitted(1, 5, root);
+        vm.expectEmit(true, true, false, true, address(da));
+        emit RangeCommitted(1, 5, after5, root, digest, "receipt", 0);
+        vm.prank(sequencer);
+        da.commitRange(instanceId, 1, 5, after5, root, digest, "receipt");
+        assertEq(da.lastBatchHeight(), 5);
+        assertEq(da.chainHash(), after5);
+        assertEq(da.lastBlock(), 100);
+        assertEq(hpplite.lastCheckpointHeight(), 5);
+        assertEq(hpplite.lastStateRoot(), root);
+        assertEq(hpplite.leaseExpiry(), block.timestamp + hpplite.leaseDuration());
+        (uint256 last, uint256 total, bytes32 ch) = da.getDAState();
+        assertEq(last, 5); assertEq(total, 5); assertEq(ch, after5);
+        // a range of one, later: its event names the previous anchor's block; the checkpoint follows
+        vm.roll(250);
+        bytes32 after6 = foldRange(after5, 6, 6);
+        vm.expectEmit(true, true, false, true, address(hpplite));
+        emit CheckpointSubmitted(6, 6, root);
+        vm.expectEmit(true, true, false, true, address(da));
+        emit RangeCommitted(6, 6, after6, root, keccak256("manifest 6"), "", 100);
+        vm.prank(sequencer);
+        da.commitRange(instanceId, 6, 6, after6, root, keccak256("manifest 6"), "");
+        assertEq(da.lastBatchHeight(), 6);
+        assertEq(da.lastBlock(), 250);
+        assertEq(hpplite.lastCheckpointHeight(), 6);
+    }
+
+    function test_CommitRange_Rules() public {
+        bytes32 h = keccak256("x");
+        vm.startPrank(sequencer);
+        vm.expectRevert("Non-sequential batch");
+        da.commitRange(instanceId, 2, 3, h, h, h, "");
+        vm.expectRevert("Invalid range");
+        da.commitRange(instanceId, 1, 0, h, h, h, "");
+        vm.expectRevert("Empty manifest");
+        da.commitRange(instanceId, 1, 1, h, h, bytes32(0), "");
+        vm.expectRevert("Empty hash");
+        da.commitRange(instanceId, 1, 1, bytes32(0), h, h, "");
+        vm.expectRevert("Wrong instance");
+        da.commitRange(keccak256("other"), 1, 1, h, h, h, "");
+        vm.stopPrank();
+        vm.prank(address(0xBAD));
+        vm.expectRevert("Not the sequencer");
+        da.commitRange(instanceId, 1, 1, h, h, h, "");
+        // the per-batch forms and the ranges share the one height line and the one chain hash
+        vm.prank(sequencer);
+        da.submitBatch(instanceId, 1, "one");
+        bytes32 c = chain(bytes32(0), 1, "one");
+        c = keccak256(abi.encode(c, uint256(2), keccak256("two")));
+        c = keccak256(abi.encode(c, uint256(3), keccak256("three")));
+        vm.prank(sequencer);
+        da.commitRange(instanceId, 2, 3, c, h, h, "");
+        vm.prank(sequencer);
+        da.commitBatch(instanceId, 4, keccak256("four"), "ref", "");
+        assertEq(da.lastBatchHeight(), 4);
+        assertEq(da.chainHash(), keccak256(abi.encode(c, uint256(4), keccak256("four"))));
+        // the lease must be live
+        vm.warp(block.timestamp + 61 minutes);
+        vm.prank(sequencer);
+        vm.expectRevert("Lease expired");
+        da.commitRange(instanceId, 5, 5, h, h, h, "");
+    }
+
+    function test_CommitRangeFor_Relay() public {
+        bytes32 after3 = foldRange(bytes32(0), 1, 3);
+        bytes32 root = keccak256("r");
+        bytes32 digest = keccak256("m");
+        bytes memory sig = sign(sequencerKey, da.rangeDigest(instanceId, 1, 3, after3, root, digest));
+        vm.prank(address(0xBEEF));
+        da.commitRangeFor(instanceId, 1, 3, after3, root, digest, "receipt", sig);
+        assertEq(da.lastBatchHeight(), 3);
+        assertEq(hpplite.lastCheckpointHeight(), 3);
+        // a stranger's signature; the sequencer's signature over another range
+        bytes memory bad = sign(0x2, da.rangeDigest(instanceId, 4, 4, after3, root, digest));
+        vm.prank(address(0xBEEF));
+        vm.expectRevert("Not the sequencer");
+        da.commitRangeFor(instanceId, 4, 4, after3, root, digest, "", bad);
+        bytes memory other = sign(sequencerKey, da.rangeDigest(instanceId, 4, 5, after3, root, digest));
+        vm.prank(address(0xBEEF));
+        vm.expectRevert("Not the sequencer");
+        da.commitRangeFor(instanceId, 4, 4, after3, root, digest, "", other);
+    }
+
+    /* every commitment's event names the previous anchor's block: a reader walks them backward from lastBlock() */
+    function test_PrevBlock_Chain() public {
+        vm.roll(10);
+        vm.prank(sequencer);
+        da.submitBatch(instanceId, 1, "one");
+        assertEq(da.lastBlock(), 10);
+        vm.roll(20);
+        vm.expectEmit(true, true, false, true, address(da));
+        emit BatchCommitted(2, keccak256("two"), "ref", "", 10);
+        vm.prank(sequencer);
+        da.commitBatch(instanceId, 2, keccak256("two"), "ref", "");
+        vm.roll(30);
+        vm.expectEmit(true, true, false, true, address(da));
+        emit BatchSubmitted(3, keccak256("three"), "three", 20);
+        vm.prank(sequencer);
+        da.submitBatch(instanceId, 3, "three");
+        assertEq(da.lastBlock(), 30);
+    }
+
+    /* only the DA contract records an anchor on the coordinator */
+    function test_RecordAnchor_OnlyDA() public {
+        vm.prank(sequencer);
+        vm.expectRevert("Not the DA");
+        hpplite.recordAnchor(sequencer, instanceId, 1, keccak256("r"));
+    }
+
+    /* the lease duration is the rollup owner's to set; the anchor renews the lease for that long */
+    function test_LeaseDuration_Settable() public {
+        hpplite.setLeaseDuration(2 hours);
+        (, , , , , uint256 leaseDuration) = hpplite.getSystemConfig();
+        assertEq(leaseDuration, 2 hours);
+        assertEq(hpplite.LEASE_DURATION(), 2 hours);
+        vm.prank(sequencer);
+        da.commitRange(instanceId, 1, 1, keccak256("c"), keccak256("r"), keccak256("m"), "");
+        assertEq(hpplite.leaseExpiry(), block.timestamp + 2 hours);
+        vm.prank(sequencer);
+        vm.expectRevert("Not owner");
+        hpplite.setLeaseDuration(1 hours);
+    }
+
+    /* the cost this issue is for: one anchor, root inside, warm slots, against ~55k per commitBatch and ~50k per checkpoint before */
+    function test_CommitRange_Gas() public {
+        bytes memory receipt = new bytes(114);
+        vm.prank(sequencer);
+        da.commitRange(instanceId, 1, 10, keccak256("c1"), keccak256("r1"), keccak256("m1"), receipt);   // the slots exist after the first anchor
+        vm.roll(block.number + 100);
+        vm.prank(sequencer);
+        uint256 gas = gasleft();
+        da.commitRange(instanceId, 11, 20, keccak256("c2"), keccak256("r2"), keccak256("m2"), receipt);
+        gas -= gasleft();
+        emit log_named_uint("gas for an anchor (range of 10, root inside, 114-byte receipt)", gas);
+        assertLt(gas, 60000);
     }
 }
 

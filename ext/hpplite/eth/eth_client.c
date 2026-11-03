@@ -735,6 +735,72 @@ uint8_t *eth_client_get_log(EthClient *client, const uint8_t address[20], uint64
     return out;
 }
 
+int eth_client_get_block_logs(EthClient *client, const uint8_t address[20], uint64_t block, EthLog **pLogs, int *pnLogs) {
+    cJSON *params = cJSON_CreateArray(), *filter = cJSON_CreateObject();
+    cJSON *response, *result, *log;
+    char *addr_hex = eth_hex_encode(address, 20);
+    char block_hex[32];
+    EthLog *out = NULL;
+    int n = 0, cap = 0, ok = 0;
+    *pLogs = NULL; *pnLogs = 0;
+    snprintf(block_hex, sizeof block_hex, "0x%llx", (unsigned long long)block);
+    cJSON_AddStringToObject(filter, "address", addr_hex);
+    cJSON_AddStringToObject(filter, "fromBlock", block_hex);
+    cJSON_AddStringToObject(filter, "toBlock", block_hex);
+    cJSON_AddItemToArray(params, filter);
+    free(addr_hex);
+    response = rpc_call(client, "eth_getLogs", params);
+    if (!response) return -1;
+    result = cJSON_GetObjectItem(response, "result");
+    if (!result || !cJSON_IsArray(result)) {
+        snprintf(client->error, sizeof(client->error), "no result in response");
+        cJSON_Delete(response);
+        return -1;
+    }
+    ok = 1;
+    cJSON_ArrayForEach(log, result) {
+        cJSON *data = cJSON_GetObjectItem(log, "data");
+        cJSON *tp = cJSON_GetObjectItem(log, "topics");
+        cJSON *t;
+        EthLog *e;
+        const char *hex;
+        size_t len;
+        if (!data || !cJSON_IsString(data) || !tp || !cJSON_IsArray(tp)) continue;
+        if (n == cap) {
+            EthLog *grown = realloc(out, (size_t)(cap ? cap * 2 : 8) * sizeof(EthLog));
+            if (!grown) { ok = 0; break; }
+            out = grown; cap = cap ? cap * 2 : 8;
+        }
+        e = &out[n];
+        memset(e, 0, sizeof *e);
+        cJSON_ArrayForEach(t, tp) {
+            if (e->nTopics >= 4 || !cJSON_IsString(t)) break;
+            if (eth_hex_decode(t->valuestring, e->topics[e->nTopics], 32) != 0) break;
+            e->nTopics++;
+        }
+        hex = data->valuestring;
+        if (hex[0] == '0' && hex[1] == 'x') hex += 2;
+        len = strlen(hex) / 2;
+        e->data = malloc(len + 1);
+        if (!e->data) { ok = 0; break; }
+        if (len > 0 && eth_hex_decode(data->valuestring, e->data, len) != 0) { free(e->data); ok = 0; break; }
+        e->data[len] = 0;
+        e->nData = len;
+        n++;
+    }
+    cJSON_Delete(response);
+    if (!ok) { eth_logs_free(out, n); snprintf(client->error, sizeof(client->error), "malformed log in block %llu", (unsigned long long)block); return -1; }
+    *pLogs = out; *pnLogs = n;
+    return 0;
+}
+
+void eth_logs_free(EthLog *logs, int n) {
+    int i;
+    if (!logs) return;
+    for (i = 0; i < n; i++) free(logs[i].data);
+    free(logs);
+}
+
 int eth_address_from_compressed_pubkey(const uint8_t pubkey[33], uint8_t address[20]) {
     eth_client_global_init();
     if (!g_addr_ctx) return -1;

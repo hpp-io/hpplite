@@ -78,6 +78,13 @@ struct HppliteL1Ops {
     char *(*commit_batch)(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32],
                           const char *zRef, const uint8_t *receipt, size_t nReceipt);
     int (*get_commitment)(HppliteL1 *l1, uint64_t height, uint8_t hash[32], char **pzRef, uint8_t **pReceipt, size_t *pnReceipt);
+    /* Ranges (#164): one commitment for every batch a store holds since the
+    ** last. commit_range anchors r (NULL: refused or unsupported); get_range
+    ** fills *out for the range a height is inside (0; -1 when the height is
+    ** not inside one or the backend keeps none). NULL ops: no ranges. */
+    char *(*commit_range)(HppliteL1 *l1, const uint8_t instanceId[32], const HppliteRange *r);
+    int (*get_range)(HppliteL1 *l1, uint64_t height, HppliteRange *out);
+    int (*has_ranges)(HppliteL1 *l1);     /* 1 when the contract takes commit_range (DA v3); NULL op: 0 */
     /* The chain this connection is on (0: the backend is on none) and an
     ** ERC-20 balance there (#11): balanceOf(owner) of token as 32 big-endian
     ** bytes; -1 when the backend cannot read one or the call fails. NULL

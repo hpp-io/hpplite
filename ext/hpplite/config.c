@@ -123,7 +123,9 @@ HppliteConfig *hpplite_config_create(void) {
     cfg->rpcUrl = strdup(HPPLITE_DEFAULT_RPC_URL);
     cfg->dataDir = strdup(HPPLITE_DEFAULT_DATA_DIR);
     cfg->role = HPPLITE_CFG_ROLE_OBSERVER;  /* Safe default */
-    cfg->batchIntervalMs = 5000;  /* 5 seconds default */
+    cfg->batchIntervalMs = 5000;
+   /* 5 seconds default */
+    cfg->anchorIntervalMs = 30 * 60 * 1000;   /* HPP's cadence (#164); anchor= overrides */
     cfg->encrypt = 1;             /* everything posted is public otherwise */
     cfg->compress = 1;            /* smaller batches everywhere they go (#12) */
     cfg->storeFallback = 1;       /* a store that does not answer never holds a batch back (#11) */
@@ -231,6 +233,11 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         int ms = parse_duration_ms(val);
         if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
     }
+    val = getenv("HPPLITE_ANCHOR");
+    if (val) {
+        int ms = parse_duration_ms(val);
+        if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
+    }
 
     /* Encryption */
     val = getenv(HPPLITE_ENV_ENCRYPT);
@@ -258,7 +265,10 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_CHECKPOINT);
     if (val && atoi(val) > 0) cfg->checkpointInterval = atoi(val);
 
-    if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;   /* the chain's cadence (#162) */
+    /* the chain's cadence applies to whatever goes to the chain (#162, #164): the batches
+    ** of a node without a store, the anchors of a node with one */
+    if (cfg->aliasIntervalMs && cfg->storeUrl) { if (!cfg->anchorGiven) cfg->anchorIntervalMs = cfg->aliasIntervalMs; }
+    else if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;
     return 0;
 }
 
@@ -464,6 +474,10 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         int ms = parse_duration_ms(buf);
         if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
     }
+    if (get_uri_param(uri, "anchor", buf, sizeof(buf))) {
+        int ms = parse_duration_ms(buf);
+        if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
+    }
 
     /* Encryption */
     if (get_uri_param(uri, HPPLITE_URI_COMPRESS, buf, sizeof(buf))) {
@@ -502,7 +516,10 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->checkpointInterval = atoi(buf);
     }
 
-    if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;   /* the chain's cadence (#162) */
+    /* the chain's cadence applies to whatever goes to the chain (#162, #164): the batches
+    ** of a node without a store, the anchors of a node with one */
+    if (cfg->aliasIntervalMs && cfg->storeUrl) { if (!cfg->anchorGiven) cfg->anchorIntervalMs = cfg->aliasIntervalMs; }
+    else if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;
     return 0;
 }
 
@@ -634,6 +651,11 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
         int ms = parse_duration_ms(val);
         if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
     }
+    val = sqlite3_uri_parameter(filename, "anchor");
+    if (val) {
+        int ms = parse_duration_ms(val);
+        if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
+    }
 
     /* Encryption */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_ENCRYPT);
@@ -661,7 +683,10 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_CHECKPOINT);
     if (val && atoi(val) > 0) cfg->checkpointInterval = atoi(val);
 
-    if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;   /* the chain's cadence (#162) */
+    /* the chain's cadence applies to whatever goes to the chain (#162, #164): the batches
+    ** of a node without a store, the anchors of a node with one */
+    if (cfg->aliasIntervalMs && cfg->storeUrl) { if (!cfg->anchorGiven) cfg->anchorIntervalMs = cfg->aliasIntervalMs; }
+    else if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;
     return 0;
 }
 

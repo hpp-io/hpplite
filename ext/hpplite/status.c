@@ -80,6 +80,8 @@ typedef struct StatusCursor {
 #define STATUS_COL_STORE_PRICE      31     /* what the provider charges for a put of the last batch's size; NULL when free */
 #define STATUS_COL_STORE_BALANCE    32     /* the wallet's balance of the store's asset on the chain; NULL when not readable */
 #define STATUS_COL_READERS          33     /* readers granted besides the wallet (#15) */
+#define STATUS_COL_ANCHORED         34     /* the chain's last height (#164): above it the store alone holds the batches; NULL without a chain */
+#define STATUS_COL_LAST_ANCHOR_TX   35     /* the transaction of the last anchor this node made */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -95,7 +97,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
-        " readers INTEGER)");
+        " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -343,6 +345,12 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             }
             break;
         }
+        case STATUS_COL_ANCHORED:
+            if (node->l1) sqlite3_result_int64(ctx, (sqlite3_int64)node->anchoredHeight);
+            break;
+        case STATUS_COL_LAST_ANCHOR_TX:
+            if (node->lastAnchorTx[0]) sqlite3_result_text(ctx, node->lastAnchorTx, -1, SQLITE_TRANSIENT);
+            break;
         default:
             sqlite3_result_null(ctx);
     }

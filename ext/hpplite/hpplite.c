@@ -53,6 +53,17 @@ static const char *HPPLITE_SCHEMA =
   "  height INTEGER PRIMARY KEY,"
   "  data BLOB NOT NULL"
   ");"
+  /* batches a store holds that the chain has not anchored yet (#164): the
+  ** next anchor names them, in a manifest, under one commitment */
+  "CREATE TABLE IF NOT EXISTS _hpplite_unanchored("
+  "  height INTEGER PRIMARY KEY,"
+  "  hash BLOB NOT NULL,"          /* keccak256 of the posted bytes */
+  "  ref TEXT NOT NULL,"           /* the store's reference */
+  "  receipt BLOB,"                /* the store's compact receipt */
+  "  chain_before BLOB NOT NULL,"  /* the chain hash before this batch: the manifest starts from the first row's */
+  "  chain_after BLOB NOT NULL,"   /* the chain hash after this batch */
+  "  root BLOB"                    /* the state root after it, when known at the finalize (page mode) */
+  ");"
   /* the part of a transaction a replica holds back until its end is posted (#57) */
   "CREATE TABLE IF NOT EXISTS _hpplite_carry("
   "  seq INTEGER PRIMARY KEY,"
@@ -749,6 +760,7 @@ void hppliteRemoveNode(sqlite3 *db) {
 /* Forward declarations for SQL functions */
 static void hpplite_sync_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_flush_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_anchor_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_keyfile_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_keystore_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
@@ -808,6 +820,8 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_sync_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_flush", 0, SQLITE_UTF8, NULL,
                             hpplite_flush_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_anchor", 0, SQLITE_UTF8, NULL,
+                            hpplite_anchor_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_key", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
                             hpplite_key_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_keyfile", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
@@ -999,6 +1013,17 @@ uint64_t hpplite_flush(sqlite3 *db) {
     if (!node) return 0;
     /* Use the node's flush (sequencer path) */
     return hpplite_node_flush_batch(node);
+}
+
+uint64_t hpplite_anchor(sqlite3 *db) {
+    HppliteNode *node = hppliteFindNode(db);
+    if (!node) return 0;
+    return hpplite_node_anchor(node);
+}
+
+static void hpplite_anchor_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_anchor(sqlite3_context_db_handle(ctx)));
 }
 
 /*

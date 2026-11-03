@@ -173,6 +173,7 @@ struct HppliteCtx {
   unsigned char stateRoot[HPPLITE_HASH_SIZE];  /* Root after last confirmed batch */
   uint64_t lastCheckpointHeight;
   unsigned char lastCheckpointRoot[HPPLITE_HASH_SIZE];
+  const struct HppliteAnchorRow *pAnchorRow;   /* the batch being finalized is at a store, not yet anchored (#164): its row for _hpplite_unanchored */
 
   /* Cached content hash of the committed state */
   unsigned char curRoot[HPPLITE_HASH_SIZE];
@@ -286,6 +287,16 @@ void hpplite_enable(HppliteCtx *pCtx, int bEnable);
 ** All zeros for a database with no user schema.
 */
 void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut);
+
+/* A batch the store holds and the chain has not anchored yet (#164): what
+** the finalize writes to _hpplite_unanchored with the height, so the anchor
+** can name it and a restart knows what is owed to the chain. */
+typedef struct HppliteAnchorRow {
+  unsigned char hash[HPPLITE_HASH_SIZE];   /* keccak256 of the posted bytes, as the chain hash folds it */
+  const char *zRef;                        /* the store's reference */
+  const unsigned char *receipt;            /* the store's compact receipt, or NULL */
+  size_t nReceipt;
+} HppliteAnchorRow;
 /* A verifier's rebuilt root after batch height, when it is among the last HPPLITE_ROOT_RING replayed
 ** (bTrackRoots) or is the last posted root compared: 0, or -1 when not kept */
 int hpplite_root_at(HppliteCtx *pCtx, uint64_t height, unsigned char out[32]);
@@ -588,6 +599,10 @@ uint64_t hpplite_flush(sqlite3 *db);
 ** Same as hpplite_flush(); kept for API compatibility.
 */
 uint64_t hpplite_check_flush(sqlite3 *db);
+
+/* Anchor on the chain every batch the store holds since the last anchor (#164): the
+** last height anchored, 0 when there was nothing to anchor or the chain did not take it */
+uint64_t hpplite_anchor(sqlite3 *db);
 
 /*
 ** Get current state root.

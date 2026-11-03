@@ -133,7 +133,7 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
 | Contract | Address | Description |
 |----------|---------|-------------|
-| HPPLiteFactory | `0xa80365fd5b4e7a22df13de334e3ef0c74032d345` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 8 with DA version 2 (#33: batch bytes in the log, the rolling chain hash, signed forms of every sequencer call); rollups from earlier factories keep working with the rules they were created with - give their factory with `factory=` (`0xac18df18…`: VERSION 8 too, deployed and superseded the same day, 2026-11-01: its DA recorded Ethereum Sepolia's block numbers (HPP is Arbitrum-style, #128), so no replica can fetch its logs; `0xc0fa50eb…`: VERSION 7, batches in contract storage, a checkpoint cannot reach past the DA's height #44; `0xd1aaa8d1…`: VERSION 6, `0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
+| HPPLiteFactory | `0xa80365fd5b4e7a22df13de334e3ef0c74032d345` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 8 with DA version 2 (#33: batch bytes in the log, the rolling chain hash, signed forms of every sequencer call). The contracts in `contracts/` are VERSION 9 with DA version 3 (#164: range commitments, the anchor as the checkpoint, the lease duration the owner's to set, no storage that grows with the history), not deployed on HPP Sepolia yet: a store node on this factory commits per batch as before; rollups from earlier factories keep working with the rules they were created with - give their factory with `factory=` (`0xac18df18…`: VERSION 8 too, deployed and superseded the same day, 2026-11-01: its DA recorded Ethereum Sepolia's block numbers (HPP is Arbitrum-style, #128), so no replica can fetch its logs; `0xc0fa50eb…`: VERSION 7, batches in contract storage, a checkpoint cannot reach past the DA's height #44; `0xd1aaa8d1…`: VERSION 6, `0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
 | HPPLite | *(per rollup)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
 | HPPLiteDA | *(per rollup)* | Your rollup's data-availability contract: batch data |
 
@@ -153,9 +153,10 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
 | `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls), `kubo://host:port` of a Kubo node's RPC, or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (none from Kubo or a bucket) (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
 | `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
-| `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason |
+| `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
+| `anchor` | No | With `store=` on a chain that takes ranges (VERSION 9, #164): how often the batches the store holds are anchored on the chain in one commitment: `5m`, `30m` (default: HPP's cadence), `1h`; `0` = at close and on `hpplite_anchor()` only. Also `HPPLITE_ANCHOR`. See Stores and commitments |
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
-| `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
+| `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min for a node without a store, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). With `store=` the chain's cadence goes to `anchor` instead and the interval stays 5 s: the batches reach the store in seconds, the chain gets one commitment per anchor (#164). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `compress` | No | `on` (default): the batch JSON is deflated before it is sealed or posted when that shrinks it, five to twelve times for SQL and row records (#12); `off`: posted as is. Every reader takes both forms, and batches from before stay readable. Also `HPPLITE_COMPRESS` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
@@ -381,6 +382,7 @@ the bytes went into contract storage at ~0.7k gas per byte.
 | Batch submit (40 KB sealed, as cut on HPP Sepolia; from the per-byte cost) | ~1.0M | 0.00001 |
 | Checkpoint | 50k | 0.0000005 |
 | Lease claim / renew / release | 28-37k | 0.0000003 |
+| Anchor (VERSION 9, #164: a range of batches at the store, root inside, 114-byte receipt; measured on anvil, the second anchor of a rollup; the first is 126k) | 75k | 0.0000008 |
 
 **Batch size on HPP Sepolia is set by the chain, not the contract.** The
 contract allows 128 KB; the chain's RPC refuses more than ~84.9 KB of
@@ -516,7 +518,10 @@ why), `store_spent` and `store_calls` (paid by this process in the asset's
 atomic units, and the puts and gets that succeeded), `store_price` (what the
 provider charges for a put of the last batch's size; NULL when it is free)
 and `store_balance` (the wallet's balance of the store's asset on the chain,
-read at most every 30 s; NULL without a paid store on this chain). `state` says what this node is doing about posting: `sequencing`,
+read at most every 30 s; NULL without a paid store on this chain), `anchored`
+(the chain's last height, #164: above it the store alone holds the batches;
+NULL without a chain) and `last_anchor_tx` (the transaction of this node's
+last anchor). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
@@ -598,6 +603,37 @@ Three words the rest of this document uses precisely (#35, #11):
   lives. The on-chain store has it by construction. A pinned store has it
   only as far as the pinner's receipt and the fallback to posting on chain
   carry it. A directory has none: it is a store with no availability claim.
+
+### Ranges: the store in seconds, the chain per anchor (#164)
+
+On a chain whose contracts take ranges (VERSION 9, DA version 3: the
+contracts in `contracts/`; the HPP Sepolia factory above does not yet), a
+node with `store=` does not commit each batch. A batch is finalized once the
+store has it (its height moves on, `pending` drops, a row waits in
+`_hpplite_unanchored`), and the **anchor**, every `anchor=` (30 min on HPP,
+the chain's own cadence), at close, and on `SELECT hpplite_anchor()`, writes
+a **manifest** to the store naming every batch since the last anchor (height,
+hash, reference, receipt) and commits the range in one transaction: the
+chain hash after it (the same fold the per-batch path keeps), the state root
+after its last batch (the anchor is the checkpoint, and renews the lease: a
+node that anchors sends no checkpoint or lease transactions of its own), the
+manifest's sha-256 and the store's signed receipt for the manifest. A
+replica reaching a height inside a range fetches the manifest by its
+digest's CID, refuses one whose batches do not fold to the anchored chain
+hash, and fetches each batch by the manifest's reference, checked against
+its hash as before. `hpplite_status.anchored` is the chain's height; above
+it the store alone holds the batches, for one anchor interval at most. What
+a run leaves at the store, the next run anchors first.
+
+What it costs: one anchor on anvil is 75k gas (the first of a rollup 126k,
+its slots written for the first time), about what one per-batch commitment
+cost, so a database writing all day pays 48 anchors instead of 17 000
+commitments. A store that is down holds the anchor too: the fallback to
+posting bytes on the chain applies only while nothing waits for an anchor,
+since the chain takes only the next height. The lease lasts an hour by
+default on VERSION 9 (`setLeaseDuration`, the owner's), longer than the
+anchor interval; a sequencer that dies without releasing is replaced after
+that long. `l1=file://` keeps the single cadence.
 
 Every build carries every backend; the `l1=` value picks one at run time
 (`l1.c`, `l1_backend.h`): a network alias or `rpc=` is the Ethereum client,

@@ -9,6 +9,11 @@ pragma solidity ^0.8.19;
  *      hold the lease; a lease that lapses can only be re-taken by it. The
  *      chain holds the ordered, encrypted history and the state roots; the
  *      key holder rebuilds and compares. No fraud proofs, no challenge period.
+ *      Version 9 (#164): the lease duration is the owner's to set (an hour
+ *      by default: a sequencer that anchors every 30 minutes renews it by
+ *      anchoring, no lease transactions of its own), the DA contract
+ *      records an anchor as the checkpoint, and the lease, the checkpoint
+ *      height and its time share one storage slot.
  */
 /* The one thing the coordinator asks its DA contract (HPPLiteDA imports
 ** this file, so an interface rather than an import) */
@@ -22,8 +27,7 @@ contract HPPLite {
     using EIP712Sig for bytes32;
 
     // ============ Constants ============
-    uint256 public constant LEASE_DURATION = 5 minutes;
-    uint256 public constant VERSION = 8;   // 8: signed forms of the lease and checkpoint calls, DA v2 (#33); 7: a checkpoint cannot reach past the DA's height (#44)
+    uint256 public constant VERSION = 9;   // 9: DA v3 (#164: ranges, recordAnchor, the lease duration settable); 8: signed forms of the lease and checkpoint calls, DA v2 (#33); 7: a checkpoint cannot reach past the DA's height (#44)
     bytes32 public constant LEASE_TYPEHASH = keccak256("Lease(string action,bytes32 instanceId,uint256 nonce)");
     bytes32 public constant CHECKPOINT_TYPEHASH = keccak256("Checkpoint(bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 stateRoot)");
 
@@ -34,13 +38,16 @@ contract HPPLite {
     // Sequencer lease - ensures singleton even with same private key on multiple instances
     address public sequencerWallet;
     bytes32 public sequencerInstance;  // Unique per process (e.g., hash of pid+timestamp+random)
-    uint256 public leaseExpiry;
     uint256 public leaseNonce;         // spent by every signed lease call: a signature is used once (#126)
 
+    // One slot: what every anchor writes (#164)
+    uint64 private _leaseExpiry;
+    uint64 private _leaseDuration;
+    uint64 private _lastCheckpointHeight;
+    uint64 private _lastCheckpointTime;
+
     // Checkpoints
-    uint256 public lastCheckpointHeight;
     bytes32 public lastStateRoot;
-    uint256 public lastCheckpointTime;
     uint256 public checkpointInterval;
 
     // Data Availability
@@ -65,7 +72,7 @@ contract HPPLite {
         require(msg.sender == sequencer, "Not the sequencer");
         require(msg.sender == sequencerWallet, "Not sequencer wallet");
         require(instanceId == sequencerInstance, "Wrong instance");
-        require(block.timestamp < leaseExpiry, "Lease expired");
+        require(block.timestamp < _leaseExpiry, "Lease expired");
         _;
     }
 
@@ -80,8 +87,17 @@ contract HPPLite {
         checkpointInterval = _checkpointInterval > 0 ? _checkpointInterval : 100;
         daScheme = bytes(_daScheme).length > 0 ? _daScheme : "hppda";
         daContract = _daContract;
-        lastCheckpointTime = block.timestamp;
+        _leaseDuration = 1 hours;
+        _lastCheckpointTime = uint64(block.timestamp);
     }
+
+    // ============ The packed slot, read as before ============
+
+    function leaseExpiry() public view returns (uint256) { return _leaseExpiry; }
+    function leaseDuration() public view returns (uint256) { return _leaseDuration; }
+    function LEASE_DURATION() external view returns (uint256) { return _leaseDuration; }
+    function lastCheckpointHeight() public view returns (uint256) { return _lastCheckpointHeight; }
+    function lastCheckpointTime() public view returns (uint256) { return _lastCheckpointTime; }
 
     // ============ Sequencer Lease Functions ============
 
@@ -99,16 +115,16 @@ contract HPPLite {
         // decrypt, stopping every rebuild at that height for good.
         require(wallet == sequencer, "Not the sequencer");
         require(
-            sequencerWallet == address(0) || block.timestamp >= leaseExpiry,
+            sequencerWallet == address(0) || block.timestamp >= _leaseExpiry,
             "Lease still active"
         );
         require(instanceId != bytes32(0), "Invalid instance ID");
 
         sequencerWallet = wallet;
         sequencerInstance = instanceId;
-        leaseExpiry = block.timestamp + LEASE_DURATION;
+        _leaseExpiry = uint64(block.timestamp + _leaseDuration);
 
-        emit SequencerClaimed(wallet, instanceId, leaseExpiry);
+        emit SequencerClaimed(wallet, instanceId, _leaseExpiry);
     }
 
     /**
@@ -120,8 +136,8 @@ contract HPPLite {
     }
 
     function _renew(address wallet, bytes32 instanceId) internal {
-        leaseExpiry = block.timestamp + LEASE_DURATION;
-        emit LeaseRenewed(wallet, instanceId, leaseExpiry);
+        _leaseExpiry = uint64(block.timestamp + _leaseDuration);
+        emit LeaseRenewed(wallet, instanceId, _leaseExpiry);
     }
 
     // ============ Signed forms (#33, #126) ============
@@ -130,7 +146,7 @@ contract HPPLite {
     // checkpoint signature names its range, which must be the next one.
 
     function domainSeparator() public view returns (bytes32) {
-        return EIP712Sig.domain("HPPLite", "8", address(this));
+        return EIP712Sig.domain("HPPLite", "9", address(this));
     }
 
     /// What the sequencer wallet signs for claimSequencerFor ("claim"), renewLeaseFor ("renew"), releaseLeaseFor ("release")
@@ -177,22 +193,22 @@ contract HPPLite {
         require(wallet == sequencer, "Not the sequencer");
         require(wallet == sequencerWallet, "Not sequencer wallet");
         require(instanceId == sequencerInstance, "Wrong instance");
-        require(block.timestamp < leaseExpiry, "Lease expired");
+        require(block.timestamp < _leaseExpiry, "Lease expired");
     }
 
     /**
      * @notice Check if current sequencer lease is active
      */
     function isLeaseActive() external view returns (bool) {
-        return sequencerWallet != address(0) && block.timestamp < leaseExpiry;
+        return sequencerWallet != address(0) && block.timestamp < _leaseExpiry;
     }
 
     /**
      * @notice Get time remaining on lease (0 if expired)
      */
     function leaseTimeRemaining() external view returns (uint256) {
-        if (block.timestamp >= leaseExpiry) return 0;
-        return leaseExpiry - block.timestamp;
+        if (block.timestamp >= _leaseExpiry) return 0;
+        return uint256(_leaseExpiry) - block.timestamp;
     }
 
     // ============ Checkpoint Functions ============
@@ -214,19 +230,39 @@ contract HPPLite {
     }
 
     function _checkpoint(uint256 fromHeight, uint256 toHeight, bytes32 stateRoot) internal {
-        require(fromHeight == lastCheckpointHeight + 1 || lastCheckpointHeight == 0, "Non-sequential");
+        require(fromHeight == _lastCheckpointHeight + 1 || _lastCheckpointHeight == 0, "Non-sequential");
         require(toHeight >= fromHeight, "Invalid range");
         // a root for batches the DA does not hold would be a root nobody can
         // check (#44); the DA contract is this rollup's, set by the factory
         require(daContract == address(0) || toHeight <= IHPPLiteDAHeight(daContract).lastBatchHeight(), "Beyond DA height");
+        _anchor(fromHeight, toHeight, stateRoot);
+    }
 
-        lastCheckpointHeight = toHeight;
+    /**
+     * @notice An anchor (#164): the DA contract committed a range of batches
+     *         ending at toHeight with this state root. It is the checkpoint,
+     *         and renews the lease: a sequencer that anchors on the chain's
+     *         cadence sends no lease transactions of its own.
+     * @dev Only the rollup's DA contract. The lease is checked here, once,
+     *      for the wallet the DA names (its caller, or the signer of a
+     *      relayed anchor): one call into the coordinator per anchor
+     *      instead of three views and a record.
+     */
+    function recordAnchor(address wallet, bytes32 instanceId, uint256 toHeight, bytes32 stateRoot) external {
+        require(msg.sender == daContract, "Not the DA");
+        require(wallet == sequencer, "Not the sequencer");
+        require(wallet == sequencerWallet, "Not sequencer wallet");
+        require(instanceId == sequencerInstance, "Wrong instance");
+        require(block.timestamp < _leaseExpiry, "Lease expired");
+        require(toHeight > _lastCheckpointHeight, "Invalid range");
+        _anchor(uint256(_lastCheckpointHeight) + 1, toHeight, stateRoot);
+    }
+
+    function _anchor(uint256 fromHeight, uint256 toHeight, bytes32 stateRoot) internal {
+        _lastCheckpointHeight = uint64(toHeight);
+        _lastCheckpointTime = uint64(block.timestamp);
+        _leaseExpiry = uint64(block.timestamp + _leaseDuration);   // Auto-renew lease on activity
         lastStateRoot = stateRoot;
-        lastCheckpointTime = block.timestamp;
-
-        // Auto-renew lease on activity
-        leaseExpiry = block.timestamp + LEASE_DURATION;
-
         emit CheckpointSubmitted(fromHeight, toHeight, stateRoot);
     }
 
@@ -239,7 +275,7 @@ contract HPPLite {
         if (sequencer == owner) {
             emit SequencerChanged(sequencer, newOwner);
             sequencer = newOwner;
-            leaseExpiry = block.timestamp;   // the old key's lease ends with its role
+            _leaseExpiry = uint64(block.timestamp);   // the old key's lease ends with its role
         }
         owner = newOwner;
     }
@@ -251,7 +287,18 @@ contract HPPLite {
         require(newSequencer != address(0), "Invalid sequencer");
         emit SequencerChanged(sequencer, newSequencer);
         sequencer = newSequencer;
-        leaseExpiry = block.timestamp;       // a rotated-out key cannot keep posting on its old lease
+        _leaseExpiry = uint64(block.timestamp);       // a rotated-out key cannot keep posting on its old lease
+    }
+
+    /**
+     * @notice How long a claim or a renewal holds the lease (#164). Longer
+     *         than the anchor interval, and the anchors keep it; a crashed
+     *         sequencer that did not release is replaced after this long.
+     */
+    function setLeaseDuration(uint256 seconds_) external onlyOwner {
+        require(seconds_ >= 1 minutes && seconds_ <= 30 days, "Invalid lease duration");
+        _leaseDuration = uint64(seconds_);
+        emit ConfigUpdated("leaseDuration", abi.encode(seconds_));
     }
 
     /**
@@ -264,8 +311,8 @@ contract HPPLite {
     function _release(address wallet, bytes32 instanceId) internal {
         require(wallet == sequencerWallet, "Not sequencer wallet");
         require(instanceId == sequencerInstance, "Wrong instance");
-        require(block.timestamp < leaseExpiry, "Lease expired");
-        leaseExpiry = block.timestamp;
+        require(block.timestamp < _leaseExpiry, "Lease expired");
+        _leaseExpiry = uint64(block.timestamp);
         emit LeaseReleased(wallet, instanceId);
     }
 
@@ -284,7 +331,7 @@ contract HPPLite {
      * @dev Use if sequencer is misbehaving and needs to be replaced
      */
     function forceExpireLease() external onlyOwner {
-        leaseExpiry = block.timestamp;
+        _leaseExpiry = uint64(block.timestamp);
     }
 
     // ============ View Functions ============
@@ -293,19 +340,19 @@ contract HPPLite {
         address _owner,
         address _sequencerWallet,
         bytes32 _sequencerInstance,
-        uint256 _leaseExpiry,
-        uint256 _lastCheckpointHeight,
+        uint256 leaseExpiry_,
+        uint256 lastCheckpointHeight_,
         bytes32 _lastStateRoot,
-        uint256 _lastCheckpointTime
+        uint256 lastCheckpointTime_
     ) {
         return (
             owner,
             sequencerWallet,
             sequencerInstance,
-            leaseExpiry,
-            lastCheckpointHeight,
+            _leaseExpiry,
+            _lastCheckpointHeight,
             lastStateRoot,
-            lastCheckpointTime
+            _lastCheckpointTime
         );
     }
 
@@ -315,9 +362,9 @@ contract HPPLite {
         uint256 _version,
         uint256 _chainId,
         uint256 _checkpointInterval,
-        uint256 _leaseDuration
+        uint256 leaseDuration_
     ) {
-        return (daScheme, daContract, VERSION, block.chainid, checkpointInterval, LEASE_DURATION);
+        return (daScheme, daContract, VERSION, block.chainid, checkpointInterval, _leaseDuration);
     }
 
     function version() external pure returns (uint256) {

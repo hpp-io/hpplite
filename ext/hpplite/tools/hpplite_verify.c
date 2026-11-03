@@ -320,6 +320,17 @@ open_again:
         unsigned char root[32]; char z[65];
         if (hpplite_db_hash(db, root) == SQLITE_OK) { hex(root, z); printf("rebuilt state root: 0x%s\n", z); }
     }
+    /* ranges (#164): what the chain anchored against what the rebuild holds */
+    if (onChain > 0) {
+        HppliteRange r;
+        if (hpplite_l1_get_range(node->l1, onChain, &r) == 0) {
+            char z[65];
+            hex(r.manifestDigest, z);
+            printf("anchored to %llu: the last range %llu-%llu, manifest sha-256 %s%s\n", (unsigned long long)onChain,
+                   (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, z, r.nReceipt ? ", with the store's receipt" : ", no receipt");
+            hpplite_l1_range_clear(&r);
+        }
+    }
 
     if (zLive) {
         sqlite3 *live = NULL;

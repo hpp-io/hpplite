@@ -41,6 +41,15 @@ typedef struct EthL1 {
     /* Callback */
     HppliteL1Callback callback;
     void *callback_arg;
+
+    /* DA v3 (#164, coordinator VERSION >= 9): where each height's commitment
+    ** is, learned by walking the events backward from lastBlock(): every
+    ** event names the block of the commitment before it. Heights 1..indexedHeight. */
+    uint64_t *aBlock;          /* [height]: the block whose log carries the commitment */
+    uint64_t *aRangeFrom;      /* [height]: the first height of the range the height is inside, 0 for a per-batch commitment */
+    uint64_t nIndexAlloc;
+    uint64_t indexedHeight;
+    uint64_t lastIndexedBlock; /* the block the last walk started from: the next walk stops there */
 } EthL1;
 
 /* The backend's view of the l1 parameter */
@@ -64,6 +73,11 @@ static uint8_t SEL_BLOCK_OF[4];         /* DA v2 (#33): the block whose log carr
 static uint8_t SEL_COMMIT_BATCH[4];     /* DA v2 (#11): commitBatch(bytes32,uint256,bytes32,bytes,bytes) */
 static uint8_t TOPIC_BATCH_SUBMITTED[32];   /* DA v2: BatchSubmitted(uint256 indexed height, bytes32 indexed hash, bytes data) */
 static uint8_t TOPIC_BATCH_COMMITTED[32];   /* DA v2: BatchCommitted(uint256 indexed height, bytes32 indexed hash, bytes ref, bytes receipt) */
+static uint8_t SEL_COMMIT_RANGE[4];     /* DA v3 (#164): commitRange(bytes32,uint256,uint256,bytes32,bytes32,bytes32,bytes) */
+static uint8_t SEL_LAST_BLOCK[4];       /* DA v3: lastBlock() */
+static uint8_t TOPIC3_BATCH_SUBMITTED[32];  /* DA v3: BatchSubmitted(uint256 indexed height, bytes32 indexed hash, bytes data, uint256 prevBlock) */
+static uint8_t TOPIC3_BATCH_COMMITTED[32];  /* DA v3: BatchCommitted(..., bytes ref, bytes receipt, uint256 prevBlock) */
+static uint8_t TOPIC3_RANGE_COMMITTED[32];  /* DA v3: RangeCommitted(uint256 indexed from, uint256 indexed to, bytes32 chainHashAfter, bytes32 stateRoot, bytes32 manifestDigest, bytes receipt, uint256 prevBlock) */
 
 /* Function selectors - HPPLiteFactory contract */
 static uint8_t SEL_GET_ROLLUP[4];
@@ -77,6 +91,7 @@ static uint8_t SEL_CREATE_ROLLUP[4];
 static uint8_t SEL_CREATE_SIMPLE_ROLLUP[4];
 
 static int selectors_initialized = 0;
+static int eth_get_da_state(HppliteL1 *l1, uint64_t *last_batch_height, uint64_t *total_batches, uint8_t latest_batch_hash[32]);
 
 /* Default factory address on HPP Sepolia (update after deployment) */
 static const char *DEFAULT_FACTORY_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -112,6 +127,16 @@ static void init_selectors(void) {
         static const char zCommit[] = "BatchCommitted(uint256,bytes32,bytes,bytes)";
         keccak256((const uint8_t *)zSig, sizeof(zSig) - 1, TOPIC_BATCH_SUBMITTED);
         keccak256((const uint8_t *)zCommit, sizeof(zCommit) - 1, TOPIC_BATCH_COMMITTED);
+    }
+    abi_function_selector("commitRange(bytes32,uint256,uint256,bytes32,bytes32,bytes32,bytes)", SEL_COMMIT_RANGE);
+    abi_function_selector("lastBlock()", SEL_LAST_BLOCK);
+    {
+        static const char z1[] = "BatchSubmitted(uint256,bytes32,bytes,uint256)";
+        static const char z2[] = "BatchCommitted(uint256,bytes32,bytes,bytes,uint256)";
+        static const char z3[] = "RangeCommitted(uint256,uint256,bytes32,bytes32,bytes32,bytes,uint256)";
+        keccak256((const uint8_t *)z1, sizeof(z1) - 1, TOPIC3_BATCH_SUBMITTED);
+        keccak256((const uint8_t *)z2, sizeof(z2) - 1, TOPIC3_BATCH_COMMITTED);
+        keccak256((const uint8_t *)z3, sizeof(z3) - 1, TOPIC3_RANGE_COMMITTED);
     }
 
     /* HPPLiteFactory selectors */
@@ -181,6 +206,8 @@ static HppliteL1 *eth_connect_config(const HppliteNetworkConfig *config) {
 
 static void eth_disconnect(HppliteL1 *l1) {
     if (!l1) return;
+    free(self->aBlock);
+    free(self->aRangeFrom);
     if (self->cached_state) hpplite_l1_state_free(self->cached_state);
     if (self->cached_system_config) hpplite_l1_system_config_free(self->cached_system_config);
     if (self->rpcUrl) free(self->rpcUrl);
@@ -945,6 +972,145 @@ static char *eth_submit_batch(
     return hash_hex;
 }
 
+/* A word of ABI-encoded data, 0 when out of range */
+static uint64_t abi_word_u64(const uint8_t *data, size_t len, int i) {
+    return (len >= (size_t)(32 * (i + 1))) ? abi_decode_uint64(data + 32 * i) : 0;
+}
+
+/*
+** DA v3 (#164): the contract keeps no block per height; every event names
+** the block of the commitment before it. The index walks the events
+** backward from lastBlock() to the block the previous walk started from,
+** one eth_getLogs per block, and records per height its block and, when the
+** height is inside an anchored range, the range's first height.
+*/
+static int eth_index_update(HppliteL1 *l1) {
+    uint64_t last = 0, total = 0, block, top, stop;
+    uint8_t calldata[4], latest[32];
+    uint8_t *result;
+    size_t result_len = 0;
+    if (eth_get_da_state(l1, &last, &total, latest) != 0) return -1;
+    if (last <= self->indexedHeight) return 0;
+    if (last + 1 > self->nIndexAlloc) {
+        uint64_t n = self->nIndexAlloc ? self->nIndexAlloc : 1024;
+        uint64_t *b, *r;
+        while (n < last + 1) n *= 2;
+        b = realloc(self->aBlock, (size_t)n * sizeof(uint64_t));
+        if (!b) return -1;
+        self->aBlock = b;
+        r = realloc(self->aRangeFrom, (size_t)n * sizeof(uint64_t));
+        if (!r) return -1;
+        self->aRangeFrom = r;
+        memset(self->aBlock + self->nIndexAlloc, 0, (size_t)(n - self->nIndexAlloc) * sizeof(uint64_t));
+        memset(self->aRangeFrom + self->nIndexAlloc, 0, (size_t)(n - self->nIndexAlloc) * sizeof(uint64_t));
+        self->nIndexAlloc = n;
+    }
+    memcpy(calldata, SEL_LAST_BLOCK, 4);
+    result = eth_client_call(self->eth, self->da_contract, calldata, 4, &result_len);
+    if (!result || result_len < 32) { free(result); return -1; }
+    top = block = abi_decode_uint64(result);
+    free(result);
+    stop = self->lastIndexedBlock;
+    while (block > stop) {
+        EthLog *logs = NULL;
+        int n = 0, i;
+        uint64_t prev = block;
+        if (eth_client_get_block_logs(self->eth, self->da_contract, block, &logs, &n) != 0) return -1;
+        for (i = 0; i < n; i++) {
+            EthLog *e = &logs[i];
+            uint64_t p = block, h, from, to;
+            if (e->nTopics < 2) continue;
+            if (memcmp(e->topics[0], TOPIC3_BATCH_SUBMITTED, 32) == 0 || memcmp(e->topics[0], TOPIC3_BATCH_COMMITTED, 32) == 0) {
+                h = abi_decode_uint64(e->topics[1]);
+                if (h >= 1 && h <= last) { self->aBlock[h] = block; self->aRangeFrom[h] = 0; }
+                p = abi_word_u64(e->data, e->nData, memcmp(e->topics[0], TOPIC3_BATCH_SUBMITTED, 32) == 0 ? 1 : 2);
+            } else if (memcmp(e->topics[0], TOPIC3_RANGE_COMMITTED, 32) == 0 && e->nTopics >= 3) {
+                from = abi_decode_uint64(e->topics[1]);
+                to = abi_decode_uint64(e->topics[2]);
+                if (to > last) to = last;
+                for (h = from; h >= 1 && h <= to; h++) { self->aBlock[h] = block; self->aRangeFrom[h] = from; }
+                p = abi_word_u64(e->data, e->nData, 4);
+            } else {
+                continue;
+            }
+            if (p < prev) prev = p;
+        }
+        eth_logs_free(logs, n);
+        if (n == 0 || prev >= block) break;      /* nothing of ours here, or no earlier commitment named: the walk ends */
+        block = prev;
+    }
+    self->lastIndexedBlock = top;
+    self->indexedHeight = last;
+    return 0;
+}
+
+static int eth_has_ranges(HppliteL1 *l1) {
+    return l1 && ensure_da_contract(l1) && self->version >= 9;
+}
+
+/* DA v3 commitRange (#164): one transaction for every batch stored since the last commitment */
+static char *eth_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const HppliteRange *r) {
+    size_t rcptLen, rcptPad, n;
+    uint8_t *calldata, *p, *tx_hash;
+    uint64_t gas;
+    if (!l1 || !self->has_privkey || !instanceId || !r) return NULL;
+    if (!ensure_da_contract(l1) || self->version < 9) return NULL;
+    rcptLen = r->receipt ? r->nReceipt : 0;
+    rcptPad = (rcptLen + 31) / 32 * 32;
+    n = 4 + 7 * 32 + 32 + rcptPad;
+    calldata = calloc(1, n);
+    if (!calldata) return NULL;
+    p = calldata;
+    memcpy(p, SEL_COMMIT_RANGE, 4); p += 4;
+    memcpy(p, instanceId, 32); p += 32;
+    abi_encode_uint64(r->fromHeight, p); p += 32;
+    abi_encode_uint64(r->toHeight, p); p += 32;
+    memcpy(p, r->chainHashAfter, 32); p += 32;
+    memcpy(p, r->stateRoot, 32); p += 32;
+    memcpy(p, r->manifestDigest, 32); p += 32;
+    abi_encode_uint64(7 * 32, p); p += 32;                         /* the receipt's offset from the start of the arguments */
+    abi_encode_uint64(rcptLen, p); p += 32;
+    if (rcptLen) memcpy(p, r->receipt, rcptLen);
+    gas = eth_client_estimate_gas(self->eth, self->da_contract, calldata, n);
+    if (gas == (uint64_t)-1) gas = 300000 + rcptLen * 100;
+    else gas += gas / 4;
+    if (gas < 200000) gas = 200000;
+    if (self->maxTxGas && gas > self->maxTxGas) gas = self->maxTxGas;
+    tx_hash = eth_client_send_tx(self->eth, self->da_contract, calldata, n, gas, 0);
+    free(calldata);
+    return tx_hash ? txHashString(tx_hash) : NULL;
+}
+
+static uint8_t *abi_dynamic_bytes(const uint8_t *raw, size_t raw_len, int i, size_t *pLen);
+
+/* RangeCommitted(from, to, chainHashAfter, stateRoot, manifestDigest, bytes receipt, prevBlock) for the range `height` is inside */
+static int eth_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
+    uint8_t topic1[32], topic2[32], *raw, *rcpt;
+    size_t raw_len = 0, rcptLen = 0;
+    uint64_t from;
+    if (!l1 || !out || !ensure_da_contract(l1) || self->version < 9) return -1;
+    if (eth_index_update(l1) != 0 || height == 0 || height > self->indexedHeight) return -1;
+    from = self->aRangeFrom[height];
+    if (from == 0) return -1;
+    abi_encode_uint64(from, topic1);
+    raw = eth_client_get_log(self->eth, self->da_contract, self->aBlock[height], TOPIC3_RANGE_COMMITTED, topic1, &raw_len, topic2);
+    if (!raw || raw_len < 5 * 32) { free(raw); return -1; }
+    out->fromHeight = from;
+    out->toHeight = abi_decode_uint64(topic2);
+    memcpy(out->chainHashAfter, raw, 32);
+    memcpy(out->stateRoot, raw + 32, 32);
+    memcpy(out->manifestDigest, raw + 64, 32);
+    rcpt = abi_dynamic_bytes(raw, raw_len, 3, &rcptLen);
+    free(raw);
+    out->receipt = NULL; out->nReceipt = 0;
+    if (rcpt && rcptLen) {
+        out->receipt = sqlite3_malloc((int)rcptLen);
+        if (out->receipt) { memcpy(out->receipt, rcpt, rcptLen); out->nReceipt = rcptLen; }
+    }
+    free(rcpt);
+    return 0;
+}
+
 /*
 ** DA v2 (#33): the batch's bytes are in the log of the block blockOf(height)
 ** names, as the ABI-encoded `bytes data` of BatchSubmitted; its hash is the
@@ -958,12 +1124,21 @@ static uint8_t *eth_height_log(HppliteL1 *l1, uint64_t height, const uint8_t top
     uint64_t block;
     uint8_t *result;
 
-    memcpy(calldata, SEL_BLOCK_OF, 4);
-    abi_encode_uint64(height, calldata + 4);
-    result = eth_client_call(self->eth, self->da_contract, calldata, sizeof(calldata), &result_len);
-    if (!result || result_len < 32) { free(result); return NULL; }   /* "No such batch" reverts */
-    block = abi_decode_uint64(result);
-    free(result);
+    if (self->version >= 9) {
+        /* DA v3: no blockOf(); the index, walked from the events (#164) */
+        if (eth_index_update(l1) != 0 || height == 0 || height > self->indexedHeight || self->aBlock[height] == 0) return NULL;
+        if (self->aRangeFrom[height]) return NULL;        /* inside a range: no log of its own (eth_get_range) */
+        block = self->aBlock[height];
+        if (topic0 == TOPIC_BATCH_SUBMITTED) topic0 = TOPIC3_BATCH_SUBMITTED;
+        else if (topic0 == TOPIC_BATCH_COMMITTED) topic0 = TOPIC3_BATCH_COMMITTED;
+    } else {
+        memcpy(calldata, SEL_BLOCK_OF, 4);
+        abi_encode_uint64(height, calldata + 4);
+        result = eth_client_call(self->eth, self->da_contract, calldata, sizeof(calldata), &result_len);
+        if (!result || result_len < 32) { free(result); return NULL; }   /* "No such batch" reverts */
+        block = abi_decode_uint64(result);
+        free(result);
+    }
     abi_encode_uint64(height, topic1);
     return eth_client_get_log(self->eth, self->da_contract, block, topic0, topic1, raw_len, hash_out);
 }
@@ -1268,6 +1443,9 @@ const HppliteL1Ops hppliteL1EthOps = {
     .get_chain_hash = eth_get_chain_hash,
     .commit_batch = eth_commit_batch,
     .get_commitment = eth_get_commitment,
+    .commit_range = eth_commit_range,
+    .get_range = eth_get_range,
+    .has_ranges = eth_has_ranges,
     .chain_id = eth_chain_id,
     .token_balance = eth_token_balance,
 };

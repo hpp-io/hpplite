@@ -89,6 +89,19 @@ uint8_t *eth_client_get_log(EthClient *client, const uint8_t address[20], uint64
                             const uint8_t topic0[32], const uint8_t topic1[32],
                             size_t *data_len, uint8_t topic2[32]);
 
+/* Every log of `address` in `block`, in log order (#164: DA v3 names the
+** previous commitment's block in every event, so a reader walks the
+** commitments backward from the contract's lastBlock()). 0 with a malloc'd
+** array (eth_logs_free), -1 when the call failed. */
+typedef struct EthLog {
+    int nTopics;
+    uint8_t topics[4][32];
+    uint8_t *data;          /* ABI-encoded, malloc'd, terminated */
+    size_t nData;
+} EthLog;
+int eth_client_get_block_logs(EthClient *client, const uint8_t address[20], uint64_t block, EthLog **pLogs, int *pnLogs);
+void eth_logs_free(EthLog *logs, int n);
+
 /* === Utility === */
 
 /* Get last error message */

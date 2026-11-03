@@ -6,40 +6,50 @@ import "./EIP712Sig.sol";
 
 /**
  * @title HPPLiteDA
- * @notice The rollup's store and its commitments (#33).
- * @dev Version 2. A batch's bytes go into the transaction's log, not into
- *      storage: BatchSubmitted(height, hash, data). Storage keeps what the
- *      chain vouches for: the height, a rolling hash over every batch so
- *      far (chainHash), and the block each batch's log is in (batchBlock,
- *      packed four to a slot), so a reader fetches one block's log by the
- *      height topic and a rebuild recomputes chainHash to the tip.
- *      commitBatch records a batch whose bytes live elsewhere (#11): its
- *      hash, an opaque reference into that store and a pinner's receipt.
+ * @notice The rollup's store and its commitments (#33, #164).
+ * @dev Version 3. A batch's bytes go into the transaction's log, not into
+ *      storage: BatchSubmitted(height, hash, data, prevBlock). commitBatch
+ *      records a batch whose bytes live elsewhere (#11): its hash, an opaque
+ *      reference into that store and a pinner's receipt. commitRange (#164)
+ *      anchors a whole range of such batches in one transaction: the chain
+ *      hash the sequencer folded over them (the same fold, batch by batch,
+ *      that _record does; a reader folds the manifest's hashes and refuses a
+ *      manifest that does not reach it), the state root after the last, the
+ *      digest of a manifest at the store naming every batch, and the store's
+ *      receipt for the manifest. The anchor is the coordinator's checkpoint.
+ *      Storage keeps only what every commitment rewrites, two slots: the
+ *      height and the block of the last commitment, packed, and the chain
+ *      hash. Nothing grows with the history: every event names the block of
+ *      the commitment before it, so a reader walks them backward from
+ *      lastBlock() (version 2 kept a block per height, batchBlock, a storage
+ *      slot per batch, and blockOf(height)).
  *      The *For forms take the sequencer wallet's EIP-712 signature instead
  *      of its transaction, so a relay may pay the gas (#126); a signature
- *      names one height and can only be used while that height is next.
- *      Version 1 kept the bytes in storage (batchData); readers tell the
- *      two apart by the coordinator's VERSION (7 before, 8 from here on).
+ *      names one height or range and can only be used while that is next.
+ *      Readers tell the versions apart by the coordinator's VERSION (7:
+ *      bytes in storage, 8: version 2, 9: this).
  */
 contract HPPLiteDA {
     using EIP712Sig for bytes32;
 
     // ============ Constants ============
-    uint256 public constant VERSION = 2;
+    uint256 public constant VERSION = 3;
     bytes32 public constant BATCH_TYPEHASH = keccak256("Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)");
+    bytes32 public constant RANGE_TYPEHASH = keccak256("Range(bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 chainHashAfter,bytes32 stateRoot,bytes32 manifestDigest)");
 
     // ============ State ============
     address public owner;
     HPPLite public coordinator;  // HPPLite contract for lease verification
 
-    uint256 public lastBatchHeight;
+    uint64 private _lastBatchHeight;
+    uint64 private _lastBlock;    // the block whose log carries the last commitment
     bytes32 public chainHash;    // keccak256(abi.encode(chainHash, height, batchHash)) over every batch, from bytes32(0)
-    uint64[] public batchBlock;  // batchBlock[height - 1]: the block whose log carries batch `height`
     uint256 public batchSizeLimit;
 
     // ============ Events ============
-    event BatchSubmitted(uint256 indexed height, bytes32 indexed batchHash, bytes data);
-    event BatchCommitted(uint256 indexed height, bytes32 indexed batchHash, bytes ref, bytes receipt);
+    event BatchSubmitted(uint256 indexed height, bytes32 indexed batchHash, bytes data, uint256 prevBlock);
+    event BatchCommitted(uint256 indexed height, bytes32 indexed batchHash, bytes ref, bytes receipt, uint256 prevBlock);
+    event RangeCommitted(uint256 indexed fromHeight, uint256 indexed toHeight, bytes32 chainHashAfter, bytes32 stateRoot, bytes32 manifestDigest, bytes receipt, uint256 prevBlock);
     event CoordinatorChanged(address indexed oldCoordinator, address indexed newCoordinator);
 
     // ============ Modifiers ============
@@ -70,7 +80,7 @@ contract HPPLiteDA {
     // ============ Signed forms ============
 
     function domainSeparator() public view returns (bytes32) {
-        return EIP712Sig.domain("HPPLiteDA", "2", address(this));
+        return EIP712Sig.domain("HPPLiteDA", "3", address(this));
     }
 
     /// What the sequencer wallet signs for submitBatchFor / commitBatchFor
@@ -78,9 +88,16 @@ contract HPPLiteDA {
         return domainSeparator().digest(keccak256(abi.encode(BATCH_TYPEHASH, instanceId, height, batchHash)));
     }
 
-    function _requireSequencerSig(bytes32 instanceId, uint256 height, bytes32 batchHash, bytes calldata sig) internal view {
+    /// What the sequencer wallet signs for commitRangeFor
+    function rangeDigest(bytes32 instanceId, uint256 fromHeight, uint256 toHeight, bytes32 chainHashAfter, bytes32 stateRoot, bytes32 manifestDigest)
+        public view returns (bytes32)
+    {
+        return domainSeparator().digest(keccak256(abi.encode(RANGE_TYPEHASH, instanceId, fromHeight, toHeight, chainHashAfter, stateRoot, manifestDigest)));
+    }
+
+    function _requireSequencerSig(bytes32 instanceId, bytes32 digest, bytes calldata sig) internal view {
         require(address(coordinator) != address(0), "No coordinator set");
-        address signer = batchDigest(instanceId, height, batchHash).recover(sig);
+        address signer = digest.recover(sig);
         require(signer != address(0) && signer == coordinator.sequencerWallet(), "Not sequencer wallet");
         _requireActiveInstance(instanceId);
     }
@@ -99,7 +116,7 @@ contract HPPLiteDA {
 
     /// submitBatch by anyone, with the sequencer wallet's signature over (instanceId, height, keccak256(data))
     function submitBatchFor(bytes32 instanceId, uint256 height, bytes calldata data, bytes calldata sig) external {
-        _requireSequencerSig(instanceId, height, keccak256(data), sig);
+        _requireSequencerSig(instanceId, batchDigest(instanceId, height, keccak256(data)), sig);
         _submit(height, data);
     }
 
@@ -118,30 +135,69 @@ contract HPPLiteDA {
     function commitBatchFor(bytes32 instanceId, uint256 height, bytes32 batchHash, bytes calldata ref, bytes calldata receipt, bytes calldata sig)
         external
     {
-        _requireSequencerSig(instanceId, height, batchHash, sig);
+        _requireSequencerSig(instanceId, batchDigest(instanceId, height, batchHash), sig);
         _commit(height, batchHash, ref, receipt);
+    }
+
+    /**
+     * @notice Anchor a range of batches held by a store (#164), one transaction for all of them
+     * @param fromHeight The first height of the range: the one after the last commitment
+     * @param toHeight The last height of the range
+     * @param chainHashAfter The chain hash after the range: the fold of _record over every batch in it, done by the sequencer
+     * @param stateRoot The state root after toHeight: this anchor is the checkpoint
+     * @param manifestDigest The digest of the manifest at the store: per height its batch hash, reference and receipt
+     * @param receipt The store's signed promise to hold the manifest, or empty
+     */
+    function commitRange(bytes32 instanceId, uint256 fromHeight, uint256 toHeight, bytes32 chainHashAfter, bytes32 stateRoot, bytes32 manifestDigest, bytes calldata receipt)
+        external
+    {
+        _range(msg.sender, instanceId, fromHeight, toHeight, chainHashAfter, stateRoot, manifestDigest, receipt);
+    }
+
+    function commitRangeFor(bytes32 instanceId, uint256 fromHeight, uint256 toHeight, bytes32 chainHashAfter, bytes32 stateRoot, bytes32 manifestDigest, bytes calldata receipt, bytes calldata sig)
+        external
+    {
+        address signer = rangeDigest(instanceId, fromHeight, toHeight, chainHashAfter, stateRoot, manifestDigest).recover(sig);
+        require(signer != address(0), "Bad signature");
+        _range(signer, instanceId, fromHeight, toHeight, chainHashAfter, stateRoot, manifestDigest, receipt);
     }
 
     function _submit(uint256 height, bytes calldata data) internal {
         require(data.length > 0, "Empty batch");
         require(data.length <= batchSizeLimit, "Batch too large");
         bytes32 batchHash = keccak256(data);
-        _record(height, batchHash);
-        emit BatchSubmitted(height, batchHash, data);
+        uint256 prevBlock = _record(height, batchHash);
+        emit BatchSubmitted(height, batchHash, data, prevBlock);
     }
 
     function _commit(uint256 height, bytes32 batchHash, bytes calldata ref, bytes calldata receipt) internal {
         require(batchHash != bytes32(0), "Empty hash");
         require(ref.length > 0, "Empty ref");
-        _record(height, batchHash);
-        emit BatchCommitted(height, batchHash, ref, receipt);
+        uint256 prevBlock = _record(height, batchHash);
+        emit BatchCommitted(height, batchHash, ref, receipt, prevBlock);
     }
 
-    function _record(uint256 height, bytes32 batchHash) internal {
-        require(height == lastBatchHeight + 1, "Non-sequential batch");
+    /// The lease and the instance are the coordinator's to check, in recordAnchor: one call per anchor
+    function _range(address wallet, bytes32 instanceId, uint256 fromHeight, uint256 toHeight, bytes32 chainHashAfter, bytes32 stateRoot, bytes32 manifestDigest, bytes calldata receipt) internal {
+        require(address(coordinator) != address(0), "No coordinator set");
+        require(fromHeight == uint256(_lastBatchHeight) + 1, "Non-sequential batch");
+        require(toHeight >= fromHeight, "Invalid range");
+        require(chainHashAfter != bytes32(0), "Empty hash");
+        require(manifestDigest != bytes32(0), "Empty manifest");
+        coordinator.recordAnchor(wallet, instanceId, toHeight, stateRoot);
+        uint256 prevBlock = _lastBlock;
+        _lastBatchHeight = uint64(toHeight);
+        _lastBlock = _blockNumber();
+        chainHash = chainHashAfter;
+        emit RangeCommitted(fromHeight, toHeight, chainHashAfter, stateRoot, manifestDigest, receipt, prevBlock);
+    }
+
+    function _record(uint256 height, bytes32 batchHash) internal returns (uint256 prevBlock) {
+        require(height == uint256(_lastBatchHeight) + 1, "Non-sequential batch");
         chainHash = keccak256(abi.encode(chainHash, height, batchHash));
-        batchBlock.push(_blockNumber());
-        lastBatchHeight = height;
+        prevBlock = _lastBlock;
+        _lastBatchHeight = uint64(height);
+        _lastBlock = _blockNumber();
     }
 
     /**
@@ -160,15 +216,18 @@ contract HPPLiteDA {
 
     // ============ View Functions ============
 
-    /// The block whose log carries batch `height`
-    function blockOf(uint256 height) external view returns (uint64) {
-        require(height >= 1 && height <= lastBatchHeight, "No such batch");
-        return batchBlock[height - 1];
+    function lastBatchHeight() public view returns (uint256) {
+        return _lastBatchHeight;
+    }
+
+    /// The block whose log carries the last commitment; its event names the block of the one before, and so on back to the first
+    function lastBlock() external view returns (uint256) {
+        return _lastBlock;
     }
 
     /// What a reader recomputes over batches 1..lastBatchHeight: the chain hash
-    function getDAState() external view returns (uint256 _lastBatchHeight, uint256 _totalBatches, bytes32 _chainHash) {
-        return (lastBatchHeight, lastBatchHeight, chainHash);
+    function getDAState() external view returns (uint256 lastBatchHeight_, uint256 _totalBatches, bytes32 _chainHash) {
+        return (_lastBatchHeight, _lastBatchHeight, chainHash);
     }
 
     // ============ Admin Functions ============

@@ -336,15 +336,19 @@ static void hmac256(const uint8_t *key, size_t klen, const void *msg, size_t mle
 
 /* CIDv1, raw (0x55), sha2-256 multihash, base32 lower with the 'b' prefix:
 ** what a pin service and Kubo (raw leaves) name the same bytes */
-static void cidOf(const uint8_t *data, size_t len, char out[64]) {
-    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
-    uint8_t raw[36] = { 0x01, 0x55, 0x12, 0x20 };
+void hpplite_store_sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
     SHA256_CTX c;
-    unsigned bits = 0, acc = 0;
-    size_t i, n = 0;
     hpplite_sha256_init(&c);
     hpplite_sha256_update(&c, data, len);
-    hpplite_sha256_final(&c, raw + 4);
+    hpplite_sha256_final(&c, out);
+}
+
+void hpplite_store_cid_from_sha256(const uint8_t digest[32], char out[64]) {
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz234567";
+    uint8_t raw[36] = { 0x01, 0x55, 0x12, 0x20 };
+    unsigned bits = 0, acc = 0;
+    size_t i, n = 0;
+    memcpy(raw + 4, digest, 32);
     out[n++] = 'b';
     for (i = 0; i < sizeof raw; i++) {
         acc = (acc << 8) | raw[i];
@@ -353,6 +357,12 @@ static void cidOf(const uint8_t *data, size_t len, char out[64]) {
     }
     if (bits) out[n++] = alphabet[(acc << (5 - bits)) & 31];
     out[n] = 0;
+}
+
+static void cidOf(const uint8_t *data, size_t len, char out[64]) {
+    uint8_t digest[32];
+    hpplite_store_sha256(data, len, digest);
+    hpplite_store_cid_from_sha256(digest, out);
 }
 
 /* /bucket/prefix/cid, every segment URI-encoded the way the signature wants it */
