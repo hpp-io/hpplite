@@ -472,23 +472,29 @@ something is pending, so an idle database costs nothing.
 function getOrCreateRollup() external returns (address);          // the wallet's primary
 function getRollup(address owner) external view returns (address);
 function createRollup(uint256 checkpointInterval) external returns (address);   // one more, for a named database (#61)
+function createRollupFor(address owner, uint256 checkpointInterval, uint256 nonce, uint256 deadline, bytes sig)
+    external returns (address);                                    // the owner's EIP-712 signature, anyone's gas (#171); createNonce(owner) is spent
 function getRollupsByOwner(address owner) external view returns (address[] memory);
 
-// HPPLite (per-rollup coordinator, VERSION 8)
+// HPPLite (per-rollup coordinator, VERSION 10)
 function claimSequencer(bytes32 instanceId) external;
 function renewLease(bytes32 instanceId) external;
 function releaseLease(bytes32 instanceId) external;
 function submitCheckpoint(bytes32 instanceId, uint256 from, uint256 to, bytes32 root) external;
 // the same with the sequencer wallet's EIP-712 signature, submitted by anyone (#33, #126):
-function claimSequencerFor(bytes32 instanceId, uint256 nonce, bytes sig) external;   // renewLeaseFor, releaseLeaseFor alike; leaseNonce() is spent
+function claimSequencerFor(bytes32 instanceId, uint256 nonce, uint256 deadline, bytes sig) external;
+    // renewLeaseFor, releaseLeaseFor alike; leaseNonce() is spent, refused after the deadline (#171)
 function submitCheckpointFor(bytes32 instanceId, uint256 from, uint256 to, bytes32 root, bytes sig) external;
+function setCheckpointIntervalFor(uint256 interval, uint256 nonce, uint256 deadline, bytes sig) external;   // the owner's (#171); ownerNonce()
 
-// HPPLiteDA (per-rollup store, version 2): the bytes go into the log, storage keeps the commitment
-function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;   // emits BatchSubmitted(height, keccak256(data), data)
+// HPPLiteDA (per-rollup store, version 3): the bytes go into the log or a store, storage keeps the commitment
+function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;   // emits BatchSubmitted(height, keccak256(data), data, prevBlock)
 function submitBatchFor(bytes32 instanceId, uint256 height, bytes data, bytes sig) external;
 function commitBatch(bytes32 instanceId, uint256 height, bytes32 hash, bytes ref, bytes receipt) external;   // bytes held elsewhere (#11)
+function commitRange(bytes32 instanceId, uint256 from, uint256 to, bytes32 chainHashAfter, bytes32 stateRoot,
+                     bytes32 manifestDigest, bytes receipt) external;   // a range at the store, the anchor (#164); commitRangeFor with a signature
 function chainHash() external view returns (bytes32);        // keccak256(abi.encode(prev, height, hash)) over every batch
-function blockOf(uint256 height) external view returns (uint64);   // the block whose log carries the batch
+function lastBlock() external view returns (uint256);        // the block of the last commitment; each event's prevBlock walks back
 function getDAState() external view returns (uint256 lastBatchHeight, uint256, bytes32 chainHash);
 ```
 

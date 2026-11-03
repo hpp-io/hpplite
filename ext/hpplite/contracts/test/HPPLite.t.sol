@@ -7,6 +7,7 @@ import "../src/HPPLiteDA.sol";
 import "../src/HPPLiteFactory.sol";
 
 contract HPPLiteTest is Test {
+    uint256 constant DL = 4_000_000_000;   // a lease signature's deadline far ahead (#171)
     HPPLite public hpplite;
     HPPLiteDA public da;
 
@@ -43,7 +44,7 @@ contract HPPLiteTest is Test {
         assertEq(hpplite.sequencerInstance(), bytes32(0));
         assertEq(hpplite.checkpointInterval(), 100);
         assertEq(hpplite.daContract(), address(da));
-        assertEq(hpplite.VERSION(), 9);
+        assertEq(hpplite.VERSION(), 10);
         assertEq(da.VERSION(), 3);
     }
 
@@ -297,7 +298,7 @@ contract HPPLiteTest is Test {
 
         assertEq(daScheme, "hppda");
         assertEq(daContract, address(da));
-        assertEq(version, 9);
+        assertEq(version, 10);
         assertEq(checkpointInterval, 100);
         assertEq(leaseDuration, 1 hours);
     }
@@ -310,6 +311,7 @@ contract HPPLiteTest is Test {
 }
 
 contract HPPLiteDATest is Test {
+    uint256 constant DL = 4_000_000_000;   // a lease signature's deadline far ahead (#171)
     HPPLite public hpplite;
     HPPLiteDA public da;
 
@@ -529,9 +531,9 @@ contract HPPLiteDATest is Test {
         vm.prank(sequencer);
         hpplite.releaseLease(instanceId);
         assertEq(hpplite.leaseNonce(), 0);
-        bytes memory sig = sign(sequencerKey, hpplite.leaseDigest("claim", instanceId2, 0));
+        bytes memory sig = sign(sequencerKey, hpplite.leaseDigest("claim", instanceId2, 0, DL));
         vm.prank(address(0xBEEF));
-        hpplite.claimSequencerFor(instanceId2, 0, sig);
+        hpplite.claimSequencerFor(instanceId2, 0, DL, sig);
         assertEq(hpplite.sequencerWallet(), sequencer);
         assertEq(hpplite.sequencerInstance(), instanceId2);
         assertTrue(hpplite.isLeaseActive());
@@ -541,32 +543,112 @@ contract HPPLiteDATest is Test {
         vm.prank(sequencer);
         hpplite.releaseLease(instanceId2);
         vm.expectRevert("Wrong nonce");
-        hpplite.claimSequencerFor(instanceId2, 0, sig);
+        hpplite.claimSequencerFor(instanceId2, 0, DL, sig);
 
         // a stranger's signature is no claim
-        bytes memory other = sign(0x2, hpplite.leaseDigest("claim", instanceId2, 1));
+        bytes memory other = sign(0x2, hpplite.leaseDigest("claim", instanceId2, 1, DL));
         vm.expectRevert("Not the sequencer");
-        hpplite.claimSequencerFor(instanceId2, 1, other);
+        hpplite.claimSequencerFor(instanceId2, 1, DL, other);
     }
 
     function test_RenewAndReleaseLeaseFor() public {
         uint256 expiry = hpplite.leaseExpiry();
         vm.warp(block.timestamp + 2 minutes);
-        bytes memory renew = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 0));
+        bytes memory renew = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 0, DL));
         vm.prank(address(0xBEEF));
-        hpplite.renewLeaseFor(instanceId, 0, renew);
+        hpplite.renewLeaseFor(instanceId, 0, DL, renew);
         assertGt(hpplite.leaseExpiry(), expiry);
 
         // a renew signature does not release
-        bytes memory renew2 = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 1));
+        bytes memory renew2 = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 1, DL));
         vm.expectRevert("Not sequencer wallet");          // the digest of "release" recovers another signer
-        hpplite.releaseLeaseFor(instanceId, 1, renew2);
+        hpplite.releaseLeaseFor(instanceId, 1, DL, renew2);
 
-        bytes memory release = sign(sequencerKey, hpplite.leaseDigest("release", instanceId, 1));
+        bytes memory release = sign(sequencerKey, hpplite.leaseDigest("release", instanceId, 1, DL));
         vm.prank(address(0xBEEF));
-        hpplite.releaseLeaseFor(instanceId, 1, release);
+        hpplite.releaseLeaseFor(instanceId, 1, DL, release);
         assertFalse(hpplite.isLeaseActive());
         assertEq(hpplite.leaseNonce(), 2);
+    }
+
+    /* #171: a claim signed for an instance that died, held back by a relay,
+    ** must not take the lease from the live instance once its lease lapses */
+    function test_LeaseSig_WithheldClaimRefusedPastDeadline() public {
+        bytes32 dead = keccak256("dead instance");
+        uint256 deadline = block.timestamp + 5 minutes;
+        bytes memory withheld = sign(sequencerKey, hpplite.leaseDigest("claim", dead, 0, deadline));
+        // the live instance holds the lease (the setup's direct claim: the nonce stays 0), then pauses past it
+        vm.warp(block.timestamp + 2 hours);
+        assertFalse(hpplite.isLeaseActive());
+        vm.prank(address(0xBAD));
+        vm.expectRevert("Signature expired");
+        hpplite.claimSequencerFor(dead, 0, deadline, withheld);
+        // the live instance takes it back directly
+        vm.prank(sequencer);
+        hpplite.claimSequencer(instanceId);
+        assertEq(hpplite.sequencerInstance(), instanceId);
+        assertEq(hpplite.leaseNonce(), 0);
+    }
+
+    function test_LeaseSig_DeadlineSigned() public {
+        uint256 deadline = block.timestamp + 5 minutes;
+        bytes memory renew = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 0, deadline));
+        // the deadline is part of what was signed: another one recovers another signer
+        vm.expectRevert("Not the sequencer");
+        hpplite.renewLeaseFor(instanceId, 0, deadline + 1 days, renew);
+        // at the deadline itself it still holds
+        vm.warp(deadline);
+        hpplite.renewLeaseFor(instanceId, 0, deadline, renew);
+        assertEq(hpplite.leaseNonce(), 1);
+    }
+
+    /* #171: the owner's interval write-back with no ETH */
+    function test_SetCheckpointIntervalFor() public {
+        uint256 ownerKey = 0xA11CE;
+        HPPLite h = new HPPLite(100, "hppda", address(0));
+        h.transferOwnership(vm.addr(ownerKey));
+        uint256 deadline = block.timestamp + 5 minutes;
+        bytes memory sig = sign(ownerKey, h.intervalDigest(250, 0, deadline));
+        vm.prank(address(0xBEEF));
+        h.setCheckpointIntervalFor(250, 0, deadline, sig);
+        assertEq(h.checkpointInterval(), 250);
+        assertEq(h.ownerNonce(), 1);
+        vm.expectRevert("Wrong nonce");
+        h.setCheckpointIntervalFor(250, 0, deadline, sig);
+        // the sequencer's key is not the owner's
+        bytes memory seqSig = sign(sequencerKey, h.intervalDigest(7, 1, deadline));
+        vm.expectRevert("Not owner");
+        h.setCheckpointIntervalFor(7, 1, deadline, seqSig);
+        bytes memory late = sign(ownerKey, h.intervalDigest(7, 1, deadline));
+        vm.warp(deadline + 1);
+        vm.expectRevert("Signature expired");
+        h.setCheckpointIntervalFor(7, 1, deadline, late);
+        assertEq(h.checkpointInterval(), 250);
+    }
+
+    /* #171: the domain is computed once, and again on another chain */
+    function test_DomainSeparator_Cached() public {
+        bytes32 typeHash = keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+        bytes32 want = keccak256(abi.encode(typeHash, keccak256("HPPLite"), keccak256("10"), block.chainid, address(hpplite)));
+        assertEq(hpplite.domainSeparator(), want);
+        bytes32 wantDA = keccak256(abi.encode(typeHash, keccak256("HPPLiteDA"), keccak256("3"), block.chainid, address(da)));
+        assertEq(da.domainSeparator(), wantDA);
+        // a fork's chain: the cached value is not used, a signature for this chain is not valid there
+        uint256 deadline = block.timestamp + 5 minutes;
+        bytes memory here = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 0, deadline));
+        vm.chainId(999);
+        assertEq(hpplite.domainSeparator(), keccak256(abi.encode(typeHash, keccak256("HPPLite"), keccak256("10"), 999, address(hpplite))));
+        vm.expectRevert("Not the sequencer");
+        hpplite.renewLeaseFor(instanceId, 0, deadline, here);
+    }
+
+    function test_LeaseSig_Gas() public {
+        uint256 deadline = block.timestamp + 5 minutes;
+        bytes memory renew = sign(sequencerKey, hpplite.leaseDigest("renew", instanceId, 0, deadline));
+        uint256 g = gasleft();
+        hpplite.renewLeaseFor(instanceId, 0, deadline, renew);
+        g -= gasleft();
+        emit log_named_uint("renewLeaseFor gas", g);
     }
 
     function test_SubmitCheckpointFor() public {
@@ -788,5 +870,43 @@ contract HPPLiteFactoryTest is Test {
 
         assertEq(HPPLite(rollup).owner(), address(this));
         assertEq(HPPLiteDA(da).owner(), address(this));
+    }
+
+    function sign(uint256 key, bytes32 digest) internal pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    /* #171: a relay creates the rollup of a wallet with no ETH */
+    function test_CreateRollupFor() public {
+        uint256 key = 0xA11CE;
+        address wallet = vm.addr(key);
+        uint256 deadline = block.timestamp + 5 minutes;
+        bytes memory sig = sign(key, factory.createDigest(wallet, 100, 0, deadline));
+        vm.prank(address(0xBEEF));
+        address rollup = factory.createRollupFor(wallet, 100, 0, deadline, sig);
+        assertEq(factory.getRollup(wallet), rollup);
+        assertEq(HPPLite(rollup).owner(), wallet);
+        assertEq(HPPLite(rollup).sequencer(), wallet);
+        assertEq(HPPLiteDA(factory.getDA(rollup)).owner(), wallet);
+        assertEq(factory.getRollup(address(0xBEEF)), address(0));
+        assertEq(factory.createNonce(wallet), 1);
+        // once: a replay would add rollups to the wallet
+        vm.expectRevert("Wrong nonce");
+        factory.createRollupFor(wallet, 100, 0, deadline, sig);
+        // another wallet's signature creates nothing for this one
+        bytes memory other = sign(0xB0B, factory.createDigest(wallet, 100, 1, deadline));
+        vm.expectRevert("Not owner");
+        factory.createRollupFor(wallet, 100, 1, deadline, other);
+        // a second, named database's rollup: the next nonce
+        bytes memory second = sign(key, factory.createDigest(wallet, 100, 1, deadline));
+        address rollup2 = factory.createRollupFor(wallet, 100, 1, deadline, second);
+        assertEq(factory.getRollupsByOwner(wallet).length, 2);
+        assertEq(factory.getRollup(wallet), rollup);                // the primary stays the first
+        assertTrue(rollup2 != rollup);
+        bytes memory late = sign(key, factory.createDigest(wallet, 100, 2, deadline));
+        vm.warp(deadline + 1);
+        vm.expectRevert("Signature expired");
+        factory.createRollupFor(wallet, 100, 2, deadline, late);
     }
 }

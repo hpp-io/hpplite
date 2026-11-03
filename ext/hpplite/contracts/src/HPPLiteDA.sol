@@ -45,6 +45,8 @@ contract HPPLiteDA {
     uint64 private _lastBlock;    // the block whose log carries the last commitment
     bytes32 public chainHash;    // keccak256(abi.encode(chainHash, height, batchHash)) over every batch, from bytes32(0)
     uint256 public batchSizeLimit;
+    bytes32 private immutable _domain;
+    uint256 private immutable _domainChain;
 
     // ============ Events ============
     event BatchSubmitted(uint256 indexed height, bytes32 indexed batchHash, bytes data, uint256 prevBlock);
@@ -75,12 +77,16 @@ contract HPPLiteDA {
         owner = msg.sender;
         coordinator = HPPLite(_coordinator);
         batchSizeLimit = _batchSizeLimit > 0 ? _batchSizeLimit : 128 * 1024;
+        _domain = EIP712Sig.domain("HPPLiteDA", "3", address(this));
+        _domainChain = block.chainid;
     }
 
     // ============ Signed forms ============
 
+    // The EIP-712 domain, computed once; again only on another chain (#171).
+    // The signed types are unchanged, so the domain's version stays "3"
     function domainSeparator() public view returns (bytes32) {
-        return EIP712Sig.domain("HPPLiteDA", "3", address(this));
+        return block.chainid == _domainChain ? _domain : EIP712Sig.domain("HPPLiteDA", "3", address(this));
     }
 
     /// What the sequencer wallet signs for submitBatchFor / commitBatchFor

@@ -14,6 +14,9 @@ pragma solidity ^0.8.19;
  *      anchoring, no lease transactions of its own), the DA contract
  *      records an anchor as the checkpoint, and the lease, the checkpoint
  *      height and its time share one storage slot.
+ *      Version 10 (#171): a lease signature carries a deadline (one held
+ *      back cannot take a lapsed lease later), the owner's checkpoint
+ *      interval has a signed form, and the domain separator is cached.
  */
 /* The one thing the coordinator asks its DA contract (HPPLiteDA imports
 ** this file, so an interface rather than an import) */
@@ -27,8 +30,9 @@ contract HPPLite {
     using EIP712Sig for bytes32;
 
     // ============ Constants ============
-    uint256 public constant VERSION = 9;   // 9: DA v3 (#164: ranges, recordAnchor, the lease duration settable); 8: signed forms of the lease and checkpoint calls, DA v2 (#33); 7: a checkpoint cannot reach past the DA's height (#44)
-    bytes32 public constant LEASE_TYPEHASH = keccak256("Lease(string action,bytes32 instanceId,uint256 nonce)");
+    uint256 public constant VERSION = 10;  // 10: a deadline in lease signatures, setCheckpointIntervalFor, the factory's createRollupFor (#171); 9: DA v3 (#164: ranges, recordAnchor, the lease duration settable); 8: signed forms of the lease and checkpoint calls, DA v2 (#33); 7: a checkpoint cannot reach past the DA's height (#44)
+    bytes32 public constant LEASE_TYPEHASH = keccak256("Lease(string action,bytes32 instanceId,uint256 nonce,uint256 deadline)");
+    bytes32 public constant INTERVAL_TYPEHASH = keccak256("CheckpointInterval(uint256 interval,uint256 nonce,uint256 deadline)");
     bytes32 public constant CHECKPOINT_TYPEHASH = keccak256("Checkpoint(bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 stateRoot)");
 
     // ============ State ============
@@ -39,6 +43,11 @@ contract HPPLite {
     address public sequencerWallet;
     bytes32 public sequencerInstance;  // Unique per process (e.g., hash of pid+timestamp+random)
     uint256 public leaseNonce;         // spent by every signed lease call: a signature is used once (#126)
+    uint256 public ownerNonce;         // spent by every signed owner call (#171)
+
+    // The EIP-712 domain, computed once; again only on another chain (a fork)
+    bytes32 private immutable _domain;
+    uint256 private immutable _domainChain;
 
     // One slot: what every anchor writes (#164)
     uint64 private _leaseExpiry;
@@ -89,6 +98,8 @@ contract HPPLite {
         daContract = _daContract;
         _leaseDuration = 1 hours;
         _lastCheckpointTime = uint64(block.timestamp);
+        _domain = EIP712Sig.domain("HPPLite", "10", address(this));
+        _domainChain = block.chainid;
     }
 
     // ============ The packed slot, read as before ============
@@ -143,15 +154,23 @@ contract HPPLite {
     // ============ Signed forms (#33, #126) ============
     // The sequencer wallet signs, anyone submits and pays the gas. A lease
     // signature carries the contract's nonce and is spent by its use; a
-    // checkpoint signature names its range, which must be the next one.
+    // direct lease call does not move the nonce, so it also carries a
+    // deadline: a signature handed to a relay and held back cannot take a
+    // lapsed lease from a live instance later (#171). A checkpoint signature
+    // names its range, which must be the next one.
 
     function domainSeparator() public view returns (bytes32) {
-        return EIP712Sig.domain("HPPLite", "9", address(this));
+        return block.chainid == _domainChain ? _domain : EIP712Sig.domain("HPPLite", "10", address(this));
     }
 
     /// What the sequencer wallet signs for claimSequencerFor ("claim"), renewLeaseFor ("renew"), releaseLeaseFor ("release")
-    function leaseDigest(string memory action, bytes32 instanceId, uint256 nonce) public view returns (bytes32) {
-        return domainSeparator().digest(keccak256(abi.encode(LEASE_TYPEHASH, keccak256(bytes(action)), instanceId, nonce)));
+    function leaseDigest(string memory action, bytes32 instanceId, uint256 nonce, uint256 deadline) public view returns (bytes32) {
+        return domainSeparator().digest(keccak256(abi.encode(LEASE_TYPEHASH, keccak256(bytes(action)), instanceId, nonce, deadline)));
+    }
+
+    /// What the owner signs for setCheckpointIntervalFor
+    function intervalDigest(uint256 interval, uint256 nonce, uint256 deadline) public view returns (bytes32) {
+        return domainSeparator().digest(keccak256(abi.encode(INTERVAL_TYPEHASH, interval, nonce, deadline)));
     }
 
     /// What the sequencer wallet signs for submitCheckpointFor
@@ -159,25 +178,28 @@ contract HPPLite {
         return domainSeparator().digest(keccak256(abi.encode(CHECKPOINT_TYPEHASH, instanceId, fromHeight, toHeight, stateRoot)));
     }
 
-    function _spendLeaseSig(string memory action, bytes32 instanceId, uint256 nonce, bytes calldata sig) internal returns (address wallet) {
+    function _spendLeaseSig(string memory action, bytes32 instanceId, uint256 nonce, uint256 deadline, bytes calldata sig)
+        internal returns (address wallet)
+    {
+        require(block.timestamp <= deadline, "Signature expired");
         require(nonce == leaseNonce, "Wrong nonce");
-        wallet = leaseDigest(action, instanceId, nonce).recover(sig);
+        wallet = leaseDigest(action, instanceId, nonce, deadline).recover(sig);
         require(wallet != address(0), "Bad signature");
         leaseNonce = nonce + 1;
     }
 
-    function claimSequencerFor(bytes32 instanceId, uint256 nonce, bytes calldata sig) external {
-        _claim(_spendLeaseSig("claim", instanceId, nonce, sig), instanceId);
+    function claimSequencerFor(bytes32 instanceId, uint256 nonce, uint256 deadline, bytes calldata sig) external {
+        _claim(_spendLeaseSig("claim", instanceId, nonce, deadline, sig), instanceId);
     }
 
-    function renewLeaseFor(bytes32 instanceId, uint256 nonce, bytes calldata sig) external {
-        address wallet = _spendLeaseSig("renew", instanceId, nonce, sig);
+    function renewLeaseFor(bytes32 instanceId, uint256 nonce, uint256 deadline, bytes calldata sig) external {
+        address wallet = _spendLeaseSig("renew", instanceId, nonce, deadline, sig);
         _requireActive(wallet, instanceId);
         _renew(wallet, instanceId);
     }
 
-    function releaseLeaseFor(bytes32 instanceId, uint256 nonce, bytes calldata sig) external {
-        address wallet = _spendLeaseSig("release", instanceId, nonce, sig);
+    function releaseLeaseFor(bytes32 instanceId, uint256 nonce, uint256 deadline, bytes calldata sig) external {
+        address wallet = _spendLeaseSig("release", instanceId, nonce, deadline, sig);
         _release(wallet, instanceId);
     }
 
@@ -323,6 +345,15 @@ contract HPPLite {
     }
 
     function setCheckpointInterval(uint256 _interval) external onlyOwner {
+        checkpointInterval = _interval;
+    }
+
+    /// The owner's signature, anyone's gas: a node with no ETH writes its interval back (#44, #171)
+    function setCheckpointIntervalFor(uint256 _interval, uint256 nonce, uint256 deadline, bytes calldata sig) external {
+        require(block.timestamp <= deadline, "Signature expired");
+        require(nonce == ownerNonce, "Wrong nonce");
+        require(intervalDigest(_interval, nonce, deadline).recover(sig) == owner, "Not owner");
+        ownerNonce = nonce + 1;
         checkpointInterval = _interval;
     }
 

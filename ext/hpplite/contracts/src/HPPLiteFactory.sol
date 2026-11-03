@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "./HPPLite.sol";
 import "./HPPLiteDA.sol";
+import "./EIP712Sig.sol";
 
 /**
  * @title HPPLiteFactory
@@ -14,6 +15,11 @@ import "./HPPLiteDA.sol";
  *   // Then call claimSequencer(instanceId) on the rollup
  */
 contract HPPLiteFactory {
+    using EIP712Sig for bytes32;
+
+    /// A rollup created for the signer, by a relay that pays the gas (#171)
+    bytes32 public constant CREATE_TYPEHASH =
+        keccak256("CreateRollup(address owner,uint256 checkpointInterval,uint256 nonce,uint256 deadline)");
     // ============ Events ============
     event RollupCreated(
         address indexed rollup,
@@ -27,6 +33,24 @@ contract HPPLiteFactory {
     mapping(address => address) public rollupOf;         // owner => their rollup (1:1)
     mapping(address => address[]) public rollupsByOwner; // owner => all rollups
     mapping(address => address) public daOf;             // rollup => its DA contract
+    mapping(address => uint256) public createNonce;      // owner => spent by each createRollupFor: a signature creates one rollup
+
+    bytes32 private immutable _domain;
+    uint256 private immutable _domainChain;
+
+    constructor() {
+        _domain = EIP712Sig.domain("HPPLiteFactory", "10", address(this));
+        _domainChain = block.chainid;
+    }
+
+    function domainSeparator() public view returns (bytes32) {
+        return block.chainid == _domainChain ? _domain : EIP712Sig.domain("HPPLiteFactory", "10", address(this));
+    }
+
+    /// What the owner signs for createRollupFor
+    function createDigest(address owner, uint256 checkpointInterval, uint256 nonce, uint256 deadline) public view returns (bytes32) {
+        return domainSeparator().digest(keccak256(abi.encode(CREATE_TYPEHASH, owner, checkpointInterval, nonce, deadline)));
+    }
 
     // ============ Factory Functions ============
 
@@ -49,6 +73,20 @@ contract HPPLiteFactory {
         string calldata daScheme
     ) external returns (address rollup) {
         return _createRollupInternal(msg.sender, checkpointInterval, daScheme);
+    }
+
+    /**
+     * @notice Create a rollup for `owner`, who signed for it; anyone submits
+     *         and pays the gas (a node with no ETH, through a relay, #171)
+     */
+    function createRollupFor(address owner, uint256 checkpointInterval, uint256 nonce, uint256 deadline, bytes calldata sig)
+        external returns (address rollup)
+    {
+        require(block.timestamp <= deadline, "Signature expired");
+        require(nonce == createNonce[owner], "Wrong nonce");
+        require(owner != address(0) && createDigest(owner, checkpointInterval, nonce, deadline).recover(sig) == owner, "Not owner");
+        createNonce[owner] = nonce + 1;
+        return _createRollupInternal(owner, checkpointInterval, "hppda");
     }
 
     /**

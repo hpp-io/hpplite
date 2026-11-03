@@ -371,17 +371,18 @@ The L1 contract stores:
 - **Configuration** - sequencer address, parameters
 
 ```solidity
-interface IHPPLite {                       // coordinator, VERSION 8
+interface IHPPLite {                       // coordinator, VERSION 10
     function claimSequencer(bytes32 instanceId) external;
     function renewLease(bytes32 instanceId) external;
     function submitCheckpoint(bytes32 instanceId, uint256 from, uint256 to, bytes32 root) external;
-    function claimSequencerFor(bytes32 instanceId, uint256 nonce, bytes sig) external;   // the sequencer's EIP-712 signature, anyone's gas (#126)
+    function claimSequencerFor(bytes32 instanceId, uint256 nonce, uint256 deadline, bytes sig) external;   // the sequencer's EIP-712 signature, anyone's gas (#126, #171)
 }
-interface IHPPLiteDA {                     // store, version 2 (#33)
+interface IHPPLiteDA {                     // store, version 3 (#164)
     function submitBatch(bytes32 instanceId, uint256 height, bytes data) external;        // bytes in the log, hash in chainHash
     function commitBatch(bytes32 instanceId, uint256 height, bytes32 hash, bytes ref, bytes receipt) external;   // bytes elsewhere (#11)
+    function commitRange(bytes32 instanceId, uint256 from, uint256 to, bytes32 chainHashAfter, bytes32 root, bytes32 manifestDigest, bytes receipt) external;   // the anchor (#164)
     function chainHash() external view returns (bytes32);
-    function blockOf(uint256 height) external view returns (uint64);
+    function lastBlock() external view returns (uint256);
 }
 ```
 
