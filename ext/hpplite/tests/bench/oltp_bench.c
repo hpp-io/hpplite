@@ -15,7 +15,7 @@
 ** Usage: oltp_bench [--ext FILE] [--mode read_write|write_only|read_only]
 **                   [--skip-trx] [--tables N] [--rows M] [--seconds S]
 **                   [--dir DIR] [--seed S] [--label TEXT] [--json FILE]
-**                   [--uri "&param=value..."] [--hist] [--think MICROSECONDS] [--pragma "PRAGMA ..."]
+**                   [--uri "&param=value..."] [--l1 local|file:///dir] [--hist] [--think MICROSECONDS] [--pragma "PRAGMA ..."]
 ** Not part of ctest; tools/bench_versions.sh runs it per tag.
 */
 #include "sqlite3.h"
@@ -38,7 +38,8 @@ static struct {
     Mode mode;
     int skipTrx, tables, rows, seconds, hist, busyPoll, thinkUs, slow, extPlain;
     uint64_t seed;
-} opt = { NULL, "/tmp/hpplite_oltp", "", NULL, "", NULL, MODE_RW, 0, 4, 10000, 10, 0, 0, 0, 0, 0, 42 };
+    const char *l1;                 /* --l1: local (default, kept nowhere) or file:///dir (#35) */
+} opt = { NULL, "/tmp/hpplite_oltp", "", NULL, "", NULL, MODE_RW, 0, 4, 10000, 10, 0, 0, 0, 0, 0, 42, NULL };
 
 static double now_ms(void) {
     struct timespec ts;
@@ -146,6 +147,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--label")) opt.label = v;
         else if (!strcmp(a, "--json")) opt.json = v;
         else if (!strcmp(a, "--uri")) opt.uriExtra = v;
+        else if (!strcmp(a, "--l1")) opt.l1 = v;                    /* local (default: kept nowhere), or file:///dir: the posted bytes land there (#35) */
         else if (!strcmp(a, "--think")) opt.thinkUs = atoi(v);
         else if (!strcmp(a, "--pragma")) opt.pragma = v;
         else if (!strcmp(a, "--tables")) opt.tables = atoi(v);
@@ -181,7 +183,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (opt.extPlain) snprintf(uri, sizeof(uri), "file:%s?%s", path, opt.uriExtra);
-        else snprintf(uri, sizeof(uri), "file:%s?hpplite=on&l1=local&privkey=0x" PRIVKEY_HEX "&datadir=%s%s", path, opt.dir, opt.uriExtra);
+        else snprintf(uri, sizeof(uri), "file:%s?hpplite=on&l1=%s&privkey=0x" PRIVKEY_HEX "&datadir=%s%s", path, opt.l1 ? opt.l1 : "local", opt.dir, opt.uriExtra);
     } else {
         snprintf(uri, sizeof(uri), "file:%s?%s", path, opt.uriExtra);
     }

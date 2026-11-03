@@ -905,13 +905,14 @@ void hpplite_node_destroy(HppliteNode *node) {
     /* Shutdown HPPLite context */
     if (node->ctx) {
         if (node->pm) { hpplite_pagemode_stop(node->pm); node->pm = NULL; }
+        node->ctx->xWalMaint = NULL; node->ctx->pWalMaintArg = NULL;     /* before the context goes */
         hpplite_shutdown(node->ctx);
+        node->ctx = NULL;
     }
 
     if (node->pieceDb) { sqlite3_exec(node->pieceDb, "ROLLBACK", NULL, NULL, NULL); sqlite3_close(node->pieceDb); node->pieceDb = NULL; }
     node_ck_close(node);
     node_pins_close(node);
-    if (node->ctx) { node->ctx->xWalMaint = NULL; node->ctx->pWalMaintArg = NULL; }
     if (node->bkDb) {
         sqlite3_close(node->bkDb);
     }
