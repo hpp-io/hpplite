@@ -32,8 +32,17 @@ tests/real_apps/docker/wordpress.sh
   is rebuilt against the volume's SQLite amalgamation (the bundled one
   truncates bound strings in expanded SQL), then Ghost's Admin API session
   (`ghost/drive.py`) and the replica check on the host.
+- `Dockerfile.homeassistant`, `homeassistant.sh`, `homeassistant_inner.sh`:
+  Python 3.13, Home Assistant from pip with the requirements of the
+  integrations the suite's configuration loads (inside Docker, Home
+  Assistant installs nothing at first start: the image carries it; the
+  requirements come from the integrations' manifests), the `.pth` preload;
+  inside, the recorder under `homeassistant/configuration.yaml` for 150 s
+  (`HPPLITE_HA_SECONDS`), a SIGTERM, the database copied out; the replica
+  check on the host.
 
 ```bash
 tests/real_apps/docker/rails.sh
 tests/real_apps/docker/ghost.sh
+tests/real_apps/docker/homeassistant.sh
 ```

@@ -1,0 +1,41 @@
+# Home Assistant on HPPLite, in a container (tests/real_apps/docker/homeassistant.sh).
+# Python 3.13 on the Debian the module is built for (trixie, so.sh), the
+# runtime libraries the module links, Home Assistant from pip, and the
+# preload that puts HPPLite into Python's sqlite3 when the interpreter starts
+# (a .pth file: Home Assistant has no hook for SQLite extensions).
+FROM python:3.13-trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsecp256k1-2 libcurl4t64 zlib1g build-essential libffi-dev libturbojpeg0 ca-certificates curl sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir homeassistant
+# Inside Docker, Home Assistant does not install what its integrations need
+# at first start (the official image carries it all), so the image carries
+# what the suite's configuration and the integrations Home Assistant loads
+# by default need: the requirements of those integrations and of everything
+# they depend on, read from their manifests.
+RUN python - <<'PY'
+import json, os, subprocess, sys
+import homeassistant.components as c
+root = os.path.dirname(c.__file__)
+want = ["frontend", "cloud", "http", "recorder", "counter", "input_number", "input_boolean", "template", "automation",
+        "onboarding", "config", "websocket_api", "api", "system_log", "lovelace", "history", "logbook", "person", "sun", "zone"]
+seen, reqs = set(), set()
+while want:
+    n = want.pop()
+    if n in seen: continue
+    seen.add(n)
+    m = os.path.join(root, n, "manifest.json")
+    if not os.path.exists(m): continue
+    j = json.load(open(m))
+    reqs.update(j.get("requirements", []))
+    want.extend(j.get("dependencies", []) + j.get("after_dependencies", []))
+cons = os.path.join(os.path.dirname(root), "package_constraints.txt")
+print(len(seen), "integrations,", len(reqs), "requirements")
+sys.exit(subprocess.call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "-c", cons] + sorted(reqs)))
+PY
+COPY homeassistant/hpplite_preload.py /tmp/hpplite_preload.py
+RUN SP=$(python -c "import site; print(site.getsitepackages()[0])") && cp /tmp/hpplite_preload.py "$SP/" && echo "import hpplite_preload" > "$SP/hpplite.pth"
+RUN mkdir -p /ha/config
+COPY homeassistant/configuration.yaml /ha/config/configuration.yaml
+WORKDIR /ha
