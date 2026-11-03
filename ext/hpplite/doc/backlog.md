@@ -190,7 +190,8 @@ batches; `workflow_dispatch` takes a duration.
 - **v0.1 — Small databases, on-chain DA** (complete, end of life): scope: databases up to ~100 MB, batches in contract storage on L1 (the cost driver; #11/#33).
 - **v0.2 — Verification** (v0.2.0 tagged 2026-11-01): #19 row capture by default, #5 `hpplite verify`, several writers per file, the fault harness (#98) as the gate, the SQLite-dependence inventory and trunk CI job (#105, #108). Still open in the milestone: #49 realistic singleton tests on anvil, #62 the SQLite TCL suite with HPPLite on every connection.
 - **v0.3 — Large databases, economical DA** (v0.3.0 tagged 2026-11-02): #11 off-chain stores with L1 commitments (pin service over x402, Kubo, S3) and the status row for them, #9 incremental state root, #12 batch compression, the soak through a store. These shipped together: cheap DA invites the sizes where a full-scan root is the wall. Open flakes #132, #133.
-- **v0.4 — Keys**: #17 key roles and provisioning (runtime injection, keystore V3, signer interface, owner/sequencer split), #15 viewing keys and the public-key envelope, #126 the HPP-only node by relay (waits on HPP), x402 `upto`/channels for store payments.
+- **v0.4 — Keys and page capture**: #17 key roles and provisioning (runtime injection, keystore V3, signer interface, owner/sequencer split), #15 viewing keys and the public-key envelope, #146 page capture (the pages each commit wrote, read from the WAL file; a Merkle root over the file's pages; the default for a new rollup).
+- **v0.5 — HPP economics**: #126 the HPP-only node (commitments and the lease by relay over x402, pinning priced in HPP), #135 one payment authorization for many puts. Both wait on HPP's side.
 - **v1.0 — Stable formats**: frozen batch JSON / `_hpplite_meta` / `hppda://`, bindings.
 
 ---
