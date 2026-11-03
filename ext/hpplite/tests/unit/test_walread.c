@@ -6,6 +6,8 @@
 #include "test_lib.h"
 #include "walread.h"
 #include <sys/stat.h>
+#include <limits.h>
+#include <stdlib.h>
 
 #define DIR "/tmp/hpplite_test_walread"
 
@@ -56,7 +58,7 @@ static unsigned char *read_file(const char *path, size_t *pLen) {
     *pLen = (size_t)n; return buf;
 }
 static int exec_ok(sqlite3 *db, const char *sql) { return sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK; }
-static const char *key(sqlite3 *db) { static char z[1024]; const char *f = sqlite3_db_filename(db, "main"); return realpath(f, z) ? z : f; }
+static const char *key(sqlite3 *db) { static char z[PATH_MAX]; const char *f = sqlite3_db_filename(db, "main"); return realpath(f, z) ? z : f; }   /* realpath wants PATH_MAX (4 KB on Linux) */
 
 static void test_commits_rebuild_the_file(void) {
     TEST("a watched database's commits, polled after each, with checkpoints and a WAL restart between, rebuild the file byte for byte");
@@ -103,7 +105,7 @@ static void test_in_flight_and_start_frame(void) {
     hpplite_walread_poll(key(db), 0);
     if (s.n != 0) FAIL("a sink was called for an unwatched database");
     /* the frames the WAL holds already (the CREATE's, the INSERT's): a watch from there delivers only what comes after */
-    struct stat st; char wal[1100]; snprintf(wal, sizeof wal, "%s-wal", key(db));
+    struct stat st; char wal[PATH_MAX + 8]; snprintf(wal, sizeof wal, "%s-wal", key(db));
     unsigned held = stat(wal, &st) == 0 && st.st_size > 32 ? (unsigned)((st.st_size - 32) / (24 + 4096)) : 0;
     if (held < 2) FAILF("expected frames in the WAL, found %u", held);
     if (hpplite_walread_watch(key(db), sink, &s, held) != SQLITE_OK) FAIL("watch");
