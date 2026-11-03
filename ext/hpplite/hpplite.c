@@ -500,7 +500,8 @@ static int pagesTrace(unsigned mask, void *pArg, void *pS, void *pX) {
     ** in autocommit (vdbeapi.c, doWalCallbacks): a statement reset after a
     ** row - RETURNING stepped once, a driver's .get() - commits at the reset
     ** without it. The statement's end reads whatever was committed since */
-    if (!pCtx->bWalHookFired && pCtx->zWalKey) hpplite_walread_poll(pCtx->zWalKey, 0);
+    if (!pCtx->bWalHookFired && pCtx->zWalKey && sqlite3_get_autocommit(pCtx->db) && !sqlite3_stmt_readonly((sqlite3_stmt *)pS))
+      hpplite_walread_poll(pCtx->zWalKey, 0);                   /* only a statement that can have committed: not one inside a transaction, not a read */
   }
   return 0;
 }

@@ -108,12 +108,49 @@ static int readAt(int fd, unsigned char *p, size_t n, off_t off) {
 }
 
 /* with the reader's lock: the frames committed since the cursor, to mxFrame (0: the file's end) */
+/* the committing connection's own frames, with the count SQLite handed its
+** hook: no stat, no header read, no checksum (the frames are this process's,
+** written a moment ago); the salts are checked, and anything unexpected
+** (a restart, a short read) falls back to the full look */
+static int pollOwnLocked(Reader *r, unsigned mxFrame, int *pDone) {
+  unsigned frameSz = FRAME_HDR + (unsigned)r->pageSize, f = r->next, i, n;
+  int delivered = 0, got;
+  *pDone = 0;
+  if (r->fd < 0 || r->next == 0 || mxFrame < r->next || !r->buf) return 0;
+  while (f <= mxFrame) {
+    n = mxFrame - f + 1;
+    if (n > READ_FRAMES) n = READ_FRAMES;
+    got = readAt(r->fd, r->buf, (size_t)n * frameSz, (off_t)WAL_HDR + (off_t)(f - 1) * frameSz);
+    if (got < (int)frameSz) { txnFree(r); return 0; }
+    n = (unsigned)got / frameSz;
+    for (i = 0; i < n; i++, f++) {
+      const unsigned char *fr = r->buf + (size_t)i * frameSz;
+      unsigned pg = be32(fr), nTrunc = be32(fr + 4);
+      if (be32(fr + 8) != r->salt1 || be32(fr + 12) != r->salt2) { txnFree(r); return 0; }   /* not this generation: the full look */
+      if (txnAdd(r, pg, fr + FRAME_HDR) != SQLITE_OK) { txnFree(r); return 0; }
+      if (nTrunc) { txnCommit(r, f, nTrunc); r->next = f + 1; delivered++; }
+    }
+  }
+  txnFree(r);                                       /* a transaction in flight past mxFrame: next time */
+  *pDone = 1;
+  return delivered;
+}
+
 static int pollLocked(Reader *r, unsigned mxFrame) {
   unsigned char hdr[WAL_HDR];
   struct stat st;
   unsigned magic, pageSize, salt1, salt2, frameSz, mx, f;
   unsigned hs1 = 0, hs2 = 0;
   int delivered = 0;
+  if (mxFrame) {
+    int done = 0;
+    delivered = pollOwnLocked(r, mxFrame, &done);
+    if (done) {
+      /* the checksum chain is not advanced here: the next full look rebuilds
+      ** it from the last commit frame's stored checksum */
+      return delivered;
+    }
+  }
   if (r->fd < 0) {
     r->fd = open(r->zWal, O_RDONLY | O_CLOEXEC);
     if (r->fd < 0) return 0;                        /* no WAL yet (or deleted: a switch out of WAL mode) */
@@ -135,6 +172,12 @@ static int pollLocked(Reader *r, unsigned mxFrame) {
     r->next = 1; r->s1 = hs1; r->s2 = hs2;
     txnFree(r);
     sqlite3_free(r->buf); r->buf = NULL;
+  } else if (r->next > 1) {
+    /* the chain through frame next-1, as that frame stores it (the fast path
+    ** moves the cursor without computing it) */
+    unsigned char fh[FRAME_HDR];
+    if (readAt(r->fd, fh, FRAME_HDR, (off_t)WAL_HDR + (off_t)(r->next - 2) * (FRAME_HDR + (off_t)r->pageSize)) == FRAME_HDR
+        && be32(fh + 8) == salt1 && be32(fh + 12) == salt2) { r->s1 = be32(fh + 16); r->s2 = be32(fh + 20); }
   }
   if (!r->buf) { r->buf = sqlite3_malloc64((sqlite3_uint64)READ_FRAMES * (FRAME_HDR + (sqlite3_uint64)r->pageSize)); if (!r->buf) return SQLITE_NOMEM; }
   frameSz = FRAME_HDR + pageSize;
