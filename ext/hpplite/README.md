@@ -153,6 +153,8 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
 | `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls), `kubo://host:port` of a Kubo node's RPC, or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (none from Kubo or a bucket) (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
 | `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
+| `relay` | No | `http://host:port` of a relay ([examples/relay](examples/relay/README.md), #170): every write to the chain goes there as its EIP-712 signed form, paid over x402 like the store: creating the rollup (VERSION 10 factories), the lease, anchors, commitments, checkpoints. A wallet with USDC.e and no ETH runs this way. When the relay fails, the wallet sends the plain transaction itself if it holds ETH; otherwise the write waits and `last_error` says why (#126). Also `HPPLITE_RELAY` |
+| `relaycap` | No | The most to pay the relay per call, in its asset's atomic units; 0 (default) pays nothing. Also `HPPLITE_RELAY_CAP` |
 | `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
 | `anchor` | No | With `store=` on a chain that takes ranges (VERSION 9 and later, #164, the `hpp-sepolia` factory): how often the batches the store holds are anchored on the chain in one commitment: `5m`, `30m` (default: HPP's cadence), `1h`; `0` = at close and on `hpplite_anchor()` only. Also `HPPLITE_ANCHOR`. See Stores and commitments |
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
@@ -534,7 +536,9 @@ read at most every 30 s; NULL without a paid store on this chain), `anchored`
 NULL without a chain), `last_anchor_tx` (the transaction of this node's
 last anchor) and `last_checkpoint_root` (the root the last checkpoint or
 anchor carried; a page-mode file keeps its bookkeeping in the sidecar, so
-the row is the way to read it). `state` says what this node is doing about posting: `sequencing`,
+the row is the way to read it), `relay` and `relay_spent` (`relay=`, #126:
+the URL and what this process paid it, in its asset's atomic units) and
+`last_tx_path` (`relay` or `direct`: how the last write reached the chain). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
@@ -704,6 +708,23 @@ chain, the offline fixture for `hpplite-verify`, and the crash harness
 (`crash_hpplite --l1 dir`). What it is not: data availability - the
 directory is as available as the disk it is on. The crash harness and the
 directory test (`test_l1_dir`) run against it in every build.
+
+### No ETH: a relay (#126, #170)
+
+With `store=` and `relay=`, a node needs no ETH at all: its wallet holds
+USDC.e, the store is paid per put and the relay per transaction, both over
+x402. The relay ([examples/relay](examples/relay/README.md)) takes each
+write as the contract's signed form: `createRollupFor` at the first open
+(VERSION 10 factories), `claimSequencerFor`/`renewLeaseFor`/`releaseLeaseFor`
+(the lease signature carries a ten-minute deadline), `commitRangeFor` per
+anchor, and the others where they apply. It pays the gas and settles the
+payment once the transaction has landed. The contracts check every
+signature, so a relay cannot forge, alter or misattribute a write; it can
+only delay one. If it doesn't answer, an anchor waits with the relay's
+reason in `last_error` and goes through at the next anchor; a wallet that
+holds ETH sends the plain call itself instead. On anvil (scenario 27) a
+wallet with MockUSDC and 0 ETH creates its rollup, writes, anchors and
+releases, and a replica rebuilds.
 
 ### A storage provider: `examples/pin_service/`
 

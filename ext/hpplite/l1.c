@@ -109,6 +109,24 @@ uint64_t hpplite_l1_chain_id(HppliteL1 *l1) {
     return (l1 && l1->ops->chain_id) ? l1->ops->chain_id(l1) : 0;
 }
 
+void hpplite_l1_set_relay(HppliteL1 *l1, struct HppliteStore *relay) {
+    if (l1 && l1->ops->set_relay) l1->ops->set_relay(l1, relay);
+}
+
+const char *hpplite_l1_last_tx_path(HppliteL1 *l1) {
+    return (l1 && l1->ops->last_tx_path) ? l1->ops->last_tx_path(l1) : NULL;
+}
+
+const char *hpplite_l1_relay_error(HppliteL1 *l1) {
+    return (l1 && l1->ops->relay_error) ? l1->ops->relay_error(l1) : NULL;
+}
+
+int hpplite_l1_factory_create_rollup_for(const char *rpc_url, const char *factory_address, const uint8_t privkey[32],
+                                         struct HppliteStore *relay, uint64_t checkpointInterval, uint8_t rollup_out[20]) {
+    const HppliteL1Ops *ops = backendFor(rpc_url);
+    return ops->factory_create_rollup_for ? ops->factory_create_rollup_for(rpc_url, factory_address, privkey, relay, checkpointInterval, rollup_out) : -2;
+}
+
 int hpplite_l1_token_balance(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]) {
     return (l1 && l1->ops->token_balance) ? l1->ops->token_balance(l1, token, owner, out) : -1;
 }

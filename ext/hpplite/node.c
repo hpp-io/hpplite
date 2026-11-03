@@ -143,6 +143,18 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeCap = config->storeCap;
     node->config.storeFallback = config->storeFallback;
     node->config.anchorIntervalMs = config->anchorIntervalMs;
+    node->config.relayUrl = node_strdup(config->relayUrl);
+    node->config.relayCap = config->relayCap;
+    if (node->config.relayUrl) {
+        /* the relay (#126): an x402-paid service like the store, its /commit takes the signed forms */
+        if (strncmp(node->config.relayUrl, "http://", 7) != 0 && strncmp(node->config.relayUrl, "https://", 8) != 0) node->relay = NULL;
+        else node->relay = hpplite_store_open(node->config.relayUrl, config->hasPrivkey ? config->privkey : NULL, config->relayCap);
+        if (node->relay) hpplite_store_set_relay(node->relay);
+        if (!node->relay) {
+            fprintf(stderr, "hpplite: relay=%s: not a relay URL (http://host:port of examples/relay or a service like it)\n", node->config.relayUrl);
+            return -1;
+        }
+    }
     if (node->config.storeUrl) {
         /* the batch bytes' store (#11): the chain will hold commitments only */
         node->store = hpplite_store_open(node->config.storeUrl, config->hasPrivkey ? config->privkey : NULL, config->storeCap);
@@ -588,6 +600,11 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     ** unnamed database uses. A named database's must never be it: the
     ** primary comes first (getOrCreateRollup is idempotent, also when two
     ** processes ask at once) */
+    if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) == 0 && node->relay
+        && hpplite_l1_factory_create_rollup_for(config->rpcUrl, factoryHex, config->privkey, node->relay,
+                                                config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100, rollup) == 0) {
+        /* the primary, through the relay (#126) */
+    }
     if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) == 0) {
         char *txHash = hpplite_l1_factory_get_or_create_rollup(config->rpcUrl, factoryHex, config->privkey, rollup);
         if (txHash) {
@@ -610,6 +627,12 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet (its databases: %s); creating one\n",
             zName, zOthers ? zOthers : "none named");
     sqlite3_free(zOthers);
+    if (node->relay) {
+        int rc = hpplite_l1_factory_create_rollup_for(config->rpcUrl, factoryHex, config->privkey, node->relay,
+                                                      config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100, rollup);
+        if (rc == 0) return 1;
+        if (rc == -1) return 0;
+    }
     return hpplite_l1_factory_create_rollup(config->rpcUrl, factoryHex, config->privkey,
                                             config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100,
                                             rollup);
@@ -649,6 +672,14 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
         if (result == 0 && config->verifyOnly) {
             fprintf(stderr, "hpplite: role=verify: this wallet has no rollup on this factory; nothing to verify\n");
             return;
+        }
+        if (result == 0 && !named && node->relay) {
+            /* through the relay (#126): createRollupFor, the wallet's signature, the relay's gas */
+            int rc = hpplite_l1_factory_create_rollup_for(config->rpcUrl, factoryHex, config->privkey, node->relay,
+                                                          config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100, rollup);
+            if (rc == 0) result = hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup);
+            /* -2: created from the wallet below (a factory before VERSION 10, or the relay failed and the wallet can pay) */
+            else if (rc == -1) result = -1;
         }
         if (result == 0 && !named) {
             /* No rollup exists - create one */
@@ -917,6 +948,10 @@ void hpplite_node_destroy(HppliteNode *node) {
         hpplite_store_close(node->store);
         node->store = NULL;
     }
+    if (node->relay) {
+        hpplite_store_close(node->relay);
+        node->relay = NULL;
+    }
 
     /* Shutdown HPPLite context */
     if (node->ctx) {
@@ -969,6 +1004,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     sqlite3_free(node->config.dbPath);
     sqlite3_free(node->config.dbName);
     sqlite3_free(node->config.storeUrl);
+    sqlite3_free(node->config.relayUrl);
     free(node->aReaders);
     memset(node->viewKey, 0, sizeof node->viewKey);
     memset(node->seriesDek, 0, sizeof node->seriesDek);
@@ -1017,6 +1053,7 @@ static void node_cap_batch_limit(HppliteNode *node) {
 static void node_learn_batch_limit(HppliteNode *node) {
     HppliteSystemConfig *cfg;
     if (!node || !node->l1) return;
+    if (node->relay) hpplite_l1_set_relay(node->l1, node->relay);     /* before the interval write-back below (#126) */
     cfg = hpplite_l1_get_system_config(node->l1);
     if (cfg) {
         if (cfg->batchSizeLimit > 0) node->config.maxBatchBytes = (size_t)cfg->batchSizeLimit;
@@ -1915,7 +1952,9 @@ static int node_anchor(HppliteNode *node) {
         hpplite_error_clear(ctx);
         rc = 1;
     } else {
-        hpplite_error(ctx, "anchor: the chain did not take the commitment of batches %llu-%llu; tried again at the next anchor", (unsigned long long)from, (unsigned long long)to);
+        const char *zRelay = hpplite_l1_relay_error(node->l1);    /* why the relay did not take it (#126) */
+        hpplite_error(ctx, "anchor: the chain did not take the commitment of batches %llu-%llu%s%s%s; tried again at the next anchor",
+                      (unsigned long long)from, (unsigned long long)to, zRelay ? " (relay: " : "", zRelay ? zRelay : "", zRelay ? ")" : "");
         rc = -1;
     }
     free(text); sqlite3_free(zRef); sqlite3_free(zReceipt);

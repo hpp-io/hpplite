@@ -288,6 +288,20 @@ int eth_client_set_privkey(EthClient *client, const uint8_t privkey[32]) {
     return 0;
 }
 
+int eth_client_sign_hash(EthClient *client, const uint8_t hash[32], uint8_t sig[65]) {
+    int recid;
+    if (!client || !client->has_privkey) return -1;
+    if (client->signFn) {
+        if (client->signFn(client->signArg, hash, sig, &recid) != 0 || recid < 0 || recid > 1) return -1;
+    } else {
+        secp256k1_ecdsa_recoverable_signature rs;
+        if (!secp256k1_ecdsa_sign_recoverable(client->secp_ctx, &rs, hash, client->privkey, NULL, NULL)) return -1;
+        secp256k1_ecdsa_recoverable_signature_serialize_compact(client->secp_ctx, sig, &recid, &rs);
+    }
+    sig[64] = (uint8_t)(27 + recid);
+    return 0;
+}
+
 int eth_client_set_signer(EthClient *client, EthSignFn fn, void *arg, const uint8_t address[20]) {
     if (!client || !fn || !address) return -1;
     memset(client->privkey, 0, 32);
@@ -421,6 +435,25 @@ uint64_t eth_client_get_nonce(EthClient *client, const uint8_t address[20]) {
     uint64_t nonce = strtoull(result->valuestring, NULL, 16);
     cJSON_Delete(response);
     return nonce;
+}
+
+int eth_client_has_balance(EthClient *client, const uint8_t address[20]) {
+    cJSON *params = cJSON_CreateArray(), *response, *result;
+    char *addr_hex = eth_hex_encode(address, 20);
+    const char *p;
+    int has = -1;
+    cJSON_AddItemToArray(params, cJSON_CreateString(addr_hex));
+    cJSON_AddItemToArray(params, cJSON_CreateString("latest"));
+    free(addr_hex);
+    response = rpc_call(client, "eth_getBalance", params);
+    if (!response) return -1;
+    result = cJSON_GetObjectItem(response, "result");
+    if (result && cJSON_IsString(result) && strncmp(result->valuestring, "0x", 2) == 0) {
+        for (p = result->valuestring + 2; *p == '0'; p++) {}
+        has = *p != 0;
+    }
+    cJSON_Delete(response);
+    return has;
 }
 
 uint64_t eth_client_gas_price(EthClient *client) {

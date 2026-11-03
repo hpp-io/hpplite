@@ -50,6 +50,7 @@ struct HppliteStore {
     unsigned char signer[20];
     unsigned char payTo[20];        /* the receipt domain's verifyingContract */
     uint64_t chainId;
+    int isRelay;                    /* opened for relay= (#126): its messages name the relay and relaycap */
     char error[256];
     char streamError[200];          /* Kubo's X-Stream-Error trailer of the last request, "" when none */
     HppliteCrypto *crypto;
@@ -225,7 +226,8 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         }
         amt = strtoull(amount->valuestring, NULL, 10);
         if (!s->hasKey) { snprintf(s->error, sizeof s->error, "the store asks %llu and this node has no key to pay with", (unsigned long long)amt); cJSON_Delete(req); return NULL; }
-        if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the store asks %llu, storecap is %llu: refused", (unsigned long long)amt, (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
+        if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the %s asks %llu, %s is %llu: refused", s->isRelay ? "relay" : "store",
+                                     (unsigned long long)amt, s->isRelay ? "relaycap" : "storecap", (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
         if (strncmp(network->valuestring, "eip155:", 7) == 0) chainId = strtoull(network->valuestring + 7, NULL, 10);
 
         /* domain = keccak(typehash, keccak(name), keccak(version), chainId, asset) */
@@ -720,6 +722,33 @@ static char *kuboAdd(HppliteStore *s, const uint8_t *data, size_t len) {
     curl_easy_cleanup(c);
     free(out.p);
     return zRef;
+}
+
+void hpplite_store_set_relay(HppliteStore *s) { if (s) s->isRelay = 1; }
+
+long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *body, size_t len, char **pzOut) {
+    Buf out = {0};
+    char *zRequired = NULL, *zResponse = NULL;
+    long status;
+    if (pzOut) *pzOut = NULL;
+    if (!s || s->kind != STORE_PIN || !path || !body) return 0;
+    s->error[0] = 0;
+    status = storeRequest(s, "POST", path, body, len, NULL, &out, &zRequired, NULL);
+    if (status == 402 && zRequired) {
+        uint64_t amount = 0;
+        char *zPay = storePay(s, zRequired, &amount);
+        free(out.p); out.p = NULL; out.n = 0;
+        if (!zPay) { sqlite3_free(zRequired); return 402; }
+        status = storeRequest(s, "POST", path, body, len, zPay, &out, NULL, &zResponse);
+        sqlite3_free(zPay);
+        if (status == 200 && zResponse) { s->spent += amount; s->calls++; }
+    }
+    sqlite3_free(zRequired);
+    sqlite3_free(zResponse);
+    if (status == 200) s->nOk++;
+    if (pzOut && out.p) *pzOut = sqlite3_mprintf("%.*s", (int)out.n, out.p);
+    free(out.p);
+    return status;
 }
 
 char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char **pzReceipt) {

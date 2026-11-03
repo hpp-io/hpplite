@@ -10,6 +10,8 @@
 #include "eth_client.h"
 #include "abi.h"
 #include "keccak256.h"
+#include "store.h"
+#include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -50,6 +52,13 @@ typedef struct EthL1 {
     uint64_t nIndexAlloc;
     uint64_t indexedHeight;
     uint64_t lastIndexedBlock; /* the block the last walk started from: the next walk stops there */
+
+    /* relay= (#126): the signed forms of the node's writes go through it,
+    ** paid over x402; the plain call only when it fails and the wallet
+    ** holds ETH */
+    HppliteStore *relay;
+    const char *lastPath;      /* "relay" or "direct": how the last write went (NULL: none yet) */
+    char relayError[240];
 } EthL1;
 
 /* The backend's view of the l1 parameter */
@@ -84,6 +93,10 @@ static uint8_t SEL_GET_ROLLUP[4];
 static uint8_t SEL_HAS_ROLLUP[4];
 static uint8_t SEL_FORCE_EXPIRE_LEASE[4];
 static uint8_t SEL_SET_SEQUENCER[4];        /* setSequencer(address): the owner rotates the hot key (#17) */
+/* The signed forms (#126): the same call with the wallet's EIP-712 signature, anyone's gas */
+static uint8_t SEL_COMMIT_RANGE_FOR[4], SEL_SUBMIT_BATCH_FOR[4], SEL_COMMIT_BATCH_FOR[4];
+static uint8_t SEL_CLAIM_FOR[4], SEL_RENEW_FOR[4], SEL_RELEASE_FOR[4], SEL_CHECKPOINT_FOR[4], SEL_INTERVAL_FOR[4];
+static uint8_t SEL_CREATE_FOR[4], SEL_LEASE_NONCE[4], SEL_OWNER_NONCE[4], SEL_CREATE_NONCE[4];
 static uint8_t SEL_RELEASE_LEASE[4];
 static uint8_t SEL_GET_OR_CREATE_ROLLUP[4];
 static uint8_t SEL_GET_ROLLUPS_BY_OWNER[4];
@@ -146,6 +159,20 @@ static void init_selectors(void) {
     abi_function_selector("getRollupsByOwner(address)", SEL_GET_ROLLUPS_BY_OWNER);
     abi_function_selector("createRollup(uint256)", SEL_CREATE_ROLLUP);
     abi_function_selector("createSimpleRollup(address)", SEL_CREATE_SIMPLE_ROLLUP);
+
+    /* The signed forms a relay submits (#126) and the nonces they spend */
+    abi_function_selector("commitRangeFor(bytes32,uint256,uint256,bytes32,bytes32,bytes32,bytes,bytes)", SEL_COMMIT_RANGE_FOR);
+    abi_function_selector("submitBatchFor(bytes32,uint256,bytes,bytes)", SEL_SUBMIT_BATCH_FOR);
+    abi_function_selector("commitBatchFor(bytes32,uint256,bytes32,bytes,bytes,bytes)", SEL_COMMIT_BATCH_FOR);
+    abi_function_selector("claimSequencerFor(bytes32,uint256,uint256,bytes)", SEL_CLAIM_FOR);
+    abi_function_selector("renewLeaseFor(bytes32,uint256,uint256,bytes)", SEL_RENEW_FOR);
+    abi_function_selector("releaseLeaseFor(bytes32,uint256,uint256,bytes)", SEL_RELEASE_FOR);
+    abi_function_selector("submitCheckpointFor(bytes32,uint256,uint256,bytes32,bytes)", SEL_CHECKPOINT_FOR);
+    abi_function_selector("setCheckpointIntervalFor(uint256,uint256,uint256,bytes)", SEL_INTERVAL_FOR);
+    abi_function_selector("createRollupFor(address,uint256,uint256,uint256,bytes)", SEL_CREATE_FOR);
+    abi_function_selector("leaseNonce()", SEL_LEASE_NONCE);
+    abi_function_selector("ownerNonce()", SEL_OWNER_NONCE);
+    abi_function_selector("createNonce(address)", SEL_CREATE_NONCE);
 
     selectors_initialized = 1;
 }
@@ -230,15 +257,209 @@ static char *txHashString(uint8_t *tx_hash) {
     return out;
 }
 
+/* ============ The relay (#126) ============ */
+
+/* One argument of a call: a 32-byte word at p, or (dyn) n bytes */
+typedef struct AbiArg { const uint8_t *p; size_t n; int dyn; } AbiArg;
+
+/* selector || the arguments, ABI-encoded (malloc), its length in *pLen */
+static uint8_t *abi_call(const uint8_t sel[4], const AbiArg *a, int nArg, size_t *pLen) {
+    size_t head = 32 * (size_t)nArg, tail = 0, off, n;
+    uint8_t *out;
+    int i;
+    for (i = 0; i < nArg; i++) if (a[i].dyn) tail += 32 + (a[i].n + 31) / 32 * 32;
+    n = 4 + head + tail;
+    out = calloc(1, n);
+    if (!out) return NULL;
+    memcpy(out, sel, 4);
+    off = head;
+    for (i = 0; i < nArg; i++) {
+        uint8_t *slot = out + 4 + 32 * (size_t)i;
+        if (a[i].dyn) {
+            abi_encode_uint64(off, slot);
+            abi_encode_uint64(a[i].n, out + 4 + off);
+            if (a[i].n) memcpy(out + 4 + off + 32, a[i].p, a[i].n);
+            off += 32 + (a[i].n + 31) / 32 * 32;
+        } else {
+            memcpy(slot, a[i].p, 32);
+        }
+    }
+    *pLen = n;
+    return out;
+}
+
+/* The EIP-712 digest of a struct (its type string and its fields, 32 bytes each) in a contract's domain */
+static void eip712_digest(const char *zName, const char *zVersion, uint64_t chainId, const uint8_t contract[20],
+                          const char *zType, const uint8_t *fields, size_t nFields, uint8_t out[32]) {
+    static const char zDomainType[] = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+    uint8_t w[32 * 5], domain[32], pre[66];
+    uint8_t *st = malloc(32 + 32 * nFields);
+    keccak256((const uint8_t *)zDomainType, sizeof(zDomainType) - 1, w);
+    keccak256((const uint8_t *)zName, strlen(zName), w + 32);
+    keccak256((const uint8_t *)zVersion, strlen(zVersion), w + 64);
+    abi_encode_uint64(chainId, w + 96);
+    memset(w + 128, 0, 12); memcpy(w + 140, contract, 20);
+    keccak256(w, sizeof w, domain);
+    pre[0] = 0x19; pre[1] = 0x01;
+    memcpy(pre + 2, domain, 32);
+    if (!st) { memset(out, 0, 32); return; }
+    keccak256((const uint8_t *)zType, strlen(zType), st);
+    memcpy(st + 32, fields, 32 * nFields);
+    keccak256(st, 32 + 32 * nFields, pre + 34);
+    free(st);
+    keccak256(pre, sizeof pre, out);
+}
+
+static uint64_t eth_chain_id(HppliteL1 *l1);
+static HppliteSystemConfig *eth_get_system_config(HppliteL1 *l1);
+
+/* A uint the contract answers to a view call with no arguments but an optional address; -1 on failure */
+static uint64_t view_u64(EthClient *eth, const uint8_t to[20], const uint8_t sel[4], const uint8_t *addr) {
+    uint8_t calldata[36] = {0};
+    size_t len = 0;
+    uint8_t *r;
+    uint64_t v;
+    memcpy(calldata, sel, 4);
+    if (addr) memcpy(calldata + 16, addr, 20);
+    r = eth_client_call(eth, to, calldata, addr ? 36 : 4, &len);
+    if (!r || len < 32) { free(r); return (uint64_t)-1; }
+    v = abi_decode_uint64(r);
+    free(r);
+    return v;
+}
+
+/* A signature's deadline: ten minutes on the chain's clock */
+static uint64_t sig_deadline(EthClient *eth) {
+    uint64_t number = 0, ts = 0;
+    if (eth_client_latest_block(eth, &number, &ts) != 0 || ts == 0) ts = (uint64_t)time(NULL);
+    return ts + 600;
+}
+
+/* POST {to, data} to the relay's /commit, paid within relaycap=: the
+** transaction's hash once it landed (sqlite3_mprintf), or NULL with the
+** reason in relayError */
+static char *relay_post(HppliteStore *relay, EthClient *eth, const uint8_t to[20], const uint8_t *data, size_t n,
+                        char *zErr, size_t nErr) {
+    char *toHex = eth_hex_encode(to, 20), *dataHex = eth_hex_encode(data, n), *zBody = NULL, *zOut = NULL, *zTx = NULL;
+    long status;
+    (void)eth;
+    if (!toHex || !dataHex) { free(toHex); free(dataHex); snprintf(zErr, nErr, "out of memory"); return NULL; }
+    zBody = sqlite3_mprintf("{\"to\":\"%s\",\"data\":\"%s\"}", toHex, dataHex);
+    free(toHex); free(dataHex);
+    if (!zBody) { snprintf(zErr, nErr, "out of memory"); return NULL; }
+    status = hpplite_store_paid_post(relay, "/commit", (const uint8_t *)zBody, strlen(zBody), &zOut);
+    sqlite3_free(zBody);
+    if (status == 200) {
+        cJSON *r = zOut ? cJSON_Parse(zOut) : NULL, *tx = r ? cJSON_GetObjectItem(r, "tx") : NULL;
+        if (tx && cJSON_IsString(tx) && strncmp(tx->valuestring, "0x", 2) == 0) zTx = sqlite3_mprintf("%s", tx->valuestring);
+        else snprintf(zErr, nErr, "the relay's answer names no transaction");
+        cJSON_Delete(r);
+    } else if (status == 0) {
+        snprintf(zErr, nErr, "the relay %s does not answer", hpplite_store_url(relay));
+    } else if (status == 402) {
+        snprintf(zErr, nErr, "not paid: %s", hpplite_store_error(relay));
+    } else {
+        cJSON *r = zOut ? cJSON_Parse(zOut) : NULL, *e = r ? cJSON_GetObjectItem(r, "error") : NULL;
+        snprintf(zErr, nErr, "the relay answered %ld: %.160s", status, e && cJSON_IsString(e) ? e->valuestring : (zOut ? zOut : ""));
+        cJSON_Delete(r);
+    }
+    sqlite3_free(zOut);
+    return zTx;
+}
+
+/* The signed form (forData, freed here; NULL when the contract has none)
+** through the relay. 1: handled - *pTx the hash, or NULL when the relay
+** failed and the wallet holds no ETH to submit the plain call itself;
+** 0: submit the plain call (no relay, or the relay failed and the wallet
+** can pay) */
+static int relay_first(HppliteL1 *l1, const uint8_t to[20], uint8_t *forData, size_t forLen, const char *zWhat, char **pTx) {
+    *pTx = NULL;
+    if (!self->relay) { free(forData); return 0; }
+    if (forData) {
+        *pTx = relay_post(self->relay, self->eth, to, forData, forLen, self->relayError, sizeof self->relayError);
+        free(forData);
+        if (*pTx) { self->lastPath = "relay"; self->relayError[0] = 0; return 1; }
+    } else {
+        snprintf(self->relayError, sizeof self->relayError, "this rollup's contracts have no signed form of %s (VERSION %llu)",
+                 zWhat, (unsigned long long)self->version);
+    }
+    if (eth_client_has_balance(self->eth, self->address) == 1) {
+        fprintf(stderr, "hpplite: relay: %s: %s; submitting it from the wallet\n", zWhat, self->relayError);
+        return 0;
+    }
+    fprintf(stderr, "hpplite: relay: %s: %s; the wallet holds no ETH to submit it itself\n", zWhat, self->relayError);
+    return 1;
+}
+
+/* Signed with the wallet's key or signer: 0, or -1 */
+static int sign_digest(HppliteL1 *l1, const uint8_t digest[32], uint8_t sig[65]) {
+    return eth_client_sign_hash(self->eth, digest, sig);
+}
+
+/* The coordinator's EIP-712 domain version: its VERSION, from 10 (the signed forms a relay may submit) */
+static int coord_domain(HppliteL1 *l1, char zVersion[8]) {
+    if (self->version == 0) {
+        HppliteSystemConfig *cfg = eth_get_system_config(l1);
+        if (cfg) hpplite_l1_system_config_free(cfg);
+    }
+    if (self->version < 10) return -1;
+    snprintf(zVersion, 8, "%llu", (unsigned long long)self->version);
+    return 0;
+}
+
+/* claimSequencerFor / renewLeaseFor / releaseLeaseFor (VERSION 10): NULL when the contract has none */
+static uint8_t *lease_for(HppliteL1 *l1, const char *zAction, const uint8_t sel[4], const unsigned char instanceId[32], size_t *pLen) {
+    char zV[8];
+    uint64_t nonce, deadline;
+    uint8_t f[4 * 32], digest[32], sig[65], wNonce[32], wDeadline[32];
+    if (coord_domain(l1, zV) != 0) return NULL;
+    nonce = view_u64(self->eth, self->contract, SEL_LEASE_NONCE, NULL);
+    if (nonce == (uint64_t)-1) return NULL;
+    deadline = sig_deadline(self->eth);
+    keccak256((const uint8_t *)zAction, strlen(zAction), f);
+    memcpy(f + 32, instanceId, 32);
+    abi_encode_uint64(nonce, f + 64);
+    abi_encode_uint64(deadline, f + 96);
+    eip712_digest("HPPLite", zV, eth_chain_id(l1), self->contract,
+                  "Lease(string action,bytes32 instanceId,uint256 nonce,uint256 deadline)", f, 4, digest);
+    if (sign_digest(l1, digest, sig) != 0) return NULL;
+    memcpy(wNonce, f + 64, 32); memcpy(wDeadline, f + 96, 32);
+    {
+        AbiArg a[] = { {instanceId, 32, 0}, {wNonce, 32, 0}, {wDeadline, 32, 0}, {sig, 65, 1} };
+        return abi_call(sel, a, 4, pLen);
+    }
+}
+
 static char *eth_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
     uint8_t calldata[4 + 32];
     uint8_t *tx_hash;
+    char *zTx;
     if (!l1 || interval == 0) return NULL;
     init_selectors();
+    if (self->relay) {
+        /* the owner's signature: setCheckpointIntervalFor (VERSION 10, #171) */
+        char zV[8];
+        uint8_t *forData = NULL, f[3 * 32], digest[32], sig[65];
+        size_t forLen = 0;
+        uint64_t nonce = coord_domain(l1, zV) == 0 ? view_u64(self->eth, self->contract, SEL_OWNER_NONCE, NULL) : (uint64_t)-1;
+        if (nonce != (uint64_t)-1) {
+            abi_encode_uint64(interval, f);
+            abi_encode_uint64(nonce, f + 32);
+            abi_encode_uint64(sig_deadline(self->eth), f + 64);
+            eip712_digest("HPPLite", zV, eth_chain_id(l1), self->contract,
+                          "CheckpointInterval(uint256 interval,uint256 nonce,uint256 deadline)", f, 3, digest);
+            if (sign_digest(l1, digest, sig) == 0) {
+                AbiArg a[] = { {f, 32, 0}, {f + 32, 32, 0}, {f + 64, 32, 0}, {sig, 65, 1} };
+                forData = abi_call(SEL_INTERVAL_FOR, a, 4, &forLen);
+            }
+        }
+        if (relay_first(l1, self->contract, forData, forLen, "setCheckpointIntervalFor", &zTx)) return zTx;
+    }
     memcpy(calldata, SEL_SET_CHECKPOINT_INTERVAL, 4);
     abi_encode_uint64(interval, calldata + 4);
     tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
     if (!tx_hash) return NULL;
+    self->lastPath = "direct";
     return txHashString(tx_hash);
 }
 
@@ -432,6 +653,24 @@ static char *eth_submit_checkpoint(
     const unsigned char instanceId[32]
 ) {
     if (!l1 || !self->has_privkey || !checkpoint || !instanceId) return NULL;
+    if (self->relay) {
+        char zV[8], *zTx;
+        uint8_t *forData = NULL, f[4 * 32], digest[32], sig[65];
+        size_t forLen = 0;
+        if (coord_domain(l1, zV) == 0) {
+            memcpy(f, instanceId, 32);
+            abi_encode_uint64(checkpoint->fromHeight, f + 32);
+            abi_encode_uint64(checkpoint->toHeight, f + 64);
+            memcpy(f + 96, checkpoint->postStateRoot, 32);
+            eip712_digest("HPPLite", zV, eth_chain_id(l1), self->contract,
+                          "Checkpoint(bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 stateRoot)", f, 4, digest);
+            if (sign_digest(l1, digest, sig) == 0) {
+                AbiArg a[] = { {f, 32, 0}, {f + 32, 32, 0}, {f + 64, 32, 0}, {f + 96, 32, 0}, {sig, 65, 1} };
+                forData = abi_call(SEL_CHECKPOINT_FOR, a, 5, &forLen);
+            }
+        }
+        if (relay_first(l1, self->contract, forData, forLen, "submitCheckpointFor", &zTx)) return zTx;
+    }
 
     /* Build calldata for submitCheckpoint(bytes32,uint256,uint256,bytes32) */
     size_t calldata_len = 4 + 32 + 32 + 32 + 32;
@@ -466,6 +705,7 @@ static char *eth_submit_checkpoint(
     free(calldata);
 
     if (!tx_hash) return NULL;
+    self->lastPath = "direct";
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
@@ -475,6 +715,13 @@ static char *eth_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[3
     if (!l1 || !self->has_privkey || !instanceId) return NULL;
     init_selectors();
 
+    if (self->relay) {
+        char *zTx;
+        size_t n = 0;
+        uint8_t *forData = lease_for(l1, "claim", SEL_CLAIM_FOR, instanceId, &n);
+        if (relay_first(l1, self->contract, forData, n, "claimSequencerFor", &zTx)) return zTx;
+    }
+
     /* Build calldata: claimSequencer(bytes32) */
     uint8_t calldata[4 + 32];
     memcpy(calldata, SEL_CLAIM_SEQUENCER, 4);
@@ -483,6 +730,7 @@ static char *eth_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[3
     /* Send transaction */
     uint8_t *tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 200000, 0);
     if (!tx_hash) return NULL;
+    self->lastPath = "direct";
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
@@ -492,6 +740,13 @@ static char *eth_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) 
     if (!l1 || !self->has_privkey || !instanceId) return NULL;
     init_selectors();
 
+    if (self->relay) {
+        char *zTx;
+        size_t n = 0;
+        uint8_t *forData = lease_for(l1, "renew", SEL_RENEW_FOR, instanceId, &n);
+        if (relay_first(l1, self->contract, forData, n, "renewLeaseFor", &zTx)) return zTx;
+    }
+
     /* Build calldata: renewLease(bytes32) */
     uint8_t calldata[4 + 32];
     memcpy(calldata, SEL_RENEW_LEASE, 4);
@@ -500,6 +755,7 @@ static char *eth_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) 
     /* Send transaction */
     uint8_t *tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 100000, 0);
     if (!tx_hash) return NULL;
+    self->lastPath = "direct";
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
@@ -518,6 +774,12 @@ static char *eth_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]
         HppliteSystemConfig *cfg = eth_get_system_config(l1);
         if (cfg) hpplite_l1_system_config_free(cfg);
     }
+    if (self->relay && instanceId) {
+        char *zTx;
+        size_t n = 0;
+        uint8_t *forData = lease_for(l1, "release", SEL_RELEASE_FOR, instanceId, &n);
+        if (relay_first(l1, self->contract, forData, n, "releaseLeaseFor", &zTx)) return zTx;
+    }
     if (self->version >= 5 && instanceId) {
         uint8_t calldata[36];
         memcpy(calldata, SEL_RELEASE_LEASE, 4);
@@ -532,6 +794,7 @@ static char *eth_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]
         fprintf(stderr, "hpplite: lease release: %s\n", eth_client_error(self->eth));
         return NULL;
     }
+    self->lastPath = "direct";
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
@@ -888,6 +1151,17 @@ static int ensure_da_contract(HppliteL1 *l1) {
     return self->has_da_contract;
 }
 
+
+/* The DA contract's Batch / Range digests (DA version 3, VERSION 9 and later) */
+static void batch_digest(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32], uint8_t out[32]) {
+    uint8_t f[3 * 32];
+    memcpy(f, instanceId, 32);
+    abi_encode_uint64(height, f + 32);
+    memcpy(f + 64, hash, 32);
+    eip712_digest("HPPLiteDA", "3", eth_chain_id(l1), self->da_contract,
+                  "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)", f, 3, out);
+}
+
 static char *eth_submit_batch(
     HppliteL1 *l1,
     const uint8_t instanceId[32],
@@ -898,6 +1172,21 @@ static char *eth_submit_batch(
     if (l1) self->lastOversized = 0;
     if (!l1 || !self->has_privkey || !instanceId || !data || data_len == 0) return NULL;
     if (!ensure_da_contract(l1)) return NULL;  /* Need DA contract */
+    if (self->relay) {
+        char *zTx;
+        uint8_t *forData = NULL, h[32], digest[32], sig[65], wHeight[32];
+        size_t forLen = 0;
+        if (self->version >= 9) {
+            keccak256(data, data_len, h);
+            batch_digest(l1, instanceId, height, h, digest);
+            if (sign_digest(l1, digest, sig) == 0) {
+                abi_encode_uint64(height, wHeight);
+                AbiArg a[] = { {instanceId, 32, 0}, {wHeight, 32, 0}, {data, data_len, 1}, {sig, 65, 1} };
+                forData = abi_call(SEL_SUBMIT_BATCH_FOR, a, 4, &forLen);
+            }
+        }
+        if (relay_first(l1, self->da_contract, forData, forLen, "submitBatchFor", &zTx)) return zTx;
+    }
 
     /* Build calldata: submitBatch(bytes32 instanceId, uint256 height, bytes data) */
     /* Static: 4 + 32 + 32 + 32 (offset) = 100 */
@@ -967,6 +1256,7 @@ static char *eth_submit_batch(
         if (e && strstr(e, "oversized")) self->lastOversized = 1;
         return NULL;
     }
+    self->lastPath = "direct";
 
     char *hash_hex = txHashString(tx_hash);
     return hash_hex;
@@ -1055,6 +1345,26 @@ static char *eth_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const
     uint64_t gas;
     if (!l1 || !self->has_privkey || !instanceId || !r) return NULL;
     if (!ensure_da_contract(l1) || self->version < 9) return NULL;
+    if (self->relay) {
+        char *zTx;
+        uint8_t *forData = NULL, f[6 * 32], digest[32], sig[65];
+        size_t forLen = 0;
+        memcpy(f, instanceId, 32);
+        abi_encode_uint64(r->fromHeight, f + 32);
+        abi_encode_uint64(r->toHeight, f + 64);
+        memcpy(f + 96, r->chainHashAfter, 32);
+        memcpy(f + 128, r->stateRoot, 32);
+        memcpy(f + 160, r->manifestDigest, 32);
+        eip712_digest("HPPLiteDA", "3", eth_chain_id(l1), self->da_contract,
+                      "Range(bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 chainHashAfter,bytes32 stateRoot,bytes32 manifestDigest)",
+                      f, 6, digest);
+        if (sign_digest(l1, digest, sig) == 0) {
+            AbiArg a[] = { {f, 32, 0}, {f + 32, 32, 0}, {f + 64, 32, 0}, {f + 96, 32, 0}, {f + 128, 32, 0}, {f + 160, 32, 0},
+                           {r->receipt, r->receipt ? r->nReceipt : 0, 1}, {sig, 65, 1} };
+            forData = abi_call(SEL_COMMIT_RANGE_FOR, a, 8, &forLen);
+        }
+        if (relay_first(l1, self->da_contract, forData, forLen, "commitRangeFor", &zTx)) return zTx;
+    }
     rcptLen = r->receipt ? r->nReceipt : 0;
     rcptPad = (rcptLen + 31) / 32 * 32;
     n = 4 + 7 * 32 + 32 + rcptPad;
@@ -1078,6 +1388,7 @@ static char *eth_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const
     if (self->maxTxGas && gas > self->maxTxGas) gas = self->maxTxGas;
     tx_hash = eth_client_send_tx(self->eth, self->da_contract, calldata, n, gas, 0);
     free(calldata);
+    if (tx_hash) self->lastPath = "direct";
     return tx_hash ? txHashString(tx_hash) : NULL;
 }
 
@@ -1178,6 +1489,21 @@ static char *eth_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint6
     uint64_t gas;
     if (!l1 || !self->has_privkey || !instanceId || !hash || !zRef || !zRef[0]) return NULL;
     if (!ensure_da_contract(l1) || self->version < 8) return NULL;
+    if (self->relay) {
+        char *zTx;
+        uint8_t *forData = NULL, digest[32], sig[65], wHeight[32];
+        size_t forLen = 0;
+        if (self->version >= 9) {
+            batch_digest(l1, instanceId, height, hash, digest);
+            if (sign_digest(l1, digest, sig) == 0) {
+                abi_encode_uint64(height, wHeight);
+                AbiArg a[] = { {instanceId, 32, 0}, {wHeight, 32, 0}, {hash, 32, 0}, {(const uint8_t *)zRef, strlen(zRef), 1},
+                               {receipt, receipt ? nReceipt : 0, 1}, {sig, 65, 1} };
+                forData = abi_call(SEL_COMMIT_BATCH_FOR, a, 6, &forLen);
+            }
+        }
+        if (relay_first(l1, self->da_contract, forData, forLen, "commitBatchFor", &zTx)) return zTx;
+    }
     refLen = strlen(zRef);
     rcptLen = receipt ? nReceipt : 0;
     refPad = (refLen + 31) / 32 * 32;
@@ -1203,6 +1529,7 @@ static char *eth_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint6
     if (self->maxTxGas && gas > self->maxTxGas) gas = self->maxTxGas;
     tx_hash = eth_client_send_tx(self->eth, self->da_contract, calldata, n, gas, 0);
     free(calldata);
+    if (tx_hash) self->lastPath = "direct";
     return tx_hash ? txHashString(tx_hash) : NULL;
 }
 
@@ -1404,6 +1731,71 @@ static int eth_token_balance(HppliteL1 *l1, const unsigned char token[20], const
     return 0;
 }
 
+static void eth_set_relay(HppliteL1 *l1, HppliteStore *relay) {
+    if (l1) self->relay = relay;
+}
+
+static const char *eth_last_tx_path(HppliteL1 *l1) {
+    return l1 ? self->lastPath : NULL;
+}
+
+static const char *eth_relay_error(HppliteL1 *l1) {
+    return l1 && self->relay && self->relayError[0] ? self->relayError : NULL;
+}
+
+/* createRollupFor (VERSION 10 factories, #171) through the relay: the
+** wallet's rollup with no ETH. 0 and the rollup in rollup_out; -2: create
+** it from the wallet (the factory has no signed form, or the relay failed
+** and the wallet holds ETH); -1: the relay failed and the wallet cannot pay
+** (the reason on stderr) */
+static int eth_factory_create_rollup_for(const char *rpc_url, const char *factory_address, const uint8_t privkey[32],
+                                         HppliteStore *relay, uint64_t checkpointInterval, uint8_t rollup_out[20]) {
+    uint8_t factory[20], owner[20], f[4 * 32], digest[32], sig[65], *data;
+    uint64_t nonce, chainId;
+    size_t n = 0;
+    char zErr[240], *zTx;
+    EthClient *eth;
+    int rc = -1;
+    init_selectors();
+    if (!relay || eth_hex_decode(factory_address ? factory_address : DEFAULT_FACTORY_ADDRESS, factory, 20) != 0) return -1;
+    eth = eth_client_create(rpc_url, hpplite_l1_default_chain_id());
+    if (!eth) return -1;
+    if (eth_client_set_privkey(eth, privkey) != 0 || eth_address_from_privkey(privkey, owner) != 0) { eth_client_destroy(eth); return -1; }
+    nonce = view_u64(eth, factory, SEL_CREATE_NONCE, owner);
+    if (nonce == (uint64_t)-1) { eth_client_destroy(eth); return -2; }
+    chainId = hpplite_l1_default_chain_id();
+    memset(f, 0, 12); memcpy(f + 12, owner, 20);
+    abi_encode_uint64(checkpointInterval, f + 32);
+    abi_encode_uint64(nonce, f + 64);
+    abi_encode_uint64(sig_deadline(eth), f + 96);
+    eip712_digest("HPPLiteFactory", "10", chainId, factory,
+                  "CreateRollup(address owner,uint256 checkpointInterval,uint256 nonce,uint256 deadline)", f, 4, digest);
+    if (eth_client_sign_hash(eth, digest, sig) != 0) { eth_client_destroy(eth); return -1; }
+    {
+        AbiArg a[] = { {f, 32, 0}, {f + 32, 32, 0}, {f + 64, 32, 0}, {f + 96, 32, 0}, {sig, 65, 1} };
+        data = abi_call(SEL_CREATE_FOR, a, 5, &n);
+    }
+    zTx = data ? relay_post(relay, eth, factory, data, n, zErr, sizeof zErr) : NULL;
+    if (!zTx) {
+        int canPay = eth_client_has_balance(eth, owner) == 1;
+        fprintf(stderr, "hpplite: relay: createRollupFor: %s%s\n", data ? zErr : "out of memory",
+                canPay ? "; creating it from the wallet" : "; the wallet holds no ETH to create it itself");
+        free(data);
+        eth_client_destroy(eth);
+        return canPay ? -2 : -1;
+    }
+    free(data);
+    eth_client_destroy(eth);
+    sqlite3_free(zTx);
+    /* the relay answers once the transaction landed: the newest rollup of the wallet is it */
+    {
+        uint8_t all[64][20];
+        int k = eth_factory_list_my_rollups(rpc_url, factory_address, privkey, all, 64);
+        if (k > 0) { memcpy(rollup_out, all[k - 1], 20); rc = 0; }
+    }
+    return rc;
+}
+
 const HppliteL1Ops hppliteL1EthOps = {
     .name = "eth",
     .connect = eth_connect,
@@ -1448,4 +1840,8 @@ const HppliteL1Ops hppliteL1EthOps = {
     .has_ranges = eth_has_ranges,
     .chain_id = eth_chain_id,
     .token_balance = eth_token_balance,
+    .set_relay = eth_set_relay,
+    .last_tx_path = eth_last_tx_path,
+    .relay_error = eth_relay_error,
+    .factory_create_rollup_for = eth_factory_create_rollup_for,
 };

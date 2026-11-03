@@ -142,6 +142,7 @@ void hpplite_config_free(HppliteConfig *cfg) {
     if (cfg->dataDir) free(cfg->dataDir);
     if (cfg->dbPath) free(cfg->dbPath);
     free(cfg->storeUrl);
+    free(cfg->relayUrl);
     free(cfg->dbName);
     free(cfg);
 }
@@ -256,6 +257,10 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
     val = getenv(HPPLITE_ENV_STORE_CAP);
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
+    val = getenv(HPPLITE_ENV_RELAY);
+    if (val && val[0]) { free(cfg->relayUrl); cfg->relayUrl = strdup(val); }
+    val = getenv(HPPLITE_ENV_RELAY_CAP);
+    if (val && atoll(val) > 0) cfg->relayCap = (uint64_t)atoll(val);
     val = getenv(HPPLITE_ENV_MAX_TX);
     if (val && atol(val) > 0) cfg->maxTxBytes = (size_t)atol(val);
     val = getenv(HPPLITE_ENV_MAX_TX_GAS);
@@ -504,6 +509,13 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_STORE_CAP, buf, sizeof(buf)) && atoll(buf) > 0) {
         cfg->storeCap = (uint64_t)atoll(buf);
     }
+    if (get_uri_param(uri, HPPLITE_URI_RELAY, buf, sizeof(buf)) && buf[0]) {
+        free(cfg->relayUrl);
+        cfg->relayUrl = strdup(buf);
+    }
+    if (get_uri_param(uri, HPPLITE_URI_RELAY_CAP, buf, sizeof(buf)) && atoll(buf) > 0) {
+        cfg->relayCap = (uint64_t)atoll(buf);
+    }
     if (get_uri_param(uri, HPPLITE_URI_STORE_FALLBACK, buf, sizeof(buf))) {
         cfg->storeFallback = strcasecmp(buf, "off") != 0 && strcmp(buf, "0") != 0;
     }
@@ -674,6 +686,10 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_CAP);
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY);
+    if (val && val[0]) { free(cfg->relayUrl); cfg->relayUrl = strdup(val); }
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_CAP);
+    if (val && atoll(val) > 0) cfg->relayCap = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_FALLBACK);
     if (val) cfg->storeFallback = strcasecmp(val, "off") != 0 && strcmp(val, "0") != 0;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX_GAS);

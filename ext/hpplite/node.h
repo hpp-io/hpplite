@@ -79,6 +79,8 @@ typedef struct HppliteNodeConfig {
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
+    char *relayUrl;                 /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */
+    uint64_t relayCap;              /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
     int storeFallback;              /* storefallback=: a store that does not answer lets the chain carry the bytes (default on) */
     int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
@@ -127,6 +129,7 @@ typedef struct HppliteNode {
     /* L1 connection */
     HppliteL1 *l1;
     struct HppliteStore *store;     /* the batch bytes' store when store= is given (#11); the chain commits hash, ref, receipt */
+    struct HppliteStore *relay;     /* relay= (#126): the signed forms of the writes go through it, paid like the store */
     int warnedStoreDown;            /* said once per outage that batches go on the chain meanwhile */
     int warnedNames;                /* said once that the store takes no names (#165) */
     int softWalked;                 /* the store's names past the chain were read once (#167) */

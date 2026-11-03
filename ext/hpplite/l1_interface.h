@@ -207,6 +207,21 @@ uint64_t hpplite_l1_chain_id(HppliteL1 *l1);
 /* An ERC-20 balance on that chain (#11): balanceOf(owner) of token, 32 big-endian bytes. 0, or -1 when it cannot be read. */
 int hpplite_l1_token_balance(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]);
 
+/* A relay (#126, examples/relay): the node's writes go through it as their
+** EIP-712 signed forms, paid over x402; the plain transaction only when the
+** relay fails and the wallet holds ETH. The handle stays the caller's. */
+struct HppliteStore;
+void hpplite_l1_set_relay(HppliteL1 *l1, struct HppliteStore *relay);
+/* "relay" or "direct": how the last write went (NULL: none yet, or a backend that submits nothing) */
+const char *hpplite_l1_last_tx_path(HppliteL1 *l1);
+/* Why the last relay attempt failed (NULL: no relay, or it succeeded since) */
+const char *hpplite_l1_relay_error(HppliteL1 *l1);
+/* The wallet's rollup created through the relay (createRollupFor, VERSION 10
+** factories): 0; -2 create it from the wallet (no signed form, or the relay
+** failed and the wallet holds ETH); -1 the relay failed and the wallet cannot pay */
+int hpplite_l1_factory_create_rollup_for(const char *rpc_url, const char *factory_address, const uint8_t privkey[32],
+                                         struct HppliteStore *relay, uint64_t checkpointInterval, uint8_t rollup_out[20]);
+
 /*
 ** Which backend a connection is on: "eth", "dir" or "mock" (#35). Every
 ** build has all three; the endpoint given to hpplite_l1_connect() and the

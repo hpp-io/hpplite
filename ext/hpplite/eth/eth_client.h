@@ -53,6 +53,13 @@ size_t eth_client_sign_tx(EthClient *client, uint64_t nonce, uint64_t gas_price,
 /* Latest block number and timestamp (the chain's clock). 0 on success. */
 int eth_client_latest_block(EthClient *client, uint64_t *pNumber, uint64_t *pTimestamp);
 
+/* An EIP-712 digest signed with the client's key or signer (the signed forms
+** a relay submits, #126): r || s || v (27/28). 0 on success */
+int eth_client_sign_hash(EthClient *client, const uint8_t hash[32], uint8_t sig[65]);
+
+/* The address holds any ETH: 1, 0, or -1 when the balance cannot be read */
+int eth_client_has_balance(EthClient *client, const uint8_t address[20]);
+
 /* Get current gas price */
 uint64_t eth_client_gas_price(EthClient *client);
 

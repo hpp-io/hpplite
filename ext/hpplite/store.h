@@ -32,6 +32,14 @@ typedef struct HppliteStore HppliteStore;
 HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64_t cap);
 void hpplite_store_close(HppliteStore *store);
 
+/* POST a body to another endpoint of the same service, paying a 402 as put
+** does (the cap, the accounting): the reference relay's /commit (#126).
+** The HTTP status (0: unreachable; 402: not paid, the reason in
+** hpplite_store_error) and the answer's body (sqlite3_free) */
+long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *body, size_t len, char **pzOut);
+/* The handle is a relay's (#126): what it says names the relay and relaycap= */
+void hpplite_store_set_relay(HppliteStore *s);
+
 /* Put bytes: the reference (sqlite3_mprintf, caller frees) and, when the
 ** provider signed one, its receipt as compact JSON (sqlite3_mprintf, or
 ** NULL). NULL on failure; hpplite_store_error() says why. */

@@ -917,6 +917,8 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->checkpointInterval = cfg->checkpointInterval;
     nc->storeUrl = cfg->storeUrl;
     nc->storeCap = cfg->storeCap;
+    nc->relayUrl = cfg->relayUrl;
+    nc->relayCap = cfg->relayCap;
     nc->storeFallback = cfg->storeFallback;
     nc->anchorIntervalMs = cfg->anchorIntervalMs;   /* the anchor's cadence (#164) */
 

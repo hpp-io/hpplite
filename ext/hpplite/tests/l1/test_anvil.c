@@ -2129,6 +2129,136 @@ static void test_page_mode_end_to_end(void) {
     PASS();
 }
 
+/* 27. A wallet that holds USDC.e and no ETH at all (#126): its rollup is
+** created, its lease taken, its batches anchored and the lease released,
+** each through the reference relay (examples/relay, #170) as an EIP-712
+** signed form paid over x402; the batches at a pin service. A replica
+** rebuilds; the wallet's ETH balance is 0 throughout. */
+static long eth_balance_of(const char *addr) {
+    char cmd[300], out[80];
+    snprintf(cmd, sizeof cmd, "cast balance %s --rpc-url %s", addr, RPC);
+    return run_cmd(cmd, out, sizeof out) == 0 ? first_number(out) : -1;
+}
+/* the reference relay (#170) on port, paying with KEY9; -1 when it did not come up */
+static pid_t start_relay(const char *svc, const char *usdc, int port) {
+    char cmd[300], out[400], script[600];
+    FILE *f = fopen(DIR "/relay.key", "w");
+    if (!f) return -1;
+    fprintf(f, "%s\n", KEY9);
+    fclose(f);
+    snprintf(script, sizeof script, "%s/../relay/relay.py", svc);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char portStr[16];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        int fd = open(DIR "/relay.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key",
+               "--factory", FACTORY, "--facilitator", "mock", "--asset", usdc, "--eth-usd", "30", (char *)NULL);
+        _exit(127);
+    }
+    for (int i = 0; i < 50; i++) {
+        if (!test_child_alive(pid)) return -1;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
+        if (run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "hpplite-relay")) return pid;
+        usleep(200 * 1000);
+    }
+    kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+    return -1;
+}
+static void test_relay_no_eth(void) {
+    TEST("a wallet with USDC.e and no ETH (#126): its rollup, lease and anchors through the relay, paid in USDC.e; a replica rebuilds; its ETH stays 0");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    static const char ZKEY[] = "0x7777777777777777777777777777777777777777777777777777777777777777";
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
+    char cmd[2400], wallet[80], out[400], extra[400];
+    int sport = test_free_port(), rport = test_free_port();
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", ZKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    /* anvil's base fee climbs over the suite's hundreds of transactions: the relay's quotes with it (#126) */
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 1000000000 >/dev/null", RPC, KEY0, usdc, wallet);
+    if (run_cmd(cmd, out, sizeof out) != 0) FAIL("fund the wallet with MockUSDC");
+    if (eth_balance_of(wallet) != 0) FAIL("the wallet should start with no ETH");
+    pid_t store = start_pin_service_free(svc, sport);
+    if (store < 0) FAIL("the pin service did not come up");
+    pid_t relay = start_relay(svc, usdc, rport);
+#define STOP_SERVICES() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); } while (0)
+    if (relay < 0) { STOP_SERVICES(); FAIL("the relay did not come up (see relay.log)"); }
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead: see scenario 18 */
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&relaycap=200000000&anchor=0", sport, rport);
+    sqlite3 *w = open_db("nz_writer.db", ZKEY, extra);
+    if (!w) { STOP_SERVICES(); FAIL("open writer"); }
+    char contract[80];
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    if (!contract[0] || status_int(w, "lease") != 1) {
+        printf("(contract '%s', lease %lld, %s) ", contract, status_int(w, "lease"), status_text(w, "last_error"));
+        sqlite3_close(w); STOP_SERVICES(); FAIL("the rollup created and the lease taken through the relay");
+    }
+    sqlite3_exec(w, "CREATE TABLE z(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    int ok1 = scalar(w, "SELECT hpplite_flush()") > 0;
+    sqlite3_exec(w, "INSERT INTO z(v) VALUES('no eth'), ('only usdc.e')", NULL, NULL, NULL);
+    int ok2 = scalar(w, "SELECT hpplite_flush()") > 0;
+    long long anchored = scalar(w, "SELECT hpplite_anchor()");
+    char path[20];
+    snprintf(path, sizeof path, "%s", status_text(w, "last_tx_path"));
+    long long spent = status_int(w, "relay_spent");
+    printf("(contract %.10s, anchored %lld via %s, relay_spent %lld units) ", contract, anchored, path, spent);
+    if (!ok1 || !ok2 || anchored <= 0 || strcmp(path, "relay") != 0 || spent <= 0) {
+        printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); STOP_SERVICES();
+        FAIL("batches at the store, the anchor through the relay, paid");
+    }
+    char replicaExtra[440];
+    snprintf(replicaExtra, sizeof replicaExtra, "%s&role=verify", extra);
+    const char *why = replica_equals_as(w, "nz_replica.db", ZKEY, replicaExtra);   /* an audit of the same wallet, through the same store */
+    /* the relay down: the batch reaches the store, the anchor waits and says why (no ETH to send it itself);
+    ** the relay back, the next anchor takes it */
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); relay = -1;
+    sqlite3_exec(w, "INSERT INTO z(v) VALUES('while the relay is down')", NULL, NULL, NULL);
+    int ok3 = scalar(w, "SELECT hpplite_flush()") > 0;
+    long long anchoredDown = scalar(w, "SELECT hpplite_anchor()"), afterDown = scalar(w, "SELECT anchored FROM hpplite_status");
+    char errDown[300];
+    snprintf(errDown, sizeof errDown, "%s", status_text(w, "last_error"));
+    relay = start_relay(svc, usdc, rport);
+    long long anchoredBack = relay > 0 ? scalar(w, "SELECT hpplite_anchor()") : -1;
+    printf("(relay down: flush %d, anchor %lld, anchored %lld, '%.70s'; back: anchor %lld) ", ok3, anchoredDown, afterDown, errDown, anchoredBack);
+    int downOk = ok3 && anchoredDown <= 0 && afterDown == anchored && strstr(errDown, "relay") != NULL && anchoredBack > anchored;
+    sqlite3_close(w);                                                         /* the lease released through the relay */
+    long ethAfter = eth_balance_of(wallet);
+    snprintf(cmd, sizeof cmd, "cast call %s 'isLeaseActive()(bool)' --rpc-url %s", contract, RPC);
+    run_cmd(cmd, out, sizeof out);
+    int released = strncmp(out, "false", 5) == 0;
+    STOP_SERVICES();
+#undef STOP_SERVICES
+    if (why) FAIL(why);
+    if (!downOk) FAIL("with the relay down and no ETH the anchor should wait and say why, then go through once the relay is back");
+    if (!released) FAIL("the close should release the lease through the relay");
+    if (ethAfter != 0) FAILF("the wallet's ETH balance is %ld, want 0", ethAfter);
+    PASS();
+}
+
+/* 28. A relay that does not answer, and a wallet with ETH (#126): every
+** write goes from the wallet itself, as without a relay, and says so.
+** KEY8, its own named database. */
+static void test_relay_fallback(void) {
+    TEST("relay= that does not answer, a wallet with ETH (#126): the writes go from the wallet itself; last_tx_path says direct; a replica rebuilds");
+    char extra[200];
+    int dead = test_free_port();                                  /* nobody listens there */
+    snprintf(extra, sizeof extra, "&dbname=relayfallback&relay=http://127.0.0.1:%d&relaycap=1000", dead);
+    sqlite3 *w = open_db("rf_writer.db", KEY8, extra);
+    if (!w) FAIL("open writer");
+    sqlite3_exec(w, "CREATE TABLE f(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO f(v) VALUES('direct')", NULL, NULL, NULL);
+    long long h = scalar(w, "SELECT hpplite_flush()");
+    char path[20];
+    snprintf(path, sizeof path, "%s", status_text(w, "last_tx_path"));
+    printf("(flush %lld, last_tx_path %s, relay_spent %lld) ", h, path, status_int(w, "relay_spent"));
+    const char *why = h > 0 ? replica_equals_as(w, "rf_replica.db", KEY8, "&dbname=relayfallback&role=verify") : "the batch did not post";
+    sqlite3_close(w);
+    if (why) FAIL(why);
+    if (strcmp(path, "direct") != 0) FAIL("last_tx_path should say the wallet sent it");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2166,6 +2296,8 @@ int main(void) {
     if (wanted(24)) test_owner_names_sequencer();
     if (wanted(25)) test_viewing_key_reads();
     if (wanted(26)) test_page_mode_end_to_end();
+    if (wanted(27)) test_relay_no_eth();
+    if (wanted(28)) test_relay_fallback();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

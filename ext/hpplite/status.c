@@ -83,6 +83,9 @@ typedef struct StatusCursor {
 #define STATUS_COL_ANCHORED         34     /* the chain's last height (#164): above it the store alone holds the batches; NULL without a chain */
 #define STATUS_COL_LAST_ANCHOR_TX   35     /* the transaction of the last anchor this node made */
 #define STATUS_COL_LAST_CHECKPOINT_ROOT 36 /* the root the last checkpoint (or anchor) carried, hex; NULL before one */
+#define STATUS_COL_RELAY          37  /* relay= (#126): the URL; NULL without one */
+#define STATUS_COL_RELAY_SPENT    38  /* ...paid to it, atomic units of its asset */
+#define STATUS_COL_LAST_TX_PATH   39  /* "relay" or "direct": how the last write went to the chain; NULL before one */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -98,7 +101,8 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
-        " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT)");
+        " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
+        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -360,6 +364,17 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
                 hpplite_bytes_to_hex(node->ctx->lastCheckpointRoot, 32, hex + 2);
                 sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
             }
+            break;
+        }
+        case STATUS_COL_RELAY:
+            if (node->config.relayUrl) sqlite3_result_text(ctx, node->config.relayUrl, -1, SQLITE_TRANSIENT);
+            break;
+        case STATUS_COL_RELAY_SPENT:
+            if (node->relay) sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_store_spent(node->relay, NULL));
+            break;
+        case STATUS_COL_LAST_TX_PATH: {
+            const char *z = node->l1 ? hpplite_l1_last_tx_path(node->l1) : NULL;
+            if (z) sqlite3_result_text(ctx, z, -1, SQLITE_STATIC);
             break;
         }
         default:

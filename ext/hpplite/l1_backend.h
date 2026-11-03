@@ -91,6 +91,13 @@ struct HppliteL1Ops {
     ** when the backend has neither (the mock, a directory). */
     uint64_t (*chain_id)(HppliteL1 *l1);
     int (*token_balance)(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]);
+    /* A relay (#126): the signed forms of the writes go through it; NULL
+    ** ops when the backend submits nothing (the mock, a directory) */
+    void (*set_relay)(HppliteL1 *l1, struct HppliteStore *relay);
+    const char *(*last_tx_path)(HppliteL1 *l1);
+    const char *(*relay_error)(HppliteL1 *l1);         /* why the last relay attempt failed; NULL after a success */
+    int (*factory_create_rollup_for)(const char *rpc_url, const char *factory_address, const uint8_t privkey[32],
+                                     struct HppliteStore *relay, uint64_t checkpointInterval, uint8_t rollup_out[20]);
 };
 
 extern const HppliteL1Ops hppliteL1EthOps;    /* l1_eth.c */
