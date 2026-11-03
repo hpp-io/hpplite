@@ -1,0 +1,17 @@
+# WordPress on HPPLite, in a container (tests/real_apps/docker/wordpress.sh).
+# PHP 8.4 (Pdo\Sqlite::loadExtension), the runtime libraries the Linux
+# hpplite.so links (libsecp256k1, libcurl, zlib), and a stock WordPress with
+# the SQLite Database Integration plugin fetched at build time by the same
+# setup.sh a host run uses. The module itself is mounted at run time from the
+# Linux build volume (tools/linux_test.sh), so the image never goes stale
+# with the extension.
+FROM php:8.4-cli
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsecp256k1-2 libcurl4t64 zlib1g unzip curl python3 ca-certificates sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY wordpress/setup.sh /suite/setup.sh
+RUN sh /suite/setup.sh /wp
+COPY wordpress/php.sh wordpress/preload.php wordpress/session.sh wordpress/load.py /suite/
+ENV WP_CLI_ALLOW_ROOT=1
+WORKDIR /wp

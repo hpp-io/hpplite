@@ -23,7 +23,20 @@ HPPLITE_EXT=build_real/hpplite.dylib HPPLITE_ANVIL_RPC=... HPPLITE_ANVIL_FACTORY
   python tests/orm/orm_common.py .ht.sqlite
 ```
 
-## Results (2026-10-30, anvil; PHP 8.4.23 static build, SQLite 3.45.2)
+## In a container (2026-11-03, anvil; PHP 8.4 image, Debian trixie; page capture, the default)
+
+`tests/real_apps/docker/wordpress.sh` runs the same session with PHP and
+WordPress in a container (`docker/Dockerfile.wordpress`, the Linux
+`hpplite.so` built on the image's Debian by `docker/so.sh`), anvil and the
+factory on the host, and the replica check on the host. Nothing on the host
+but Docker, foundry and `build_real/hpplite.dylib`.
+
+- The session: every WP-CLI command, the pages and the REST writes, no
+  failure, no HPPLite message. 131 batches of pages on the chain.
+- The replica rebuilt from the chain equals the site: 22 tables, 871 rows,
+  the same root at height 132.
+
+## Results (2026-10-30, anvil; PHP 8.4.23 static build, SQLite 3.45.2; row capture)
 
 - `wp core install`: installed. One statement refused, by design (#53): the
   installer's `DELETE FROM wp_options WHERE option_name REGEXP ...`. SQLite has

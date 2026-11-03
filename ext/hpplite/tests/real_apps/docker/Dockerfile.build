@@ -1,0 +1,10 @@
+# The builder of hpplite.so for the application containers: the same Debian
+# the runtime images stand on (trixie), so the module links the libsecp256k1
+# and libcurl sonames those images carry. See so.sh.
+FROM debian:trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake pkg-config ca-certificates \
+        libsecp256k1-dev libcurl4-openssl-dev zlib1g-dev tcl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
