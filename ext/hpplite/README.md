@@ -37,7 +37,7 @@ sqlite3_exec(db, "INSERT INTO users VALUES(1, 'alice')", NULL, NULL, NULL);
 sqlite3_close(db);
 ```
 
-`l1=hpp-sepolia` selects the RPC endpoint and factory contract for HPP Sepolia (see Contracts). On first open, the factory auto-deploys your rollup contracts (~3s). All writes are batched and submitted to L1 for data availability.
+`l1=hpp-sepolia` selects the RPC endpoint, factory contract and batch interval (30 minutes, the chain's own cadence; `interval=5s` for development) for HPP Sepolia (see Contracts). On first open, the factory auto-deploys your rollup contracts (~3s). All writes are batched and submitted to L1 for data availability.
 
 The same works from the stock `sqlite3` shell after `.load ./hpplite`, and
 from any language whose SQLite binding can load extensions.
@@ -155,7 +155,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
 | `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason |
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
-| `interval` | No | Batch flush interval: `500ms`, `5s` (default), `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
+| `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `compress` | No | `on` (default): the batch JSON is deflated before it is sealed or posted when that shrinks it, five to twelve times for SQL and row records (#12); `off`: posted as is. Every reader takes both forms, and batches from before stay readable. Also `HPPLITE_COMPRESS` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
@@ -392,6 +392,19 @@ and cuts batches at 40 KB; elsewhere set `maxtx=` (bytes) and `maxtxgas=`,
 or let it learn: a batch the RPC refuses as oversized, or whose gas estimate
 is over the cap, is never sent, and later batches are cut smaller. Bulk
 data costs ~0.00025 ETH per MB of sealed SQL at 0.01 gwei (was ~0.008).
+
+**The number of batches is the cost, not their size.** A batch costs ~46k
+gas before its first byte (the transaction, the contract's bookkeeping) and
+24 gas per byte after, so a day of writes posted as 1,000 batches costs
+about ten times what the same bytes cost as 100. HPP anchors to L1 every
+30 minutes: a batch posted more often than that only waits in HPP's queue
+until the next anchor, so `l1=hpp-sepolia` sets `interval=30m` unless the
+URI says otherwise (48 batches a day at most from the timer; the half-limit
+flush, #143, still posts a busy writer's batches as they fill). Shorter
+intervals are for development, or for a replica that must follow within
+seconds. A store (#125) with a chain commitment per range of batches (#162)
+is the way to both: the bytes at the store as they are written, one
+commitment per anchor.
 
 | Usage | Batches/day | ETH/day on HPP Sepolia |
 |-------|-------------|------------------------|

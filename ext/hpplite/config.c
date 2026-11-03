@@ -229,7 +229,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_BATCH_INTERVAL);
     if (val) {
         int ms = parse_duration_ms(val);
-        if (ms >= 0) cfg->batchIntervalMs = ms;
+        if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
     }
 
     /* Encryption */
@@ -258,6 +258,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_CHECKPOINT);
     if (val && atoi(val) > 0) cfg->checkpointInterval = atoi(val);
 
+    if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;   /* the chain's cadence (#162) */
     return 0;
 }
 
@@ -387,6 +388,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         if (network) {
             cfg->chainId = network->chainId;
             cfg->chainIdSource = 2;
+            cfg->aliasIntervalMs = network->batchIntervalMs;
 
             /* Also set RPC URL from alias */
             if (network->rpcUrl) {
@@ -460,7 +462,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     /* Batch interval */
     if (get_uri_param(uri, "interval", buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
-        if (ms >= 0) cfg->batchIntervalMs = ms;
+        if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
     }
 
     /* Encryption */
@@ -500,6 +502,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->checkpointInterval = atoi(buf);
     }
 
+    if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;   /* the chain's cadence (#162) */
     return 0;
 }
 
@@ -542,6 +545,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
         if (chainId > 0) {
             cfg->chainId = chainId;
             cfg->chainIdSource = 2;
+            cfg->aliasIntervalMs = hpplite_network_batch_interval_ms(chainId);
 
             /* Also set RPC URL from alias */
             const char *rpc = hpplite_da_get_rpc_url(chainId);
@@ -628,7 +632,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, "interval");
     if (val) {
         int ms = parse_duration_ms(val);
-        if (ms >= 0) cfg->batchIntervalMs = ms;
+        if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
     }
 
     /* Encryption */
@@ -657,6 +661,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_CHECKPOINT);
     if (val && atoi(val) > 0) cfg->checkpointInterval = atoi(val);
 
+    if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;   /* the chain's cadence (#162) */
     return 0;
 }
 

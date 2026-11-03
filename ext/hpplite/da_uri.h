@@ -59,11 +59,13 @@ typedef struct HppliteNetworkAlias {
     const char *factory;    /* Factory contract address (hex string) */
     size_t maxTxBytes;      /* Largest batch to post in one transaction (0 = unknown) */
     uint64_t maxTxGas;      /* Gas cap per transaction (0 = unknown) */
+    int batchIntervalMs;    /* The chain's own cadence: the batch interval unless interval= says otherwise (0 = the default) */
 } HppliteNetworkAlias;
 
 /* The limits of a known chain, by chain id (0 = unknown) */
 size_t hpplite_network_max_tx_bytes(uint64_t chainId);
 uint64_t hpplite_network_max_tx_gas(uint64_t chainId);
+int hpplite_network_batch_interval_ms(uint64_t chainId);   /* 0 when the chain sets none */
 
 /*
 ** Built-in network aliases

@@ -6,6 +6,7 @@
 
 #include "da_uri.h"
 #include "l1_interface.h"
+#include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -257,6 +258,32 @@ static void test_uri_parse_file(void) {
     PASS();
 }
 
+
+/* The chain's own cadence: HPP anchors every 30 minutes, so l1=hpp-sepolia
+** sets the batch interval to 30 minutes unless the URI says interval= (#162);
+** a local chain keeps the default */
+static void test_alias_interval(void) {
+    TEST("Chain alias sets the batch interval");
+    struct { const char *uri; int ms; } cases[] = {
+        {"hpplite://x?hpplite=1&l1=hpp-sepolia&privkey=0x" "0000000000000000000000000000000000000000000000000000000000000001", 30 * 60 * 1000},
+        {"hpplite://x?hpplite=1&l1=hpp-sepolia&interval=5s&privkey=0x" "0000000000000000000000000000000000000000000000000000000000000001", 5000},
+        {"hpplite://x?hpplite=1&l1=hpp-mainnet", 30 * 60 * 1000},
+        {"hpplite://x?hpplite=1&l1=local", 5000},
+        {"hpplite://x?hpplite=1", 5000},
+    };
+    size_t i;
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        HppliteConfig *cfg = hpplite_config_load(cases[i].uri);
+        int ms = cfg ? cfg->batchIntervalMs : -1;
+        if (cfg) hpplite_config_free(cfg);
+        if (ms != cases[i].ms) {
+            printf("  %s: interval %d ms, expected %d\n", cases[i].uri, ms, cases[i].ms);
+            FAIL("interval");
+        }
+    }
+    PASS();
+}
+
 int main(void) {
     printf("test_da_uri: DA URI Scheme Tests\n");
     printf("================================\n\n");
@@ -269,6 +296,7 @@ int main(void) {
     test_uri_build();
     test_uri_from_config();
     test_uri_parse_file();
+    test_alias_interval();
 
     printf("\n================================\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);
