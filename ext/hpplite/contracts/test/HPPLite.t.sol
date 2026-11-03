@@ -738,7 +738,10 @@ contract HPPLiteDATest is Test {
         da.commitRange(instanceId, 11, 20, keccak256("c2"), keccak256("r2"), keccak256("m2"), receipt);
         gas -= gasleft();
         emit log_named_uint("gas for an anchor (range of 10, root inside, 114-byte receipt)", gas);
-        assertLt(gas, 60000);
+        /* what the call costs depends on how forge meters it: in-process with warm slots (forge 1.4) it reads
+        ** ~13k, metered as its own transaction (newer stable, CI) ~75k, which is what anvil and HPP Sepolia
+        ** charge (73.5k, #164). The budget is the transaction's: about one per-batch commitment */
+        assertLt(gas, 90000);
     }
 }
 
