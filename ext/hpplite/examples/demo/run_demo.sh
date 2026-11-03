@@ -17,6 +17,10 @@ fi
 [ -n "$HPPLITE_PRIVATE_KEY" ] || { echo "HPPLITE_PRIVATE_KEY not set"; exit 1; }
 unset HPPLITE_CONTRACT_ADDRESS HPPLITE_FACTORY_ADDRESS HPPLITE_L1_RPC HPPLITE_DATA_DIR
 cd "$here"
+# the app loads a copy: a rebuild of build_real (development goes on beside a
+# public demo) must not change the module under a running process
+mkdir -p "$here/data"
+cp "$ext" "$here/data/hpplite-module.dylib" && ext="$here/data/hpplite-module.dylib"
 # the store (#164): the batch bytes go to a pin service here (free mode, data/pins), the
 # chain gets one anchor per 30 minutes; the receipt key is the service's own, nothing valuable
 pinport=${PIN_PORT:-8788}
