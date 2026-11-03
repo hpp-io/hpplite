@@ -1,0 +1,80 @@
+# Reference relay (#170)
+
+`relay.py` submits an HPPLite node's signed contract calls and pays their
+gas, charged over x402 in USDC.e. With it, a node whose wallet holds only
+USDC.e can create its rollup, take and renew its lease, and anchor. With the
+pin service beside it ([../pin_service](../pin_service)), it needs no ETH
+at all. Standard library Python. It reuses the pin service's `eth.py`
+(keccak, secp256k1, EIP-712) and its x402 seller code.
+
+```sh
+relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file relay.key \
+    --factory 0xbce61e56f84620bc4365e95126f82b51faed7b4e \
+    --facilitator https://facilitator-sepolia.hpp.io
+```
+
+## What it does
+
+`POST /commit` takes `{"to": address, "data": calldata}`:
+
+1. **Is it a call the relay takes?** Only the EIP-712 signed forms, and
+   only on the factory it serves (VERSION 10 or later) or on a rollup or DA
+   contract that factory created:
+   - the factory's `createRollupFor`;
+   - a rollup's `claimSequencerFor`, `renewLeaseFor`, `releaseLeaseFor`,
+     `submitCheckpointFor` and `setCheckpointIntervalFor`;
+   - a DA contract's `commitRangeFor`, `submitBatchFor` and
+     `commitBatchFor`.
+
+   Anything else gets `400` before any simulation. The relay's ETH pays for
+   HPPLite, not for whatever a caller sends.
+2. **Would it succeed?** It runs `eth_estimateGas`. A call that would revert
+   (a bad signature, a range already anchored) gets `422` with the reason,
+   and nothing is charged.
+3. **The price.** A `402` quotes the gas plus a quarter of headroom at the
+   current fee (base plus tip), plus `--margin` (20%), converted at
+   `--eth-usd`, and at least `--min-fee` units. The quote holds for two
+   minutes, so the paid retry pays exactly what was quoted.
+4. **Paid:** the payment is verified, the transaction submitted, and the
+   relay waits for its receipt. The payment is settled only once the
+   transaction succeeded. A call that reverts on chain after all, for
+   example because another got in first, gets `409` and isn't charged.
+   Success gets `200 {tx, block, gasUsed, call}` with `PAYMENT-RESPONSE`.
+
+`GET /status`: the relay's address and ETH balance, the chain, the factory,
+the calls it takes and the prices.
+
+## Trust
+
+The relay is trusted for liveness only. The contracts check every
+signature, so a relay can't forge a call, change one, or submit one for a
+wallet that didn't sign it. It can delay or drop one. A lease signature
+carries a deadline (VERSION 10, #171), so a claim it holds back can't be used
+later to take a lease away from a live instance. A node that sees its anchor
+not land falls back to another relay, or to its own ETH.
+
+The relay takes the risk the other way round: it pays the gas before it
+settles the payment. A payer who empties their wallet in between gets one
+call for free. Settling first would put that risk on the node instead, for
+a transaction that might never land.
+
+## Cost
+
+On HPP Sepolia (0.01 gwei), an anchor costs about 73.5k gas, or $0.0022
+of ETH at $3,000. The relay quotes the estimate with its headroom and
+margin, about 0.0037 USDC.e per anchor, or about $5 a month at one anchor
+per 30 minutes. Creating a rollup costs 3.43M gas, a quote of about
+0.15 USDC.e. The headroom is charged even when the transaction uses less;
+a relay that wants to charge what was used would settle that amount instead
+(#172 is the pricing work).
+
+## Tests
+
+`selftest.sh` (ctest `test_relay`) runs on a fresh anvil with the factory
+and MockUSDC:
+- A new wallet holding 10 MockUSDC and no ETH creates its rollup, claims the
+  lease, anchors heights 1-3, renews and releases, all through the relay.
+  Each call is paid on inclusion.
+- A range anchored twice, a bad signature, a token transfer and an owner
+  call without a signed form are each refused, and nothing is charged.
+- The wallet's ETH balance is zero at the end.

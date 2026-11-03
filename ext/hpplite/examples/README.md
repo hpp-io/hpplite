@@ -80,6 +80,13 @@ export HPPLITE_PRIVATE_KEY=0x...
 
 **Note:** Requires network access to HPP Sepolia.
 
+### pin_service/ and relay/
+
+Two reference services for a node that pays in USDC.e over x402 instead of ETH:
+[pin_service](pin_service) stores batches and signs receipts (#125), and
+[relay](relay/README.md) submits the node's signed contract calls (its rollup,
+the lease, anchors) and pays their gas (#170).
+
 ## URI Parameters
 
 Open databases with configuration in the URI:
