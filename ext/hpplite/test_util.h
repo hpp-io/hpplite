@@ -19,7 +19,7 @@
 
 /* Default HPP Sepolia settings */
 #define HPPLITE_DEFAULT_RPC "https://sepolia.hpp.io"
-#define HPPLITE_DEFAULT_FACTORY "0x7748552ecedbe80e9cc27a72f1fac0cf7d1ab37e"
+#define HPPLITE_DEFAULT_FACTORY "0xbce61e56f84620bc4365e95126f82b51faed7b4e"
 
 /* Run command and capture first line of output */
 static inline char *test_util_run_cmd(const char *cmd) {
