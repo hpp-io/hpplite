@@ -679,7 +679,7 @@ sends to a node's wallet). Not here yet: `upto` and payment channels.
 Scope is tied to versions. v0.1.1 is the last of the v0.1 line (end of life:
 upgrade to v0.2; `capture=text` keeps v0.1's capture). **v0.2.0 is tagged**
 (2026-11-01): row capture by default, `hpplite verify`, several writers per
-file, the fault harness as the gate, an inventory of the SQLite behaviours
+file, the fault harness as the acceptance test, an inventory of the SQLite behaviours
 the capture relies on with a CI build against SQLite trunk. **v0.3.0 is
 tagged** (2026-11-02): batches deflated, the state root kept as per-table
 Merkle trees so a checkpoint costs what changed, the bytes of a batch in a

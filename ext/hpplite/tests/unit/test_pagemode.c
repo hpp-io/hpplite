@@ -603,6 +603,78 @@ static void test_capture_auto(void) {
     PASS();
 }
 
+/* a writer without HPPLite (another process, say) commits, checkpoints and
+** writes again: SQLite restarts the WAL once it is fully backfilled, and the
+** sequencer must have read every frame before that can happen. Its pinned
+** read transaction keeps the WAL from being fully backfilled past what it
+** read (#153); here the sequencer takes no tick between the burst and the
+** restart, so only the pin stands between it and a lost thousand commits */
+static void test_foreign_checkpoint_and_restart_lose_nothing(void) {
+    TEST("a thousand commits, a checkpoint and a WAL restart by a connection without HPPLite, with no tick of the sequencer between: nothing is lost");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof config);
+    config.nodeId = "fc"; config.dataDir = DIR; config.dbPath = DIR "/fc.db"; config.capturePages = 1; config.noEncrypt = 1; config.noCompress = 1;
+    config.checkpointInterval = TEST_INTERVAL_1000; config.batchIntervalMs = 3600 * 1000;   /* a timer: its ticks checkpoint and move the pin, the interval never comes */
+    for (int i = 0; i < 32; i++) config.privkey[i] = (unsigned char)(i + 1);
+    config.hasPrivkey = 1;
+    HppliteNode *s = hpplite_node_create(&config);
+    if (!s) FAIL("open");
+    hpplite_node_set_l1(s, l1); hpplite_node_sync_from_l1(s, 1); hpplite_node_start(s); hpplite_node_start_timer(s);
+    hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 1");
+    usleep(1500000);                                  /* ticks: the WAL checkpointed whole (the checkpoint runs once a second), the pin moved after that */
+    hpplite_node_stop_timer(s);                       /* and no tick from here to the flush: the pin as it is must hold */
+    sqlite3 *c = NULL;
+    if (sqlite3_open(DIR "/fc.db", &c) != SQLITE_OK) FAIL("plain open");
+    sqlite3_busy_timeout(c, 5000);
+    for (int i = 0; i < 1100; i++) {
+        char sql[64]; snprintf(sql, sizeof sql, "INSERT INTO t(v) VALUES(%d)", i);
+        if (sqlite3_exec(c, sql, NULL, NULL, NULL) != SQLITE_OK) FAIL("plain write");
+    }
+    int ckLog = -1, ckDone = -1;
+    sqlite3_wal_checkpoint_v2(c, "main", SQLITE_CHECKPOINT_PASSIVE, &ckLog, &ckDone);     /* what a plain process's auto-checkpoint does */
+    if (sqlite3_exec(c, "INSERT INTO t(v) VALUES(-1)", NULL, NULL, NULL) != SQLITE_OK) FAIL("plain write after the checkpoint");
+    sqlite3_close(c);
+    uint64_t h = hpplite_node_flush_batch(s);
+    HppliteNode *r = open_pages_role(DIR "/fcr.db", l1, 1, 1, 1);
+    long long rows = r ? scalar(r->db, "SELECT count(*) FROM t") : -1;
+    int same = r && same_root(s, r);
+    printf("(checkpoint backfilled %d of %d frames; flush to %llu; replica %lld rows, roots %s) ", ckDone, ckLog, (unsigned long long)h, rows, same ? "equal" : "differ");
+    if (r) hpplite_node_destroy(r);
+    hpplite_node_destroy(s); hpplite_l1_disconnect(l1);
+    if (ckDone >= ckLog) FAIL("the plain checkpoint backfilled the whole WAL: the sequencer's pin did not hold");
+    if (rows != 1101 || !same) FAIL("commits were lost");
+    PASS();
+}
+
+/* what another connection or process committed is pending the moment it is
+** asked about, not at the next tick: the count polls the WAL (#153) */
+static void test_pending_counts_foreign_commits(void) {
+    TEST("commits by a connection without HPPLite count as pending at once, and a close posts them");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/fp.db", l1, 1, 1);
+    if (!s) FAIL("open");
+    hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    if (hpplite_node_flush_batch(s) == 0) FAIL("flush 1");
+    sqlite3 *c = NULL;
+    if (sqlite3_open(DIR "/fp.db", &c) != SQLITE_OK) FAIL("plain open");
+    for (int i = 0; i < 5; i++) if (sqlite3_exec(c, "INSERT INTO t(v) VALUES(1)", NULL, NULL, NULL) != SQLITE_OK) FAIL("plain write");
+    sqlite3_close(c);
+    int pending = hpplite_node_pending_count(s);
+    hpplite_node_destroy(s);                          /* a clean close posts what is pending */
+    HppliteNode *r = open_pages_role(DIR "/fpr.db", l1, 1, 1, 1);
+    long long rows = r ? scalar(r->db, "SELECT count(*) FROM t") : -1;
+    if (r) hpplite_node_destroy(r);
+    hpplite_l1_disconnect(l1);
+    printf("(pending %d, replica %lld rows) ", pending, rows);
+    if (pending < 5) FAIL("the other connection's commits did not count as pending");
+    if (rows != 5) FAIL("the close did not post them");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -623,6 +695,8 @@ int main(void) {
     test_commit_over_the_limit_is_cut_into_pieces();
     test_death_between_pieces();
     test_capture_auto();
+    test_foreign_checkpoint_and_restart_lose_nothing();
+    test_pending_counts_foreign_commits();
     remove_dir();
     return test_report();
 }

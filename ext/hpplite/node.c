@@ -2667,7 +2667,13 @@ int hpplite_node_exec(HppliteNode *node, const char *sql, char **errMsg) {
 */
 int hpplite_node_pending_count(HppliteNode *node) {
     if (!node || !node->ctx) return 0;
-    if (node->pm) return (int)hpplite_pagemode_pending(node->pm);
+    if (node->pm) {
+        /* what another connection or process committed since the last look
+        ** is pending too (#153): a look at the WAL first, cheap when nothing
+        ** was added */
+        if (node->ctx->zWalKey && !node->config.verifyOnly) hpplite_walread_poll(node->ctx->zWalKey, 0);
+        return (int)hpplite_pagemode_pending(node->pm);
+    }
     return hpplite_pending_count(node->ctx);
 }
 
