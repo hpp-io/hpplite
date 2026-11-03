@@ -861,7 +861,7 @@ static void test_own_txn_commit_pending_then_tracked(void) {
     exec(b.db, "ALTER TABLE t ADD COLUMN c DEFAULT 'x'");          /* a's next statement is stale: tracked, in HPPLite's transaction */
     if (sqlite3_prepare_v2(a.db, "INSERT INTO t(v) VALUES(1) RETURNING id", -1, &s1, NULL) != SQLITE_OK) FAIL("prepare s1");
     int rc1 = sqlite3_step(s1);                                      /* in progress: HPPLite's transaction cannot be committed yet */
-    int rc2 = exec(a.db, "ALTER TABLE u DROP COLUMN b");             /* tracked too (its capture triggers go) while the commit is owed */
+    int rc2 = exec(a.db, "ALTER TABLE u ADD COLUMN c DEFAULT 1");     /* tracked too (its capture triggers go) while the commit is owed; not DROP COLUMN, which SQLite trunk refuses (SQLITE_LOCKED) while a statement is in progress (#163) */
     sqlite3_finalize(s1);
     int rc3 = exec(a.db, "INSERT INTO t(v) VALUES(3)");              /* a statement's end with nothing in progress: the commit is due */
     int autoc = sqlite3_get_autocommit(a.db);
@@ -870,7 +870,7 @@ static void test_own_txn_commit_pending_then_tracked(void) {
     const char *why = replica_differs(&a, DIR "/pending_r.db", &nr, &nt);
     close_writer(&b);
     close_writer(&a);
-    if (rc1 != SQLITE_ROW || !rc2 || !rc3) FAILF("premise: s1 %d (want ROW), drop column %d, insert %d", rc1, rc2, rc3);
+    if (rc1 != SQLITE_ROW || !rc2 || !rc3) FAILF("premise: s1 %d (want ROW), add column %d, insert %d", rc1, rc2, rc3);
     if (!autoc) FAIL("HPPLite's transaction is still open after a later statement ended (the commit owed was forgotten when the DROP COLUMN was tracked)");
     if (seen != 2) FAILF("the other connection sees %lld rows, want 2", (long long)seen);
     if (why) FAIL(why);
