@@ -916,6 +916,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->storeUrl = cfg->storeUrl;
     nc->storeCap = cfg->storeCap;
     nc->storeFallback = cfg->storeFallback;
+    nc->anchorIntervalMs = cfg->anchorIntervalMs;   /* the anchor's cadence (#164) */
 
     /* Role removed - always sequencer in simplified model */
 }

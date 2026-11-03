@@ -486,6 +486,28 @@ static void test_ranges_restart(const char *url) {
     PASS();
 }
 
+
+/* 8. The timer anchors (#164): a node opened by URI (the way an application opens one) with a
+** store and anchor= anchors on its own; nothing calls hpplite_anchor(). */
+static void test_anchor_timer(const char *url) {
+    TEST("ranges: a node opened by URI with store= and anchor=1s anchors from its timer, without hpplite_anchor()");
+    char uri[700];
+    sqlite3 *db;
+    sqlite3_int64 anchored = -1;
+    int i;
+    snprintf(uri, sizeof uri, "file:%s?hpplite=on&rpc=mock&contract=0x0000000000000000000000000000000000000001"
+             "&privkey=0x1111111111111111111111111111111111111111111111111111111111111111&store=%s&interval=500ms&anchor=1s&datadir=%s",
+             tpath("tm_w.db"), url, test_dir());
+    db = hpplite_open(uri);
+    if (!db) FAIL("open by URI on the mock chain");
+    sqlite3_exec(db, "CREATE TABLE t(v); INSERT INTO t VALUES(1)", NULL, NULL, NULL);
+    if (scalar(db, "SELECT hpplite_flush()") < 1) { printf("(%s) ", status_text(db, "last_error")); sqlite3_close(db); FAIL("flush through the store"); }
+    for (i = 0; i < 80 && anchored < 1; i++) { usleep(100000); anchored = status_int(db, "anchored"); }
+    if (anchored != 1) { printf("(anchored %lld after 8 s, last_error '%s') ", (long long)anchored, status_text(db, "last_error")); sqlite3_close(db); FAIL("the timer should have anchored the batch within a few seconds"); }
+    sqlite3_close(db);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = 8470 + (int)(getpid() % 200);
@@ -505,6 +527,7 @@ int main(int argc, char **argv) {
     test_node_status(url);
     test_ranges(url);
     test_ranges_restart(url);
+    test_anchor_timer(url);
     {
         int kport = 8670 + (int)(getpid() % 200);
         char kurl[64];
