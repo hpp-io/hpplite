@@ -37,6 +37,14 @@ int test_pages_mode(void);                   /* HPPLITE_CAPTURE=pages: page capt
 /* pending is n commits; in page mode the file as opened (its pages, never shipped) may count as one more */
 int test_pending_is(long long pending, int n);
 
+/* A TCP port on 127.0.0.1 free right now, from the OS (bind to port 0), for
+** a service a suite starts: never one derived from the pid, which another
+** program may hold (#177). -1 when there is none */
+int test_free_port(void);
+/* A service the suite forked is still running: a probe that gets an answer
+** after it exited is talking to someone else's server (#177) */
+int test_child_alive(pid_t pid);
+
 /* The end of main: the tally, and the process's exit code */
 int test_report(void);
 

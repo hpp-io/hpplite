@@ -36,6 +36,7 @@ static int start_service(const char *dir, int port) {
     }
     for (int i = 0; i < 50; i++) {
         char cmd[200];
+        if (!test_child_alive(g_pid)) { g_pid = 0; return -1; }        /* the port was taken: never probe another's server (#177) */
         snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status 2>/dev/null | grep -q signer", port);
         if (system(cmd) == 0) return 0;
         usleep(200 * 1000);
@@ -58,6 +59,7 @@ static int start_kubo(const char *dir, int port) {
     }
     for (int i = 0; i < 50; i++) {
         char cmd[200];
+        if (!test_child_alive(g_kubo)) { g_kubo = 0; return -1; }
         snprintf(cmd, sizeof cmd, "curl -s -m 2 -X POST 'http://127.0.0.1:%d/api/v0/cat?arg=x' 2>/dev/null | grep -q Message", port);
         if (system(cmd) == 0) return 0;
         usleep(200 * 1000);
@@ -86,6 +88,7 @@ static int start_s3(const char *dir, int port) {
     }
     for (int i = 0; i < 50; i++) {
         char cmd[200];
+        if (!test_child_alive(g_s3)) { g_s3 = 0; return -1; }
         snprintf(cmd, sizeof cmd, "curl -s -m 2 'http://127.0.0.1:%d/batches/x' 2>/dev/null | grep -q SignatureDoesNotMatch", port);
         if (system(cmd) == 0) return 0;
         usleep(200 * 1000);
@@ -657,7 +660,7 @@ static void test_recovery(const char *url) {
 
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
-    int port = 8470 + (int)(getpid() % 200);
+    int port = test_free_port();
     test_suite_init("store", NULL, NULL);
     reset_dir();
     printf("Store client (#11)\n");
@@ -678,7 +681,7 @@ int main(int argc, char **argv) {
     test_anchor_timer(url);
     test_recovery(url);
     {
-        int kport = 8670 + (int)(getpid() % 200);
+        int kport = test_free_port();
         char kurl[64];
         snprintf(kurl, sizeof kurl, "kubo://127.0.0.1:%d", kport);
         if (start_kubo(dir, kport) != 0) { stop_kubo(); stop_service(); printf("FAIL: the Kubo stand-in did not start\n"); return 1; }
@@ -687,7 +690,7 @@ int main(int argc, char **argv) {
         if (getenv("HPPLITE_KUBO")) test_kubo(getenv("HPPLITE_KUBO"), "_live");    /* a real daemon, when one is named (kubo://127.0.0.1:5001) */
     }
     {
-        int sport = 8870 + (int)(getpid() % 200);
+        int sport = test_free_port();
         char endpoint[64];
         /* a real bucket first, with the environment's own credentials (MinIO in a container, or AWS) */
         if (getenv("HPPLITE_S3")) test_s3(getenv("HPPLITE_S3"), getenv("AWS_SECRET_ACCESS_KEY"), "_live");

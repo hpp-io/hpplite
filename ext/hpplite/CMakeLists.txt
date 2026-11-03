@@ -365,6 +365,13 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_store_pages COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service)   # the page flush through the store (#146)
         set_tests_properties(test_store_pages PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT HPPLITE_CAPTURE=pages RESOURCE_LOCK test_store)
         set_tests_properties(test_store PROPERTIES RESOURCE_LOCK test_store)
+        # ...with the ports it used to derive from its pid taken by another program (#177)
+        add_test(NAME test_store_ports_taken COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ports_taken.sh
+                 $<TARGET_FILE:test_store> ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service)
+        set_tests_properties(test_store_ports_taken PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK test_store)
+        add_test(NAME test_pin_service_ports_taken COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ports_taken.sh
+                 sh ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service/selftest.sh)
+        set_tests_properties(test_pin_service_ports_taken PROPERTIES RESOURCE_LOCK test_store)
     endif()
     if(HPPLITE_BUILD_EXTENSION)
         add_test(NAME test_loadable COMMAND test_loadable)

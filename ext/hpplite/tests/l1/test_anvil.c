@@ -1013,7 +1013,7 @@ static void test_rpc_faults(void) {
         { "503s",     "error=0.4\n" },
         { "storm",    "latency_ms=100\ndrop=0.2\ntimeout=0.1\nhold_ms=4000\nerror=0.2\n" },
     };
-    int port = 8400 + (int)(getpid() % 200);
+    int port = test_free_port();   /* never one another program may hold (#177) */
     char proxyRpc[64];
     snprintf(proxyRpc, sizeof proxyRpc, "http://127.0.0.1:%d", port);
     set_proxy_mode(modeFile, "");
@@ -1332,7 +1332,7 @@ static void test_soak(void) {
     printf("\n    %ld s, an oracle pass every %ld batches\n", seconds, every);
     if (storeMode && storeMode[0] && strcmp(storeMode, "0") != 0) {
         const char *svc = getenv("HPPLITE_PIN_SERVICE");
-        int port = 9300 + (int)(getpid() % 200);
+        int port = test_free_port();
         if (!svc) FAIL("HPPLITE_SOAK_STORE needs HPPLITE_PIN_SERVICE (anvil_test.sh sets it)");
         svcPid = start_pin_service_free(svc, port);
         if (svcPid < 0) FAIL("the pin service did not start");
@@ -1517,7 +1517,7 @@ static void test_pin_service(void) {
     TEST("reference pin service (#125): x402 exact payments on a MockUSDC through the mock facilitator; receipts; idempotent put; the cap");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
     if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
-    int port = 9100 + (int)(getpid() % 200);   /* off the harness's anvil range, 8600 + its pid % 200 (#130) */
+    int port = test_free_port();   /* from the OS: off the harness's anvil and any other program's (#130, #177) */
     char cmd[2400], out[8192], payTo[80], before[80], after[80];
     FILE *f = fopen(DIR "/pin_signer.key", "w");
     if (!f) FAIL("signer key file");
@@ -1546,6 +1546,7 @@ static void test_pin_service(void) {
     }
     int up = 0;
     for (int i = 0; i < 50 && !up; i++) {
+        if (!test_child_alive(pid)) break;          /* the port was taken (#177) */
         snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
         up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
         if (!up) usleep(200 * 1000);
@@ -1598,6 +1599,7 @@ static pid_t start_pin_service_free(const char *svc, int port) {
     }
     for (int i = 0; i < 50; i++) {
         char cmd[200], out[400];
+        if (!test_child_alive(pid)) return -1;     /* the port was taken: never probe another's server (#177) */
         snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
         if (run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"")) return pid;
         usleep(200 * 1000);
@@ -1609,7 +1611,7 @@ static void test_store_commit(void) {
     TEST("a store for the bytes (#11, #164): batches at the pin service, nothing on the chain until the anchor, then one range with the root and the manifest's receipt; a replica with the store rebuilds, one without says so; the anchor is cheap");
     const char *svc = getenv("HPPLITE_PIN_SERVICE");
     if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
-    int port = 8800 + (int)(getpid() % 200);
+    int port = test_free_port();
     pid_t pid = start_pin_service_free(svc, port);
     if (pid < 0) FAIL("the pin service did not come up");
     char extra[200], big[1001], sql[1200], contract[80], want[80], out[4096] = "";
@@ -1766,7 +1768,7 @@ static void test_store_paid(void) {
     TEST("the node pays the store (#11): a 402 per batch paid with the node's key up to storecap=; below the price nothing is signed and the batch waits");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
     if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
-    int port = 8900 + (int)(getpid() % 200);
+    int port = test_free_port();
     char cmd[2400], payTo[80], before[80], after[80], extra[240];
     FILE *f = fopen(DIR "/paid_signer.key", "w");
     if (!f) FAIL("signer key file");
@@ -1792,6 +1794,7 @@ static void test_store_paid(void) {
     int up = 0;
     for (int i = 0; i < 50 && !up; i++) {
         char out[400];
+        if (!test_child_alive(pid)) break;          /* the port was taken (#177) */
         snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
         up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
         if (!up) usleep(200 * 1000);

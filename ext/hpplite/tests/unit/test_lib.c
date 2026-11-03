@@ -6,6 +6,9 @@
 #include "compress.h"
 #include <strings.h>
 #include <unistd.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 
 int tests_run = 0, tests_passed = 0;
 int test_verbose = 0;
@@ -318,4 +321,24 @@ sqlite3_int64 status_int(sqlite3 *db, const char *col) {
     char sql[128];
     snprintf(sql, sizeof sql, "SELECT %s FROM hpplite_status", col);
     return scalar(db, sql);
+}
+
+/* ---- services a suite starts (#177) ---- */
+
+int test_free_port(void) {
+    struct sockaddr_in a;
+    socklen_t n = sizeof a;
+    int fd = socket(AF_INET, SOCK_STREAM, 0), port = -1;
+    if (fd < 0) return -1;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) == 0 && getsockname(fd, (struct sockaddr *)&a, &n) == 0)
+        port = ntohs(a.sin_port);
+    close(fd);
+    return port;
+}
+
+int test_child_alive(pid_t pid) {
+    return pid > 0 && waitpid(pid, NULL, WNOHANG) == 0;
 }
