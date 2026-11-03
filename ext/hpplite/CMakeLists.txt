@@ -62,6 +62,9 @@ target_compile_definitions(sqlite3 PUBLIC
     # Python's builds: what applications use, row capture records (their tables)
     SQLITE_ENABLE_FTS5
     SQLITE_ENABLE_RTREE
+    # the pre-update hook, as there too: the only thing that sees an incremental
+    # blob write, which row and statement capture refuse (#169)
+    SQLITE_ENABLE_PREUPDATE_HOOK
 )
 target_link_libraries(sqlite3 PUBLIC
     Threads::Threads
@@ -154,6 +157,7 @@ if(HPPLITE_BUILD_EXTENSION)
     target_compile_definitions(hpplite_ext PRIVATE HPPLITE_EXTENSION)
     target_link_libraries(hpplite_ext PRIVATE
         Threads::Threads
+        ${CMAKE_DL_LIBS}
         ${SECP256K1_LIBRARIES}
         ${CURL_LIBRARIES}
         ZLIB::ZLIB
@@ -266,6 +270,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_rows hpplite_testlib)
         add_executable(test_rows_e2e tests/unit/test_rows_e2e.c)
         target_link_libraries(test_rows_e2e hpplite_testlib)
+        add_executable(test_blob_io tests/unit/test_blob_io.c)
+        target_link_libraries(test_blob_io hpplite_testlib)
 
         # Microbenchmark (not a test): `make bench` or ./bench_hpplite [--rows N] [--mb 1,10,50]
         add_executable(bench_hpplite tests/bench/bench_hpplite.c)
@@ -401,12 +407,13 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_concurrency COMMAND test_concurrency)
         add_test(NAME test_rows COMMAND test_rows)
         add_test(NAME test_rows_e2e COMMAND test_rows_e2e)
+        add_test(NAME test_blob_io COMMAND test_blob_io)
         add_test(NAME test_crash COMMAND crash_hpplite)
 
         # Every suite above again with statement capture (capture=text, v0.1's;
         # rows are the default, #19): the cases about statement text run there
         foreach(t test_checkpoint_flow test_durability test_compress test_faults test_keys test_abuse test_foreign_keys
-                  test_big_txn test_clock test_reorg test_big_stmt test_concurrency)
+                  test_big_txn test_clock test_reorg test_big_stmt test_concurrency test_blob_io)
             add_test(NAME ${t}_text COMMAND ${t})
             # the same scratch directory: never at once (ctest -j)
             set_tests_properties(${t} ${t}_text PROPERTIES RESOURCE_LOCK ${t})
@@ -415,7 +422,7 @@ if(HPPLITE_BUILD_TESTS)
         # ...and with page capture (#146): the cases about statements, the log table
         # or the content root skip there, the rest runs on pages
         foreach(t test_checkpoint_flow test_durability test_faults test_keys test_abuse test_foreign_keys
-                  test_big_txn test_clock test_big_stmt test_concurrency test_readers test_node test_state_root test_simple_open test_loadable test_env_enable)
+                  test_big_txn test_clock test_big_stmt test_concurrency test_readers test_node test_state_root test_simple_open test_loadable test_env_enable test_blob_io)
             add_test(NAME ${t}_pages COMMAND ${t})
             set_tests_properties(${t} ${t}_pages PROPERTIES RESOURCE_LOCK ${t})
             set_tests_properties(${t}_pages PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=pages)

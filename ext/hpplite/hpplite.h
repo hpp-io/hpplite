@@ -62,6 +62,9 @@ struct HppliteCtx {
                                ** the timer thread reads it instead of touching db. */
   int bStatusGone;            /* hpplite_status was disconnected by a close that failed */
   sqlite3_int64 curTxn;       /* Id of the first logged row of the open transaction (0 = none) */
+  int bBlobWrite;             /* an incremental blob write (sqlite3_blob_write) in the open transaction:
+                              ** row and statement capture cannot see it, the commit is refused (#169) */
+  int bPreupdate;             /* the pre-update hook that sees one is installed (the host SQLite has it) */
   sqlite3_stmt *pLogStmt;     /* Cached INSERT INTO _hpplite_pending */
   sqlite3_stmt *pRecTrigStmt; /* Cached PRAGMA recursive_triggers (read) */
   int bRecTrigSeen;           /* The application prepared PRAGMA recursive_triggers: read it per statement */
@@ -476,6 +479,7 @@ void hpplite_error_clear(HppliteCtx *pCtx);
 void hpplite_refresh_meta(HppliteCtx *pCtx);
 #ifdef HPPLITE_TEST_HOOKS
 extern int hpplite_test_fail_commits;   /* mock builds: the next n bookkeeping COMMITs fail as SQLITE_FULL */
+extern int hpplite_test_no_preupdate;   /* mock builds: contexts opened while set act as on a host SQLite without the pre-update hook (#169) */
 extern long hpplite_test_rows_hashed;   /* rows read for a state root since the counter was last zeroed (#9) */
 /* called after a VACUUM released the file and before its marker is logged (#75): another connection's turn */
 extern void (*hpplite_test_before_vacuum_log)(void *pArg);

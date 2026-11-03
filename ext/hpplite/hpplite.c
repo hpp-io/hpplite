@@ -392,6 +392,7 @@ int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
   sqlite3_rollback_hook(db, hppliteRollbackHook, pCtx);
   sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, hppliteTraceCallback, pCtx);
   sqlite3_set_authorizer(db, hppliteAuthorizer, pCtx);
+  hppliteBlobGuardArm(pCtx, 1);
 
   *ppCtx = pCtx;
   return SQLITE_OK;
@@ -422,6 +423,7 @@ static void rearmHooks(HppliteCtx *pCtx, int bClosing) {
   ** usually replaces the others; the data_version check in #37 covers the rest) */
   sqlite3_trace_v2(pCtx->db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, hppliteTraceCallback, pCtx);
   sqlite3_set_authorizer(pCtx->db, hppliteAuthorizer, pCtx);
+  hppliteBlobGuardArm(pCtx, 0);
   if (lost) {
     pCtx->nHooksReplaced++;
     if (pCtx->nHooksReplaced == 1) {

@@ -56,6 +56,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX);  /* 
 int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const char *z3, const char *z4);  /* ...and re-arms */
 int hppliteCommitHook(void *pArg);
 void hppliteRollbackHook(void *pArg);
+void hppliteBlobGuardArm(HppliteCtx *pCtx, int bInit);  /* the pre-update hook that sees incremental blob writes (#169) */
 int hppliteSchemaVersion(HppliteCtx *pCtx);    /* PRAGMA schema_version (cached statement) */
 void hpplitePragmaModeRead(HppliteCtx *pCtx);  /* the connection pragmas the mode bits mirror (#28) */
 void hppliteFreeFunctionChecks(HppliteCtx *pCtx);  /* the function verdicts and the replica's function list */

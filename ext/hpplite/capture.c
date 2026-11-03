@@ -22,6 +22,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 #include <time.h>
+#include <dlfcn.h>
 
 /*
 ** Connection pragmas that change what a statement does without showing in
@@ -1166,6 +1167,7 @@ static void barrierExclusiveEnd(HppliteCtx *pCtx) {
 ** anyone reads) */
 #ifdef HPPLITE_TEST_HOOKS
 void (*hpplite_test_before_vacuum_log)(void *pArg) = NULL;
+int hpplite_test_no_preupdate;
 void *hpplite_test_before_vacuum_log_arg = NULL;
 #endif
 
@@ -1607,11 +1609,102 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
 }
 
 /*
+** Incremental blob I/O (#169). sqlite3_blob_write changes a row without a
+** statement: no trigger, no trace, no authorizer, so row and statement
+** capture have nothing to log, and the replica would keep the old bytes.
+** Page capture ships the pages it changed; the others refuse its
+** transaction at the commit. Only the pre-update hook sees the write
+** (a DELETE with sqlite3_preupdate_blobwrite() >= 0), and only in a SQLite
+** compiled with SQLITE_ENABLE_PREUPDATE_HOOK. The extension API has no
+** entry for it: loaded into a host's SQLite, HPPLite looks the two
+** functions up in the library that supplied that API (never another copy
+** of SQLite in the process), and goes without when it does not export them.
+*/
+typedef void (*PreupdateCb)(void*, sqlite3*, int, const char*, const char*, sqlite3_int64, sqlite3_int64);
+typedef void *(*PreupdateHookFn)(sqlite3*, PreupdateCb, void*);
+typedef int (*PreupdateBlobwriteFn)(sqlite3*);
+static PreupdateHookFn xPreupdateHook;
+static PreupdateBlobwriteFn xPreupdateBlobwrite;
+static pthread_once_t preupdateOnce = PTHREAD_ONCE_INIT;
+
+static void preupdateResolve(void) {
+#ifdef HPPLITE_EXTENSION
+  Dl_info info;
+  void *h;
+  if (dladdr((void*)sqlite3_api->libversion, &info) && info.dli_fname
+      && (h = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_LAZY)) != NULL) {
+    xPreupdateHook = (PreupdateHookFn)dlsym(h, "sqlite3_preupdate_hook");
+    xPreupdateBlobwrite = (PreupdateBlobwriteFn)dlsym(h, "sqlite3_preupdate_blobwrite");
+    dlclose(h);       /* RTLD_NOLOAD: only the reference just taken; the library stays */
+  }
+  if (!xPreupdateHook || !xPreupdateBlobwrite) xPreupdateHook = NULL, xPreupdateBlobwrite = NULL;
+#elif defined(SQLITE_ENABLE_PREUPDATE_HOOK)
+  xPreupdateHook = sqlite3_preupdate_hook;
+  xPreupdateBlobwrite = sqlite3_preupdate_blobwrite;
+#endif
+}
+
+static void blobWriteSeen(void *pArg, sqlite3 *db, int op, const char *zDb, const char *zTab,
+                          sqlite3_int64 iKey1, sqlite3_int64 iKey2) {
+  HppliteCtx *pCtx = (HppliteCtx*)pArg;
+  (void)zDb; (void)zTab; (void)iKey1; (void)iKey2;
+  if (op == SQLITE_DELETE && !pCtx->bInternal && xPreupdateBlobwrite(db) >= 0) pCtx->bBlobWrite = 1;
+}
+
+/* Row and statement capture: the pre-update hook, where the host SQLite has
+** it; a note once per process where it does not */
+void hppliteBlobGuardArm(HppliteCtx *pCtx, int bInit) {
+  static int warned;
+  void *prev;
+  pthread_once(&preupdateOnce, preupdateResolve);
+#ifdef HPPLITE_TEST_HOOKS
+  if (bInit && hpplite_test_no_preupdate) { pCtx->bPreupdate = 0; return; }
+#endif
+  if (!bInit && !pCtx->bPreupdate) return;
+  if (!xPreupdateHook) {
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr, "hpplite: this SQLite has no pre-update hook: row and statement capture cannot see an "
+                      "incremental blob write (sqlite3_blob_write) inside a transaction, and would lose it. "
+                      "An application that writes blobs that way needs page capture (capture=pages)\n");
+    }
+    return;
+  }
+  prev = xPreupdateHook(pCtx->db, blobWriteSeen, pCtx);
+  if (bInit && prev && prev != pCtx)
+    fprintf(stderr, "hpplite: the connection's pre-update hook was another component's; HPPLite's replaced it (#169)\n");
+  pCtx->bPreupdate = 1;
+}
+
+/* A statement of SQL running on the connection. sqlite3_blob_close commits
+** from the blob's own program, which has no SQL text */
+static int sqlStatementRunning(sqlite3 *db) {
+  sqlite3_stmt *p = NULL;
+  while ((p = sqlite3_next_stmt(db, p)) != NULL) {
+    const char *z = sqlite3_sql(p);
+    if (sqlite3_stmt_busy(p) && z && z[0]) return 1;
+  }
+  return 0;
+}
+
+static int refuseBlobWrite(HppliteCtx *pCtx) {
+  static const char zWhy[] = "an incremental blob write (sqlite3_blob_write) needs page capture (capture=pages): "
+                             "row and statement capture cannot see it; its transaction was rolled back";
+  pCtx->bBlobWrite = 0;
+  fprintf(stderr, "hpplite: %s\n", zWhy);
+  snprintf(pCtx->zLastRefusal, sizeof(pCtx->zLastRefusal), "%s (the driver reports a constraint failure)", zWhy);
+  return 1;
+}
+
+/*
 ** Commit hook: close the current transaction group.
 */
 int hppliteCommitHook(void *pArg) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   if (pCtx->bInternal) return 0;
+  /* a blob write seen, or with no pre-update hook, a commit with no SQL
+  ** running: sqlite3_blob_close committing one (the commit becomes a rollback) */
+  if (pCtx->bBlobWrite || (!pCtx->bPreupdate && !sqlStatementRunning(pCtx->db))) return refuseBlobWrite(pCtx);
   pCtx->curTxn = 0;
   pCtx->bRootDirty = 1;
   __atomic_add_fetch(&pCtx->nCommitBegun, 1, __ATOMIC_RELEASE);
@@ -1626,6 +1719,7 @@ int hppliteCommitHook(void *pArg) {
 */
 void hppliteRollbackHook(void *pArg) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
+  pCtx->bBlobWrite = 0;
   if (pCtx->bInternal) return;
   pCtx->curTxn = 0;
   if (pCtx->xOnRollback) {

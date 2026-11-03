@@ -818,7 +818,21 @@ a hundred batches later:
 | `last_insert_rowid()`, `changes()`, `total_changes()`, `sqlite_version()`, `sqlite_source_id()`, `sqlite_compileoption_*()`, `load_extension()` in a write | connection or build state | read the value (`SELECT last_insert_rowid()` is fine), then bind it |
 | a write that calls a function the application registered (`sqlite3_create_function`, Python `create_function`; Django's `django_date_extract` behind `filter(due__month=3).update(...)`), directly or through a view, trigger, generated column or expression index | a replica has SQLite's functions only, so the statement could not run there (#53) | compute the value in the application and bind it, or filter with a built-in (`due__year`, a range); reads may call it |
 | `ATTACH` | writes to another file are not captured | one database per file |
+| an incremental blob write (`sqlite3_blob_write`, Python's `blobopen`), with row or statement capture: its transaction is rolled back at the commit | it changes a row without a statement, so no trigger or trace sees it, and the replica would keep the old bytes (#169) | page capture (`capture=pages`), which ships the pages it wrote; or write the blob with SQL (`UPDATE t SET data = ?`) |
 | writes that name `_hpplite_*` tables (`INSERT INTO _hpplite_pending`, a trigger on it, `RENAME TO _hpplite_x`, `INSERT INTO t SELECT ... FROM _hpplite_pending`) | the log and meta are per-replica, not data (#18) | reads are fine (`SELECT`), writes go through HPPLite |
+
+**Incremental blob writes, in detail (#169).** Row and statement capture
+see one through SQLite's pre-update hook. HPPLite's own build has it, and so
+do the SQLite libraries of Homebrew and Debian. Loaded into an application,
+HPPLite looks it up in the SQLite library that loaded it. A commit with one
+in it fails with `SQLITE_CONSTRAINT_COMMITHOOK` (Python: `IntegrityError:
+constraint failed` at the `COMMIT`). An autocommitted one is rolled back when
+the blob is closed, and Python's `Blob.close()` does not report that: the
+write is simply not there, with the reason on stderr and in `last_refusal`.
+Where the application's SQLite has no pre-update hook (conda's, for one),
+HPPLite says so at load. There it still refuses an autocommitted blob write,
+but cannot see one inside a transaction, which would be lost: an application
+that writes blobs that way needs page capture.
 
 **What a refusal looks like.** The driver reports only SQLite's code:
 `interrupted` (`SQLITE_INTERRUPT`) or `not authorized` (`SQLITE_AUTH`) - in

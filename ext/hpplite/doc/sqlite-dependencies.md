@@ -35,6 +35,7 @@ the same binary with `HPPLITE_CAPTURE=text`.
 | 10 | A schema reset is immediate even while another statement of the connection is running | test_rows, test_concurrency(+_text), test_faults(+_text), test_rows_e2e | handled (#108) |
 | 11 | The wal hook runs only when `sqlite3_step()` returns SQLITE_DONE in autocommit; a statement reset after a row commits without it | test_abuse_pages | handled (#155) |
 | 12 | A read transaction pinned at a WAL frame bounds every checkpoint there; the frames past it can be cut off the WAL file | test_wal_pin | ok (2026-11-02 trunk) |
+| 13 | An incremental blob write runs no trigger, trace or authorizer; only the pre-update hook sees it (a DELETE with `sqlite3_preupdate_blobwrite() >= 0`), the blob's commit runs from a program with no SQL text, and a refusing commit hook runs the rollback hook | test_blob_io | handled (#169) |
 
 Entry 10 was not on the list in #105: it is the one trunk broke, found by the
 first run of the trunk build (2026-11-01; details under 10). HPPLite no
@@ -456,6 +457,45 @@ page-mode maintenance, the frame arithmetic `walread.c`).
 **Pinned by.** test_wal_pin: `TEST("a reader pinned at a frame bounds every
 checkpoint there...")`, `TEST("the frames past the pin cut off the WAL
 file...")`, `TEST("a pin held under 3000 commits...")`.
+
+## 13. An incremental blob write is seen only by the pre-update hook
+
+**What HPPLite relies on.** `sqlite3_blob_write` changes a row without a
+statement: no trigger fires (row capture), no `SQLITE_TRACE_STMT` arrives
+(statement capture), the authorizer is not asked at `sqlite3_blob_open`. The
+pre-update hook is called for each write, with `SQLITE_DELETE`, the table and
+the rowid, and `sqlite3_preupdate_blobwrite()` returns the column (>= 0;
+-1 for a real DELETE). That needs `SQLITE_ENABLE_PREUPDATE_HOOK`, and the
+extension API (`sqlite3_api_routines`) has no entry for the hook: the module
+resolves `sqlite3_preupdate_hook`/`sqlite3_preupdate_blobwrite` with
+`dladdr` on an API routine and `dlsym` in that library. An autocommitted
+blob write commits from `sqlite3_blob_close`, by finalizing the blob's own
+program, which `sqlite3_sql()` gives no text for; every application
+statement has text. A commit hook that returns non-zero turns the commit
+into a rollback (`SQLITE_CONSTRAINT_COMMITHOOK`) and the rollback hook runs.
+If any of this changes, row and statement capture lose blob writes again
+or refuse ordinary commits.
+
+**SQLite source.** `vdbeblob.c` `blobReadWrite()`: the
+`sqlite3VdbePreUpdateHook(..., SQLITE_DELETE, ..., p->iCol)` call under
+`SQLITE_ENABLE_PREUPDATE_HOOK` (its comment says why DELETE);
+`sqlite3_blob_open()` builds its program with `sqlite3VdbeCreate()` and
+`sqlite3VdbeAddOpList()`, no SQL; `vdbeaux.c` `vdbeCommit()` returns
+`SQLITE_CONSTRAINT_COMMITHOOK` when `xCommitCallback` is non-zero;
+`main.c` `sqlite3RollbackAll()` calls `xRollbackCallback`; `loadext.c`
+`sqlite3Apis` (no pre-update entries).
+
+**HPPLite code.** `capture.c` `preupdateResolve()`, `blobWriteSeen()`,
+`hppliteBlobGuardArm()` (from `hpplite_init` and `rearmHooks`),
+`sqlStatementRunning()` and the check at the top of `hppliteCommitHook()`.
+
+**Pinned by.** test_blob_io (rows, `_text`, `_pages`): `TEST("an
+autocommitted sqlite3_blob_write: refused in row/statement capture...")`,
+`TEST("sqlite3_blob_write inside BEGIN...COMMIT: the COMMIT refused...")`,
+`TEST("no pre-update hook in the host SQLite: ...")`. The module's lookup
+in a host library was checked by hand (Homebrew 3.51.0, Debian trixie
+3.46.1: found; conda 3.50.2: not exported); no suite loads the module into
+another SQLite yet.
 
 ## Adding an entry
 
