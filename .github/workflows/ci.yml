@@ -124,7 +124,7 @@ jobs:
             -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
           cmake --build ext/hpplite/build_real -j"$(nproc)"
       - name: forge tests (contracts)
-        run: cd ext/hpplite/contracts && forge test -q
+        run: cd ext/hpplite/contracts && forge test
       - name: anvil harness
         run: cd ext/hpplite/build_real && ctest -R "test_anvil|test_tx_encoding" --output-on-failure
 
