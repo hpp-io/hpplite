@@ -72,16 +72,17 @@ void hpplite_store_cid_from_sha256(const uint8_t digest[32], char out[64]);
 void hpplite_store_sha256(const uint8_t *data, size_t len, uint8_t out[32]);
 
 /* Named entries (#165): a batch under its rollup's name "<da hex, no 0x>-<height>" with the
-** sequencer's EIP-712 Batch signature (65 bytes, what HPPLiteDA.batchDigest signs: instanceId,
-** height, keccak256 of the bytes, in the DA contract's domain) appended, so a reader finds
-** batches by height and knows who claims them. sign fills sig from the store's key (-1 without
-** one); put_named stores bytes||sig under the name (0, or -1 with the reason in error);
-** get_named reads them back, the signature apart (malloc'd bytes, or NULL). A pin service
-** and an S3 bucket take names; a Kubo node does not (-1 / NULL). */
+** sequencer instance (32 bytes) and its EIP-712 Batch signature (65 bytes, what
+** HPPLiteDA.batchDigest signs: instanceId, height, keccak256 of the bytes, in the DA contract's
+** domain) appended, so a reader finds batches by height and recovers who claims them (#167).
+** sign fills sig from the store's key (-1 without one); put_named stores bytes||instance||sig
+** under the name (0, or -1 with the reason in error); get_named reads them back, the instance
+** and the signature apart (malloc'd bytes, or NULL). A pin service and an S3 bucket take
+** names; a Kubo node does not (-1 / NULL). */
 int hpplite_store_sign_batch(HppliteStore *store, const unsigned char da[20], uint64_t chainId, const unsigned char instance[32],
                              uint64_t height, const uint8_t *data, size_t len, uint8_t sig[65]);
 int hpplite_store_put_named(HppliteStore *store, const char *zName, const unsigned char instance[32], const uint8_t *data, size_t len, const uint8_t sig[65]);
-uint8_t *hpplite_store_get_named(HppliteStore *store, const char *zName, size_t *pLen, uint8_t sig[65]);
+uint8_t *hpplite_store_get_named(HppliteStore *store, const char *zName, size_t *pLen, uint8_t sig[65], unsigned char instance[32]);
 /* The wallet a named entry's signature recovers to (0), or -1 when it does not recover */
 int hpplite_store_batch_signer(const unsigned char da[20], uint64_t chainId, const unsigned char instance[32], uint64_t height,
                                const uint8_t *data, size_t len, const uint8_t sig[65], unsigned char out[20]);

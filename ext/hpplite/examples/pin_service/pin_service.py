@@ -480,7 +480,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("X-HPPLite-Signer", eth.recover(batch_digest(self.service.chain_id, name, self.headers.get("X-HPPLite-Instance") or "", data[:-65]), data[-65:]) if len(data) > 65 and self.headers.get("X-HPPLite-Instance") else "")
+            self.send_header("X-HPPLite-Signer", eth.recover(batch_digest(self.service.chain_id, name, "0x" + data[-97:-65].hex(), data[:-97]), data[-65:]) if len(data) > 97 else "")
             self.end_headers()
             self.wfile.write(data)
             return
@@ -513,16 +513,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
         if path.startswith("/name/"):
-            # a batch under its rollup's name (#165): the bytes with the sequencer's EIP-712 Batch signature
-            # (65 bytes) appended; the instance the signature names in a header. Free: the content put paid.
+            # a batch under its rollup's name (#165): the bytes, then the sequencer instance (32 bytes) and its
+            # EIP-712 Batch signature (65 bytes) the instance names. Free: the content put paid.
             name = path[6:]
-            instance = self.headers.get("X-HPPLite-Instance") or ""
-            if not NAME_RE.match(name) or len(body) <= 65 or len(body) > self.service.args.max_bytes + 65:
-                return self.reply(400, {"error": "a name is <da>-<height>, the body the bytes and a 65-byte signature"})
-            if not re.match(r"^0x[0-9a-fA-F]{64}$", instance):
-                return self.reply(400, {"error": "X-HPPLite-Instance: the sequencer instance the signature names, 0x + 64 hex"})
+            if not NAME_RE.match(name) or len(body) <= 97 or len(body) > self.service.args.max_bytes + 97:
+                return self.reply(400, {"error": "a name is <da>-<height>, the body the bytes, a 32-byte instance and a 65-byte signature"})
+            instance = "0x" + body[-97:-65].hex()
             da = "0x" + name.split("-")[0]
-            signer = eth.recover(batch_digest(self.service.chain_id, name, instance, body[:-65]), body[-65:])
+            signer = eth.recover(batch_digest(self.service.chain_id, name, instance, body[:-97]), body[-65:])
             if not signer:
                 return self.reply(400, {"error": "the signature does not recover"})
             holder = self.service.store.name_signer(da)
@@ -533,7 +531,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if wallet and wallet.lower() != signer.lower():
                     return self.reply(403, {"error": "not the rollup's sequencer wallet", "signer": signer, "sequencer": wallet})
             self.service.store.put_named(name, da, signer, body)
-            return self.reply(200, {"name": name, "bytes": len(body) - 65, "signer": signer})
+            return self.reply(200, {"name": name, "bytes": len(body) - 97, "signer": signer})
         if path == "/put":
             if not body:
                 return self.reply(400, {"error": "empty body"})

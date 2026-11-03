@@ -1647,7 +1647,7 @@ static void test_store_commit(void) {
         snprintf(name, sizeof name, "%.40s-2", da + 2);
         for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
         memcpy(hex40, name, 40); hex40[40] = 0; hpplite_hex_to_bytes(hex40, daBytes, 20);
-        bytes = st ? hpplite_store_get_named(st, name, &n, sig) : NULL;
+        bytes = st ? hpplite_store_get_named(st, name, &n, sig, NULL) : NULL;
         {
             HppliteNode *nd = hpplite_get_node(w);
             unsigned char k[32];

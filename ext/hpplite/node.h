@@ -129,6 +129,7 @@ typedef struct HppliteNode {
     struct HppliteStore *store;     /* the batch bytes' store when store= is given (#11); the chain commits hash, ref, receipt */
     int warnedStoreDown;            /* said once per outage that batches go on the chain meanwhile */
     int warnedNames;                /* said once that the store takes no names (#165) */
+    int softWalked;                 /* the store's names past the chain were read once (#167) */
     uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
     int storeBalanceOk;
     long storeBalanceAt;            /* seconds (time()) */

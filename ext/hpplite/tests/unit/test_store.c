@@ -276,7 +276,7 @@ static void test_kubo(const char *url, const char *tag) {   /* tag: the files' s
         HppliteStore *rs = hpplite_store_open(url, NULL, 0);
         uint8_t sig[65];
         size_t n = 0;
-        if (rs && hpplite_store_get_named(rs, "dadadadadadadadadadadadadadadadadadadada-1", &n, sig) != NULL) { hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("a Kubo node takes no names"); }
+        if (rs && hpplite_store_get_named(rs, "dadadadadadadadadadadadadadadadadadadada-1", &n, sig, NULL) != NULL) { hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("a Kubo node takes no names"); }
         if (rs) hpplite_store_close(rs);
     }
     {
@@ -355,7 +355,7 @@ static void test_s3(const char *url, const char *secret, const char *tag) {
         hpplite_l1_get_addresses(l1, c, d);
         snprintf(name, sizeof name, "%.40s-1", (d[0] ? d : c) + 2);
         for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
-        bytes = rs ? hpplite_store_get_named(rs, name, &n, sig) : NULL;
+        bytes = rs ? hpplite_store_get_named(rs, name, &n, sig, NULL) : NULL;
         if (!bytes || n == 0) { printf("(%s: %s) ", name, rs ? hpplite_store_error(rs) : "no store"); if (rs) hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("batch 1 under its name in the bucket"); }
         free(bytes); hpplite_store_close(rs);
     }
@@ -411,7 +411,7 @@ static void test_ranges(const char *url) {
         snprintf(name, sizeof name, "%.40s-3", (d[0] ? d : c) + 2);
         for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
         { char hex40[41]; memcpy(hex40, name, 40); hex40[40] = 0; hpplite_hex_to_bytes(hex40, da, 20); }
-        bytes = rs ? hpplite_store_get_named(rs, name, &n, sig) : NULL;
+        bytes = rs ? hpplite_store_get_named(rs, name, &n, sig, NULL) : NULL;
         if (!bytes) { printf("(%s: %s) ", name, rs ? hpplite_store_error(rs) : "no store"); if (rs) hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("batch 3 under its name"); }
         hpplite_keccak256(bytes, n, hash);
         sqlite3_prepare_v2(w->ctx->bkDb, "SELECT hash FROM _hpplite_unanchored WHERE height = 3", -1, &q, NULL);
@@ -577,7 +577,7 @@ static void test_named(const char *url) {
     if (!s1 || !s2) FAIL("open with keys");
     if (hpplite_store_sign_batch(s1, da, 181228, inst, 7, data, sizeof data, sig) != 0) FAIL("sign");
     if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", inst, data, sizeof data, sig) != 0) { printf("(%s) ", hpplite_store_error(s1)); FAIL("put named"); }
-    back = hpplite_store_get_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", &n, got);
+    back = hpplite_store_get_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", &n, got, NULL);
     if (!back || n != sizeof data || memcmp(back, data, n) != 0 || memcmp(got, sig, 65) != 0) { printf("(%s) ", hpplite_store_error(s1)); free(back); FAIL("get named: the bytes and the signature"); }
     free(back);
     if (hpplite_store_batch_signer(da, 181228, inst, 7, data, sizeof data, sig, me1) != 0) FAIL("the signer recovers");
@@ -594,9 +594,64 @@ static void test_named(const char *url) {
     memcpy(bad, sig, 65); bad[10] ^= 1;
     if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-9", inst, data, sizeof data, bad) == 0) FAIL("a signature that does not recover to the holder must be refused");
     if (hpplite_store_batch_signer(da, 181228, inst, 7, data, sizeof data, bad, who) == 0 && memcmp(who, me1, 20) == 0) FAIL("a changed signature must not recover to the signer");
-    if (hpplite_store_get_named(s1, "dadadadadadadadadadadadadadadadadadadada-9", &n, got) != NULL) FAIL("nothing under a refused name");
-    if (hpplite_store_get_named(s1, "not a name", &n, got) != NULL) FAIL("a malformed name is refused by the client");
+    if (hpplite_store_get_named(s1, "dadadadadadadadadadadadadadadadadadadada-9", &n, got, NULL) != NULL) FAIL("nothing under a refused name");
+    if (hpplite_store_get_named(s1, "not a name", &n, got, NULL) != NULL) FAIL("a malformed name is refused by the client");
     hpplite_store_close(s1); hpplite_store_close(s2);
+    PASS();
+}
+
+
+/* 10. Recovery (#167): a sequencer that dies with batches at the store and none anchored; another
+** with the same key on a fresh file reads them by name, applies them, anchors them; nothing lost. */
+static void test_recovery(const char *url) {
+    TEST("recovery: the sequencer dies with three batches at the store, none anchored; a new one on a fresh file with the same key recovers them by name, anchors them, a replica sees all of it");
+    static const unsigned char kseq[32] = { [31] = 0x79 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "rec_a", .privkey = kseq };
+    HppliteNode *w = test_open_node(tpath("rec_a.db"), l1, &o), *w2;
+    uint64_t last = 0, total = 0;
+    unsigned char latest[32];
+    int i;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3; i++) {
+        char sql[80];
+        snprintf(sql, sizeof sql, "INSERT INTO t(v) VALUES('before the crash %d')", i);
+        hpplite_node_exec(w, sql, NULL);
+        if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("a flush"); }
+    }
+    /* the machine is gone: no close, no anchor, the file with it */
+    hpplite_node_stop_timer(w);
+    w->ownsL1 = 0;
+    w->l1 = NULL;
+    hpplite_node_destroy(w);
+    hpplite_l1_get_da_state(l1, &last, &total, latest);
+    if (last != 0) { hpplite_l1_disconnect(l1); FAIL("nothing reached the chain"); }
+    hpplite_l1_mock_advance_time(l1, 400);                        /* the dead one's lease runs out */
+    {
+        TestNodeOpts o2 = { .storeUrl = url, .nodeId = "rec_b", .privkey = kseq };
+        w2 = test_open_node(tpath("rec_b.db"), l1, &o2);
+    }
+    if (!w2) { hpplite_l1_disconnect(l1); FAIL("open the successor"); }
+    if (status_int(w2->db, "height") != 4 || count_rows(w2->db, "t") != 3 || scalar(w2->ctx->bkDb, "SELECT count(*) FROM _hpplite_unanchored") != 3) {
+        printf("(height %lld, rows %d, unanchored %lld, last_error '%s') ", (long long)status_int(w2->db, "height"), count_rows(w2->db, "t"),
+               (long long)scalar(w2->ctx->bkDb, "SELECT count(*) FROM _hpplite_unanchored"), status_text(w2->db, "last_error"));
+        w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1); FAIL("the successor should hold the three batches the store had");
+    }
+    hpplite_node_exec(w2, "INSERT INTO t(v) VALUES('after')", NULL);
+    if (hpplite_node_flush_batch(w2) < 1 || hpplite_node_anchor(w2) != 4) {
+        printf("(%s) ", status_text(w2->db, "last_error")); w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1); FAIL("its own batch, then one anchor 1-4");
+    }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "rec_r", .privkey = kseq };
+        HppliteNode *r = test_open_node(tpath("rec_r.db"), l1, &ro);
+        int rows = r ? count_rows(r->db, "t") : -1, same = r ? same_root(w2, r) : 0;
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); }
+        if (rows != 4 || !same) { printf("(replica rows %d, same root %d) ", rows, same); w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1); FAIL("a replica sees the recovered batches and the new one"); }
+    }
+    w2->ownsL1 = 0;
+    hpplite_node_destroy(w2);
+    hpplite_l1_disconnect(l1);
     PASS();
 }
 
@@ -621,6 +676,7 @@ int main(int argc, char **argv) {
     test_ranges(url);
     test_ranges_restart(url);
     test_anchor_timer(url);
+    test_recovery(url);
     {
         int kport = 8670 + (int)(getpid() % 200);
         char kurl[64];

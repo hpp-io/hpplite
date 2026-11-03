@@ -25,8 +25,8 @@ this order and verifies every receipt before it believes it.
 | `POST /put` with the bytes | yes: `pricePerPin + pricePerByte × size` buys `retentionSeconds` | `{cid, bytes, expires, receipt, held}` |
 | `POST /pin/<cid>` | yes, the same price | retention extended, a new `receipt` |
 | `GET /get/<cid>` | no (`--paid-get` to charge) | the bytes |
-| `POST /name/<da>-<height>` with the bytes and the sequencer's 65-byte EIP-712 `Batch` signature appended, `X-HPPLite-Instance` the instance it names (#165) | no | `{name, bytes, signer}`; 403 when another signer holds the rollup's names, or (with `--rpc`) when the signer is not the coordinator's `sequencerWallet()` |
-| `GET /name/<da>-<height>` | no | the bytes with the signature appended |
+| `POST /name/<da>-<height>` with the bytes, then the sequencer instance (32 bytes) and its 65-byte EIP-712 `Batch` signature appended (#165) | no | `{name, bytes, signer}`; 403 when another signer holds the rollup's names, or (with `--rpc`) when the signer is not the coordinator's `sequencerWallet()` |
+| `GET /name/<da>-<height>` | no | the bytes with the instance and the signature appended; `X-HPPLite-Signer` the wallet it recovers to |
 | `GET /status` | no | prices, retention, the **signer** and the receipt's typed-data layout |
 
 - **Idempotent by CID.** A `put` of bytes already held answers 200 with the

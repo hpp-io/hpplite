@@ -903,24 +903,23 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
     if (!s || !nameOk(zName) || !instance || !data || !len || !sig) return -1;
     s->error[0] = 0;
     if (s->kind == STORE_KUBO) { snprintf(s->error, sizeof s->error, "a Kubo node takes no names"); return -1; }
-    body = malloc(len + 65);
+    body = malloc(len + 97);
     if (!body) return -1;
     memcpy(body, data, len);
-    memcpy(body + len, sig, 65);
+    memcpy(body + len, instance, 32);
+    memcpy(body + len + 32, sig, 65);
     if (s->kind == STORE_S3) {
         char key[80], *path;
         snprintf(key, sizeof key, "name-%s", zName);
         path = s3Path(s, key);
-        status = path ? s3Request(s, "PUT", path, body, len + 65, &out) : 0;
+        status = path ? s3Request(s, "PUT", path, body, len + 97, &out) : 0;
         if (status == 200) rc = 0;
         else if (status) { char code[120]; s3ErrorCode(&out, code, sizeof code); snprintf(s->error, sizeof s->error, "S3 answered %ld to put %s: %s", status, key, code); }
         sqlite3_free(path);
     } else {
-        char path[120], hdr[120];
+        char path[120];
         snprintf(path, sizeof path, "/name/%s", zName);
-        snprintf(hdr, sizeof hdr, "X-HPPLite-Instance: 0x");
-        hpplite_bytes_to_hex(instance, 32, hdr + strlen(hdr));
-        status = storeRequest(s, "POST", path, body, len + 65, hdr, &out, NULL, NULL);
+        status = storeRequest(s, "POST", path, body, len + 97, NULL, &out, NULL, NULL);
         if (status == 200) rc = 0;
         else if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s: %.120s", status, zName, out.p ? out.p : "");
     }
@@ -929,7 +928,7 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
     return rc;
 }
 
-uint8_t *hpplite_store_get_named(HppliteStore *s, const char *zName, size_t *pLen, uint8_t sig[65]) {
+uint8_t *hpplite_store_get_named(HppliteStore *s, const char *zName, size_t *pLen, uint8_t sig[65], unsigned char instance[32]) {
     Buf out = {0};
     long status;
     if (pLen) *pLen = 0;
@@ -947,13 +946,14 @@ uint8_t *hpplite_store_get_named(HppliteStore *s, const char *zName, size_t *pLe
         snprintf(path, sizeof path, "/name/%s", zName);
         status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
     }
-    if (status != 200 || !out.p || out.n < 66) {
+    if (status != 200 || !out.p || out.n < 98) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s", status, zName);
         free(out.p);
         return NULL;
     }
-    out.n -= 65;
-    if (sig) memcpy(sig, out.p + out.n, 65);
+    out.n -= 97;
+    if (instance) memcpy(instance, out.p + out.n, 32);
+    if (sig) memcpy(sig, out.p + out.n + 32, 65);
     out.p[out.n] = 0;
     if (pLen) *pLen = out.n;
     return (uint8_t *)out.p;

@@ -2550,6 +2550,94 @@ uint64_t hpplite_node_flush_batch(HppliteNode *node) {
 /*
 ** Bring the local database up to date with L1.
 */
+/*
+** Recovery (#167): the batches the store holds above the chain's height,
+** read by their names, applied, and taken as this node's own, so a sequencer
+** that starts where the last one died (another machine, a fresh file) loses
+** nothing that reached the store. A name is taken only when its signature
+** recovers to this node's wallet (the one sequencer key) and the batch
+** applies on top of what is already here; the walk stops at the first height
+** without one. Each recovered batch gets its _hpplite_unanchored row (the
+** content reference, the chain hash before and after), so the next anchor
+** names it. Once per node: a restart on the same file starts past them.
+*/
+static int node_soft_walk(HppliteNode *node) {
+    char c[43], d[43], name[80], *p, cid[64];
+    const char *zDa;
+    unsigned char da[20], me[20], who[20], inst[32], k[32], before[32], after[32], digest[32];
+    uint8_t sig[65];
+    uint64_t first = 0, last = 0;
+    if (node->softWalked || !node_ranges(node) || node->follower || !node->ctx) return 0;
+    node->softWalked = 1;
+    if (hpplite_l1_get_addresses(node->l1, c, d) != 0 || hpplite_l1_get_my_address(node->l1, me) != 0) return 0;
+    zDa = d[0] ? d : c;
+    if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return 0;
+    for (;;) {
+        uint64_t h = node->ctx->blockHeight, chainId;
+        size_t n = 0;
+        uint8_t *data;
+        HppliteBatch *batch;
+        int rc, saved;
+        sqlite3_stmt *q = NULL;
+        snprintf(name, sizeof name, "%.40s-%llu", zDa + 2, (unsigned long long)h);
+        for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+        data = hpplite_store_get_named(node->store, name, &n, sig, inst);
+        if (!data) break;                                            /* the first height the store has no name for: the end */
+        chainId = hpplite_l1_chain_id(node->l1);
+        if (!chainId) chainId = hpplite_l1_default_chain_id();
+        if (hpplite_store_batch_signer(da, chainId, inst, h, data, n, sig, who) != 0 || memcmp(who, me, 20) != 0) {
+            char zw[41];
+            hpplite_bytes_to_hex(who, 20, zw);
+            hpplite_error(node->ctx, "batch %llu at the store under its name is signed by 0x%s, not this wallet: not recovered, nothing past it either", (unsigned long long)h, zw);
+            free(data);
+            break;
+        }
+        batch = node_decode_batch(node, h, data, n);
+        if (!batch) { hpplite_error(node->ctx, "batch %llu at the store could not be read; recovery stops before it", (unsigned long long)h); free(data); break; }
+        batch->pPosted = data; batch->nPosted = n; batch->bOwnsPosted = 1;
+        memcpy(before, node->ctx->chainHash, 32);
+        if (batch->bPages) rc = (node->pm && !node->config.verifyOnly && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
+        else { rc = hpplite_replay_batch(node->ctx, batch, 1); if (rc == SQLITE_DONE) rc = SQLITE_OK; }
+        if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
+            hpplite_error(node->ctx, "batch %llu at the store does not apply on this history (rc=%d); recovery stops before it", (unsigned long long)h, rc);
+            hpplite_batch_free(batch);
+            break;
+        }
+        hpplite_keccak256(data, n, k);
+        hpplite_chain_hash_next(before, h, k, after);
+        hpplite_store_sha256(data, n, digest);
+        hpplite_store_cid_from_sha256(digest, cid);
+        rc = hppliteBkBegin(node->ctx, 1);
+        if (rc == SQLITE_OK) {
+            saved = hppliteBkEnter(node->ctx);
+            rc = sqlite3_prepare_v2(node->ctx->bkDb, "INSERT OR REPLACE INTO _hpplite_unanchored(height, hash, ref, receipt, chain_before, chain_after, root) VALUES(?1, ?2, ?3, NULL, ?4, ?5, NULL)", -1, &q, NULL);
+            if (rc == SQLITE_OK) {
+                sqlite3_bind_int64(q, 1, (sqlite3_int64)h);
+                sqlite3_bind_blob(q, 2, k, 32, SQLITE_STATIC);
+                sqlite3_bind_text(q, 3, cid, -1, SQLITE_STATIC);
+                sqlite3_bind_blob(q, 4, before, 32, SQLITE_STATIC);
+                sqlite3_bind_blob(q, 5, after, 32, SQLITE_STATIC);
+                rc = sqlite3_step(q) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+            }
+            sqlite3_finalize(q);
+            hppliteBkLeave(node->ctx, saved);
+            rc = hppliteBkEnd(node->ctx, rc);
+        }
+        hpplite_batch_free(batch);
+        if (rc != SQLITE_OK) { hpplite_error(node->ctx, "batch %llu recovered but its row for the anchor could not be written (rc=%d)", (unsigned long long)h, rc); break; }
+        if (!first) first = h;
+        last = h;
+        node->batchesProduced++;
+        node->batchesSinceCheckpoint++;
+    }
+    if (first) {
+        fprintf(stderr, "hpplite: recovered batches %llu-%llu from the store (signed by this wallet, not yet anchored): the next anchor takes them\n",
+                (unsigned long long)first, (unsigned long long)last);
+        node->anchorAt = 0;                                          /* the timer anchors them soon */
+    }
+    return first ? (int)(last - first + 1) : 0;
+}
+
 int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     uint64_t lastBatch = 0, totalBatches = 0;
     unsigned char latestHash[32];
@@ -2636,6 +2724,8 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
+    if (!node->config.verifyOnly && node->ctx->blockHeight == lastBatch + 1 && hpplite_node_pending_count(node) == 0)
+        synced += node_soft_walk(node);             /* what the store holds past the chain (#167), before anything of ours */
     node_pages_decide_snapshot(node);               /* the chain seen: is the file ahead of it? */
     if (node->pagesWalSuspended && !node->pieceDb) {
         /* the pages applied: back to WAL for this node's own writes, the file as

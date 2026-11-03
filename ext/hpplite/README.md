@@ -642,6 +642,16 @@ rollup, and, given `--rpc`, only from the coordinator's `sequencerWallet()`;
 an S3 bucket takes it as a key; a Kubo node takes no names. The hard tier does
 not depend on the name: a store that refuses it is said once on stderr.
 
+**Recovery (#167).** A sequencer that dies with batches at the store and not
+yet anchored loses none of them: the next sequencer with the same key, on
+the same file or a fresh one on another machine, replays the chain, then
+reads the names past the anchored height, takes each batch whose signature
+recovers to its own wallet and that applies on its history, and anchors them
+with its own. It stops at the first height without a name, or at one signed
+by another wallet. What is lost is what never reached the store: at most one
+flush interval. The successor waits out the dead one's lease (an hour on
+VERSION 9) before it can anchor; its writes are captured meanwhile.
+
 What it costs: one anchor on HPP Sepolia is 73.5k gas (the first of a
 rollup 124.8k, its slots written for the first time), about what one
 per-batch commitment cost, so a database writing all day pays 48 anchors instead of 17 000
