@@ -82,6 +82,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_READERS          33     /* readers granted besides the wallet (#15) */
 #define STATUS_COL_ANCHORED         34     /* the chain's last height (#164): above it the store alone holds the batches; NULL without a chain */
 #define STATUS_COL_LAST_ANCHOR_TX   35     /* the transaction of the last anchor this node made */
+#define STATUS_COL_LAST_CHECKPOINT_ROOT 36 /* the root the last checkpoint (or anchor) carried, hex; NULL before one */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -97,7 +98,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
-        " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT)");
+        " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -351,6 +352,16 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_LAST_ANCHOR_TX:
             if (node->lastAnchorTx[0]) sqlite3_result_text(ctx, node->lastAnchorTx, -1, SQLITE_TRANSIENT);
             break;
+        case STATUS_COL_LAST_CHECKPOINT_ROOT: {
+            static const unsigned char zero[32];
+            if (node->ctx->lastCheckpointHeight > 0 && memcmp(node->ctx->lastCheckpointRoot, zero, 32) != 0) {
+                char hex[67];
+                hex[0] = '0'; hex[1] = 'x';
+                hpplite_bytes_to_hex(node->ctx->lastCheckpointRoot, 32, hex + 2);
+                sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
+            }
+            break;
+        }
         default:
             sqlite3_result_null(ctx);
     }

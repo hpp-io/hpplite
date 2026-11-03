@@ -13,7 +13,8 @@ key = os.environ["HPPLITE_PRIVATE_KEY"]
 
 def rebuild():
     d = tempfile.mkdtemp(prefix="hpplite-verify-")
-    uri = f"file:{d}/rebuilt.db?hpplite=on&l1=hpp-sepolia&interval=0&datadir={d}"
+    store = os.environ.get("HPPLITE_DEMO_STORE")
+    uri = f"file:{d}/rebuilt.db?hpplite=on&l1=hpp-sepolia&interval=0&datadir={d}" + (f"&store={store}" if store else "")
     t0 = time.time()
     c = sqlite3.connect(":memory:")
     c.enable_load_extension(True); c.load_extension(os.path.splitext(ext)[0]); c.close()

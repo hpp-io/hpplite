@@ -23,7 +23,7 @@ const HppliteNetworkAlias HPPLITE_NETWORKS[] = {
     /* HPP anchors to L1 every 30 minutes: a batch posted more often only waits
     ** in its queue, and each costs a commitment (#162), so that is the interval
     ** on HPP unless interval= says otherwise */
-    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xa80365fd5b4e7a22df13de334e3ef0c74032d345", 40000, 32000000, 30 * 60 * 1000},
+    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0x7748552ecedbe80e9cc27a72f1fac0cf7d1ab37e", 40000, 32000000, 30 * 60 * 1000},
     {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL, 40000, 32000000, 30 * 60 * 1000},  /* Not deployed yet */
     {"ethereum",    1,      "https://eth.llamarpc.com", NULL, 20000, 16777216, 0},
     {"sepolia",     11155111, "https://sepolia.drpc.org", NULL, 20000, 16777216, 0},

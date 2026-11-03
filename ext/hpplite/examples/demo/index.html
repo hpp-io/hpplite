@@ -56,10 +56,10 @@ async function refresh(){
   try{st=await (await fetch('/api/status')).json();}catch(e){return}
   const ex=st.explorer;
   const link=(a,t)=>a?`<a target="_blank" href="${ex}/${t}/${a}">${a.slice(0,10)}…${a.slice(-4)}</a>`:'—';
-  $('#cards').innerHTML=card('batches on chain',st.batches)+card('pending entries',st.pending,st.pending?'warn':'')+card('last checkpoint','batch '+st.last_checkpoint_height)
+  $('#cards').innerHTML=card(st.store?'batches at the store':'batches on chain',st.batches)+(st.store?card('anchored on chain','batch '+st.anchored+' (every 30 min)'):'')+card('pending entries',st.pending,st.pending?'warn':'')+card('last checkpoint','batch '+st.last_checkpoint_height)
    +card('entries',st.entries)+card('db size',(st.db_bytes/1024).toFixed(0)+' KB')+card('lease',st.lease?'held':'—',st.lease?'ok':'')
    +card('live state root (content hash now)',st.state_root?st.state_root.slice(0,18)+'…':'—','small')+card('anchored root (checkpoint '+st.last_checkpoint_height+')',st.anchored_root?st.anchored_root.slice(0,18)+'…':'—','small')+card('encryption',st.encryption,'small')
-   +card('rollup contract',link(st.contract,'address'),'small')+card('DA contract',link(st.da_contract,'address'),'small')+card('last batch tx',link(st.last_batch_tx,'tx'),'small');
+   +card('rollup contract',link(st.contract,'address'),'small')+card('DA contract',link(st.da_contract,'address'),'small')+(st.store?card('last anchor tx',link(st.last_anchor_tx,'tx'),'small'):card('last batch tx',link(st.last_batch_tx,'tx'),'small'));
   const es=await (await fetch('/api/entries')).json();
   const em=Object.fromEntries((st.agents||[]).map(a=>[a.name,a.emoji]));
   $('#entries').innerHTML=es.map(e=>`<div class="entry ${e.kind==='agent'?'agent':''}"><span class="who">${e.kind==='agent'?(em[e.name]||'🤖')+' ':''}${esc(e.name)}</span>${e.kind==='agent'?'<span class="badge">agent</span>':''}<span class="when">${new Date(e.posted_at*1000).toLocaleString()} · #${e.id}</span><div class="body">${esc(e.body)}</div></div>`).join('')||'<span class="note">nothing yet</span>';
@@ -68,11 +68,11 @@ async function refresh(){
     $('#schema').innerHTML=sc.map(t=>`<div class="tbl"><div class="tn">${esc(t.name)}<span class="cnt">${t.rows} rows</span></div>${t.note?`<div class="note">${esc(t.note)}</div>`:''}<pre>${esc(t.sql)}</pre>
       <div class="tblwrap"><table class="prev"><tr>${t.columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>${t.preview.map(r=>`<tr>${r.map(v=>`<td title="${esc(v)}">${esc(v)}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${t.columns.length}" class="note">empty</td></tr>`}</table></div></div>`).join('');}catch(e){}
   if(st.batches>0){try{const b=await (await fetch('/api/batch?h='+st.batches)).json();
-    $('#chain').innerHTML=b.error?esc(b.error):`batch ${b.height}: ${b.bytes} bytes, envelope <b class="${b.sealed?'ok':'bad'}">${esc(b.magic)}</b> scheme ${b.scheme_id} ${b.sealed?'(sealed)':'(PLAINTEXT)'}<br>${b.hex_head}…${b.hex_tail}`;}catch(e){}}
+    $('#chain').innerHTML=b.error?esc(b.error):`batch ${b.height} (${esc(b.where||'the chain')}): ${b.bytes} bytes, envelope <b class="${b.sealed?'ok':'bad'}">${esc(b.magic)}</b> scheme ${b.scheme_id} ${b.sealed?'(sealed)':'(PLAINTEXT)'}<br>${b.hex_head}…${b.hex_tail}`;}catch(e){}}
 }
 $('#f').addEventListener('submit',async ev=>{ev.preventDefault();$('#post').disabled=true;$('#postmsg').textContent='posting…';
   try{const r=await fetch('/api/entries',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:$('#name').value,body:$('#body').value})});const j=await r.json();
-    $('#postmsg').textContent=j.error?j.error:`entry #${j.id} committed; on chain within ~90 s`;if(!j.error)$('#body').value='';}catch(e){$('#postmsg').textContent='failed'}
+    $('#postmsg').textContent=j.error?j.error:`entry #${j.id} committed; at the store within ~90 s, anchored on chain within 30 min`;if(!j.error)$('#body').value='';}catch(e){$('#postmsg').textContent='failed'}
   $('#post').disabled=false;refresh();});
 $('#verify').addEventListener('click',async()=>{$('#verify').disabled=true;$('#vmsg').textContent='rebuilding from chain… (fetches every batch)';$('#vres').innerHTML='';
   try{const j=await (await fetch('/api/verify',{method:'POST'})).json();
