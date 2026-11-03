@@ -1750,6 +1750,29 @@ static void node_anchor_row(HppliteNode *node, const unsigned char hash[32], con
     }
 }
 
+/* The batch under its rollup's name at the store (#165): the bytes with the sequencer's
+** signature, so a reader finds it by height before the anchor. Best effort: a store that
+** takes no names, or refuses, is said once; the hard tier does not depend on it. */
+static void node_name_batch(HppliteNode *node, uint64_t height, const uint8_t *payload, size_t payloadLen) {
+    char c[43], d[43], name[80];
+    unsigned char da[20];
+    uint8_t sig[65];
+    const char *zDa;
+    uint64_t chainId;
+    if (!node->store || !node->l1 || hpplite_l1_get_addresses(node->l1, c, d) != 0) return;
+    zDa = d[0] ? d : c;
+    if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return;
+    chainId = hpplite_l1_chain_id(node->l1);
+    if (!chainId) chainId = hpplite_l1_default_chain_id();          /* a backend on no chain (the mock): the signing domain still needs one */
+    if (hpplite_store_sign_batch(node->store, da, chainId, node->instanceId, height, payload, payloadLen, sig) != 0) return;   /* no raw key here: the content put stands alone */
+    snprintf(name, sizeof name, "%.40s-%llu", zDa + 2, (unsigned long long)height);
+    { char *p; for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a'); }
+    if (hpplite_store_put_named(node->store, name, node->instanceId, payload, payloadLen, sig) != 0 && !node->warnedNames) {
+        fprintf(stderr, "hpplite: the store did not take batch %llu under its name (%s): readers find it only through the anchor\n", (unsigned long long)height, hpplite_store_error(node->store));
+        node->warnedNames = 1;
+    }
+}
+
 /* how many batches above the chain's height the store holds (rows of _hpplite_unanchored) */
 static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch) {
     sqlite3_stmt *q = NULL;
@@ -2105,6 +2128,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
                 hpplite_keccak256(payload, payloadLen, h);
                 if (node_ranges(node)) {
                     node_anchor_row(node, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);   /* the chain's commitment comes with the anchor (#164) */
+                    node_name_batch(node, height, payload, payloadLen);
                     txHash = NULL;
                     storedOnly = 1;
                 } else {
@@ -2332,6 +2356,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                         if (node_ranges(node)) {
                             /* the store has it: the chain gets one commitment per anchor (#164) */
                             node_anchor_row(node, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                            node_name_batch(node, height, payload, payloadLen);
                             txHash = NULL;
                             storedOnly = 1;
                         } else {

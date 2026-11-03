@@ -832,6 +832,133 @@ int hpplite_store_receipt_verify(const uint8_t *receipt, size_t n, const unsigne
     return memcmp(addr, signer, 20) == 0 ? 0 : -1;
 }
 
+/* What HPPLiteDA.batchDigest() computes (DA version 3): the sequencer's claim about one height */
+static void batchDigest(const unsigned char da[20], uint64_t chainId, const unsigned char instance[32], uint64_t height,
+                        const uint8_t *data, size_t len, unsigned char digest[32]) {
+    static const char zDomainType[] = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+    static const char zBatchType[] = "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)";
+    unsigned char w[32 * 5], domain[32], h[32], pre[66];
+    hpplite_keccak256((const unsigned char *)zDomainType, sizeof(zDomainType) - 1, w);
+    hpplite_keccak256((const unsigned char *)"HPPLiteDA", 9, w + 32);
+    hpplite_keccak256((const unsigned char *)"3", 1, w + 64);
+    wordInt(chainId, w + 96);
+    memset(w + 128, 0, 32); memcpy(w + 128 + 12, da, 20);
+    hpplite_keccak256(w, 160, domain);
+    hpplite_keccak256((const unsigned char *)zBatchType, sizeof(zBatchType) - 1, w);
+    memcpy(w + 32, instance, 32);
+    wordInt(height, w + 64);
+    hpplite_keccak256(data, len, w + 96);
+    hpplite_keccak256(w, 128, h);
+    pre[0] = 0x19; pre[1] = 0x01; memcpy(pre + 2, domain, 32); memcpy(pre + 34, h, 32);
+    hpplite_keccak256(pre, 66, digest);
+}
+
+int hpplite_store_batch_signer(const unsigned char da[20], uint64_t chainId, const unsigned char instance[32], uint64_t height,
+                               const uint8_t *data, size_t len, const uint8_t sig[65], unsigned char out[20]) {
+    unsigned char digest[32], pub[33];
+    HppliteSignature hs;
+    HppliteCrypto *crypto;
+    int rc;
+    if (!da || !instance || !data || !sig || !out) return -1;
+    batchDigest(da, chainId, instance, height, data, len, digest);
+    memcpy(hs.sig, sig, 64);
+    hs.recid = sig[64] >= 27 ? sig[64] - 27 : sig[64];
+    if (hs.recid > 1) return -1;
+    crypto = hpplite_crypto_init();
+    if (!crypto) return -1;
+    rc = hpplite_crypto_recover_pubkey(crypto, digest, &hs, pub);
+    hpplite_crypto_free(crypto);
+    if (rc != 0 || eth_address_from_compressed_pubkey(pub, out) != 0) return -1;
+    return 0;
+}
+
+int hpplite_store_sign_batch(HppliteStore *s, const unsigned char da[20], uint64_t chainId, const unsigned char instance[32],
+                             uint64_t height, const uint8_t *data, size_t len, uint8_t sig[65]) {
+    unsigned char digest[32];
+    HppliteSignature hs;
+    unsigned char v;
+    if (!s || !s->hasKey || !da || !instance || !data || !sig) return -1;
+    batchDigest(da, chainId, instance, height, data, len, digest);
+    if (hpplite_crypto_sign(s->crypto, &s->kp, digest, &hs) != 0) return -1;
+    hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);
+    sig[64] = v;
+    return 0;
+}
+
+static int nameOk(const char *zName) {
+    const char *p = zName;
+    int n = 0;
+    if (!zName) return 0;
+    while (*p && *p != '-') { if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return 0; p++; n++; }
+    if (n != 40 || *p != '-') return 0;
+    for (p++, n = 0; *p; p++, n++) if (*p < '0' || *p > '9') return 0;
+    return n >= 1 && n <= 18;
+}
+
+int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned char instance[32], const uint8_t *data, size_t len, const uint8_t sig[65]) {
+    uint8_t *body;
+    Buf out = {0};
+    long status;
+    int rc = -1;
+    if (!s || !nameOk(zName) || !instance || !data || !len || !sig) return -1;
+    s->error[0] = 0;
+    if (s->kind == STORE_KUBO) { snprintf(s->error, sizeof s->error, "a Kubo node takes no names"); return -1; }
+    body = malloc(len + 65);
+    if (!body) return -1;
+    memcpy(body, data, len);
+    memcpy(body + len, sig, 65);
+    if (s->kind == STORE_S3) {
+        char key[80], *path;
+        snprintf(key, sizeof key, "name-%s", zName);
+        path = s3Path(s, key);
+        status = path ? s3Request(s, "PUT", path, body, len + 65, &out) : 0;
+        if (status == 200) rc = 0;
+        else if (status) { char code[120]; s3ErrorCode(&out, code, sizeof code); snprintf(s->error, sizeof s->error, "S3 answered %ld to put %s: %s", status, key, code); }
+        sqlite3_free(path);
+    } else {
+        char path[120], hdr[120];
+        snprintf(path, sizeof path, "/name/%s", zName);
+        snprintf(hdr, sizeof hdr, "X-HPPLite-Instance: 0x");
+        hpplite_bytes_to_hex(instance, 32, hdr + strlen(hdr));
+        status = storeRequest(s, "POST", path, body, len + 65, hdr, &out, NULL, NULL);
+        if (status == 200) rc = 0;
+        else if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s: %.120s", status, zName, out.p ? out.p : "");
+    }
+    free(body);
+    free(out.p);
+    return rc;
+}
+
+uint8_t *hpplite_store_get_named(HppliteStore *s, const char *zName, size_t *pLen, uint8_t sig[65]) {
+    Buf out = {0};
+    long status;
+    if (pLen) *pLen = 0;
+    if (!s || !nameOk(zName)) return NULL;
+    s->error[0] = 0;
+    if (s->kind == STORE_KUBO) { snprintf(s->error, sizeof s->error, "a Kubo node takes no names"); return NULL; }
+    if (s->kind == STORE_S3) {
+        char key[80], *path;
+        snprintf(key, sizeof key, "name-%s", zName);
+        path = s3Path(s, key);
+        status = path ? s3Request(s, "GET", path, NULL, 0, &out) : 0;
+        sqlite3_free(path);
+    } else {
+        char path[120];
+        snprintf(path, sizeof path, "/name/%s", zName);
+        status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+    }
+    if (status != 200 || !out.p || out.n < 66) {
+        if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s", status, zName);
+        free(out.p);
+        return NULL;
+    }
+    out.n -= 65;
+    if (sig) memcpy(sig, out.p + out.n, 65);
+    out.p[out.n] = 0;
+    if (pLen) *pLen = out.n;
+    return (uint8_t *)out.p;
+}
+
 uint8_t *hpplite_store_get(HppliteStore *s, const char *zRef, size_t *pLen) {
     Buf out = {0};
     char path[600];

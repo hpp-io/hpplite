@@ -1592,7 +1592,8 @@ static pid_t start_pin_service_free(const char *svc, int port) {
         int fd = open(DIR "/store_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/store_pins", "--signer-key", DIR "/store_signer.key",
-               "--pay-to", "0x1111111111111111111111111111111111111111", "--network", "eip155:31337", (char *)NULL);   /* the receipt domain's chain: anvil's */
+               "--pay-to", "0x1111111111111111111111111111111111111111", "--network", "eip155:31337",   /* the receipt domain's chain: anvil's */
+               "--rpc", RPC, (char *)NULL);                                                            /* names checked against the rollup's sequencer wallet (#165) */
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -1630,6 +1631,35 @@ static void test_store_commit(void) {
         printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor should commit the range 1-2 and be the checkpoint");
     }
     long gasFirst = receipt_gas(status_text(w, "last_anchor_tx"));
+    {
+        /* each batch is also under its rollup's name at the store, signed by the sequencer; the service checked the signer
+        ** against the coordinator's sequencerWallet() over the RPC (#165) */
+        char da[43], c2[43], name[80], hex40[41], *p, url[64];
+        unsigned char daBytes[20], who[20], me[20];
+        uint8_t sig[65], *bytes;
+        size_t n = 0;
+        HppliteStore *st;
+        int ok;
+        snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+        st = hpplite_store_open(url, NULL, 0);
+        (void)c2;
+        snprintf(da, sizeof da, "%s", status_text(w, "da_contract"));
+        snprintf(name, sizeof name, "%.40s-2", da + 2);
+        for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+        memcpy(hex40, name, 40); hex40[40] = 0; hpplite_hex_to_bytes(hex40, daBytes, 20);
+        bytes = st ? hpplite_store_get_named(st, name, &n, sig) : NULL;
+        {
+            HppliteNode *nd = hpplite_get_node(w);
+            unsigned char k[32];
+            hpplite_hex_to_bytes(KEY2 + 2, k, 32);
+            eth_address_from_privkey(k, me);
+            ok = bytes && nd && hpplite_store_batch_signer(daBytes, 31337, nd->instanceId, 2, bytes, n, sig, who) == 0 && memcmp(who, me, 20) == 0;
+        }
+        if (!ok) printf("(name %s: %s) ", name, st ? hpplite_store_error(st) : "no store");
+        free(bytes);
+        if (st) hpplite_store_close(st);
+        if (!ok) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 2 under its rollup's name at the store, signed by the sequencer wallet"); }
+    }
     /* the first anchor of a rollup writes its slots for the first time (three fresh slots, ~20k each); the cost of an anchor is the second one's */
     sqlite3_exec(w, "INSERT INTO s(v) VALUES('three')", NULL, NULL, NULL);
     if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 3 through the store"); }

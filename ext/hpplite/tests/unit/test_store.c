@@ -7,6 +7,7 @@
 #include "test_lib.h"
 #include "store.h"
 #include "crypto.h"
+#include "eth_client.h"
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -272,6 +273,13 @@ static void test_kubo(const char *url, const char *tag) {   /* tag: the files' s
     }
     if (hpplite_node_anchor(w) != 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("the anchor through Kubo"); }
     {
+        HppliteStore *rs = hpplite_store_open(url, NULL, 0);
+        uint8_t sig[65];
+        size_t n = 0;
+        if (rs && hpplite_store_get_named(rs, "dadadadadadadadadadadadadadadadadadadada-1", &n, sig) != NULL) { hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("a Kubo node takes no names"); }
+        if (rs) hpplite_store_close(rs);
+    }
+    {
         TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "kubo_r" };
         HppliteNode *r = test_open_node(tpath(fr), l1, &ro);
         int rows = r ? count_rows(r->db, "k") : -1;
@@ -339,6 +347,19 @@ static void test_s3(const char *url, const char *secret, const char *tag) {
     }
     if (hpplite_node_anchor(w) != 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("the anchor through S3"); }
     {
+        /* names on a bucket: a key per name (#165) */
+        char c[43], d[43], name[80], *p;
+        uint8_t sig[65], *bytes;
+        size_t n = 0;
+        HppliteStore *rs = hpplite_store_open(url, NULL, 0);
+        hpplite_l1_get_addresses(l1, c, d);
+        snprintf(name, sizeof name, "%.40s-1", (d[0] ? d : c) + 2);
+        for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+        bytes = rs ? hpplite_store_get_named(rs, name, &n, sig) : NULL;
+        if (!bytes || n == 0) { printf("(%s: %s) ", name, rs ? hpplite_store_error(rs) : "no store"); if (rs) hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("batch 1 under its name in the bucket"); }
+        free(bytes); hpplite_store_close(rs);
+    }
+    {
         TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "s3_r" };
         HppliteNode *r = test_open_node(tpath(fr), l1, &ro);
         int rows = r ? count_rows(r->db, "b") : -1;
@@ -356,8 +377,9 @@ static void test_s3(const char *url, const char *secret, const char *tag) {
 ** run anchors; the close anchors. */
 static void test_ranges(const char *url) {
     TEST("ranges: five flushes put five batches and nothing on the chain until the anchor, then one range with the root; a replica rebuilds from it; the close anchors the rest");
+    static const unsigned char kseq[32] = { [31] = 0x77 };
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .storeUrl = url, .nodeId = "ranges_w" };
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "ranges_w", .privkey = kseq };
     HppliteNode *w = test_open_node(tpath("rg_w.db"), l1, &o);
     uint64_t last = 0, total = 0;
     unsigned char latest[32];
@@ -377,6 +399,37 @@ static void test_ranges(const char *url) {
         hpplite_node_destroy(w); FAIL("five batches at the store, none on the chain, nothing pending");
     }
     if (status_int(w->db, "store_calls") != 5) { printf("(%lld) ", (long long)status_int(w->db, "store_calls")); hpplite_node_destroy(w); FAIL("five puts"); }
+    {
+        /* each batch is also under its rollup's name at the store, signed by the sequencer (#165) */
+        char c[43], d[43], name[80], *p;
+        unsigned char da[20], me[20], who[20], hash[32], want[32];
+        uint8_t sig[65], *bytes;
+        size_t n = 0;
+        sqlite3_stmt *q = NULL;
+        HppliteStore *rs = hpplite_store_open(url, NULL, 0);
+        hpplite_l1_get_addresses(l1, c, d);
+        snprintf(name, sizeof name, "%.40s-3", (d[0] ? d : c) + 2);
+        for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+        { char hex40[41]; memcpy(hex40, name, 40); hex40[40] = 0; hpplite_hex_to_bytes(hex40, da, 20); }
+        bytes = rs ? hpplite_store_get_named(rs, name, &n, sig) : NULL;
+        if (!bytes) { printf("(%s: %s) ", name, rs ? hpplite_store_error(rs) : "no store"); if (rs) hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("batch 3 under its name"); }
+        hpplite_keccak256(bytes, n, hash);
+        sqlite3_prepare_v2(w->ctx->bkDb, "SELECT hash FROM _hpplite_unanchored WHERE height = 3", -1, &q, NULL);
+        if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_bytes(q, 0) == 32) memcpy(want, sqlite3_column_blob(q, 0), 32); else memset(want, 0, 32);
+        sqlite3_finalize(q);
+        if (memcmp(hash, want, 32) != 0) { free(bytes); hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("the named bytes are the batch the row names"); }
+        {
+            int rr = hpplite_store_batch_signer(da, hpplite_l1_chain_id(l1) ? hpplite_l1_chain_id(l1) : hpplite_l1_default_chain_id(), w->instanceId, 3, bytes, n, sig, who);
+            int ra = eth_address_from_privkey(kseq, me);           /* the wallet as the chain knows it (the mock derives its own) */
+            if (rr != 0 || ra != 0 || memcmp(who, me, 20) != 0) {
+                char h1[41], h2[41];
+                hpplite_bytes_to_hex(who, 20, h1); hpplite_bytes_to_hex(me, 20, h2);
+                printf("(recover %d -> %s, wallet %d -> %s, name %s, %zu bytes) ", rr, h1, ra, h2, name, n);
+                free(bytes); hpplite_store_close(rs); hpplite_node_destroy(w); FAIL("the name's signature recovers to the sequencer's wallet");
+            }
+        }
+        free(bytes); hpplite_store_close(rs);
+    }
     if (hpplite_node_anchor(w) != 5) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("the anchor"); }
     hpplite_l1_get_da_state(l1, &last, &total, latest);
     if (last != 5 || status_int(w->db, "anchored") != 5 || status_int(w->db, "last_checkpoint_height") != 5) {
@@ -397,7 +450,7 @@ static void test_ranges(const char *url) {
     if (hpplite_node_anchor(w) != 0) { hpplite_node_destroy(w); FAIL("nothing to anchor twice"); }
     {
         /* a replica rebuilds from the range: the manifest by its digest, each batch by its reference */
-        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "ranges_r" };
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "ranges_r", .privkey = kseq };
         HppliteNode *rp = test_open_node(tpath("rg_r.db"), l1, &ro);
         int rows = rp ? count_rows(rp->db, "t") : -1;
         int same = rp ? same_root(w, rp) : 0;
@@ -416,7 +469,7 @@ static void test_ranges(const char *url) {
     if (last != 7 || hpplite_l1_get_range(l1, 7, &r) != 0 || r.fromHeight != 6 || r.toHeight != 7) { printf("(chain %llu) ", (unsigned long long)last); hpplite_l1_disconnect(l1); FAIL("the close anchors batches 6-7 as one range"); }
     hpplite_l1_range_clear(&r);
     {
-        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "ranges_r2" };
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "ranges_r2", .privkey = kseq };
         HppliteNode *rp = test_open_node(tpath("rg_r2.db"), l1, &ro);
         int rows = rp ? count_rows(rp->db, "t") : -1;
         if (rp) { rp->l1 = NULL; hpplite_node_destroy(rp); }
@@ -508,6 +561,45 @@ static void test_anchor_timer(const char *url) {
     PASS();
 }
 
+
+/* 9. Named entries (#165): a batch under <da>-<height> with the sequencer's signature; the first
+** signer holds a rollup's names at the pin service; a reader recovers the signer. */
+static void test_named(const char *url) {
+    TEST("named entries: put a signed batch under <da>-<height>, read it back with its signature, the signer recovers; another key is refused for that rollup, a bad signature too");
+    static const unsigned char k1[32] = { [31] = 0x11 }, k2[32] = { [31] = 0x22 };
+    unsigned char da[20], da2[20], inst[32], me1[20], me2[20], who[20];
+    uint8_t sig[65], sig2[65], got[65], bad[65];
+    const uint8_t data[] = "a batch under its name";
+    size_t n = 0;
+    uint8_t *back;
+    HppliteStore *s1 = hpplite_store_open(url, k1, 0), *s2 = hpplite_store_open(url, k2, 0);
+    memset(da, 0xda, 20); memset(da2, 0xdb, 20); memset(inst, 0x1e, 32);
+    if (!s1 || !s2) FAIL("open with keys");
+    if (hpplite_store_sign_batch(s1, da, 181228, inst, 7, data, sizeof data, sig) != 0) FAIL("sign");
+    if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", inst, data, sizeof data, sig) != 0) { printf("(%s) ", hpplite_store_error(s1)); FAIL("put named"); }
+    back = hpplite_store_get_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", &n, got);
+    if (!back || n != sizeof data || memcmp(back, data, n) != 0 || memcmp(got, sig, 65) != 0) { printf("(%s) ", hpplite_store_error(s1)); free(back); FAIL("get named: the bytes and the signature"); }
+    free(back);
+    if (hpplite_store_batch_signer(da, 181228, inst, 7, data, sizeof data, sig, me1) != 0) FAIL("the signer recovers");
+    {
+        /* and the service refuses a signature made for another chain: its domain is the chain it serves */
+        uint8_t other[65];
+        if (hpplite_store_sign_batch(s1, da, 31337, inst, 7, data, sizeof data, other) != 0 || hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-70", inst, data, sizeof data, other) == 0) FAIL("a signature for another chain must be refused");
+    }
+    if (hpplite_store_sign_batch(s2, da, 181228, inst, 8, data, sizeof data, sig2) != 0 || hpplite_store_batch_signer(da, 181228, inst, 8, data, sizeof data, sig2, me2) != 0) FAIL("sign with the second key");
+    if (memcmp(me1, me2, 20) == 0) FAIL("two keys, two signers");
+    /* the second key on the first rollup's names: refused; on its own rollup: taken */
+    if (hpplite_store_put_named(s2, "dadadadadadadadadadadadadadadadadadadada-8", inst, data, sizeof data, sig2) == 0 || !strstr(hpplite_store_error(s2), "403")) { printf("('%s') ", hpplite_store_error(s2)); FAIL("another signer must be refused for a rollup whose names are held"); }
+    if (hpplite_store_sign_batch(s2, da2, 181228, inst, 1, data, sizeof data, sig2) != 0 || hpplite_store_put_named(s2, "dbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdb-1", inst, data, sizeof data, sig2) != 0) { printf("(%s) ", hpplite_store_error(s2)); FAIL("the second key on its own rollup"); }
+    memcpy(bad, sig, 65); bad[10] ^= 1;
+    if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-9", inst, data, sizeof data, bad) == 0) FAIL("a signature that does not recover to the holder must be refused");
+    if (hpplite_store_batch_signer(da, 181228, inst, 7, data, sizeof data, bad, who) == 0 && memcmp(who, me1, 20) == 0) FAIL("a changed signature must not recover to the signer");
+    if (hpplite_store_get_named(s1, "dadadadadadadadadadadadadadadadadadadada-9", &n, got) != NULL) FAIL("nothing under a refused name");
+    if (hpplite_store_get_named(s1, "not a name", &n, got) != NULL) FAIL("a malformed name is refused by the client");
+    hpplite_store_close(s1); hpplite_store_close(s2);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = 8470 + (int)(getpid() % 200);
@@ -524,6 +616,7 @@ int main(int argc, char **argv) {
     test_receipt(s);
     test_errors(s);
     hpplite_store_close(s);
+    test_named(url);
     test_node_status(url);
     test_ranges(url);
     test_ranges_restart(url);

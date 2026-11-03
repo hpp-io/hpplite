@@ -632,6 +632,16 @@ its hash as before. `hpplite_status.anchored` is the chain's height; above
 it the store alone holds the batches, for one anchor interval at most. What
 a run leaves at the store, the next run anchors first.
 
+Each batch is also stored **under its rollup's name**, `<da contract hex>-<height>`,
+with the sequencer's EIP-712 `Batch` signature appended (#165: the one
+`commitBatchFor` takes, in the DA contract's domain, over the instance, the
+height and the bytes' keccak), so a reader finds batches by height before the
+anchor and knows who claims them; `hpplite_store_batch_signer()` recovers the
+wallet. The pin service takes a name only from the first signer it saw for that
+rollup, and, given `--rpc`, only from the coordinator's `sequencerWallet()`;
+an S3 bucket takes it as a key; a Kubo node takes no names. The hard tier does
+not depend on the name: a store that refuses it is said once on stderr.
+
 What it costs: one anchor on HPP Sepolia is 73.5k gas (the first of a
 rollup 124.8k, its slots written for the first time), about what one
 per-batch commitment cost, so a database writing all day pays 48 anchors instead of 17 000

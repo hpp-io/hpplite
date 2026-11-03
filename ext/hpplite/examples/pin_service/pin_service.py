@@ -39,6 +39,7 @@ several. --kubo http://127.0.0.1:5001 forwards put and pin to a Kubo node
 directory.
 """
 import argparse
+import re
 import base64
 import hashlib
 import http.client
@@ -136,6 +137,35 @@ class Store:
     def entry(self, cid):
         with self.lock:
             return dict(self.index.get(cid) or {})
+
+    # --- named entries (#165): <da>-<height> holds a batch's bytes with the sequencer's
+    # signature appended; the first signer seen for a DA contract holds its names ---
+    def name_path(self, name):
+        return os.path.join(self.dir, "name-" + name)
+
+    def name_signer(self, da):
+        with self.lock:
+            return (self.index.get("names") or {}).get(da.lower())
+
+    def put_named(self, name, da, signer, data):
+        with self.lock:
+            path = self.name_path(name)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            names = self.index.setdefault("names", {})
+            names.setdefault(da.lower(), signer)
+            self._save()
+
+    def get_named(self, name):
+        try:
+            with open(self.name_path(name), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
 
     def count(self):
         with self.lock:
@@ -325,6 +355,34 @@ class Payments:
 
 # ============ The HTTP service ============
 
+NAME_RE = re.compile(r"^[0-9a-f]{40}-[0-9]{1,18}$")
+BATCH_TYPE = "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)"
+
+
+def batch_digest(chain_id, name, instance, data):
+    """What HPPLiteDA.batchDigest() computes (DA version 3): the sequencer's claim about one height."""
+    da, height = name.split("-")
+    domain = eth.domain_separator("HPPLiteDA", "3", chain_id, "0x" + da)
+    return eth.typed_digest(domain, BATCH_TYPE, bytes.fromhex(instance[2:]), int(height), eth.keccak256(data))
+
+
+def sequencer_wallet(rpc, da):
+    """The rollup's sequencer wallet, asked of the chain: HPPLiteDA.coordinator(), then HPPLite.sequencerWallet(); '' when unreachable."""
+    def call(to, selector):
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [{"to": to, "data": selector}, "latest"]}).encode()
+        req = urllib.request.Request(rpc, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read()).get("result") or ""
+    try:
+        coord = call(da, "0x" + eth.keccak256(b"coordinator()")[:4].hex())
+        if len(coord) < 66:
+            return ""
+        wallet = call("0x" + coord[-40:], "0x" + eth.keccak256(b"sequencerWallet()")[:4].hex())
+        return "0x" + wallet[-40:] if len(wallet) >= 66 else ""
+    except (OSError, ValueError):
+        return ""
+
+
 class Service:
     def __init__(self, args):
         self.args = args
@@ -332,6 +390,7 @@ class Service:
         with open(args.signer_key) as f:
             key = bytes.fromhex(f.read().strip().replace("0x", ""))
         chain_id = int(args.network.split(":")[1])
+        self.chain_id = chain_id
         self.signer = Signer(key, chain_id, args.pay_to)
         self.payments = Payments(args.facilitator, args.network, args.asset, args.pay_to,
                                  args.asset_name, args.asset_version, args.rpc, args.settle_key)
@@ -413,6 +472,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/status":
             return self.reply(200, self.service.status())
+        if path.startswith("/name/"):
+            name = path[6:]
+            data = self.service.store.get_named(name) if NAME_RE.match(name) else None
+            if data is None:
+                return self.reply(404, {"error": "no such name", "name": name})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-HPPLite-Signer", eth.recover(batch_digest(self.service.chain_id, name, self.headers.get("X-HPPLite-Instance") or "", data[:-65]), data[-65:]) if len(data) > 65 and self.headers.get("X-HPPLite-Instance") else "")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path.startswith("/get/"):
             cid = path[5:]
             if not self.service.store.has(cid):
@@ -441,6 +512,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
+        if path.startswith("/name/"):
+            # a batch under its rollup's name (#165): the bytes with the sequencer's EIP-712 Batch signature
+            # (65 bytes) appended; the instance the signature names in a header. Free: the content put paid.
+            name = path[6:]
+            instance = self.headers.get("X-HPPLite-Instance") or ""
+            if not NAME_RE.match(name) or len(body) <= 65 or len(body) > self.service.args.max_bytes + 65:
+                return self.reply(400, {"error": "a name is <da>-<height>, the body the bytes and a 65-byte signature"})
+            if not re.match(r"^0x[0-9a-fA-F]{64}$", instance):
+                return self.reply(400, {"error": "X-HPPLite-Instance: the sequencer instance the signature names, 0x + 64 hex"})
+            da = "0x" + name.split("-")[0]
+            signer = eth.recover(batch_digest(self.service.chain_id, name, instance, body[:-65]), body[-65:])
+            if not signer:
+                return self.reply(400, {"error": "the signature does not recover"})
+            holder = self.service.store.name_signer(da)
+            if holder and holder.lower() != signer.lower():
+                return self.reply(403, {"error": "another signer holds this rollup's names", "signer": signer, "holder": holder})
+            if self.service.args.rpc and self.service.args.rpc != "mock":
+                wallet = sequencer_wallet(self.service.args.rpc, da)
+                if wallet and wallet.lower() != signer.lower():
+                    return self.reply(403, {"error": "not the rollup's sequencer wallet", "signer": signer, "sequencer": wallet})
+            self.service.store.put_named(name, da, signer, body)
+            return self.reply(200, {"name": name, "bytes": len(body) - 65, "signer": signer})
         if path == "/put":
             if not body:
                 return self.reply(400, {"error": "empty body"})
