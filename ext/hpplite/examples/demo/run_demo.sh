@@ -28,7 +28,7 @@ cp "$ext" "$here/data/module/hpplite.dylib" && ext="$here/data/module/hpplite.dy
 pinport=${PIN_PORT:-8788}
 mkdir -p "$here/data/pins"
 [ -f "$here/data/pin_signer.key" ] || printf '0x%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$here/data/pin_signer.key"
-"$py" -I "$root/examples/pin_service/pin_service.py" --port "$pinport" --dir "$here/data/pins" --signer-key "$here/data/pin_signer.key" \
+"$py" -I "$root/operators/store/pin_service.py" --port "$pinport" --dir "$here/data/pins" --signer-key "$here/data/pin_signer.key" \
     --pay-to 0x1111111111111111111111111111111111111111 --network eip155:181228 >> "$here/data/pin.log" 2>&1 &
 pin=$!
 for i in $(seq 1 30); do curl -s -m 2 "http://127.0.0.1:$pinport/status" 2>/dev/null | grep -q signer && break; sleep 0.5; done

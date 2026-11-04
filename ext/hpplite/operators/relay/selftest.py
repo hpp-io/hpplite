@@ -21,9 +21,10 @@ import urllib.error
 import urllib.request
 
 here = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(here, "..", "pin_service"))
+sys.path.insert(0, os.path.join(here, ".."))
+sys.path.insert(0, os.path.join(here, "..", "conformance"))
 sys.path.insert(0, here)
-import eth  # noqa: E402
+from x402seller import eth  # noqa: E402
 from buyer import Buyer  # noqa: E402
 from relay import Chain, selector  # noqa: E402
 

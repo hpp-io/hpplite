@@ -23,8 +23,8 @@ import sys
 import time
 import urllib.parse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import eth  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from x402seller import eth  # noqa: E402
 
 TRANSFER_TYPE = "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
 RECEIPT_TYPE = "Receipt(bytes32 hash,string cid,uint256 expires)"

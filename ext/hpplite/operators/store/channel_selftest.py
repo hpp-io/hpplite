@@ -26,9 +26,8 @@ import urllib.error
 import urllib.request
 
 here = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, here)
-import eth  # noqa: E402
-import channels  # noqa: E402
+sys.path.insert(0, os.path.join(here, ".."))
+from x402seller import channels, eth  # noqa: E402
 
 RPC = os.environ["HPPLITE_ANVIL_RPC"]
 USDC = os.environ.get("HPPLITE_ANVIL_USDC", "")

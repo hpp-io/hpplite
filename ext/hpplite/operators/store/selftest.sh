@@ -18,7 +18,7 @@ for i in $(seq 1 50); do
     sleep 0.2
 done
 kill -0 $pid 2>/dev/null || { echo "the pin service did not start"; cat "$work/service.log"; exit 1; }
-python3 -I "$here/buyer.py" --service "http://127.0.0.1:$port" \
+python3 -I "$here/../conformance/buyer.py" --service "http://127.0.0.1:$port" \
     --key 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20 --selftest
 rc=$?
 [ $rc -eq 0 ] || { echo "--- service log"; cat "$work/service.log"; }

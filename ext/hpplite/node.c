@@ -172,7 +172,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
             sqlite3_free(zPath);
         }
         if (!node->relay) {
-            fprintf(stderr, "hpplite: relay=%s: not a relay URL (http://host:port of examples/relay or a service like it)\n", node->config.relayUrl);
+            fprintf(stderr, "hpplite: relay=%s: not a relay URL (http://host:port of operators/relay or a service like it)\n", node->config.relayUrl);
             return -1;
         }
     }

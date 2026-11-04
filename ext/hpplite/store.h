@@ -4,7 +4,7 @@
 ** the store keeps the bytes: put bytes, get by reference. The reference is
 ** opaque to the node (a CID at a pin service).
 **
-** store=http://host:port is the pin service of examples/pin_service (or any
+** store=http://host:port is the pin service of operators/store (or any
 ** provider speaking its four calls): POST /put, GET /get/<ref>. A 402 is
 ** paid in x402's exact scheme with the node's key, up to storecap= per call.
 ** store=kubo://host:port is a Kubo node's own RPC (add, cat): the node pins

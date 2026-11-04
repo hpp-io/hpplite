@@ -1,7 +1,7 @@
 # A reference pin service for HPPLite (#125)
 
 What a storage provider for HPPLite nodes looks like, in one Python file
-with no dependencies beyond the standard library (`eth.py` beside it does
+with no dependencies beyond the standard library (`../x402seller/eth.py` does
 keccak-256, secp256k1 and EIP-712 in pure Python; slow, and far faster than
 a pin service needs). An HPP operator reads it before running the real
 service; HPPLite's IPFS store adapter (#11) is tested against it.
@@ -17,7 +17,7 @@ alone, which is what `selftest.sh` and ctest's `test_pin_service` exercise.
 
 ## The contract with a node
 
-Four calls. The node (or `buyer.py`, the same thing in Python) does them in
+Four calls. The node (or `../conformance/buyer.py`, the same thing in Python) does them in
 this order and verifies every receipt before it believes it.
 
 | Call | Paid | Answer |
@@ -153,8 +153,8 @@ USDC.e (six decimals) at the address above, the network `eip155:181228`.
 The buyer needs USDC.e; `hpp-x402 fund` shows where to send it. Then:
 
 ```
-buyer.py --service http://host:8420 --key <hex> --cap 50000 put batch.bin
-buyer.py --service http://host:8420 --key <hex> status
+../conformance/buyer.py --service http://host:8420 --key <hex> --cap 50000 put batch.bin
+../conformance/buyer.py --service http://host:8420 --key <hex> status
 ```
 
 ## Not here, on purpose

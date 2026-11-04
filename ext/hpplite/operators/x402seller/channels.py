@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 
-import eth
+from . import eth
 
 ESCROW = "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003"
 COLLECTOR = "0x4020806089470a89826cB9fB1f4059150b550004"     # ERC3009DepositCollector

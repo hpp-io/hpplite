@@ -2,10 +2,10 @@
 """A reference relay for HPPLite nodes (#170): submits a node's signed
 contract calls and pays their gas, charged over x402 in USDC.e, so a node
 whose wallet holds no ETH can anchor, take its lease and create its rollup.
-The pin service's companion (examples/pin_service): its own process because
+The pin service's companion (operators/store): its own process because
 it holds a funded hot key and an RPC, which the pin service does not.
-Standard library only; ../pin_service/eth.py does keccak, secp256k1 and
-EIP-712, and its Payments class the seller's side of x402.
+Standard library only; ../x402seller has eth.py (keccak, secp256k1,
+EIP-712), Payments (the seller's side of x402) and channels.py.
 
     relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file /path/to/hexkey \\
         --factory 0x... --facilitator https://facilitator-sepolia.hpp.io --pay-to 0x...
@@ -45,10 +45,9 @@ import time
 import urllib.request
 
 here = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(here, "..", "pin_service"))
-import eth  # noqa: E402
-from pin_service import Payments  # noqa: E402
-import channels  # noqa: E402
+sys.path.insert(0, os.path.join(here, ".."))
+from x402seller import channels, eth  # noqa: E402
+from x402seller.payments import Payments  # noqa: E402
 
 
 def selector(sig: str) -> str:

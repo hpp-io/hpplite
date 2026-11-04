@@ -103,7 +103,7 @@ jobs:
           AWS_ACCESS_KEY_ID: hpplite
           AWS_SECRET_ACCESS_KEY: hpplite-ci-secret
           AWS_REGION: us-east-1
-        run: cd ext/hpplite/build && ./test_store ../examples/pin_service
+        run: cd ext/hpplite/build && ./test_store ../operators/store
 
   anvil:
     name: real contracts on anvil

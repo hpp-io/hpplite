@@ -1556,7 +1556,7 @@ static void test_pin_service(void) {
     /* anvil's clock is days ahead after the lease scenarios (evm_increaseTime), and the token
     ** checks validBefore against chain time: an authorization window of ten years here;
     ** a real chain's clock is the wall clock and the default is two minutes */
-    snprintf(cmd, sizeof cmd, "python3 -I %s/buyer.py --service http://127.0.0.1:%d --key %s --cap 100000 --valid-for 315360000 --selftest --expect-paid 2>&1",
+    snprintf(cmd, sizeof cmd, "python3 -I %s/../conformance/buyer.py --service http://127.0.0.1:%d --key %s --cap 100000 --valid-for 315360000 --selftest --expect-paid 2>&1",
              svc, port, KEY0);
     int rc = run_cmd(cmd, out, sizeof out);
     kill(pid, SIGTERM);
@@ -2155,7 +2155,7 @@ static void test_page_mode_end_to_end(void) {
 
 /* 27. A wallet that holds USDC.e and no ETH at all (#126): its rollup is
 ** created, its lease taken, its batches anchored and the lease released,
-** each through the reference relay (examples/relay, #170) as an EIP-712
+** each through the reference relay (operators/relay, #170) as an EIP-712
 ** signed form paid over x402; the batches at a pin service. A replica
 ** rebuilds; the wallet's ETH balance is 0 throughout. */
 static long eth_balance_of(const char *addr) {

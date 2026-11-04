@@ -178,12 +178,12 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
 | `soft` | No | `off`: a `role=verify` connection with `store=` stays at the anchored height instead of following the store's batches past it (#166). Also `HPPLITE_SOFT` |
-| `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls), `kubo://host:port` of a Kubo node's RPC, or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (none from Kubo or a bucket) (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
+| `store` | No | `http://host:port` of a pin service (`operators/store`, or any provider speaking its four calls), `kubo://host:port` of a Kubo node's RPC, or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (none from Kubo or a bucket) (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
 | `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
 | `storedeposit` | No | Pay the store by voucher in an x402 `batch-settlement` channel when it offers one (#135). The first put deposits once into x402's escrow, and each put after it is a signed voucher, with nothing on the chain per put. The value is the most this node leaves unspent in the channel at once, in atomic units. 0 (default) pays `exact`, a settlement per put. The deposit can be got back only by the store's cooperative refund, or by a timed withdrawal the wallet sends (that needs ETH). Also `HPPLITE_STORE_DEPOSIT` |
 | `spendcap` | No | The most paid to the store and the relay together over a rolling window, in atomic units: `N/hour` or `N/day` (a bare `N` means per day; #173). It counts what was charged; a channel deposit isn't counted, because it is still the node's money. A put past it is refused before anything is signed, and the batch waits with the reason (`store_state` = `over cap`). The ledger is kept per wallet in the data directory (`spend-<wallet>.json`), so a restart doesn't reset the window. A node opened without its key keeps it in memory. Also `HPPLITE_SPEND_CAP` |
 | `lowbalance` | No | Warn when the money left lasts fewer hours than this at the last day's rate (default 72; 0 turns it off; #173). USDC.e is the wallet's balance plus what is unspent in the store's channel, against the charges. ETH is the wallet's balance, against how fast it fell. The warning prints one line on stderr when it starts and when it clears, and shows in `spend_warning`. Also `HPPLITE_LOW_BALANCE` |
-| `relay` | No | `http://host:port` of a relay ([examples/relay](examples/relay/README.md), #170): every write to the chain goes there as its EIP-712 signed form, paid over x402 like the store: creating the rollup (VERSION 10 factories), the lease, anchors, commitments, checkpoints. A wallet with USDC.e and no ETH runs this way. When the relay fails, the wallet sends the plain transaction itself if it holds ETH; otherwise the write waits and `last_error` says why (#126). Also `HPPLITE_RELAY` |
+| `relay` | No | `http://host:port` of a relay ([operators/relay](operators/relay/README.md), #170): every write to the chain goes there as its EIP-712 signed form, paid over x402 like the store: creating the rollup (VERSION 10 factories), the lease, anchors, commitments, checkpoints. A wallet with USDC.e and no ETH runs this way. When the relay fails, the wallet sends the plain transaction itself if it holds ETH; otherwise the write waits and `last_error` says why (#126). Also `HPPLITE_RELAY` |
 | `relaycap` | No | The most to pay the relay per call, in its asset's atomic units; 0 (default) pays nothing. Also `HPPLITE_RELAY_CAP` |
 | `relaydeposit` | No | Pay the relay by voucher in an x402 `batch-settlement` channel when it offers one (#179). There is one deposit, and each call is charged the gas it actually took, within its quote, with no transfer per call. The value is the most left unspent in the channel, in atomic units. It is one channel per wallet, because the relay is paid before the rollup exists. 0 (default) pays `exact`. Also `HPPLITE_RELAY_DEPOSIT` |
 | `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
@@ -776,7 +776,7 @@ directory test (`test_l1_dir`) run against it in every build.
 
 With `store=` and `relay=`, a node needs no ETH at all: its wallet holds
 USDC.e, the store is paid per put and the relay per transaction, both over
-x402. The relay ([examples/relay](examples/relay/README.md)) takes each
+x402. The relay ([operators/relay](operators/relay/README.md)) takes each
 write as the contract's signed form: `createRollupFor` at the first open
 (VERSION 10 factories), `claimSequencerFor`/`renewLeaseFor`/`releaseLeaseFor`
 (the lease signature carries a ten-minute deadline), `commitRangeFor` per
@@ -789,7 +789,7 @@ holds ETH sends the plain call itself instead. On anvil (scenario 27) a
 wallet with MockUSDC and 0 ETH creates its rollup, writes, anchors and
 releases, and a replica rebuilds.
 
-### A storage provider: `examples/pin_service/`
+### A storage provider: `operators/store/`
 
 The reference pin service (#125) is what an IPFS store behind the chain's
 commitments looks like from the node's side: four HTTP calls (put bytes
@@ -798,7 +798,7 @@ for a CID, pin a CID longer, get by CID, status), paid per call over
 answered with a signed receipt the node verifies against the signer the
 service publishes and commits with the batch (`commitBatch`, #33). One
 Python file, standard library only, with the x402 seller side written out;
-`buyer.py` is the node's side in Python. ctest runs it free
+`operators/conformance/buyer.py` is the node's side in Python. ctest runs it free
 (`test_pin_service`); anvil scenario 18 runs it paid against a mock USDC
 and a mock facilitator.
 
@@ -830,7 +830,7 @@ default). ctest `test_store` runs the client free; anvil scenarios 19, 20
 and 21 run it free, paid, and with the store down. `store=kubo://host:port`
 is a Kubo node's own RPC (`add` with CIDv1 and raw leaves, pinned; `cat`):
 the same commitments with no receipt, for a node you run yourself; ctest
-runs it against a stand-in (`examples/pin_service/kubo_mock.py`), and
+runs it against a stand-in (`operators/store/kubo_mock.py`), and
 `HPPLITE_KUBO=kubo://127.0.0.1:5001` runs the same case against a daemon.
 `store=s3://bucket[/prefix]` is a bucket: Signature Version 4 with the
 standard `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_REGION`,
@@ -848,7 +848,7 @@ Ethereum Sepolia to USDC.e on HPP Sepolia through HPP's gateway with `cast`
 chain; `--dry-run` prints the two transactions and sends nothing, `--to`
 sends to a node's wallet). Its price is per MiB-month (default $0.03 per GiB-month)
 plus a small fee per put, and the node's `store_price` is exactly what the next
-402 will ask (#172; the costs in [its README](examples/pin_service/README.md)).
+402 will ask (#172; the costs in [its README](operators/store/README.md)).
 Not here yet: one payment for many puts (#135: HPP's facilitator supports
 x402's `batch-settlement`).
 

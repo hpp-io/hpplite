@@ -3,9 +3,9 @@
 `relay.py` submits an HPPLite node's signed contract calls and pays their
 gas, charged over x402 in USDC.e. With it, a node whose wallet holds only
 USDC.e can create its rollup, take and renew its lease, and anchor. With the
-pin service beside it ([../pin_service](../pin_service)), it needs no ETH
-at all. Standard library Python. It reuses the pin service's `eth.py`
-(keccak, secp256k1, EIP-712) and its x402 seller code.
+pin service beside it ([../store](../store/README.md)), it needs no ETH
+at all. Standard library Python. It shares `../x402seller` with the store:
+`eth.py` (keccak, secp256k1, EIP-712), the x402 seller code and the channels.
 
 ```sh
 relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file relay.key \
@@ -71,7 +71,7 @@ a relay that wants to charge what was used would settle that amount instead
 ## Paid by voucher (#179)
 
 Each 402 also offers x402's `batch-settlement`, through
-`examples/pin_service/channels.py` (`--no-channels` turns it off). A node with
+`operators/x402seller/channels.py` (`--no-channels` turns it off). A node with
 `relaydeposit=` deposits once into a channel in x402's escrow and pays each
 call with a signed voucher. The relay charges the gas the call actually took
 (`gasUsed` at its effective price, converted at `--eth-usd` with the margin),

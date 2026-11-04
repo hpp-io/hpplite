@@ -209,7 +209,7 @@ int hpplite_l1_token_balance(HppliteL1 *l1, const unsigned char token[20], const
 /* The wallet's ETH balance in wei (#173): 0, or -1 when the backend has none or it cannot be read */
 int hpplite_l1_eth_balance(HppliteL1 *l1, double *pWei);
 
-/* A relay (#126, examples/relay): the node's writes go through it as their
+/* A relay (#126, operators/relay): the node's writes go through it as their
 ** EIP-712 signed forms, paid over x402; the plain transaction only when the
 ** relay fails and the wallet holds ETH. The handle stays the caller's. */
 struct HppliteStore;

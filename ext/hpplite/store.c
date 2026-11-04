@@ -25,7 +25,7 @@
 #include <time.h>
 #include <math.h>
 
-#define STORE_PIN  0                /* http(s)://host:port: a pin service (examples/pin_service) */
+#define STORE_PIN  0                /* http(s)://host:port: a pin service (operators/store) */
 #define STORE_KUBO 1                /* kubo://host:port: a Kubo node's own RPC (#11); no receipts, no payment */
 #define STORE_S3   2                /* s3://bucket[/prefix]: a bucket over Signature Version 4 (#11); no receipts, no payment */
 
@@ -225,7 +225,7 @@ static int wordAddress(const char *hex, unsigned char out[32]) {
 ** whose nonce is keccak256(channelId, salt); a payment is
 ** Voucher(channelId, maxClaimableAmount), the running total. The spec:
 ** specs/schemes/batch-settlement/scheme_batch_settlement_evm.md in
-** github.com/coinbase/x402; the seller: examples/pin_service/channels.py. */
+** github.com/coinbase/x402; the seller: operators/x402seller/channels.py. */
 #define PAY_EXACT   0
 #define PAY_VOUCHER 1
 #define PAY_DEPOSIT 2
@@ -1057,7 +1057,7 @@ size_t hpplite_store_last_bytes(HppliteStore *s) { return s ? s->lastBytes : 0; 
 uint64_t hpplite_store_quote(HppliteStore *s, size_t nbytes) {
     double storage;
     if (!s || !s->hasPayment) return 0;
-    /* as the reference service computes it (examples/pin_service price_put), in the same order:
+    /* as the reference service computes it (operators/store price_put), in the same order:
     ** the storage for the retention bought, rounded up to a whole unit */
     storage = s->pricePerMiBMonth * (double)nbytes / (1024.0 * 1024.0) * ((double)s->retentionSeconds / (30.0 * 24 * 3600));
     return s->pricePerPin + s->pricePerByte * (uint64_t)nbytes + (uint64_t)ceil(storage - 1e-9);

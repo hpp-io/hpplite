@@ -1,7 +1,7 @@
 /*
 ** The pin-service store client (#11): put bytes, get them back by the
 ** reference, the receipt the provider signed, and the errors. Against the
-** reference pin service in free mode (examples/pin_service), started here;
+** reference pin service in free mode (operators/store), started here;
 ** argv[1] is that directory. The paid path (x402) is anvil scenario 19.
 */
 #include "test_lib.h"
@@ -44,7 +44,7 @@ static int start_service(const char *dir, int port) {
     return -1;
 }
 
-/* a Kubo stand-in (examples/pin_service/kubo_mock.py), for the kubo:// store */
+/* a Kubo stand-in (operators/store/kubo_mock.py), for the kubo:// store */
 static pid_t g_kubo;
 static int start_kubo(const char *dir, int port) {
     char portStr[16], script[600];
@@ -70,7 +70,7 @@ static void stop_kubo(void) {
     if (g_kubo > 0) { kill(g_kubo, SIGTERM); waitpid(g_kubo, NULL, 0); g_kubo = 0; }
 }
 
-/* an S3 stand-in (examples/pin_service/s3_mock.py): one bucket, Signature Version 4 checked */
+/* an S3 stand-in (operators/store/s3_mock.py): one bucket, Signature Version 4 checked */
 static pid_t g_s3;
 #define S3_KEY "AKIAHPPLITETEST"
 #define S3_SECRET "hpplite-test-secret-key"

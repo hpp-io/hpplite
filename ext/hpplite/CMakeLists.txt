@@ -338,10 +338,10 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_anvil COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/anvil_test.sh $<TARGET_FILE:test_anvil>)
         set_tests_properties(test_anvil PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
         # the reference relay (#170): a wallet with USDC.e and no ETH, its rollup, lease and anchor through it
-        add_test(NAME test_relay COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/examples/relay/selftest.sh)
+        add_test(NAME test_relay COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/relay/selftest.sh)
         set_tests_properties(test_relay PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
         # the pin service's x402 batch-settlement (#135) against x402's escrow, HPP Sepolia's bytecode on anvil
-        add_test(NAME test_pin_service_channels COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service/channel_selftest.sh)
+        add_test(NAME test_pin_service_channels COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/channel_selftest.sh)
         set_tests_properties(test_pin_service_channels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
 
@@ -368,19 +368,19 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_rpc_proxy COMMAND ${HPPLITE_PYTHON3} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/test_rpc_proxy.py
                                            ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/rpc_proxy.py)
         # The reference pin service in free mode: storage, CIDs, receipts, idempotence (#125); paid on anvil in scenario 18
-        add_test(NAME test_pin_service COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service/selftest.sh)
+        add_test(NAME test_pin_service COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/selftest.sh)
         # The node's store client against it (#11); paid on anvil in scenario 19
-        add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service)
+        add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
         set_tests_properties(test_store PROPERTIES SKIP_RETURN_CODE 77)
-        add_test(NAME test_store_pages COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service)   # the page flush through the store (#146)
+        add_test(NAME test_store_pages COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)   # the page flush through the store (#146)
         set_tests_properties(test_store_pages PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT HPPLITE_CAPTURE=pages RESOURCE_LOCK test_store)
         set_tests_properties(test_store PROPERTIES RESOURCE_LOCK test_store)
         # ...with the ports it used to derive from its pid taken by another program (#177)
         add_test(NAME test_store_ports_taken COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ports_taken.sh
-                 $<TARGET_FILE:test_store> ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service)
+                 $<TARGET_FILE:test_store> ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
         set_tests_properties(test_store_ports_taken PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK test_store)
         add_test(NAME test_pin_service_ports_taken COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ports_taken.sh
-                 sh ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service/selftest.sh)
+                 sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/selftest.sh)
         set_tests_properties(test_pin_service_ports_taken PROPERTIES RESOURCE_LOCK test_store)
     endif()
     if(HPPLITE_BUILD_EXTENSION)
@@ -427,7 +427,7 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_blob_io COMMAND test_blob_io)
         add_test(NAME test_crash COMMAND crash_hpplite)
         # a sequencer lost between a flush and an anchor, a successor recovering from the store by key (#167)
-        add_test(NAME test_crash_store COMMAND crash_hpplite --store ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service)
+        add_test(NAME test_crash_store COMMAND crash_hpplite --store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
 
         # Every suite above again with statement capture (capture=text, v0.1's;
         # rows are the default, #19): the cases about statement text run there
