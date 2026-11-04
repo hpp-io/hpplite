@@ -710,6 +710,91 @@ static void test_recovery(const char *url) {
     PASS();
 }
 
+/* 11. The soft tier (#166): a verifier with the store follows the sequencer's batches as they reach the
+** store, before any anchor, and they turn hard when the anchor names what it applied. */
+static void test_soft_replica(const char *url) {
+    TEST("soft replica: a verifier applies the store's batches past the anchored height (soft_height), then the anchor makes them hard (height)");
+    static const unsigned char kseq[32] = { [31] = 0x66 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "soft_w", .privkey = kseq };
+    HppliteNode *w = test_open_node(tpath("soft_w.db"), l1, &o), *r;
+    int i;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 2; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('soft')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("a flush"); }
+    }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "soft_r", .privkey = kseq };
+        r = test_open_node(tpath("soft_r.db"), l1, &ro);
+    }
+    if (!r) { w->ownsL1 = 0; hpplite_node_destroy(w); hpplite_l1_disconnect(l1); FAIL("open the verifier"); }
+#define SOFT_DONE() do { r->l1 = NULL; hpplite_node_destroy(r); w->ownsL1 = 0; hpplite_node_destroy(w); hpplite_l1_disconnect(l1); } while (0)
+    long long hard = status_int(r->db, "height"), soft = status_int(r->db, "soft_height");
+    int rows = count_rows(r->db, "t");
+    printf("(before any anchor: height %lld, soft_height %lld, rows %d) ", hard, soft, rows);
+    if (hard != 1 || soft != 3 || rows != 2) { SOFT_DONE(); FAIL("two batches at the store, none anchored: soft to 3, hard at 1"); }
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('a third')", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { SOFT_DONE(); FAIL("the third flush"); }
+    hpplite_node_sync_from_l1(r, 1);
+    if (status_int(r->db, "soft_height") != 4 || count_rows(r->db, "t") != 3) { SOFT_DONE(); FAIL("the next batch follows within a sync"); }
+    if (hpplite_node_anchor(w) != 3) { printf("(%s) ", status_text(w->db, "last_error")); SOFT_DONE(); FAIL("the anchor 1-3"); }
+    hpplite_node_sync_from_l1(r, 1);
+    hard = status_int(r->db, "height"); soft = status_int(r->db, "soft_height");
+    printf("(after the anchor: height %lld, soft_height %lld, state %s) ", hard, soft, status_text(r->db, "state"));
+    int same = same_root(w, r);
+    if (hard != 4 || soft != 4 || !same || r->state == HPPLITE_STATE_ERROR) { SOFT_DONE(); FAIL("the anchor names what was applied: all hard, the same root"); }
+    SOFT_DONE();
+#undef SOFT_DONE
+    PASS();
+}
+
+/* 12. ... and when the chain commits another batch than the one the store served (the store lost it, a
+** successor wrote its own at that height), the verifier says its soft state is not the rollup's */
+static void test_soft_disagreement(const char *url) {
+    TEST("soft replica: the store served a batch the chain then did not commit (a successor wrote its own at that height): the verifier reports it");
+    static const unsigned char kseq[32] = { [31] = 0x67 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "dis_a", .privkey = kseq };
+    HppliteNode *a = test_open_node(tpath("dis_a.db"), l1, &o), *b, *r;
+    char name[80], path[600], c[43], d[43];
+    if (!a) FAIL("open");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    if (hpplite_node_flush_batch(a) < 1 || hpplite_node_anchor(a) != 1) { hpplite_node_destroy(a); FAIL("batch 1, anchored"); }
+    hpplite_node_exec(a, "INSERT INTO t(v) VALUES('the one the store served')", NULL);
+    if (hpplite_node_flush_batch(a) < 1) { hpplite_node_destroy(a); FAIL("batch 2 at the store"); }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "dis_r", .privkey = kseq };
+        r = test_open_node(tpath("dis_r.db"), l1, &ro);
+    }
+    if (!r || status_int(r->db, "soft_height") != 3) { printf("(soft_height %lld) ", r ? status_int(r->db, "soft_height") : -1); FAIL("the verifier follows batch 2"); }
+    /* the sequencer dies; its batch 2 is lost to the store (its name gone); a successor writes another at 2 and anchors it */
+    hpplite_l1_get_addresses(l1, c, d);
+    snprintf(name, sizeof name, "%.40s-2", (d[0] ? d : c) + 2);
+    for (char *p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+    snprintf(path, sizeof path, "%s/pins/name-%s", test_dir(), name);
+    hpplite_node_stop_timer(a); a->ownsL1 = 0; a->l1 = NULL; hpplite_node_destroy(a);
+    if (unlink(path) != 0) { printf("(%s) ", path); FAIL("the name file of batch 2"); }
+    hpplite_l1_mock_advance_time(l1, 400);
+    {
+        TestNodeOpts ob = { .storeUrl = url, .nodeId = "dis_b", .privkey = kseq };
+        b = test_open_node(tpath("dis_b.db"), l1, &ob);
+    }
+    if (!b) FAIL("open the successor");
+    hpplite_node_exec(b, "INSERT INTO t(v) VALUES('the one the chain committed')", NULL);
+    if (hpplite_node_flush_batch(b) < 1 || hpplite_node_anchor(b) != 2) { printf("(%s) ", status_text(b->db, "last_error")); FAIL("the successor's batch 2, anchored"); }
+    hpplite_node_sync_from_l1(r, 1);
+    const char *err = status_text(r->db, "last_error");
+    printf("(the verifier: state %s, '%.90s') ", status_text(r->db, "state"), err);
+    int said = r->state == HPPLITE_STATE_ERROR && strstr(err, "soft state") != NULL;
+    r->l1 = NULL; hpplite_node_destroy(r);
+    b->ownsL1 = 0; hpplite_node_destroy(b);
+    hpplite_l1_disconnect(l1);
+    if (!said) FAIL("the verifier should report that its soft state is not what the chain committed");
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = test_free_port();
@@ -733,6 +818,8 @@ int main(int argc, char **argv) {
     test_ranges_restart(url);
     test_anchor_timer(url);
     test_recovery(url);
+    test_soft_replica(url);
+    test_soft_disagreement(url);
     {
         int kport = test_free_port();
         char kurl[64];

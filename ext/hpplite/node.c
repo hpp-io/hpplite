@@ -145,6 +145,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeCap = config->storeCap;
     node->config.storeDeposit = config->storeDeposit;
     node->config.relayDeposit = config->relayDeposit;
+    node->config.softOff = config->softOff;
     node->config.spendCap = config->spendCap;
     node->config.spendWindow = config->spendWindow;
     node->config.lowBalanceHours = config->lowBalanceHours;
@@ -965,6 +966,7 @@ void hpplite_node_destroy(HppliteNode *node) {
         pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
     }
     if (node->manifest) { cJSON_Delete(node->manifest); node->manifest = NULL; }
+    free(node->softChain);
     free(node->zAnchorRef);
     node->zAnchorRef = NULL;
 
@@ -2775,6 +2777,150 @@ static int node_soft_walk(HppliteNode *node) {
     return first ? (int)(last - first + 1) : 0;
 }
 
+/*
+** The soft tier for a verifier (#166): the batches the store holds under the
+** rollup's names past the anchored height, applied as they arrive, so a
+** replica follows within a flush interval instead of an anchor interval.
+** Each one must be signed by the coordinator's sequencerWallet() and apply on
+** this history; the chain hash after each is kept, and the next range
+** commitment that lands inside them must name the same one - else the store
+** served batches the chain did not commit (equivocation, a stale store) and
+** this replica's soft state is not the rollup's.
+*/
+static int node_soft_follows(HppliteNode *node) {
+    return node && node->config.verifyOnly && !node->config.softOff && node->store && node->l1 && !node->softStopped && hpplite_l1_has_ranges(node->l1);
+}
+
+static int node_soft_push(HppliteNode *node, uint64_t h, const unsigned char after[32]) {
+    if (!node->softFirst) { node->softFirst = h; node->nSoft = 0; }
+    if (node->nSoft == node->nSoftAlloc) {
+        size_t n = node->nSoftAlloc ? node->nSoftAlloc * 2 : 64;
+        unsigned char (*a)[32] = realloc(node->softChain, n * 32);
+        if (!a) return -1;
+        node->softChain = a;
+        node->nSoftAlloc = n;
+    }
+    memcpy(node->softChain[node->nSoft++], after, 32);
+    return 0;
+}
+
+static void node_soft_clear(HppliteNode *node) {
+    node->softFirst = 0;
+    node->nSoft = 0;
+}
+
+/* the name of height h at the store: "<da hex, lower case>-<h>" */
+static int node_store_name(HppliteNode *node, uint64_t h, char name[80], unsigned char da[20]) {
+    char c[43], d[43], *p;
+    const char *zDa;
+    if (hpplite_l1_get_addresses(node->l1, c, d) != 0) return -1;
+    zDa = d[0] ? d : c;
+    if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return -1;
+    snprintf(name, 80, "%.40s-%llu", zDa + 2, (unsigned long long)h);
+    for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+    return 0;
+}
+
+/* The chain hash the range commitment ending at `height` names (0 when none ends there; height 0: zero) */
+static int node_range_chain(HppliteNode *node, uint64_t height, unsigned char out[32]) {
+    HppliteRange r;
+    int ok;
+    if (height == 0) { memset(out, 0, 32); return 0; }
+    memset(&r, 0, sizeof r);
+    if (hpplite_l1_get_range(node->l1, height, &r) != 0) return -1;
+    ok = r.toHeight == height;
+    if (ok) memcpy(out, r.chainHashAfter, 32);
+    hpplite_l1_range_clear(&r);
+    return ok ? 0 : -1;
+}
+
+/* A soft state from before this process (the file is past the anchored height): its chain hashes again,
+** from the store's names folded on the chain's hash at the anchored height; they must end at the file's */
+static int node_soft_recount(HppliteNode *node, uint64_t anchored) {
+    unsigned char chain[32], k[32], da[20], inst[32];
+    uint8_t sig[65];
+    char name[80];
+    uint64_t h;
+    if (node_range_chain(node, anchored, chain) != 0) return -1;
+    node_soft_clear(node);
+    for (h = anchored + 1; h < node->ctx->blockHeight; h++) {
+        size_t n = 0;
+        uint8_t *data;
+        if (node_store_name(node, h, name, da) != 0 || !(data = hpplite_store_get_named(node->store, name, &n, sig, inst))) return -1;
+        hpplite_keccak256(data, n, k);
+        free(data);
+        hpplite_chain_hash_next(chain, h, k, chain);
+        if (node_soft_push(node, h, chain) != 0) return -1;
+    }
+    return memcmp(chain, node->ctx->chainHash, 32) == 0 ? 0 : -1;
+}
+
+/* The anchor moved to `anchored`: the soft batches up to it are hard if the chain names what was applied */
+static int node_soft_settle(HppliteNode *node, uint64_t anchored) {
+    uint64_t end = node->softFirst + node->nSoft - 1;
+    unsigned char chain[32];
+    if (!node->softFirst || anchored < node->softFirst) return 0;
+    if (anchored > end) { node_soft_clear(node); return 0; }      /* past them: the replay from end+1 and the final check compare */
+    if (node_range_chain(node, anchored, chain) != 0) return 0;   /* asked again at the next sync */
+    if (memcmp(chain, node->softChain[anchored - node->softFirst], 32) != 0) {
+        node->softStopped = 1;
+        node->state = HPPLITE_STATE_ERROR;
+        hpplite_error(node->ctx, "the chain's commitment at height %llu names another chain hash than the batches the store served past height %llu: "
+                      "this replica's soft state from %llu on is not the rollup's (equivocation, or a stale store); rebuild it",
+                      (unsigned long long)anchored, (unsigned long long)(node->softFirst - 1), (unsigned long long)node->softFirst);
+        return -1;
+    }
+    if (anchored == end) node_soft_clear(node);
+    else {
+        size_t drop = (size_t)(anchored - node->softFirst + 1);
+        memmove(node->softChain, node->softChain + drop, (node->nSoft - drop) * 32);
+        node->nSoft -= drop;
+        node->softFirst = anchored + 1;
+    }
+    return 0;
+}
+
+/* Past the anchored height: the store's next names, checked, applied */
+static int node_soft_follow(HppliteNode *node) {
+    HppliteL1State *st;
+    unsigned char seq[20], da[20], who[20], inst[32], k[32], after[32];
+    uint8_t sig[65];
+    char name[80];
+    int applied = 0;
+    if (!node_soft_follows(node) || !(st = hpplite_l1_get_state(node->l1))) return 0;
+    memcpy(seq, st->sequencerWallet, 20);
+    hpplite_l1_state_free(st);
+    for (;;) {
+        uint64_t h = node->ctx->blockHeight, chainId = hpplite_l1_chain_id(node->l1);
+        size_t n = 0;
+        uint8_t *data;
+        HppliteBatch *batch;
+        int rc;
+        if (!chainId) chainId = hpplite_l1_default_chain_id();
+        if (node_store_name(node, h, name, da) != 0 || !(data = hpplite_store_get_named(node->store, name, &n, sig, inst))) break;
+        if (hpplite_store_batch_signer(da, chainId, inst, h, data, n, sig, who) != 0 || memcmp(who, seq, 20) != 0) {
+            fprintf(stderr, "hpplite: batch %llu at the store is not signed by the rollup's sequencer: the soft tier stops before it\n", (unsigned long long)h);
+            free(data);
+            break;
+        }
+        batch = node_decode_batch(node, h, data, n);
+        if (!batch) { free(data); break; }
+        batch->pPosted = data; batch->nPosted = n; batch->bOwnsPosted = 1;
+        hpplite_keccak256(data, n, k);
+        hpplite_chain_hash_next(node->ctx->chainHash, h, k, after);
+        if (batch->bPages) rc = node_apply_pages(node, batch);
+        else { rc = hpplite_replay_batch(node->ctx, batch, 1); if (rc == SQLITE_DONE) rc = SQLITE_OK; }
+        hpplite_batch_free(batch);
+        if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
+            fprintf(stderr, "hpplite: batch %llu at the store does not apply on this history (rc=%d): the soft tier stops before it\n", (unsigned long long)h, rc);
+            break;
+        }
+        if (node_soft_push(node, h, after) != 0) break;
+        applied++;
+    }
+    return applied;
+}
+
 int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     uint64_t lastBatch = 0, totalBatches = 0;
     unsigned char latestHash[32];
@@ -2784,6 +2930,17 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     if (node_check_rollup(node) < 0) return -1;
     if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
     node->anchoredHeight = lastBatch;
+    if (node_soft_follows(node)) {
+        /* the soft tier (#166): a state from before this process counted again, then what the anchor settled */
+        if (!node->softFirst && node->ctx->blockHeight > lastBatch + 1 && node_soft_recount(node, lastBatch) != 0) {
+            node->softStopped = 1;
+            node->state = HPPLITE_STATE_ERROR;
+            hpplite_error(node->ctx, "this replica is past the anchored height %llu and the store no longer serves the batches it applied there: rebuild it",
+                          (unsigned long long)lastBatch);
+            return -1;
+        }
+        if (node_soft_settle(node, lastBatch) != 0) return -1;
+    }
 
     while (node->ctx->blockHeight <= lastBatch) {
         HppliteBatch *batch = node_fetch_batch(node, node->ctx->blockHeight);
@@ -2863,6 +3020,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
     if (!node->config.verifyOnly && node->ctx->blockHeight == lastBatch + 1 && hpplite_node_pending_count(node) == 0)
         synced += node_soft_walk(node);             /* what the store holds past the chain (#167), before anything of ours */
+    if (node->ctx->blockHeight >= lastBatch + 1) synced += node_soft_follow(node);   /* a verifier's soft tier (#166) */
     node_pages_decide_snapshot(node);               /* the chain seen: is the file ahead of it? */
     if (node->pagesWalSuspended && !node->pieceDb) {
         /* the pages applied: back to WAL for this node's own writes, the file as

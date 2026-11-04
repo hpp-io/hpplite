@@ -177,7 +177,8 @@ int main(int argc, char **argv) {
     int triedPages = 0;
     sqlite3 *db;
 open_again:
-    { char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&datadir=%s&%s%s", dir, dir, params, zCapture);
+    /* the hard tier first: soft=off keeps the rebuild at the anchored height, the soft tier is reported after (#166) */
+    { char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s&%s%s", dir, dir, params, zCapture);
       db = uri ? hpplite_open(uri) : NULL;
       sqlite3_free(uri); }
     if (!db) {
@@ -330,6 +331,18 @@ open_again:
                    (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, z, r.nReceipt ? ", with the store's receipt" : ", no receipt");
             hpplite_l1_range_clear(&r);
         }
+    }
+
+    /* the soft tier (#166): what the store holds under the rollup's names past the anchor, signed by the
+    ** sequencer and applying on the rebuilt history - stored to here, anchored to there */
+    if (rc == 0 && node->store && hpplite_l1_has_ranges(node->l1)) {
+        uint64_t before = hpplite_get_block_height(node->ctx);
+        node->config.softOff = 0;
+        hpplite_node_sync_from_l1(node, 1);
+        uint64_t after = hpplite_get_block_height(node->ctx);
+        if (after > before) printf("stored to %llu, anchored to %llu: %llu batches at the store past the anchor, signed by the sequencer, applied on this history\n",
+                                   (unsigned long long)(after - 1), (unsigned long long)onChain, (unsigned long long)(after - before));
+        else printf("stored to %llu, anchored to %llu: nothing at the store past the anchor\n", (unsigned long long)onChain, (unsigned long long)onChain);
     }
 
     if (zLive) {

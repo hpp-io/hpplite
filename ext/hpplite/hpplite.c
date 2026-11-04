@@ -919,6 +919,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->storeCap = cfg->storeCap;
     nc->storeDeposit = cfg->storeDeposit;
     nc->relayDeposit = cfg->relayDeposit;
+    nc->softOff = cfg->softOff;
     nc->spendCap = cfg->spendCap;
     nc->spendWindow = cfg->spendWindow;
     nc->lowBalanceHours = cfg->lowBalanceHours;

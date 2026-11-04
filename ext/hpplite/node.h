@@ -80,6 +80,7 @@ typedef struct HppliteNodeConfig {
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storeDeposit;          /* storedeposit=: batch-settlement, the most unspent in the channel (0 = exact, #135) */
+    int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
     uint64_t relayDeposit;          /* relaydeposit=: the relay paid by voucher (#179); 0 = exact */
     uint64_t spendCap, spendWindow; /* spendcap=: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
     int lowBalanceHours;            /* lowbalance=: warn below this many hours of money at the recent rate; 0 = 72, -1 = off */
@@ -137,6 +138,11 @@ typedef struct HppliteNode {
     int warnedStoreDown;            /* said once per outage that batches go on the chain meanwhile */
     int warnedNames;                /* said once that the store takes no names (#165) */
     int softWalked;                 /* the store's names past the chain were read once (#167) */
+    /* the soft tier (#166): what a verifier applied from the store past the anchored height */
+    uint64_t softFirst;             /* the first soft height; 0: nothing soft */
+    unsigned char (*softChain)[32]; /* the chain hash after each soft height, from softFirst */
+    size_t nSoft, nSoftAlloc;
+    int softStopped;                /* the soft tier disagreed with the chain: not followed (#166) */
     uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
     int storeChannelBound;          /* the store's batch-settlement channel bound to this rollup (#135) */
     struct HppliteSpend *spend;     /* what the store and the relay were paid, ETH samples (#173) */

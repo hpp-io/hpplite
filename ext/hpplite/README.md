@@ -151,6 +151,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
+| `soft` | No | `off`: a `role=verify` connection with `store=` stays at the anchored height instead of following the store's batches past it (#166). Also `HPPLITE_SOFT` |
 | `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls), `kubo://host:port` of a Kubo node's RPC, or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (none from Kubo or a bucket) (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
 | `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
 | `storedeposit` | No | Pay the store by voucher in an x402 `batch-settlement` channel when it offers one (#135). The first put deposits once into x402's escrow, and each put after it is a signed voucher, with nothing on the chain per put. The value is the most this node leaves unspent in the channel at once, in atomic units. 0 (default) pays `exact`, a settlement per put. The deposit can be got back only by the store's cooperative refund, or by a timed withdrawal the wallet sends (that needs ETH). Also `HPPLITE_STORE_DEPOSIT` |
@@ -547,7 +548,9 @@ and `store_channel` and `store_locked` (`storedeposit=`, #135: the
 batch-settlement channel the store is paid in, and what it holds that has
 not been charged yet), and `spent_window` and `spend_warning` (#173: what the
 store and the relay were paid in `spendcap=`'s window, a day without one,
-and what runs out and when at the recent rate, NULL when nothing does). `state` says what this node is doing about posting: `sequencing`,
+and what runs out and when at the recent rate, NULL when nothing does), and
+`soft_height` (#166: a verifier with a store, the height its soft batches
+reach; `height` stays the anchored one). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
@@ -670,6 +673,25 @@ with its own. It stops at the first height without a name, or at one signed
 by another wallet. What is lost is what never reached the store: at most one
 flush interval. The successor waits out the dead one's lease (an hour since
 VERSION 9) before it can anchor; its writes are captured meanwhile.
+
+**The soft tier for a replica (#166).** A `role=verify` connection with
+`store=` doesn't wait for the anchor. Past the anchored height, it reads the
+batches the store holds under the rollup's names, as they arrive. It takes
+each one signed by the coordinator's `sequencerWallet()` that applies on its
+history, so it follows the sequencer within a flush interval. `height` stays
+the anchored, hard height; `soft_height` is where the replica is with the
+soft batches included. When an anchor lands, its range commitment must name
+the chain hash the replica computed at that height, and if it does, the soft
+batches up to it are hard.
+
+If it names another hash, the store served batches the chain didn't commit:
+a sequencer that equivocated, or a store that lost a batch and a successor
+that wrote another at that height. The replica stops, in `state` `error`,
+and says its soft state from that height on isn't the rollup's; it has to be
+rebuilt. `soft=off` keeps a replica at the anchored height.
+
+`hpplite-verify` verifies the hard tier as before. It then reports the soft
+tier ("stored to S, anchored to H"), or nothing past the anchor.
 
 What it costs: one anchor on HPP Sepolia is 73.5k gas (the first of a
 rollup 124.8k, its slots written for the first time), about what one
