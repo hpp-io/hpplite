@@ -153,6 +153,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
 | `store` | No | `http://host:port` of a pin service (`examples/pin_service`, or any provider speaking its four calls), `kubo://host:port` of a Kubo node's RPC, or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (none from Kubo or a bucket) (#11, #33). A replica needs the same `store=` to rebuild. Also `HPPLITE_STORE` |
 | `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
+| `storedeposit` | No | Pay the store by voucher in an x402 `batch-settlement` channel when it offers one (#135). The first put deposits once into x402's escrow, and each put after it is a signed voucher, with nothing on the chain per put. The value is the most this node leaves unspent in the channel at once, in atomic units. 0 (default) pays `exact`, a settlement per put. The deposit can be got back only by the store's cooperative refund, or by a timed withdrawal the wallet sends (that needs ETH). Also `HPPLITE_STORE_DEPOSIT` |
 | `relay` | No | `http://host:port` of a relay ([examples/relay](examples/relay/README.md), #170): every write to the chain goes there as its EIP-712 signed form, paid over x402 like the store: creating the rollup (VERSION 10 factories), the lease, anchors, commitments, checkpoints. A wallet with USDC.e and no ETH runs this way. When the relay fails, the wallet sends the plain transaction itself if it holds ETH; otherwise the write waits and `last_error` says why (#126). Also `HPPLITE_RELAY` |
 | `relaycap` | No | The most to pay the relay per call, in its asset's atomic units; 0 (default) pays nothing. Also `HPPLITE_RELAY_CAP` |
 | `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
@@ -537,8 +538,11 @@ NULL without a chain), `last_anchor_tx` (the transaction of this node's
 last anchor) and `last_checkpoint_root` (the root the last checkpoint or
 anchor carried; a page-mode file keeps its bookkeeping in the sidecar, so
 the row is the way to read it), `relay` and `relay_spent` (`relay=`, #126:
-the URL and what this process paid it, in its asset's atomic units) and
-`last_tx_path` (`relay` or `direct`: how the last write reached the chain). `state` says what this node is doing about posting: `sequencing`,
+the URL and what this process paid it, in its asset's atomic units) 
+`last_tx_path` (`relay` or `direct`: how the last write reached the chain),
+and `store_channel` and `store_locked` (`storedeposit=`, #135: the
+batch-settlement channel the store is paid in, and what it holds that has
+not been charged yet). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
@@ -747,7 +751,15 @@ the gap grows with size). A replica with the same `store=` reads the
 commitment, fetches by the CID, checks the hash, replays; one without says
 `batch N is in a store (...) and no store= names one` and rebuilds nothing.
 A 402 from the service is paid in x402's exact scheme with the node's key
-up to `storecap=` per call. The receipt is checked before it is believed:
+up to `storecap=` per call. With `storedeposit=`, a service that offers
+x402's `batch-settlement` is paid by voucher instead (#135). There is one
+deposit into a channel in x402's escrow, and after it a signed running
+total per put. The service checks the voucher itself and claims every
+channel in one transaction an hour, so a put no longer costs a settlement.
+The running total is kept in the data directory. Without it, the service's
+corrective 402 restores the total, carrying the node's own last voucher,
+which the node checks. Anvil scenario 29 runs it against x402's escrow as
+HPP Sepolia runs it. The receipt is checked before it is believed:
 its signature must recover to the signer the service publishes at
 `/status`, over the batch's hash, the CID and the expiry, or the batch is
 not committed under it; it goes on chain in a 114-byte form (signer, the

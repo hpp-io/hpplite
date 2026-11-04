@@ -34,6 +34,10 @@ work, POST to /settle, answer with PAYMENT-RESPONSE. No signing happens in
 the seller. `hpp-x402 serve --handler <url>` wraps a plain endpoint the same
 way with no code; this file is for reading what it does.
 
+Next to `exact`, each 402 offers x402's batch-settlement (#135, channels.py):
+a deposit into x402's escrow once, then a voucher the service checks itself
+per put, and one claim transaction for every channel each --claim-interval.
+
 The CID is CIDv1, raw codec, sha-256, base32 ("bafkrei..."): the same bytes
 give the same CID at any IPFS provider, so one commitment can be pinned at
 several. --kubo http://127.0.0.1:5001 forwards put and pin to a Kubo node
@@ -61,6 +65,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import eth  # noqa: E402
+import channels  # noqa: E402
 
 # ============ CID ============
 
@@ -243,6 +248,7 @@ class Payments:
         self.settle_key = settle_key
         self.settled = 0
         self.spent_nonces = set()
+        self.channels = None        # channels.Channels when batch-settlement is offered (#135)
 
     @property
     def enabled(self):
@@ -256,7 +262,7 @@ class Payments:
             "accepts": [{
                 "scheme": "exact", "network": self.network, "amount": str(amount), "asset": self.asset,
                 "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": self.extra,
-            }],
+            }] + ([self.channels.requirement(amount)] if self.channels else []),
         }
 
     def decode(self, header: str):
@@ -400,6 +406,12 @@ class Service:
         self.signer = Signer(key, chain_id, args.pay_to)
         self.payments = Payments(args.facilitator, args.network, args.asset, args.pay_to,
                                  args.asset_name, args.asset_version, args.rpc, args.settle_key)
+        if self.payments.enabled and args.channels:
+            # the receipt key authorizes claims and refunds too: one key speaks for this service
+            self.payments.channels = channels.Channels(args.dir, self.payments, key, args.withdraw_delay, args.min_deposit,
+                                                       args.claim_interval, args.refund_idle)
+            self.payments.channels.mock_queued = args.mock_deposit_queued
+            self.payments.channels.start()
         self.started = int(time.time())
 
     def price_put(self, nbytes):
@@ -418,7 +430,9 @@ class Service:
                         "pricePerByte": self.args.price_per_byte, "pricePerPin": self.args.price_per_pin,
                         "pricePerMiBMonth": self.args.price_per_mib_month,
                         "retentionSeconds": self.args.retention, "paidGet": bool(self.args.paid_get),
-                        "facilitator": self.args.facilitator or "none (free)"} if self.payments.enabled else None,
+                        "facilitator": self.args.facilitator or "none (free)",
+                        "schemes": ["exact"] + ([channels.SCHEME] if self.payments.channels else []),
+                        "channels": self.payments.channels.status() if self.payments.channels else None} if self.payments.enabled else None,
             "pinned": self.store.count(), "settled": self.payments.settled, "uptime": int(time.time()) - self.started,
         }
 
@@ -463,6 +477,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = p.decode(header)
         if not payload or "payload" not in payload:
             return self.reply(400, {"error": "PAYMENT-SIGNATURE is not a payment payload"})
+        if (payload.get("accepted") or {}).get("scheme") == channels.SCHEME and p.channels:
+            return self.paid_by_voucher(requirements, payload, work)
         v = p.verify(payload, requirements["accepts"][0])
         if not v.get("isValid"):
             requirements["error"] = v.get("invalidReason", "invalid payment")
@@ -476,6 +492,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not s.get("success"):
             return self.reply(402, {"error": "settlement failed: " + s.get("errorReason", "?"), "settlement": s})
         return self.reply(200, obj, {"PAYMENT-RESPONSE": base64.b64encode(json.dumps(s).encode()).decode()})
+
+    def paid_by_voucher(self, requirements, payload, work):
+        """batch-settlement (#135): the voucher checked here, nothing on the chain unless it opens or tops up the channel"""
+        ch = self.service.payments.channels
+        req = requirements["accepts"][-1]
+        ok, cid, err, deposit_tx = ch.verify(payload, req)
+        if not ok:
+            if err == channels.MISMATCH:
+                requirements = ch.corrective(requirements, cid)
+            else:
+                requirements["error"] = err
+            return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
+        status, obj = work()
+        if status != 200:
+            return self.reply(status, obj)          # nothing done, nothing charged (a deposit stays the node's, in its channel)
+        r = ch.commit(payload, req, cid, deposit_tx)
+        self.service.payments.settled += 1 if deposit_tx else 0
+        return self.reply(200, obj, {"PAYMENT-RESPONSE": base64.b64encode(json.dumps(r).encode()).decode()})
 
     # --- the endpoints ---
     def do_GET(self):
@@ -606,11 +640,22 @@ def main():
     ap.add_argument("--retention", type=int, default=30 * 24 * 3600, help="seconds a put or a pin buys")
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--paid-get", action="store_true")
+    ap.add_argument("--channels", action=argparse.BooleanOptionalAction, default=True,
+                    help="offer x402 batch-settlement beside exact (#135): a deposit once, a signed voucher per put, claims in batches")
+    ap.add_argument("--withdraw-delay", type=int, default=24 * 3600, help="batch-settlement: seconds a payer's timed withdrawal waits (900 to 30 days)")
+    ap.add_argument("--min-deposit", type=int, default=100000, help="batch-settlement: the deposit asked for (atomic units; at least 10 puts' worth)")
+    ap.add_argument("--claim-interval", type=int, default=3600, help="batch-settlement: seconds between claims (one transaction for all channels) and settlement")
+    ap.add_argument("--refund-idle", type=int, default=7 * 24 * 3600, help="batch-settlement: give back what a channel idle this long holds beyond its charges")
+    ap.add_argument("--mock-deposit-queued", action="store_true", help=argparse.SUPPRESS)   # tests: a deposit answered "queued" (#135)
     ap.add_argument("--kubo", default=None, help="a Kubo node's RPC API (http://127.0.0.1:5001): pin there too")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if args.facilitator == "mock" and not (args.rpc and args.settle_key):
         ap.error("--facilitator mock needs --rpc and --settle-key")
+    if not 900 <= args.withdraw_delay <= 30 * 24 * 3600:
+        ap.error("--withdraw-delay is 900 seconds to 30 days (the escrow's bounds)")
+    if args.claim_interval * 4 > args.withdraw_delay:
+        ap.error("--claim-interval must be well inside --withdraw-delay: vouchers not claimed when a withdrawal finishes are lost")
     Handler.service = Service(args)
     srv = Server(("127.0.0.1", args.port), Handler)
     print("pin_service: listening on 127.0.0.1:%d, signer %s, %s" % (

@@ -2259,6 +2259,139 @@ static void test_relay_fallback(void) {
     PASS();
 }
 
+/* 29. The store paid by voucher (#135): storedeposit= on the writer, the
+** pin service offering x402's batch-settlement beside exact, x402's escrow
+** on anvil from HPP Sepolia's bytecode (install_x402_escrow.sh). The first
+** put deposits once (the mock facilitator's key sends it); every put after
+** is a voucher, nothing on the chain; one claim pays the service exactly
+** what the node counts as spent. A restart goes on from the running total
+** in the data directory; with that file gone, the seller's corrective 402
+** (the node's own last voucher beside it) restores it, no new deposit. */
+static long long cast_number(const char *cmd) {
+    char out[200];
+    if (run_cmd(cmd, out, sizeof out) != 0) return -1;
+    return atoll(out);
+}
+static long long nonce_of(const char *addr) {
+    char cmd[300];
+    snprintf(cmd, sizeof cmd, "cast nonce %s --rpc-url %s", addr, RPC);
+    return cast_number(cmd);
+}
+static long long usdc_balance(const char *usdc, const char *addr) {
+    char cmd[400];
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, addr, RPC);
+    return cast_number(cmd);
+}
+static pid_t start_channel_service(const char *svc, const char *usdc, int port, const char *payTo, const char *claimInterval) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        snprintf(script, sizeof script, "%s/pin_service.py", svc);
+        int fd = open(DIR "/chan_service.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/chan_pins", "--signer-key", DIR "/chan_signer.key",
+               "--pay-to", payTo, "--facilitator", "mock", "--rpc", RPC, "--asset", usdc, "--settle-key", KEY1,
+               "--network", "eip155:31337", "--withdraw-delay", "3600", "--claim-interval", claimInterval, "--min-deposit", "20000", (char *)NULL);
+        _exit(127);
+    }
+    for (int i = 0; i < 50; i++) {
+        char cmd[200], out[4096];
+        if (!test_child_alive(pid)) return -1;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
+        if (run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "batch-settlement")) return pid;
+        usleep(200 * 1000);
+    }
+    kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+    return -1;
+}
+static void test_store_channel(void) {
+    TEST("the store paid by voucher (#135): one deposit into x402's escrow, then a voucher per put and nothing on the chain; one claim pays exactly what the node spent; a restart and a lost state file go on without a new deposit");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC"), *escrow = getenv("HPPLITE_ANVIL_ESCROW");
+    static const char CKEY[] = "0x2929292929292929292929292929292929292929292929292929292929292929";
+    if (!svc || !usdc || !usdc[0] || !escrow || !escrow[0]) { printf("SKIP (no pin service, MockUSDC or x402 escrow in the environment) "); PASS(); return; }
+    char cmd[2400], wallet[80], facil[80], payTo[80] = "0x2929000000000000000000000000000000000029", extra[400], statePath[400], chan[80];
+    int port = test_free_port();
+    FILE *f = fopen(DIR "/chan_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", CKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    if (run_cmd(cmd, facil, sizeof facil) != 0) FAIL("cast wallet address");
+    facil[strcspn(facil, "\r\n")] = 0;
+    /* ETH for the chain writes (no relay here), USDC.e for the store */
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s --value 10ether >/dev/null && cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 1000000 >/dev/null",
+             RPC, KEY0, wallet, RPC, KEY0, usdc, wallet);
+    if (system(cmd) != 0) FAIL("fund the wallet");
+    pid_t pid = start_channel_service(svc, usdc, port, payTo, "600");
+    if (pid < 0) FAIL("the pin service did not come up");
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead: see scenario 18 */
+#define CH_FAIL(why) do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL(why); } while (0)
+
+    snprintf(extra, sizeof extra, "&dbname=chanstore&store=http://127.0.0.1:%d&storecap=1000&storedeposit=50000", port);
+    sqlite3 *w = open_db("chan_writer.db", CKEY, extra);
+    if (!w) CH_FAIL("open writer");
+    long long n0 = nonce_of(facil);
+    sqlite3_exec(w, "CREATE TABLE c(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(state %s, pending %lld, contract %s: %s) ", status_text(w, "state"), status_int(w, "pending"), status_text(w, "contract"), status_text(w, "last_error")); sqlite3_close(w); CH_FAIL("the first batch through the store"); }
+    long long n1 = nonce_of(facil);
+    snprintf(chan, sizeof chan, "%s", status_text(w, "store_channel"));
+    long long locked1 = status_int(w, "store_locked"), spent1 = status_int(w, "store_spent");
+    printf("(channel %.10s..., first put: %lld spent, %lld locked, %lld deposit tx) ", chan, spent1, locked1, n1 - n0);
+    if (strlen(chan) != 66 || n1 - n0 != 1 || spent1 <= 0 || locked1 != 20000 - spent1) { sqlite3_close(w); CH_FAIL("the first put should open the channel with one deposit of the seller's 20000"); }
+    for (int i = 0; i < 5; i++) {
+        sqlite3_exec(w, "INSERT INTO c(v) VALUES('by voucher')", NULL, NULL, NULL);
+        if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); CH_FAIL("a batch by voucher"); }
+    }
+    long long n2 = nonce_of(facil), spent2 = status_int(w, "store_spent"), calls2 = status_int(w, "store_calls");
+    printf("(%lld paid puts, %lld spent, %lld transactions for the last five) ", calls2, spent2, n2 - n1);
+    if (n2 != n1 || calls2 != 6 || spent2 <= spent1) { sqlite3_close(w); CH_FAIL("five more puts by voucher, nothing on the chain"); }
+    sqlite3_close(w);                                    /* the close anchors: one more put, the manifest's */
+
+    /* the running total survives the restart: no deposit, the next voucher taken */
+    snprintf(statePath, sizeof statePath, DIR "/store-channel-");
+    w = open_db("chan_writer.db", CKEY, extra);
+    if (!w) CH_FAIL("reopen writer");
+    long long n3 = nonce_of(facil);
+    sqlite3_exec(w, "INSERT INTO c(v) VALUES('after a restart')", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0 || nonce_of(facil) != n3) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); CH_FAIL("after a restart: a voucher, no deposit"); }
+    sqlite3_close(w);
+
+    /* the state file gone: the seller's corrective 402 restores the total, still no deposit */
+    snprintf(cmd, sizeof cmd, "ls " DIR "/store-channel-*.json >/dev/null 2>&1 && rm -f " DIR "/store-channel-*.json");
+    if (system(cmd) != 0) CH_FAIL("the channel's state file should be in the data directory");
+    w = open_db("chan_writer.db", CKEY, extra);
+    if (!w) CH_FAIL("reopen writer");
+    long long n4 = nonce_of(facil);
+    sqlite3_exec(w, "INSERT INTO c(v) VALUES('after the state was lost')", NULL, NULL, NULL);
+    if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); CH_FAIL("after the state file was lost: the corrective 402, then a voucher"); }
+    if (nonce_of(facil) != n4) { sqlite3_close(w); CH_FAIL("after the state file was lost: no new deposit"); }
+    if (strcmp(status_text(w, "store_channel"), chan) != 0) { sqlite3_close(w); CH_FAIL("the same channel"); }
+    sqlite3_close(w);
+
+    /* one claim pays the service for every put; what it got is what the seller charged, the node's count */
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    pid = start_channel_service(svc, usdc, port, payTo, "1");
+    if (pid < 0) { unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL("the pin service did not come back"); }
+    long long got = 0, charged = -1;
+    {
+        char out[4096];
+        snprintf(cmd, sizeof cmd, "python3 -I -c \"import json;b=json.load(open('" DIR "/chan_pins/channels.json'));print(sum(s['charged'] for s in b.values()))\"");
+        if (run_cmd(cmd, out, sizeof out) == 0) charged = atoll(out);
+    }
+    for (int i = 0; i < 60 && got < charged; i++) { usleep(500 * 1000); got = usdc_balance(usdc, payTo); }
+    long long nClaim = nonce_of(facil) - n4;
+    printf("(the service charged %lld; claimed and settled %lld in %lld transactions) ", charged, got, nClaim);
+    if (charged <= 0 || got != charged || nClaim != 2) CH_FAIL("one claim and one settle should pay the service exactly its charges");
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    unsetenv("HPPLITE_STORE_VALID_FOR");
+#undef CH_FAIL
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2298,6 +2431,7 @@ int main(void) {
     if (wanted(26)) test_page_mode_end_to_end();
     if (wanted(27)) test_relay_no_eth();
     if (wanted(28)) test_relay_fallback();
+    if (wanted(29)) test_store_channel();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

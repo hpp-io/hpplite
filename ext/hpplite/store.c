@@ -6,6 +6,9 @@
 ** scheme's EIP-3009 TransferWithAuthorization signed with the node's key
 ** for the quoted amount, sent back in PAYMENT-SIGNATURE; above storecap=
 ** the call is refused before anything is signed.
+** With storedeposit= the node takes x402's batch-settlement instead when the
+** 402 offers it (#135): one deposit into a channel in x402's escrow, then a
+** signed cumulative voucher per put, nothing on the chain per put.
 ** get: GET <url>/get/<ref>: the bytes.
 */
 #include "store.h"
@@ -54,6 +57,18 @@ struct HppliteStore {
     unsigned char payTo[20];        /* the receipt domain's verifyingContract */
     uint64_t chainId;
     int isRelay;                    /* opened for relay= (#126): its messages name the relay and relaycap */
+    /* x402 batch-settlement (#135): a channel in x402's escrow, a voucher per put */
+    uint64_t depositCap;            /* storedeposit=: the most left unspent in the escrow at once; 0: exact per put */
+    unsigned char salt[32];         /* the channel's salt: keccak256("hpplite" || the rollup's DA address) */
+    char *statePath;                /* where the running total survives a restart (NULL: memory only) */
+    int hasChan;                    /* chanId below is the channel the state is for */
+    unsigned char chanId[32];
+    uint64_t charged;               /* what the seller charged in this channel so far, as this node counts it */
+    uint64_t balance;               /* what the channel holds (deposits less refunds), as this node knows it */
+    uint64_t deposited;             /* this process's deposits, for the status row */
+    int nDeposits;
+    int payKind;                    /* the payment just built: PAY_EXACT, PAY_VOUCHER, PAY_DEPOSIT */
+    uint64_t payDeposit;            /* ...and the deposit in it */
     char error[256];
     char streamError[200];          /* Kubo's X-Stream-Error trailer of the last request, "" when none */
     HppliteCrypto *crypto;
@@ -201,19 +216,367 @@ static int wordAddress(const char *hex, unsigned char out[32]) {
     return (hex && strlen(hex) == 42 && hpplite_hex_to_bytes(hex + 2, out + 12, 20) >= 0) ? 0 : -1;
 }
 
+/* === x402 batch-settlement, the payer's side (#135) ===
+** The escrow is x402's x402BatchSettlement, at one address on every chain;
+** a channel is the EIP-712 hash of its config in the escrow's domain. A
+** deposit is an ERC-3009 ReceiveWithAuthorization to the deposit collector,
+** whose nonce is keccak256(channelId, salt); a payment is
+** Voucher(channelId, maxClaimableAmount), the running total. The spec:
+** specs/schemes/batch-settlement/scheme_batch_settlement_evm.md in
+** github.com/coinbase/x402; the seller: examples/pin_service/channels.py. */
+#define PAY_EXACT   0
+#define PAY_VOUCHER 1
+#define PAY_DEPOSIT 2
+static const char zEscrow[] = "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003";
+static const char zCollector[] = "0x4020806089470a89826cB9fB1f4059150b550004";
+#define BS_MISMATCH "invalid_batch_settlement_evm_cumulative_amount_mismatch"
+
+static void typedHash(const unsigned char domain[32], const unsigned char structHash[32], unsigned char out[32]) {
+    unsigned char pre[66];
+    pre[0] = 0x19; pre[1] = 0x01;
+    memcpy(pre + 2, domain, 32);
+    memcpy(pre + 34, structHash, 32);
+    hpplite_keccak256(pre, 66, out);
+}
+
+static void domainOf(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char contract[32], unsigned char out[32]) {
+    static const char zDomainType[] = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+    unsigned char w[160];
+    hpplite_keccak256((const unsigned char *)zDomainType, sizeof(zDomainType) - 1, w);
+    hpplite_keccak256((const unsigned char *)zName, strlen(zName), w + 32);
+    hpplite_keccak256((const unsigned char *)zVersion, strlen(zVersion), w + 64);
+    wordInt(chainId, w + 96);
+    memcpy(w + 128, contract, 32);
+    hpplite_keccak256(w, 160, out);
+}
+
+static void escrowDomain(uint64_t chainId, unsigned char out[32]) {
+    unsigned char e[32];
+    wordAddress(zEscrow, e);
+    domainOf("x402 Batch Settlement", "1", chainId, e, out);
+}
+
+/* "0x" and the EIP-55 mixed case: the form x402's own clients send */
+static void checksumHex(const unsigned char a[20], char out[43]) {
+    char lower[41];
+    unsigned char h[32];
+    int i;
+    hpplite_bytes_to_hex(a, 20, lower);
+    for (i = 0; i < 40; i++) if (lower[i] >= 'A' && lower[i] <= 'F') lower[i] += 32;
+    hpplite_keccak256((const unsigned char *)lower, 40, h);
+    out[0] = '0'; out[1] = 'x';
+    for (i = 0; i < 40; i++) {
+        int nib = (h[i / 2] >> (i % 2 ? 0 : 4)) & 0xf;
+        out[2 + i] = (lower[i] >= 'a' && lower[i] <= 'f' && nib >= 8) ? (char)(lower[i] - 32) : lower[i];
+    }
+    out[42] = 0;
+}
+
+static int signDigest(HppliteStore *s, const unsigned char digest[32], unsigned char sig[65]) {
+    HppliteSignature hs;
+    unsigned char v;
+    if (hpplite_crypto_sign(s->crypto, &s->kp, digest, &hs) != 0) return -1;
+    hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);
+    sig[64] = v;
+    return 0;
+}
+
+static void voucherDigest(uint64_t chainId, const unsigned char cid[32], uint64_t ceiling, unsigned char out[32]) {
+    static const char zType[] = "Voucher(bytes32 channelId,uint128 maxClaimableAmount)";
+    unsigned char w[96], h[32], dom[32];
+    hpplite_keccak256((const unsigned char *)zType, sizeof(zType) - 1, w);
+    memcpy(w + 32, cid, 32);
+    wordInt(ceiling, w + 64);
+    hpplite_keccak256(w, 96, h);
+    escrowDomain(chainId, dom);
+    typedHash(dom, h, out);
+}
+
+/* The state a restart keeps: the channel and the running total */
+static void chanSave(HppliteStore *s) {
+    FILE *f;
+    char id[65], tmp[1100];
+    if (!s->statePath || !s->hasChan) return;
+    hpplite_bytes_to_hex(s->chanId, 32, id);
+    snprintf(tmp, sizeof tmp, "%s.tmp", s->statePath);
+    f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "{\"channelId\":\"0x%s\",\"charged\":%llu,\"balance\":%llu}\n", id, (unsigned long long)s->charged, (unsigned long long)s->balance);
+    if (fclose(f) == 0) rename(tmp, s->statePath);
+}
+
+static void chanLoad(HppliteStore *s) {
+    FILE *f = s->statePath ? fopen(s->statePath, "r") : NULL;
+    char buf[512];
+    size_t n;
+    cJSON *j, *id;
+    if (!f) return;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    j = cJSON_Parse(buf);
+    id = j ? cJSON_GetObjectItem(j, "channelId") : NULL;
+    if (id && cJSON_IsString(id) && strlen(id->valuestring) == 66 && hpplite_hex_to_bytes(id->valuestring + 2, s->chanId, 32) == 32) {
+        cJSON *c = cJSON_GetObjectItem(j, "charged"), *b = cJSON_GetObjectItem(j, "balance");
+        s->hasChan = 1;
+        s->charged = c && cJSON_IsNumber(c) ? (uint64_t)c->valuedouble : 0;
+        s->balance = b && cJSON_IsNumber(b) ? (uint64_t)b->valuedouble : 0;
+    }
+    cJSON_Delete(j);
+}
+
+void hpplite_store_set_channel(HppliteStore *s, uint64_t depositCap, const unsigned char da[20], const char *zStatePath) {
+    unsigned char seed[27];
+    if (!s) return;
+    s->depositCap = depositCap;
+    memcpy(seed, "hpplite", 7);
+    if (da) memcpy(seed + 7, da, 20); else memset(seed + 7, 0, 20);
+    hpplite_keccak256(seed, sizeof seed, s->salt);
+    sqlite3_free(s->statePath);
+    s->statePath = zStatePath ? sqlite3_mprintf("%s", zStatePath) : NULL;
+    s->hasChan = 0; s->charged = s->balance = 0;
+    chanLoad(s);
+}
+
+int hpplite_store_channel(HppliteStore *s, char zId[67], uint64_t *pCharged, uint64_t *pBalance, uint64_t *pDeposited) {
+    if (!s || !s->hasChan) return -1;
+    if (zId) { zId[0] = '0'; zId[1] = 'x'; hpplite_bytes_to_hex(s->chanId, 32, zId + 2); }
+    if (pCharged) *pCharged = s->charged;
+    if (pBalance) *pBalance = s->balance;
+    if (pDeposited) *pDeposited = s->deposited;
+    return 0;
+}
+
+static const char *jstr(cJSON *o, const char *k) {
+    cJSON *v = o ? cJSON_GetObjectItem(o, k) : NULL;
+    return v && cJSON_IsString(v) ? v->valuestring : NULL;
+}
+
+static uint64_t jnum(cJSON *o, const char *k) {
+    cJSON *v = o ? cJSON_GetObjectItem(o, k) : NULL;
+    if (v && cJSON_IsString(v)) return strtoull(v->valuestring, NULL, 10);
+    if (v && cJSON_IsNumber(v)) return (uint64_t)v->valuedouble;
+    return 0;
+}
+
+/* The channel this offer names: its id from the config the 402 and this node make together */
+static int chanConfig(HppliteStore *s, cJSON *acc, uint64_t chainId, unsigned char cid[32], cJSON **pConfig) {
+    static const char zType[] = "ChannelConfig(address payer,address payerAuthorizer,address receiver,address receiverAuthorizer,"
+                                "address token,uint40 withdrawDelay,bytes32 salt)";
+    cJSON *extra = cJSON_GetObjectItem(acc, "extra"), *config;
+    const char *payTo = jstr(acc, "payTo"), *asset = jstr(acc, "asset"), *ra = jstr(extra, "receiverAuthorizer");
+    uint64_t wd = jnum(extra, "withdrawDelay");
+    unsigned char w[256], h[32], dom[32];
+    char me[43], saltHex[67];
+    if (!payTo || !asset || !ra || !wd) return -1;
+    hpplite_keccak256((const unsigned char *)zType, sizeof(zType) - 1, w);
+    memset(w + 32, 0, 32); memcpy(w + 44, s->address, 20);
+    memcpy(w + 64, w + 32, 32);                           /* payerAuthorizer: this node's key, an EOA the seller checks itself */
+    if (wordAddress(payTo, w + 96) || wordAddress(ra, w + 128) || wordAddress(asset, w + 160)) return -1;
+    wordInt(wd, w + 192);
+    memcpy(w + 224, s->salt, 32);
+    hpplite_keccak256(w, 256, h);
+    escrowDomain(chainId, dom);
+    typedHash(dom, h, cid);
+    checksumHex(s->address, me);
+    saltHex[0] = '0'; saltHex[1] = 'x';
+    hpplite_bytes_to_hex(s->salt, 32, saltHex + 2);
+    config = cJSON_CreateObject();
+    cJSON_AddStringToObject(config, "payer", me);
+    cJSON_AddStringToObject(config, "payerAuthorizer", me);
+    cJSON_AddStringToObject(config, "receiver", payTo);
+    cJSON_AddStringToObject(config, "receiverAuthorizer", ra);
+    cJSON_AddStringToObject(config, "token", asset);
+    cJSON_AddNumberToObject(config, "withdrawDelay", (double)wd);
+    cJSON_AddStringToObject(config, "salt", saltHex);
+    *pConfig = config;
+    return 0;
+}
+
+/* A payment by voucher, with a deposit when the channel cannot cover it: the PAYMENT-SIGNATURE value or NULL */
+static char *chanPay(HppliteStore *s, cJSON *req, cJSON *acc, uint64_t amt, uint64_t chainId) {
+    cJSON *extra = cJSON_GetObjectItem(acc, "extra"), *config = NULL, *payload, *inner, *voucher;
+    const char *zName = jstr(extra, "name"), *zVersion = jstr(extra, "version"), *asset = jstr(acc, "asset");
+    unsigned char cid[32], digest[32], sig[65];
+    char hex[133], num[32], *json, *b64, *result = NULL;
+    uint64_t ceiling, deposit = 0;
+    if (!zName || !zVersion || !asset || chanConfig(s, acc, chainId, cid, &config) != 0) {
+        snprintf(s->error, sizeof s->error, "the 402's batch-settlement offer is incomplete");
+        return NULL;
+    }
+    if (!s->hasChan || memcmp(s->chanId, cid, 32) != 0) {
+        /* a channel this node has not paid in (or the seller's terms changed): nothing known in it yet */
+        memcpy(s->chanId, cid, 32);
+        s->hasChan = 1;
+        s->charged = s->balance = 0;
+    }
+    ceiling = s->charged + amt;
+    if (ceiling > s->balance) {
+        uint64_t unspent = s->balance - s->charged, minDeposit = jnum(extra, "minDeposit");
+        deposit = minDeposit > ceiling - s->balance ? minDeposit : ceiling - s->balance;
+        if (unspent + deposit > s->depositCap) deposit = s->depositCap > unspent ? s->depositCap - unspent : 0;
+        if (s->balance + deposit < ceiling) {
+            snprintf(s->error, sizeof s->error, "the %s's channel needs a deposit of %llu and storedeposit is %llu (%llu unspent in it): refused",
+                     s->isRelay ? "relay" : "store", (unsigned long long)(ceiling - s->balance), (unsigned long long)s->depositCap, (unsigned long long)unspent);
+            cJSON_Delete(config);
+            return NULL;
+        }
+    }
+    payload = cJSON_CreateObject();
+    inner = cJSON_CreateObject();
+    voucher = cJSON_CreateObject();
+    cJSON_AddNumberToObject(payload, "x402Version", 2);
+    if (cJSON_GetObjectItem(req, "resource")) cJSON_AddItemToObject(payload, "resource", cJSON_Duplicate(cJSON_GetObjectItem(req, "resource"), 1));
+    cJSON_AddItemToObject(payload, "accepted", cJSON_Duplicate(acc, 1));
+    cJSON_AddStringToObject(inner, "type", deposit ? "deposit" : "voucher");
+    cJSON_AddItemToObject(inner, "channelConfig", config);
+    hex[0] = '0'; hex[1] = 'x';
+    hpplite_bytes_to_hex(cid, 32, hex + 2);
+    cJSON_AddStringToObject(voucher, "channelId", hex);
+    snprintf(num, sizeof num, "%llu", (unsigned long long)ceiling);
+    cJSON_AddStringToObject(voucher, "maxClaimableAmount", num);
+    voucherDigest(chainId, cid, ceiling, digest);
+    if (signDigest(s, digest, sig) != 0) goto fail;
+    hpplite_bytes_to_hex(sig, 65, hex + 2);
+    cJSON_AddStringToObject(voucher, "signature", hex);
+    cJSON_AddItemToObject(inner, "voucher", voucher);
+    voucher = NULL;
+    if (deposit) {
+        /* ReceiveWithAuthorization(from = this node, to = the collector, value, window, nonce = keccak256(channelId, salt)) */
+        static const char zType[] = "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)";
+        unsigned char w[224], h[32], dom[32], token[32], dsalt[32], pre[64], nonce[32];
+        uint64_t now = (uint64_t)time(NULL), validAfter = now - 60, validBefore = now + s->validFor;
+        cJSON *dep = cJSON_CreateObject(), *auth = cJSON_CreateObject(), *e3009 = cJSON_CreateObject();
+        {
+            unsigned char seed[84];
+            static unsigned counter;
+            wordInt(now, seed);
+            memcpy(seed + 32, s->address, 20);
+            wordInt(++counter + (uint64_t)(uintptr_t)s, seed + 52);
+            hpplite_keccak256(seed, sizeof seed, dsalt);       /* used once: uniqueness, not secrecy */
+        }
+        memcpy(pre, cid, 32); memcpy(pre + 32, dsalt, 32);
+        hpplite_keccak256(pre, 64, nonce);
+        wordAddress(asset, token);
+        domainOf(zName, zVersion, chainId, token, dom);
+        hpplite_keccak256((const unsigned char *)zType, sizeof(zType) - 1, w);
+        memset(w + 32, 0, 32); memcpy(w + 44, s->address, 20);
+        wordAddress(zCollector, w + 64);
+        wordInt(deposit, w + 96);
+        wordInt(validAfter, w + 128);
+        wordInt(validBefore, w + 160);
+        memcpy(w + 192, nonce, 32);
+        hpplite_keccak256(w, 224, h);
+        typedHash(dom, h, digest);
+        if (signDigest(s, digest, sig) != 0) { cJSON_Delete(dep); cJSON_Delete(auth); cJSON_Delete(e3009); goto fail; }
+        snprintf(num, sizeof num, "%llu", (unsigned long long)deposit);
+        cJSON_AddStringToObject(dep, "amount", num);
+        snprintf(num, sizeof num, "%llu", (unsigned long long)validAfter);
+        cJSON_AddStringToObject(e3009, "validAfter", num);
+        snprintf(num, sizeof num, "%llu", (unsigned long long)validBefore);
+        cJSON_AddStringToObject(e3009, "validBefore", num);
+        hpplite_bytes_to_hex(dsalt, 32, hex + 2);
+        cJSON_AddStringToObject(e3009, "salt", hex);
+        hpplite_bytes_to_hex(sig, 65, hex + 2);
+        cJSON_AddStringToObject(e3009, "signature", hex);
+        cJSON_AddItemToObject(auth, "erc3009Authorization", e3009);
+        cJSON_AddItemToObject(dep, "authorization", auth);
+        cJSON_AddItemToObject(inner, "deposit", dep);
+    }
+    cJSON_AddItemToObject(payload, "payload", inner);
+    cJSON_AddItemToObject(payload, "extensions", cJSON_CreateObject());
+    json = cJSON_PrintUnformatted(payload);
+    cJSON_Delete(payload);
+    b64 = json ? b64encode((const unsigned char *)json, strlen(json)) : NULL;
+    free(json);
+    if (b64) { result = sqlite3_mprintf("PAYMENT-SIGNATURE: %s", b64); sqlite3_free(b64); }
+    s->payKind = deposit ? PAY_DEPOSIT : PAY_VOUCHER;
+    s->payDeposit = deposit;
+    return result;
+fail:
+    snprintf(s->error, sizeof s->error, "could not sign the voucher");
+    cJSON_Delete(voucher);
+    cJSON_Delete(payload);
+    return NULL;
+}
+
+/* After a 200: what the seller says it charged counts, if it is no more than the price (the client's rule) */
+static uint64_t chanPaid(HppliteStore *s, const char *zResponse, uint64_t amt) {
+    size_t n = 0;
+    unsigned char *json = zResponse ? b64decode(zResponse, &n) : NULL;
+    cJSON *r = json ? cJSON_Parse((const char *)json) : NULL, *extra = r ? cJSON_GetObjectItem(r, "extra") : NULL;
+    uint64_t charged = extra && cJSON_GetObjectItem(extra, "chargedAmount") ? jnum(extra, "chargedAmount") : amt;
+    const char *tx = jstr(r, "transaction");
+    uint64_t theirs = jnum(cJSON_GetObjectItem(extra, "channelState"), "balance");
+    if (charged > amt) charged = amt;
+    s->charged += charged;
+    if (s->payKind == PAY_DEPOSIT && tx && tx[0]) { s->balance += s->payDeposit; s->deposited += s->payDeposit; s->nDeposits++; }
+    else if (s->payKind == PAY_DEPOSIT && theirs > s->balance) s->balance = theirs;   /* the channel held enough: no deposit sent (#135) */
+    free(json);
+    cJSON_Delete(r);
+    chanSave(s);
+    return charged;
+}
+
+/* A 402 to a voucher: whether to try again, the state corrected. The seller's total is believed only
+** with this node's own last voucher beside it (or, without one, the chain's claimed total it reports) */
+static int chanCorrect(HppliteStore *s, const char *zRequired, uint64_t chainId) {
+    size_t n = 0;
+    unsigned char *json = zRequired ? b64decode(zRequired, &n) : NULL;
+    cJSON *req = json ? cJSON_Parse((const char *)json) : NULL, *it, *acc = NULL;
+    const char *err = jstr(req, "error");
+    int again = 0;
+    free(json);
+    if (!req || !err) { cJSON_Delete(req); return 0; }
+    cJSON_ArrayForEach(it, cJSON_GetObjectItem(req, "accepts")) {
+        const char *sc = jstr(it, "scheme");
+        if (sc && strcmp(sc, "batch-settlement") == 0) acc = it;
+    }
+    if (strcmp(err, BS_MISMATCH) == 0 && acc) {
+        cJSON *extra = cJSON_GetObjectItem(acc, "extra"), *cs = cJSON_GetObjectItem(extra, "channelState"), *vs = cJSON_GetObjectItem(extra, "voucherState");
+        const char *zSig = jstr(vs, "signature");
+        unsigned char sig[65], digest[32], pub[33], who[20];
+        if (cs && zSig && strlen(zSig) == 132 && hpplite_hex_to_bytes(zSig + 2, sig, 65) == 65) {
+            HppliteSignature hs;
+            voucherDigest(chainId, s->chanId, jnum(vs, "signedMaxClaimable"), digest);
+            memcpy(hs.sig, sig, 64);
+            hs.recid = sig[64] >= 27 ? sig[64] - 27 : sig[64];
+            if (hs.recid <= 1 && hpplite_crypto_recover_pubkey(s->crypto, digest, &hs, pub) == 0
+                && eth_address_from_compressed_pubkey(pub, who) == 0 && memcmp(who, s->address, 20) == 0) {
+                s->charged = jnum(cs, "chargedCumulativeAmount");
+                s->balance = jnum(cs, "balance");
+                again = 1;
+            }
+        } else if (cs) {
+            s->charged = jnum(cs, "totalClaimed");          /* nothing of ours to check against: the chain's count */
+            s->balance = jnum(cs, "balance");
+            again = 1;
+        }
+    } else if (strstr(err, "exceeds_balance") || strstr(err, "channel_not_found")) {
+        s->balance = s->charged;                            /* the channel cannot cover it: deposit with the payment */
+        again = 1;
+    }
+    if (again) chanSave(s);
+    cJSON_Delete(req);
+    return again;
+}
+
 /* A payment for one 402: the PAYMENT-SIGNATURE value (sqlite3_mprintf), or NULL with the reason in s->error */
 static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount) {
     size_t n = 0;
     unsigned char *json = b64decode(zRequired, &n);
     cJSON *req = json ? cJSON_Parse((const char *)json) : NULL;
-    cJSON *accepts = req ? cJSON_GetObjectItem(req, "accepts") : NULL, *acc = NULL, *it;
+    cJSON *accepts = req ? cJSON_GetObjectItem(req, "accepts") : NULL, *acc = NULL, *accBatch = NULL, *it;
     char *result = NULL;
     free(json);
+    s->payKind = PAY_EXACT;
     if (!req) { snprintf(s->error, sizeof s->error, "402 without a readable PAYMENT-REQUIRED"); return NULL; }
     cJSON_ArrayForEach(it, accepts) {
         cJSON *scheme = cJSON_GetObjectItem(it, "scheme");
-        if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "exact") == 0) { acc = it; break; }
+        if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "exact") == 0 && !acc) acc = it;
+        if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "batch-settlement") == 0 && !accBatch) accBatch = it;
     }
+    if (accBatch && s->depositCap) acc = accBatch;          /* storedeposit=: a channel, a voucher per call (#135) */
     if (!acc) { snprintf(s->error, sizeof s->error, "the store offers no exact-scheme payment"); cJSON_Delete(req); return NULL; }
     {
         cJSON *amount = cJSON_GetObjectItem(acc, "amount"), *asset = cJSON_GetObjectItem(acc, "asset"),
@@ -232,6 +595,12 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the %s asks %llu, %s is %llu: refused", s->isRelay ? "relay" : "store",
                                      (unsigned long long)amt, s->isRelay ? "relaycap" : "storecap", (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
         if (strncmp(network->valuestring, "eip155:", 7) == 0) chainId = strtoull(network->valuestring + 7, NULL, 10);
+        if (acc == accBatch) {
+            result = chanPay(s, req, acc, amt, chainId);
+            if (result && pAmount) *pAmount = amt;
+            cJSON_Delete(req);
+            return result;
+        }
 
         /* domain = keccak(typehash, keccak(name), keccak(version), chainId, asset) */
         unsigned char domain[32], w[32 * 7], h[32], digest[32], nonce[32], sig[65], t[32];
@@ -623,6 +992,7 @@ void hpplite_store_close(HppliteStore *s) {
     sqlite3_free(s->s3Bucket);
     sqlite3_free(s->s3Prefix);
     sqlite3_free(s->s3Host);
+    sqlite3_free(s->statePath);
     memset(s->s3Secret, 0, sizeof s->s3Secret);
     free(s);
 }
@@ -741,6 +1111,54 @@ static char *kuboAdd(HppliteStore *s, const uint8_t *data, size_t len) {
 
 void hpplite_store_set_relay(HppliteStore *s) { if (s) s->isRelay = 1; }
 
+/* A POST the provider may charge for: a 402 paid (exact, or a voucher in a channel), and, for a voucher,
+** paid again once the seller's correction is taken (the running total, or a deposit the channel needs) */
+static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, size_t len, Buf *out) {
+    char *zRequired = NULL, *zResponse = NULL;
+    long status = storeRequest(s, "POST", path, body, len, NULL, out, &zRequired, NULL);
+    int tries;
+    for (tries = 0; status == 402 && zRequired && tries < 3; tries++) {
+        uint64_t amount = 0, chainId = 0;
+        char *zPay = storePay(s, zRequired, &amount), *zAgain = NULL;
+        int kind = s->payKind;
+        const char *net;
+        if (!zPay) break;
+        {
+            size_t n = 0;
+            unsigned char *j = b64decode(zRequired, &n);
+            net = j ? strstr((const char *)j, "\"eip155:") : NULL;
+            if (net) chainId = strtoull(net + 8, NULL, 10);
+            free(j);
+        }
+        free(out->p); out->p = NULL; out->n = 0;
+        sqlite3_free(zResponse); zResponse = NULL;
+        status = storeRequest(s, "POST", path, body, len, zPay, out, &zAgain, &zResponse);
+        sqlite3_free(zPay);
+        sqlite3_free(zRequired);
+        zRequired = zAgain;
+        if (status == 200) {
+            s->spent += kind == PAY_EXACT ? amount : chanPaid(s, zResponse, amount);
+            s->calls++;
+            break;
+        }
+        if (status != 402 || kind == PAY_EXACT || !chanCorrect(s, zRequired, chainId)) {
+            if (status == 402 && zRequired) {
+                size_t n = 0;
+                unsigned char *j = b64decode(zRequired, &n);
+                cJSON *r = j ? cJSON_Parse((const char *)j) : NULL;
+                const char *e = jstr(r, "error");
+                if (e) snprintf(s->error, sizeof s->error, "the %s refused the payment: %.200s", s->isRelay ? "relay" : "store", e);
+                cJSON_Delete(r);
+                free(j);
+            }
+            break;
+        }
+    }
+    sqlite3_free(zRequired);
+    sqlite3_free(zResponse);
+    return status;
+}
+
 long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *body, size_t len, char **pzOut) {
     Buf out = {0};
     char *zRequired = NULL, *zResponse = NULL;
@@ -748,18 +1166,8 @@ long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *b
     if (pzOut) *pzOut = NULL;
     if (!s || s->kind != STORE_PIN || !path || !body) return 0;
     s->error[0] = 0;
-    status = storeRequest(s, "POST", path, body, len, NULL, &out, &zRequired, NULL);
-    if (status == 402 && zRequired) {
-        uint64_t amount = 0;
-        char *zPay = storePay(s, zRequired, &amount);
-        free(out.p); out.p = NULL; out.n = 0;
-        if (!zPay) { sqlite3_free(zRequired); return 402; }
-        status = storeRequest(s, "POST", path, body, len, zPay, &out, NULL, &zResponse);
-        sqlite3_free(zPay);
-        if (status == 200 && zResponse) { s->spent += amount; s->calls++; }
-    }
-    sqlite3_free(zRequired);
-    sqlite3_free(zResponse);
+    (void)zRequired; (void)zResponse;
+    status = paidPost(s, path, body, len, &out);
     if (status == 200) s->nOk++;
     if (pzOut && out.p) *pzOut = sqlite3_mprintf("%.*s", (int)out.n, out.p);
     free(out.p);
@@ -780,18 +1188,13 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
         if (zRef) s->nOk++;
         return zRef;                              /* no receipt: a Kubo node or a bucket promises nothing */
     }
-    status = storeRequest(s, "POST", "/put", data, len, NULL, &out, &zRequired, NULL);
-    if (status == 402 && zRequired) {
-        uint64_t amount = 0;
-        char *zPay = storePay(s, zRequired, &amount);
-        free(out.p); out.p = NULL; out.n = 0;
-        if (!zPay) { s->lastFailure = strstr(s->error, "storecap") ? HPPLITE_STORE_FAIL_CAP : HPPLITE_STORE_FAIL_OTHER; sqlite3_free(zRequired); return NULL; }
-        status = storeRequest(s, "POST", "/put", data, len, zPay, &out, NULL, &zResponse);
-        sqlite3_free(zPay);
-        if (status == 200) { s->spent += amount; s->calls++; }
+    (void)zRequired; (void)zResponse;
+    status = paidPost(s, "/put", data, len, &out);
+    if (status == 402 && (strstr(s->error, "storecap") || strstr(s->error, "storedeposit"))) {
+        s->lastFailure = HPPLITE_STORE_FAIL_CAP;            /* nothing signed past the caps: the batch waits */
+        free(out.p);
+        return NULL;
     }
-    sqlite3_free(zRequired);
-    sqlite3_free(zResponse);
     if (status != 200) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to put: %.120s", status, out.p ? out.p : "");
         s->lastFailure = status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;

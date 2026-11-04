@@ -90,6 +90,62 @@ and HPP's facilitator checks the quoted name against the token). That is anvil s
 the buyer pays a put and a pin, is refused over its cap before signing,
 and the pay-to wallet ends richer by what settled.
 
+## batch-settlement: a deposit once, a voucher per put (#135)
+
+Each 402 offers x402's `batch-settlement` next to `exact` (`--no-channels`
+turns it off). A node that takes it deposits once into a channel in x402's
+escrow, `x402BatchSettlement` at `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`
+on every chain. Its first payment authorizes an ERC-3009
+`receiveWithAuthorization` to the deposit collector, and the facilitator
+sends it. Every put after that carries a signed `Voucher(channelId,
+maxClaimableAmount)` for the node's running total. `channels.py` checks the
+voucher itself, with nothing on the chain:
+- the signature recovers to the channel's `payerAuthorizer`;
+- the total is exactly what it has charged plus this put's price;
+- the total is within the deposit.
+
+A total that doesn't match gets the corrective 402. It carries the channel's
+state and the node's own last voucher, which the node checks before adopting
+the total. A total past the balance is refused, and the node tops up with
+another deposit.
+
+Every `--claim-interval` (default 1 hour), one `claimWithSignature`
+transaction claims all channels charged since the last claim, then `settle`
+moves the money to `--pay-to`. The service signs as `receiverAuthorizer`
+with its receipt key. A channel idle for `--refund-idle` (default 7 days)
+gets back what it holds beyond its charges.
+
+The refund matters for a node with no ETH. The escrow's own exit, a timed
+withdrawal after `--withdraw-delay` (default 1 day), must be sent by the
+payer, so it costs gas. The claim interval has to stay well inside the
+withdraw delay, because vouchers not claimed when a withdrawal finishes are
+lost to the service.
+
+Two behaviours of HPP's facilitator are handled here:
+- **A deposit answered `settlement_queued`** (past the facilitator's
+  synchronous window) is being sent, not refused. The service waits for the
+  chain to show it before it answers. It also reads the channel before
+  sending any deposit, and doesn't send one the channel no longer needs.
+- **The facilitator answers a `/settle` body it has already seen** with its
+  earlier result. `settle(receiver, token)` would be the same body every time,
+  so each request carries `extra.requestedAt`.
+
+The per-put fee (`--price-per-pin`) is unchanged. With vouchers it no longer
+pays for a settlement transaction, so an operator can lower it.
+
+`channel_selftest.sh` (ctest `test_pin_service_channels`) runs this on anvil
+against the escrow's bytecode as HPP Sepolia runs it
+(`tests/l1/fixtures/`). A buyer holding MockUSDC and no ETH does the
+following:
+- one deposit for many puts, with no transaction for them;
+- the corrective 402;
+- a voucher from another key, refused;
+- one claim that pays the service exactly what it charged;
+- the service losing its book and taking the chain's claimed total as the
+  baseline;
+- a top-up;
+- an idle refund that gives the buyer back everything not charged.
+
 ## Against HPP Sepolia
 
 The real facilitator is `https://facilitator-sepolia.hpp.io`, the asset

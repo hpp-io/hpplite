@@ -86,6 +86,8 @@ typedef struct StatusCursor {
 #define STATUS_COL_RELAY          37  /* relay= (#126): the URL; NULL without one */
 #define STATUS_COL_RELAY_SPENT    38  /* ...paid to it, atomic units of its asset */
 #define STATUS_COL_LAST_TX_PATH   39  /* "relay" or "direct": how the last write went to the chain; NULL before one */
+#define STATUS_COL_STORE_CHANNEL  40  /* batch-settlement (#135): the channel id the store is paid in; NULL with exact */
+#define STATUS_COL_STORE_LOCKED   41  /* ...what the channel holds not yet charged (atomic units) */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -102,7 +104,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
-        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT)");
+        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_channel TEXT, store_locked INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -374,6 +376,19 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_LAST_TX_PATH: {
             const char *z = node->l1 ? hpplite_l1_last_tx_path(node->l1) : NULL;
             if (z) sqlite3_result_text(ctx, z, -1, SQLITE_STATIC);
+            break;
+        }
+        case STATUS_COL_STORE_CHANNEL: {
+            /* batch-settlement (#135): the channel the puts are paid in */
+            char id[67];
+            if (node->store && hpplite_store_channel(node->store, id, NULL, NULL, NULL) == 0) sqlite3_result_text(ctx, id, -1, SQLITE_TRANSIENT);
+            break;
+        }
+        case STATUS_COL_STORE_LOCKED: {
+            /* ...and what sits in it not yet charged: the node's money in the escrow */
+            uint64_t charged, balance;
+            if (node->store && hpplite_store_channel(node->store, NULL, &charged, &balance, NULL) == 0)
+                sqlite3_result_int64(ctx, (sqlite3_int64)(balance > charged ? balance - charged : 0));
             break;
         }
         default:

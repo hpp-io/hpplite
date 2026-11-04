@@ -79,6 +79,7 @@ typedef struct HppliteNodeConfig {
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
+    uint64_t storeDeposit;          /* storedeposit=: batch-settlement, the most unspent in the channel (0 = exact, #135) */
     char *relayUrl;                 /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */
     uint64_t relayCap;              /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
     int storeFallback;              /* storefallback=: a store that does not answer lets the chain carry the bytes (default on) */
@@ -134,6 +135,7 @@ typedef struct HppliteNode {
     int warnedNames;                /* said once that the store takes no names (#165) */
     int softWalked;                 /* the store's names past the chain were read once (#167) */
     uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
+    int storeChannelBound;          /* the store's batch-settlement channel bound to this rollup (#135) */
     int storeBalanceOk;
     long storeBalanceAt;            /* seconds (time()) */
 

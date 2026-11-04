@@ -257,6 +257,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
     val = getenv(HPPLITE_ENV_STORE_CAP);
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
+    val = getenv(HPPLITE_ENV_STORE_DEPOSIT);
+    if (val && atoll(val) > 0) cfg->storeDeposit = (uint64_t)atoll(val);
     val = getenv(HPPLITE_ENV_RELAY);
     if (val && val[0]) { free(cfg->relayUrl); cfg->relayUrl = strdup(val); }
     val = getenv(HPPLITE_ENV_RELAY_CAP);
@@ -509,6 +511,9 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_STORE_CAP, buf, sizeof(buf)) && atoll(buf) > 0) {
         cfg->storeCap = (uint64_t)atoll(buf);
     }
+    if (get_uri_param(uri, HPPLITE_URI_STORE_DEPOSIT, buf, sizeof(buf)) && atoll(buf) > 0) {
+        cfg->storeDeposit = (uint64_t)atoll(buf);
+    }
     if (get_uri_param(uri, HPPLITE_URI_RELAY, buf, sizeof(buf)) && buf[0]) {
         free(cfg->relayUrl);
         cfg->relayUrl = strdup(buf);
@@ -686,6 +691,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_CAP);
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_DEPOSIT);
+    if (val && atoll(val) > 0) cfg->storeDeposit = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY);
     if (val && val[0]) { free(cfg->relayUrl); cfg->relayUrl = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_CAP);

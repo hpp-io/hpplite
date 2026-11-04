@@ -40,6 +40,15 @@ long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *b
 /* The handle is a relay's (#126): what it says names the relay and relaycap= */
 void hpplite_store_set_relay(HppliteStore *s);
 
+/* x402 batch-settlement (#135): with depositCap > 0 the node pays a 402 that offers it by
+** voucher in a channel of x402's escrow, depositing when the channel cannot cover the call,
+** never leaving more than depositCap unspent there (storedeposit=). The channel's salt binds
+** it to the rollup (da); the running total survives a restart in zStatePath (NULL: memory
+** only, the seller's corrective 402 restores it). 0 turns it off: exact per call. */
+void hpplite_store_set_channel(HppliteStore *s, uint64_t depositCap, const unsigned char da[20], const char *zStatePath);
+/* The channel paid in: its id ("0x" + 64 hex), what it was charged and holds, and this process's deposits; -1 when none */
+int hpplite_store_channel(HppliteStore *s, char zId[67], uint64_t *pCharged, uint64_t *pBalance, uint64_t *pDeposited);
+
 /* Put bytes: the reference (sqlite3_mprintf, caller frees) and, when the
 ** provider signed one, its receipt as compact JSON (sqlite3_mprintf, or
 ** NULL). NULL on failure; hpplite_store_error() says why. */

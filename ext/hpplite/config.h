@@ -61,6 +61,7 @@ extern "C" {
 #define HPPLITE_ENV_MAX_TX_GAS    "HPPLITE_MAX_TX_GAS"
 #define HPPLITE_ENV_STORE         "HPPLITE_STORE"          /* where batch bytes live instead of the chain (#11) */
 #define HPPLITE_ENV_STORE_CAP     "HPPLITE_STORE_CAP"
+#define HPPLITE_ENV_STORE_DEPOSIT "HPPLITE_STORE_DEPOSIT"
 #define HPPLITE_ENV_RELAY         "HPPLITE_RELAY"          /* a relay submits the signed forms of the writes, paid over x402 (#126) */
 #define HPPLITE_ENV_RELAY_CAP     "HPPLITE_RELAY_CAP"
 
@@ -90,6 +91,7 @@ extern "C" {
 #define HPPLITE_URI_FACTORY       "factory"
 #define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
 #define HPPLITE_URI_STORE_CAP     "storecap"    /* the most to pay the store per call, atomic units of its asset */
+#define HPPLITE_URI_STORE_DEPOSIT "storedeposit" /* batch-settlement (#135): the most left unspent in a channel at once */
 #define HPPLITE_URI_RELAY         "relay"       /* relay=http://host:port: the writes go to the chain through it, no ETH needed (#126) */
 #define HPPLITE_URI_RELAY_CAP     "relaycap"    /* the most to pay the relay per call, atomic units of its asset */
 #define HPPLITE_URI_STORE_FALLBACK "storefallback"   /* off: a batch waits while the store is down; on (default): the chain carries it */
@@ -158,6 +160,7 @@ typedef struct HppliteConfig {
     char *relayUrl;                  /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */
     uint64_t relayCap;               /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
     uint64_t storeCap;               /* storecap=: the most to pay the store per call (0 = pay nothing) */
+    uint64_t storeDeposit;           /* storedeposit=: x402 batch-settlement, the most unspent in the channel (0 = exact per call, #135) */
     int storeFallback;               /* storefallback=off keeps a batch waiting while the store is down; on (default): the chain carries it */
 
     /* Source tracking (for debugging) */

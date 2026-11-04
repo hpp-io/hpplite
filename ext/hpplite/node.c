@@ -141,6 +141,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.maxTxGas = config->maxTxGas;
     node->config.storeUrl = node_strdup(config->storeUrl);
     node->config.storeCap = config->storeCap;
+    node->config.storeDeposit = config->storeDeposit;
     node->config.storeFallback = config->storeFallback;
     node->config.anchorIntervalMs = config->anchorIntervalMs;
     node->config.relayUrl = node_strdup(config->relayUrl);
@@ -1787,6 +1788,22 @@ static void node_anchor_row(HppliteNode *node, const unsigned char hash[32], con
     }
 }
 
+/* The store's channel (#135) is the rollup's: its salt from the DA address, its running total
+** in the data directory. Bound before the first put, once the addresses are known. */
+static void node_store_channel(HppliteNode *node) {
+    char c[43], d[43], *zPath = NULL;
+    const char *zDa;
+    unsigned char da[20];
+    if (node->storeChannelBound || !node->store || !node->config.storeDeposit) return;
+    if (!node->l1 || hpplite_l1_get_addresses(node->l1, c, d) != 0) return;
+    zDa = d[0] ? d : c;
+    if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return;
+    if (node->config.dataDir) zPath = sqlite3_mprintf("%s/store-channel-%s.json", node->config.dataDir, zDa + 2);
+    hpplite_store_set_channel(node->store, node->config.storeDeposit, da, zPath);
+    sqlite3_free(zPath);
+    node->storeChannelBound = 1;
+}
+
 /* The batch under its rollup's name at the store (#165): the bytes with the sequencer's
 ** signature, so a reader finds it by height before the anchor. Best effort: a store that
 ** takes no names, or refuses, is said once; the hard tier does not depend on it. */
@@ -1902,6 +1919,7 @@ static int node_anchor(HppliteNode *node) {
     if (!text) return -1;
     hpplite_store_sha256((const uint8_t *)text, strlen(text), digest);
     hpplite_store_cid_from_sha256(digest, cid);
+    node_store_channel(node);
     zRef = hpplite_store_put(node->store, (const uint8_t *)text, strlen(text), &zReceipt);
     node->storeBalanceOk = 0;
     if (!zRef) {
@@ -2144,7 +2162,9 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         if (node->store) {
             /* the bytes to the store, the commitment to the chain (#11), as the row flush does */
             char *zReceipt = NULL;
-            char *zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
+            char *zRef;
+            node_store_channel(node);
+            zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
             node->storeBalanceOk = 0;
             if (!zRef) {
                 if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
@@ -2365,7 +2385,9 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                 if (node->store) {
                     /* the bytes to the store, the commitment to the chain (#11) */
                     char *zReceipt = NULL;
-                    char *zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
+                    char *zRef;
+            node_store_channel(node);
+            zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
                     node->storeBalanceOk = 0;                 /* a put may have paid: the status row reads the balance again */
                     if (!zRef) {
                         if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
