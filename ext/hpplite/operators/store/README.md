@@ -118,7 +118,9 @@ Every `--claim-interval` (default 1 hour), one `claimWithSignature`
 transaction claims all channels charged since the last claim, then `settle`
 moves the money to `--pay-to`. The service signs as `receiverAuthorizer`
 with its receipt key. A channel idle for `--refund-idle` (default 7 days)
-gets back what it holds beyond its charges.
+gets back what it holds beyond its charges. All of it runs in
+`Channels.tick()`: the reference calls it from a timer thread, a Worker
+from a Cron Trigger (#185).
 
 The refund matters for a node with no ETH. The escrow's own exit, a timed
 withdrawal after `--withdraw-delay` (default 1 day), must be sent by the
@@ -128,9 +130,14 @@ lost to the service.
 
 Two behaviours of HPP's facilitator are handled here:
 - **A deposit answered `settlement_queued`** (past the facilitator's
-  synchronous window) is being sent, not refused. The service waits for the
-  chain to show it before it answers. It also reads the channel before
-  sending any deposit, and doesn't send one the channel no longer needs.
+  synchronous window) is being sent, not refused. The service records it as
+  pending and answers at once: a `402` with
+  `invalid_batch_settlement_evm_deposit_pending`, nothing waiting on the
+  chain (#185). The node's next attempt finds it landed, and the voucher is
+  taken with no second deposit; while it hasn't landed (up to 10 minutes) no
+  other deposit is sent for that channel. The service also reads the channel
+  before sending any deposit, and doesn't send one the channel no longer
+  needs.
 - **The facilitator answers a `/settle` body it has already seen** with its
   earlier result. `settle(receiver, token)` would be the same body every time,
   so each request carries `extra.requestedAt`.

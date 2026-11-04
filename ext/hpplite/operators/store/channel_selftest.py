@@ -294,9 +294,9 @@ def main():
         check(usdc_of(pay_to) == b.charged, "the service has the %d" % b.charged)
         check(eth_of(buyer) == 0, "the buyer's ETH: 0")
 
-        # 9. a deposit the facilitator answers "queued" (HPP's does past its synchronous window): the service waits
-        # for the chain, the put is done once, one deposit; a buyer that deposits again into a channel that
-        # already covers the put sends nothing to the chain (#135, seen on HPP Sepolia)
+        # 9. a deposit the facilitator answers "queued" (HPP's does past its synchronous window): answered at once as
+        # pending, nothing waits for the chain (#185); the node's retry finds it landed, takes the voucher and sends no
+        # second deposit; a buyer that deposits again into a channel that already covers the put sends nothing (#135)
         svc.terminate(); svc.wait()
         svc = start_service(work, port, pay_to)
         procs.append(svc)
@@ -305,8 +305,14 @@ def main():
         cast("send", "--private-key", KEY0, USDC, "transfer(address,uint256)", eth.address(k2), "1000000")
         b2 = ChannelBuyer(url, k2, "0x" + eth.keccak256(b"hpplite" + bytes([2]) * 20).hex())
         n5 = nonce_of(settle_addr)
+        t0 = time.time()
         st, body, h = b2.put(b"queued deposit")
-        check(st == 200 and nonce_of(settle_addr) == n5 + 1, "a deposit answered queued: the put done once, one deposit (%d %s)" % (st, body.get("error", "")))
+        took = time.time() - t0
+        check(st == 402 and "deposit_pending" in str(body.get("error", "")) and took < 10 and nonce_of(settle_addr) == n5 + 1,
+              "a deposit answered queued: 402 pending at once (%d, %.1f s), the deposit sent once" % (st, took))
+        mock_facilitator(queueDeposits=False)
+        st, body, h = b2.put(b"queued deposit")
+        check(st == 200 and nonce_of(settle_addr) == n5 + 1, "the retry: the put done, no second deposit (%d %s)" % (st, body.get("error", "")))
         cid2 = json.loads(base64.b64decode(h["PAYMENT-RESPONSE"]))["extra"]["channelState"]["channelId"] if st == 200 else None
         bal2 = channel_on_chain(cid2)[0] if cid2 else -1
         check(bal2 == 500, "the channel holds one deposit (%d)" % bal2)

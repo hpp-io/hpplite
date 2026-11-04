@@ -40,6 +40,12 @@ BATCH_TYPE = "ClaimBatch(ClaimEntry[] claims)" + ENTRY_TYPE
 
 CONFIG_TUPLE = "(address,address,address,address,address,uint40,bytes32)"
 MISMATCH = "invalid_batch_settlement_evm_cumulative_amount_mismatch"
+PENDING = "invalid_batch_settlement_evm_deposit_pending"
+PENDING_FOR = 600          # seconds a queued deposit is waited for before it counts as lost and may be sent again
+
+
+class Pending(Exception):
+    """The facilitator took a deposit and has not sent it yet (settlement_queued)"""
 
 
 def _b32(h):
@@ -109,6 +115,7 @@ class Channels:
         self.path = os.path.join(directory, "channels.json")
         self.lock = threading.RLock()
         self.log = log or (lambda m: sys.stderr.write("channels: %s\n" % m))
+        self.last_claim = int(time.time())
         self.claimed_txs = 0
         self.settled_txs = 0
         self.chain = Chain(payments.rpc) if payments.rpc else None
@@ -189,6 +196,8 @@ class Channels:
                 st = {"config": config, "charged": claimed, "signedMax": claimed, "signature": "", "balance": bal,
                       "totalClaimed": claimed, "refundNonce": nonce, "withdrawRequestedAt": wr, "last": 0}
                 self.book[cid] = st
+            elif st.get("pending"):
+                self._landed(payload, req, cid, st, kind)
             if ceiling != st["charged"] + int(req["amount"]):
                 return False, cid, MISMATCH, None
             deposit_tx = None
@@ -205,13 +214,25 @@ class Channels:
                 except RuntimeError:
                     pass
                 if ceiling <= st["balance"]:
+                    st.pop("pending", None)
                     self._save()
                     return True, cid, None, None
+                pend = st.get("pending")
+                if pend and int(time.time()) - pend["at"] < PENDING_FOR:
+                    # sent, not landed: never a second deposit for one the facilitator still holds (#135, #185)
+                    return False, cid, "%s: the deposit of %d is queued at the facilitator (%s); retry" % (PENDING, pend["amount"], pend["tx"]), None
+                st.pop("pending", None)
                 if ceiling > st["balance"] + amount:
                     return False, cid, "invalid_batch_settlement_evm_cumulative_exceeds_balance", None
                 before = st["balance"]
                 try:
                     deposit_tx = self._deposit(payload, req, config, amount, auth, cid, before)
+                except Pending as e:
+                    # answered now, not waited for: the node's next attempt (or a tick) sees it land (#185)
+                    st["pending"] = {"amount": amount, "before": before, "tx": str(e), "at": int(time.time())}
+                    self._save()
+                    self.log("deposit for %s queued at the facilitator (%s)" % (cid, e))
+                    return False, cid, "%s: the facilitator queued the deposit of %d (%s); retry" % (PENDING, amount, e), None
                 except RuntimeError as e:
                     return False, cid, "invalid_batch_settlement_evm_deposit_transaction_failed: %s" % e, None
                 st["balance"] = before + amount
@@ -219,6 +240,19 @@ class Channels:
             elif ceiling > st["balance"]:
                 return False, cid, "invalid_batch_settlement_evm_cumulative_exceeds_balance", None
             return True, cid, None, deposit_tx
+
+    def _landed(self, payload, req, cid, st, kind):
+        """A pending deposit that the chain (or the facilitator) now shows: counted, no longer pending"""
+        try:
+            st["balance"] = max(st["balance"], self._onchain(payload, req, cid, kind)[0])
+        except RuntimeError:
+            return False
+        if st["balance"] >= st["pending"]["before"] + st["pending"]["amount"]:
+            self.log("deposit for %s landed after it was queued" % cid)
+            st.pop("pending")
+            self._save()
+            return True
+        return False
 
     def _onchain(self, payload, req, cid, kind):
         if self.chain:
@@ -243,15 +277,8 @@ class Channels:
             return s.get("transaction", "")
         if s.get("errorReason") == "settlement_queued":
             # HPP's facilitator answers this when the deposit takes longer than its synchronous window: it is
-            # being sent, not refused. Wait for the chain to show it; a node told "failed" deposits again (#135)
-            for _ in range(40):
-                try:
-                    if self._onchain(payload, req, cid, "deposit")[0] >= before + amount:
-                        self.log("deposit for %s landed after it was queued" % cid)
-                        return s.get("transaction") or "queued"
-                except RuntimeError:
-                    pass
-                time.sleep(3)
+            # being sent, not refused (#135). The caller records it pending; nothing here waits for the chain (#185)
+            raise Pending(s.get("transaction") or "queued")
         raise RuntimeError("%s %s" % (s.get("errorReason", "?"), s.get("errorMessage", "")))
 
     def commit(self, payload, req, cid, deposit_tx, charge=None):
@@ -351,14 +378,29 @@ class Channels:
             raise RuntimeError("%s %s" % (s.get("errorReason", "?"), s.get("errorMessage", "")))
         return s.get("transaction", "")
 
+    def tick(self, now=None):
+        """The background work, due or not, from whatever calls it - the reference's timer thread, a Worker's Cron
+        Trigger (#185): pending deposits looked at; every claim_interval, claims and settlement, then idle refunds"""
+        now = int(now or time.time())
+        with self.lock:
+            waiting = [(cid, st) for cid, st in self.book.items() if st.get("pending") and self.chain]
+            for cid, st in waiting:
+                self._landed(None, None, cid, st, "deposit")
+        if now - self.last_claim < self.claim_interval:
+            return None
+        self.last_claim = now
+        claimed = self.claim_and_settle()
+        refunds = self.refund_idle_channels(now)
+        return claimed, refunds
+
     def start(self):
-        """Claim on the interval (the window before a withdrawal can finish is withdrawDelay, much longer); refund the idle"""
+        """Ticks from a thread: claims on the interval (the window before a withdrawal can finish is withdrawDelay,
+        much longer), idle refunds"""
         def loop():
             while True:
-                time.sleep(self.claim_interval)
+                time.sleep(min(self.claim_interval, 30))
                 try:
-                    self.claim_and_settle()
-                    self.refund_idle_channels()
+                    self.tick()
                 except Exception as e:                  # the loop outlives one bad round
                     self.log("round failed: %s" % e)
         threading.Thread(target=loop, daemon=True).start()

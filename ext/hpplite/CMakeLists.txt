@@ -371,6 +371,8 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_pin_service COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/selftest.sh)
         # The services start no process and hold no settle key: what a Worker can run (#181, #183)
         add_test(NAME test_operators_portable COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/conformance/portable_check.sh)
+        # The channels' background work as ticks; a queued deposit answered at once as pending (#185)
+        add_test(NAME test_x402seller COMMAND ${HPPLITE_PYTHON3} -I ${CMAKE_CURRENT_SOURCE_DIR}/operators/x402seller/test_channels.py)
         # The node's store client against it (#11); paid on anvil in scenario 19
         add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
         set_tests_properties(test_store PROPERTIES SKIP_RETURN_CODE 77)
