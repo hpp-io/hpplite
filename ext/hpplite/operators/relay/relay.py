@@ -67,6 +67,8 @@ DA_CALLS = {selector(s): s.split("(")[0] for s in (
     "commitBatchFor(bytes32,uint256,bytes32,bytes,bytes,bytes)")}
 
 
+PROTOCOL = "hpplite-relay/1"        # the version of doc/relay-protocol.md this relay speaks (#188)
+
 # ============ The relay ============
 
 class Relay:
@@ -173,7 +175,8 @@ class Relay:
         except (RpcError, OSError):
             bal = None
         return {
-            "service": "hpplite-relay", "version": 1, "address": self.address, "chainId": self.chain_id,
+            "service": "hpplite-relay", "version": 1, "protocol": PROTOCOL,     # doc/relay-protocol.md (#188)
+            "address": self.address, "chainId": self.chain_id,
             "factory": self.factory, "balanceWei": bal, "submitted": self.submitted, "settled": self.payments.settled,
             "calls": sorted(set(FACTORY_CALLS.values()) | set(ROLLUP_CALLS.values()) | set(DA_CALLS.values())),
             "payment": {"scheme": "exact", "network": self.payments.network, "asset": self.args.asset,

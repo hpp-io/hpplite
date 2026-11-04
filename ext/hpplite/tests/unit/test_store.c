@@ -814,6 +814,50 @@ static void test_soft_disagreement(const char *url) {
     PASS();
 }
 
+/* #188: the services say which protocol they speak (/status "protocol": "hpplite-store/1"); the node puts
+** nothing to a store speaking a version it does not know, or to a relay given as store= */
+static void test_protocol(const char *dir) {
+    static const char *claims[] = { "hpplite-store/2", "hpplite-relay/1" };
+    TEST("the node refuses a store speaking another protocol (#188): hpplite-store/2, or a relay given as store=");
+    for (int k = 0; k < 2; k++) {
+        int port = test_free_port();
+        char portStr[16], script[600], url[64], keyPath[600], tag[32];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        snprintf(script, sizeof script, "%s/pin_service.py", dir);
+        snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
+        snprintf(tag, sizeof tag, "proto_pins%d", k);
+        pid_t pid = fork();
+        if (pid == 0) {
+            int fd = open("/dev/null", O_WRONLY);
+            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+            execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", tpath(tag), "--signer-key", keyPath,
+                   "--pay-to", "0x1111111111111111111111111111111111111111", "--advertise-protocol", claims[k], (char *)NULL);
+            _exit(127);
+        }
+        int up = 0;
+        for (int i = 0; i < 50 && !up; i++) {
+            char cmd[200];
+            if (!test_child_alive(pid)) break;
+            snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status 2>/dev/null | grep -q signer", port);
+            up = system(cmd) == 0;
+            if (!up) usleep(200 * 1000);
+        }
+        if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the pin service did not start"); }
+        snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+        HppliteStore *st = hpplite_store_open(url, NULL, 0);
+        char *receipt = NULL;
+        char *ref = st ? hpplite_store_put(st, (const uint8_t *)"protocol", 8, &receipt) : NULL;
+        const char *err = st ? hpplite_store_error(st) : "open";
+        printf("(%s: %s) ", claims[k], ref ? "taken" : err);
+        int refused = !ref && err && strstr(err, claims[k]);
+        sqlite3_free(ref); sqlite3_free(receipt);
+        if (st) hpplite_store_close(st);
+        kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        if (!refused) FAIL("the node put to a store that speaks another protocol");
+    }
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = test_free_port();
@@ -833,6 +877,7 @@ int main(int argc, char **argv) {
     test_named(url);
     test_node_status(url);
     test_quote(dir);
+    test_protocol(dir);
     test_ranges(url);
     test_ranges_restart(url);
     test_anchor_timer(url);

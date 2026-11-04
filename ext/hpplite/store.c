@@ -58,6 +58,7 @@ struct HppliteStore {
     unsigned char payTo[20];        /* the receipt domain's verifyingContract */
     uint64_t chainId;
     int isRelay;                    /* opened for relay= (#126): its messages name the relay and relaycap */
+    char protocol[48];              /* what /status says it speaks ("hpplite-store/1"; empty: a service from before #188) */
     /* x402 batch-settlement (#135): a channel in x402's escrow, a voucher per put */
     uint64_t depositCap;            /* storedeposit=: the most left unspent in the escrow at once; 0: exact per put */
     unsigned char salt[32];         /* the channel's salt: keccak256("hpplite" || the rollup's DA address) */
@@ -961,6 +962,8 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
                     s->hasPayment = 1;
                 }
             }
+            cJSON *proto = st ? cJSON_GetObjectItem(st, "protocol") : NULL;
+            if (proto && cJSON_IsString(proto)) snprintf(s->protocol, sizeof s->protocol, "%s", proto->valuestring);
             cJSON *receipt = st ? cJSON_GetObjectItem(st, "receipt") : NULL;
             cJSON *domain = receipt ? cJSON_GetObjectItem(receipt, "domain") : NULL;
             cJSON *chainId = domain ? cJSON_GetObjectItem(domain, "chainId") : NULL;
@@ -1124,6 +1127,27 @@ static char *kuboAdd(HppliteStore *s, const uint8_t *data, size_t len) {
 void hpplite_store_set_relay(HppliteStore *s) { if (s) s->isRelay = 1; }
 void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp) { if (s) s->spend = sp; }
 
+/* The protocols this build speaks (doc/store-protocol.md, doc/relay-protocol.md, #188): a service that names
+** another - a later version, or the other kind (a relay given as store=) - is written nothing. One that names
+** none predates #188 and is taken as version 1. 0 when it may be written to, else -1 with the reason in s->error */
+#define HPPLITE_STORE_PROTOCOL 1
+#define HPPLITE_RELAY_PROTOCOL 1
+static int protocolOk(HppliteStore *s) {
+    const char *want = s->isRelay ? "hpplite-relay" : "hpplite-store";
+    int max = s->isRelay ? HPPLITE_RELAY_PROTOCOL : HPPLITE_STORE_PROTOCOL;
+    size_t n = strlen(want);
+    const char *v;
+    if (!s->protocol[0] || s->kind != STORE_PIN) return 0;
+    v = strncmp(s->protocol, want, n) == 0 && s->protocol[n] == '/' ? s->protocol + n + 1 : NULL;
+    if (v && atoi(v) >= 1 && atoi(v) <= max) return 0;
+    if (v) snprintf(s->error, sizeof s->error, "the %s at %s speaks %s; this build speaks up to %s/%d: upgrade HPPLite",
+                    s->isRelay ? "relay" : "store", s->url, s->protocol, want, max);
+    else snprintf(s->error, sizeof s->error, "%s speaks %s, not %s: is it a %s?", s->url, s->protocol, want,
+                  s->isRelay ? "store given as relay=" : "relay given as store=");
+    s->lastFailure = HPPLITE_STORE_FAIL_OTHER;
+    return -1;
+}
+
 /* A POST the provider may charge for: a 402 paid (exact, or a voucher in a channel), and, for a voucher,
 ** paid again once the seller's correction is taken (the running total, or a deposit the channel needs) */
 static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, size_t len, Buf *out) {
@@ -1181,6 +1205,7 @@ long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *b
     if (pzOut) *pzOut = NULL;
     if (!s || s->kind != STORE_PIN || !path || !body) return 0;
     s->error[0] = 0;
+    if (protocolOk(s) != 0) return 0;
     (void)zRequired; (void)zResponse;
     status = paidPost(s, path, body, len, &out);
     if (status == 200) s->nOk++;
@@ -1197,6 +1222,7 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
     if (!s || !data || !len) return NULL;
     s->error[0] = 0;
     s->lastFailure = HPPLITE_STORE_FAIL_NONE;
+    if (protocolOk(s) != 0) return NULL;
     s->lastBytes = len;
     if (s->kind == STORE_KUBO || s->kind == STORE_S3) {
         zRef = s->kind == STORE_KUBO ? kuboAdd(s, data, len) : s3Put(s, data, len);
@@ -1364,6 +1390,7 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
     int rc = -1;
     if (!s || !nameOk(zName) || !instance || !data || !len || !sig) return -1;
     s->error[0] = 0;
+    if (protocolOk(s) != 0) return -1;
     if (s->kind == STORE_KUBO) { snprintf(s->error, sizeof s->error, "a Kubo node takes no names"); return -1; }
     body = malloc(len + 97);
     if (!body) return -1;

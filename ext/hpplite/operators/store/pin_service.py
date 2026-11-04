@@ -303,6 +303,7 @@ class Signer:
                 "signer": self.address, "signature": "0x" + sig.hex()}
 
 
+PROTOCOL = "hpplite-store/1"        # the version of doc/store-protocol.md this service speaks (#188)
 MIB = 1024 * 1024
 MONTH = 30 * 24 * 3600
 
@@ -378,6 +379,7 @@ class Service:
     def status(self):
         return {
             "service": "hpplite-pin-service", "version": 1,
+            "protocol": self.args.advertise_protocol or PROTOCOL,           # doc/store-protocol.md (#188)
             "signer": self.signer.address, "receipt": {"domain": {"name": "HPPLitePinService", "version": "1",
                                                                    "chainId": self.signer.chain_id, "verifyingContract": self.signer.pay_to},
                                                         "type": RECEIPT_TYPE},
@@ -614,6 +616,7 @@ def main():
     ap.add_argument("--claim-interval", type=int, default=3600, help="batch-settlement: seconds between claims (one transaction for all channels) and settlement")
     ap.add_argument("--refund-idle", type=int, default=7 * 24 * 3600, help="batch-settlement: give back what a channel idle this long holds beyond its charges")
     ap.add_argument("--kubo", default=None, help="a Kubo node's RPC API (http://127.0.0.1:5001): pin there too")
+    ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)   # tests: claim another protocol (#188)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if not 900 <= args.withdraw_delay <= 30 * 24 * 3600:
