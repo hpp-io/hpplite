@@ -868,8 +868,8 @@ soak running through a store too. Key roles and viewing keys moved to v0.4.
 viewing keys and the public-key envelope (#15), page capture (#146) as the
 default for a new rollup, the application suites (WordPress, Ghost, Rails 8,
 Home Assistant) in containers and run under it, the OLTP benchmark per
-version (#140) and the three writer stalls it found, fixed. **v0.5 is
-complete, not yet tagged** (2026-11-04). It covers HPP economics:
+version (#140) and the three writer stalls it found, fixed. **v0.5.0 is
+tagged** (2026-11-04). It covers HPP economics:
 - **Persistence and commitment (#162):** the store in seconds (soft), one
   range anchor every 30 minutes (hard); replicas that follow the soft tier
   and rebuild on a disagreement (#166); recovery of a lost sequencer from the
