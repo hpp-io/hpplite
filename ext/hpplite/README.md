@@ -908,7 +908,7 @@ which v0.1 replicas cannot read; give it `capture=text` until every replica
 is on v0.2. Do not run a v0.1 binary on a file that has records pending
 (#81, below).
 
-Issues are grouped by [milestone](https://github.com/shepelt/hpplite/milestones).
+Issues are grouped by [milestone](https://github.com/hpp-io/hpplite/milestones).
 
 ## What is refused
 

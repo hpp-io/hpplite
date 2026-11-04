@@ -275,7 +275,7 @@ class Payments:
         # a named User-Agent: HPP's facilitator sits behind a WAF that answers 403 to Python's default
         req = urllib.request.Request(self.facilitator + path, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json", "Accept": "application/json",
-                                              "User-Agent": "hpplite-pin-service/1 (+https://github.com/shepelt/hpplite)"}, method="POST")
+                                              "User-Agent": "hpplite-pin-service/1 (+https://github.com/hpp-io/hpplite)"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.loads(r.read())
