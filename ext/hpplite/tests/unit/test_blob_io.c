@@ -124,8 +124,7 @@ static void test_no_preupdate(void) {
     if (!w) FAIL("open");
     if (run(w, SETUP) != 0) FAIL("setup");
     const char *sql[] = {
-        /* statement capture does not log a comment-led statement yet (#176) */
-        captureText() ? "INSERT INTO f(data) VALUES(x'cc')" : "-- a comment first\nINSERT INTO f(data) VALUES(x'cc')",
+        "-- a comment first\nINSERT INTO f(data) VALUES(x'cc')",
         "INSERT INTO f(data) VALUES(x'dd') RETURNING id",
         "BEGIN", "INSERT INTO f(data) VALUES(x'ee')", "COMMIT",
         NULL };

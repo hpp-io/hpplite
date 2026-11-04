@@ -627,6 +627,42 @@ static void test_zero_row_insert_into_autoincrement(void) {
     PASS();
 }
 
+/* #176: a statement whose text starts with a comment is the application's
+** own (sqlite3_exec and executescript pass each statement's text from right
+** after the last ';'), not a trigger's sub-program ("-- TRIGGER name"):
+** logged and replayed like any other. A trigger's own writes still once. */
+static void test_comment_led_statements(void) {
+    TEST("statements that start with a comment are logged and reach the replica; a trigger's writes are not logged twice (#176)");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *n = open_node(DIR "/cm.db", l1);
+    if (!n) FAIL("open");
+    const char *sql[] = {
+        "-- a migration\nCREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE audit(id INTEGER PRIMARY KEY, what TEXT)",
+        "CREATE TRIGGER a_ins AFTER INSERT ON a BEGIN INSERT INTO audit(what) VALUES('insert ' || new.v); END",
+        "-- one\nINSERT INTO a(v) VALUES('dash comment')",
+        "/* two */ INSERT INTO a(v) VALUES('block comment')",
+        "  -- three, indented\n  -- and a second line\n  UPDATE a SET v = v || '!' WHERE id = 1",
+        "-- \"TRIGGER\" in a comment is still the application's\nDELETE FROM a WHERE id = 2",
+        NULL };
+    if (run(n, sql) != 0) FAIL("writer SQL");
+    if (count_rows(n->db, "a") != 1 || count_rows(n->db, "audit") != 2) FAIL("test premise: the writer's rows");
+    if (hpplite_node_flush_batch(n) <= 0) FAIL("flush");
+    char *w = test_dump(n->db, 0);
+    HppliteNode *r = open_node(DIR "/cm_replica.db", l1);
+    char *d = r ? test_dump(r->db, 0) : NULL;
+    int same = w && d && strcmp(w, d) == 0;
+    if (!same && w && d) { size_t i = test_dump_diff(w, d); printf("(writer [%.60s] replica [%.60s]) ", w + i, d + i); }
+    sqlite3_free(w); sqlite3_free(d);
+    if (r) hpplite_node_destroy(r);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (!r) FAIL("replica");
+    if (!same) FAIL("the replica differs from the writer");
+    PASS();
+}
+
 /* VACUUM was refused (its internal ATTACH) and, had it run, was not logged:
 ** it may renumber the rowids of tables without an INTEGER PRIMARY KEY, and
 ** a statement after it that names a rowid must hit the same row on a
@@ -1315,6 +1351,7 @@ int main(void) {
     test_bookkeeping_waits_for_app_transaction();
     test_gate_survives_nested_begin();
     test_zero_row_insert_into_autoincrement();
+    test_comment_led_statements();
     test_vacuum_logged();
     test_count_changes();
     test_journal_mode_kept();

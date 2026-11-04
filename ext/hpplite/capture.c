@@ -1457,6 +1457,17 @@ static int captureStart(HppliteCtx *pCtx, sqlite3_stmt *pS, const char *zSql, in
   return 0;
 }
 
+/* A trace of a trigger's sub-program, not of the statement: SQLite traces a
+** sub-program by its own text ("-- TRIGGER name") and a statement by its
+** text, sqlite3_sql()'s - which may start with a comment of the
+** application's too ("-- a migration\nCREATE TABLE ...", #176) */
+static int isSubprogramTrace(sqlite3_stmt *pS, const char *zSql) {
+  const char *zOwn;
+  if (!zSql || zSql[0] != '-' || zSql[1] != '-') return 0;
+  zOwn = sqlite3_sql(pS);
+  return !(zOwn && (zOwn == zSql || strcmp(zOwn, zSql) == 0));
+}
+
 int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   HppliteCtx *pCtx = (HppliteCtx*)pArg;
   sqlite3_stmt *pS = (sqlite3_stmt*)pStmt;
@@ -1469,7 +1480,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
   ** connection itself (sqlite3_next_stmt takes the connection mutex, which
   ** sqlite3_close holds while it joins the timer thread - a deadlock). */
   if (mask == SQLITE_TRACE_STMT && pCtx->rerunStage == 2 && pS != pCtx->pRerunStmt
-      && !(zSql && zSql[0] == '-' && zSql[1] == '-')) {
+      && !isSubprogramTrace(pS, zSql)) {
     /* the rerun never came (its first run failed otherwise). Not on a
     ** sub-program's trace: a CREATE VIRTUAL TABLE's nested DDL runs inside
     ** the rerun, which is in progress - a COMMIT there fails, and the
@@ -1491,7 +1502,7 @@ int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX) {
     ** sub-program sees the count its statement started with, a new run a
     ** larger one. */
     int running;
-    if (zSql && zSql[0] == '-' && zSql[1] == '-') return 0;
+    if (isSubprogramTrace(pS, zSql)) return 0;
     if (pCtx->nRun > 0) endResetRuns(pCtx, pS);
     running = runFind(pCtx, pS);
     if (running >= 0) {
