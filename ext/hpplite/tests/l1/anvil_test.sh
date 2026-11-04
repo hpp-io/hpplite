@@ -51,6 +51,17 @@ usdc=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --
 # x402's batch-settlement escrow and deposit collector, the bytecode HPP Sepolia runs (#135)
 escrow=""
 sh "$here/install_x402_escrow.sh" "$rpc" && escrow=0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003 || echo "x402 escrow not installed: batch-settlement scenarios will be skipped"
+# the x402 facilitator the services pay through on this chain (#183), with a key of its own that no test uses
+fkey=0x0fac11177a70f0fac11177a70f0fac11177a70f0fac11177a70f0fac11177a70
+faddr=$(cast wallet address "$fkey")
+cast rpc --rpc-url "$rpc" anvil_setBalance "$faddr" 0x21e19e0c9bab2400000 >/dev/null
+fport=$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+python3 -I "$here/../../operators/conformance/facilitator_mock.py" --port "$fport" --rpc "$rpc" --key "$fkey" >"$log.facilitator" 2>&1 &
+fpid=$!
+trap 'kill $fpid 2>/dev/null; kill -CONT $pid 2>/dev/null; kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -f "$log" "$log.facilitator"' EXIT INT TERM
+for i in $(seq 1 50); do kill -0 $fpid 2>/dev/null || break; curl -s -m 2 "http://127.0.0.1:$fport/supported" 2>/dev/null | grep -q kinds && break; sleep 0.2; done
+curl -s -m 2 "http://127.0.0.1:$fport/supported" 2>/dev/null | grep -q kinds || { echo "the mock facilitator did not start"; cat "$log.facilitator"; exit 1; }
+export HPPLITE_ANVIL_FACILITATOR="http://127.0.0.1:$fport" HPPLITE_ANVIL_FACILITATOR_ADDR=$faddr
 export HPPLITE_ANVIL_USDC=$usdc HPPLITE_PIN_SERVICE="$here/../../operators/store" HPPLITE_ANVIL_ESCROW=$escrow
 # the faulty-endpoint proxy (#49), started by the suite itself in front of anvil
 HPPLITE_VERIFY_BIN="$(dirname "$bin")/hpplite-verify" HPPLITE_RPC_PROXY="$here/rpc_proxy.py" HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 HPPLITE_ANVIL_KEY2=$key2 HPPLITE_ANVIL_KEY3=$key3 HPPLITE_ANVIL_KEY4=$key4 HPPLITE_ANVIL_KEY5=$key5 HPPLITE_ANVIL_KEY6=$key6 HPPLITE_ANVIL_KEY7=$key7 HPPLITE_ANVIL_KEY8=$key8 HPPLITE_ANVIL_KEY9=$key9 HPPLITE_ANVIL_PID=$pid "$bin"

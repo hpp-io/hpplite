@@ -81,9 +81,14 @@ No signing happens in the seller. The buyer signs an EIP-3009
 nonce; the facilitator submits it and pays the gas. `hpp-x402 serve
 --handler <url>` wraps a plain endpoint in the same dance with no code.
 
-`--facilitator mock` stands in for the facilitator on anvil: verify is an
+On anvil the facilitator is `../conformance/facilitator_mock.py` (#183),
+which `tests/l1/anvil_test.sh` starts with a key of its own: verify is an
 `eth_call` of `transferWithAuthorization` (the token itself checks the
-signature), settle is `cast send` of the same call from `--settle-key`.
+signature), settle sends the same call; for batch-settlement it sends the
+escrow's deposit, claim, settle and refund, answers `/verify` with the
+channel's state, and can answer a deposit `settlement_queued` and repeat an
+earlier `/settle` answer, as HPP's does. The service never sends a
+transaction itself.
 `contracts/src/test/MockUSDC.sol` is the token, EIP-3009 with the real
 token's domain, `("Bridged USDC", "2")` (its `name()`; the symbol is USDC.e,
 and HPP's facilitator checks the quoted name against the token). That is anvil scenario 18 (`tests/l1/test_anvil.c`):

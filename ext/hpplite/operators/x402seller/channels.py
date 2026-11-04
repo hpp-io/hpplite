@@ -12,18 +12,20 @@ receiverAuthorizer here, signs ClaimBatch to claim and Refund to give back.
 The spec: specs/schemes/batch-settlement/scheme_batch_settlement_evm.md in
 github.com/coinbase/x402.
 
-Who sends the transactions: the facilitator (deposit, claim, settle, refund,
-all through its /verify and /settle) or, with --facilitator mock on anvil,
-the seller itself with --settle-key through `cast`. Standard library only.
+Who sends the transactions: the facilitator, always (deposit, claim, settle,
+refund, all through its /verify and /settle; on anvil
+operators/conformance/facilitator_mock.py, #183). The seller only reads the
+chain, when it has an RPC: what a channel holds and the refund nonce it
+expects. Standard library only.
 """
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
 
 from . import eth
+from .chain import Chain, RpcError
 
 ESCROW = "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003"
 COLLECTOR = "0x4020806089470a89826cB9fB1f4059150b550004"     # ERC3009DepositCollector
@@ -74,17 +76,29 @@ def claim_batch_digest(entries, chain_id):
     return eth.keccak256(b"\x19\x01" + domain(chain_id) + eth.keccak256(eth.keccak256(BATCH_TYPE.encode()) + root))
 
 
-def _config_arg(c):
+def config_arg(c):
+    """The ChannelConfig tuple as cast writes it"""
     return "(%s,%s,%s,%s,%s,%d,%s)" % (c["payer"], c["payerAuthorizer"], c["receiver"], c["receiverAuthorizer"],
                                       c["token"], int(c["withdrawDelay"]), c["salt"])
+
+
+def chain_state(chain, cid):
+    """(balance, totalClaimed, refundNonce, withdrawRequestedAt) of a channel, read from the escrow"""
+    def words(sig):
+        out = chain.view(ESCROW, sig, _b32(cid))
+        return [int(out[2 + 64 * k:66 + 64 * k], 16) for k in range((len(out) - 2) // 64)]
+    bal, claimed = words("channels(bytes32)")[:2]
+    nonce = words("refundNonce(bytes32)")[0]
+    requested = words("pendingWithdrawals(bytes32)")[1]
+    return bal, claimed, nonce, requested
 
 
 class Channels:
     """The seller's book of channels: what each has been charged, the latest voucher, the chain's view."""
 
     def __init__(self, directory, payments, receiver_key: bytes, withdraw_delay, min_deposit,
-                 claim_interval, refund_idle, log=None, send_lock=None):
-        self.p = payments                   # pin_service.Payments: network, asset, pay_to, facilitator, rpc, settle_key
+                 claim_interval, refund_idle, log=None):
+        self.p = payments                   # x402seller.payments.Payments: network, asset, pay_to, facilitator, rpc
         self.key = receiver_key
         self.authorizer = eth.address(receiver_key)
         self.chain_id = int(payments.network.split(":")[1])
@@ -97,8 +111,7 @@ class Channels:
         self.log = log or (lambda m: sys.stderr.write("channels: %s\n" % m))
         self.claimed_txs = 0
         self.settled_txs = 0
-        self.mock_queued = False        # test knob: the mock facilitator sends a deposit and answers "queued", as HPP's may
-        self.send_lock = send_lock      # held around every transaction sent with --settle-key (the relay's own nonce)
+        self.chain = Chain(payments.rpc) if payments.rpc else None
         try:
             with open(self.path) as f:
                 self.book = json.load(f)
@@ -133,39 +146,6 @@ class Channels:
                     a["extra"]["voucherState"] = {"signedMaxClaimable": str(st["signedMax"]), "signature": st["signature"]}
         requirements["error"] = MISMATCH
         return requirements
-
-    # --- the chain's view ---
-    def _cast(self, *args, send=False):
-        cmd = ["cast", "send" if send else "call", "--rpc-url", self.p.rpc]
-        if send:
-            cmd += ["--private-key", self.p.settle_key, "--json"]
-        elif self.p.settle_key:
-            cmd += ["--from", eth.address(bytes.fromhex(self.p.settle_key[2:] if self.p.settle_key.startswith("0x") else self.p.settle_key))]
-        if send and self.send_lock is not None:
-            with self.send_lock:
-                r = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=120)
-        else:
-            r = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1][:300] if (r.stderr or r.stdout).strip() else "cast failed")
-        return json.loads(r.stdout).get("transactionHash", "") if send else r.stdout.strip()
-
-    def _chain_state(self, cid):
-        """(balance, totalClaimed, refundNonce, withdrawRequestedAt) from the escrow (mock mode)"""
-        vals = lambda out: [int(t) for t in out.split() if not t.startswith("[")]     # cast annotates: "100000 [1e5]"
-        out = vals(self._cast(ESCROW, "channels(bytes32)(uint128,uint128)", cid))
-        nonce = vals(self._cast(ESCROW, "refundNonce(bytes32)(uint256)", cid))[0]
-        pw = vals(self._cast(ESCROW, "pendingWithdrawals(bytes32)(uint128,uint40)", cid))
-        return out[0], out[1], nonce, pw[1]
-
-    def _mock_collector_data(self, auth):
-        return subprocess.run(["cast", "abi-encode", "f(uint256,uint256,uint256,bytes)", str(auth["validAfter"]),
-                               str(auth["validBefore"]), str(int(auth["salt"], 16)), auth["signature"]],
-                              capture_output=True, text=True, check=True).stdout.strip()
-
-    def _mock_deposit(self, config, amount, auth, send):
-        return self._cast(ESCROW, "deposit(%s,uint128,address,bytes)" % CONFIG_TUPLE, _config_arg(config), str(amount),
-                          COLLECTOR, self._mock_collector_data(auth), send=send)
 
     # --- one paid call ---
     def verify(self, payload, req):
@@ -241,10 +221,10 @@ class Channels:
             return True, cid, None, deposit_tx
 
     def _onchain(self, payload, req, cid, kind):
-        if self.p.facilitator == "mock" or self.p.rpc:
+        if self.chain:
             try:
-                return self._chain_state(cid)
-            except (RuntimeError, ValueError, IndexError, OSError, subprocess.SubprocessError) as e:
+                return chain_state(self.chain, cid)
+            except (RpcError, ValueError, IndexError, OSError) as e:
                 raise RuntimeError(str(e))
         v = self.p.verify(payload, req)
         x = v.get("extra") or {}
@@ -255,17 +235,10 @@ class Channels:
         return int(x.get("balance", 0)), int(x["totalClaimed"]), int(x.get("refundNonce", 0)), int(x.get("withdrawRequestedAt", 0))
 
     def _deposit(self, payload, req, config, amount, auth, cid, before):
-        if self.p.facilitator == "mock":
-            self._mock_deposit(config, amount, auth, send=False)     # simulate: the token's own check, nothing sent
-            tx = self._mock_deposit(config, amount, auth, send=True)
-            s = {"success": True, "transaction": tx}
-            if self.mock_queued:
-                s = {"success": False, "errorReason": "settlement_queued", "transaction": tx}
-        else:
-            v = self.p.verify(payload, req)
-            if not v.get("isValid"):
-                raise RuntimeError("%s %s" % (v.get("invalidReason", "?"), v.get("invalidMessage", "")))
-            s = self.p._facilitator_post("/settle", {"x402Version": 2, "paymentPayload": payload, "paymentRequirements": req})
+        v = self.p.verify(payload, req)
+        if not v.get("isValid"):
+            raise RuntimeError("%s %s" % (v.get("invalidReason", "?"), v.get("invalidMessage", "")))
+        s = self.p._facilitator_post("/settle", {"x402Version": 2, "paymentPayload": payload, "paymentRequirements": req})
         if s.get("success"):
             return s.get("transaction", "")
         if s.get("errorReason") == "settlement_queued":
@@ -309,16 +282,10 @@ class Channels:
             entries = [(cid, st["signedMax"], st["charged"]) for cid, st in rows]
             auth_sig = "0x" + eth.sign(self.key, claim_batch_digest(entries, self.chain_id)).hex()
             try:
-                if self.p.facilitator == "mock":
-                    arg = "[" + ",".join("((%s,%d),%s,%d)" % (_config_arg(st["config"]), st["signedMax"], st["signature"], st["charged"])
-                                         for _, st in rows) + "]"
-                    tx = self._cast(ESCROW, "claimWithSignature(((%s,uint128),bytes,uint128)[],bytes)" % CONFIG_TUPLE, arg, auth_sig, send=True)
-                    stx = self._cast(ESCROW, "settle(address,address)", self.p.pay_to, self.p.asset, send=True)
-                else:
-                    claims = [{"voucher": {"channel": st["config"], "maxClaimableAmount": str(st["signedMax"])},
-                               "signature": st["signature"], "totalClaimed": str(st["charged"])} for _, st in rows]
-                    tx = self._settle_call({"type": "claim", "claims": claims, "claimAuthorizerSignature": auth_sig})
-                    stx = self._settle_call({"type": "settle", "receiver": self.p.pay_to, "token": self.p.asset})
+                claims = [{"voucher": {"channel": st["config"], "maxClaimableAmount": str(st["signedMax"])},
+                           "signature": st["signature"], "totalClaimed": str(st["charged"])} for _, st in rows]
+                tx = self._settle_call({"type": "claim", "claims": claims, "claimAuthorizerSignature": auth_sig})
+                stx = self._settle_call({"type": "settle", "receiver": self.p.pay_to, "token": self.p.asset})
             except RuntimeError as e:
                 self.log("claim failed: %s" % e)
                 return None
@@ -338,12 +305,12 @@ class Channels:
             for cid, st in list(self.book.items()):
                 if now - st.get("last", 0) < self.refund_idle or not st.get("signature"):
                     continue
-                if self.p.facilitator == "mock" or self.p.rpc:
+                if self.chain:
                     # the chain's word on what the channel holds and the refund nonce it expects: a refund
                     # by anyone else (or a deposit this book missed) moves them (#135)
                     try:
-                        st["balance"], _, st["refundNonce"], _ = self._chain_state(cid)
-                    except RuntimeError as e:
+                        st["balance"], _, st["refundNonce"], _ = chain_state(self.chain, cid)
+                    except (RpcError, ValueError, IndexError, OSError) as e:
                         self.log("refund of %s: the chain could not be read: %s" % (cid, e))
                         continue
                 left = st["balance"] - st["charged"]
@@ -352,22 +319,16 @@ class Channels:
                 nonce = st.get("refundNonce", 0)
                 sig = "0x" + eth.sign(self.key, refund_digest(cid, nonce, left, self.chain_id)).hex()
                 try:
-                    if self.p.facilitator == "mock":
-                        if st["charged"] > st["totalClaimed"]:
-                            self.claim_and_settle()
-                        tx = self._cast(ESCROW, "refundWithSignature(%s,uint128,uint256,bytes)" % CONFIG_TUPLE,
-                                        _config_arg(st["config"]), str(left), str(nonce), sig, send=True)
-                    else:
-                        claims = ([{"voucher": {"channel": st["config"], "maxClaimableAmount": str(st["signedMax"])},
-                                    "signature": st["signature"], "totalClaimed": str(st["charged"])}]
-                                  if st["charged"] > st["totalClaimed"] else [])
-                        body = {"type": "refund", "channelConfig": st["config"],
-                                "voucher": {"channelId": cid, "maxClaimableAmount": str(st["signedMax"]), "signature": st["signature"]},
-                                "amount": str(left), "refundNonce": str(nonce), "claims": claims, "refundAuthorizerSignature": sig}
-                        if claims:
-                            body["claimAuthorizerSignature"] = "0x" + eth.sign(self.key, claim_batch_digest(
-                                [(cid, st["signedMax"], st["charged"])], self.chain_id)).hex()
-                        tx = self._settle_call(body)
+                    claims = ([{"voucher": {"channel": st["config"], "maxClaimableAmount": str(st["signedMax"])},
+                                "signature": st["signature"], "totalClaimed": str(st["charged"])}]
+                              if st["charged"] > st["totalClaimed"] else [])
+                    body = {"type": "refund", "channelConfig": st["config"],
+                            "voucher": {"channelId": cid, "maxClaimableAmount": str(st["signedMax"]), "signature": st["signature"]},
+                            "amount": str(left), "refundNonce": str(nonce), "claims": claims, "refundAuthorizerSignature": sig}
+                    if claims:
+                        body["claimAuthorizerSignature"] = "0x" + eth.sign(self.key, claim_batch_digest(
+                            [(cid, st["signedMax"], st["charged"])], self.chain_id)).hex()
+                    tx = self._settle_call(body)
                 except RuntimeError as e:
                     self.log("refund of %s failed: %s" % (cid, e))
                     continue

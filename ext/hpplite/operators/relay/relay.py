@@ -10,7 +10,7 @@ EIP-712), Payments (the seller's side of x402) and channels.py.
     relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file /path/to/hexkey \\
         --factory 0x... --facilitator https://facilitator-sepolia.hpp.io --pay-to 0x...
 
-    relay.py ... --rpc http://127.0.0.1:8545 --facilitator mock --asset <MockUSDC>   # anvil
+    relay.py ... --rpc http://127.0.0.1:8545 --facilitator http://127.0.0.1:8440 --asset <MockUSDC>   # anvil (#183)
 
 Endpoints
   POST /commit   {"to": "0x...", "data": "0x..."}: one of the signed calls below, to the factory or
@@ -42,16 +42,12 @@ import socketserver
 import sys
 import threading
 import time
-import urllib.request
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 from x402seller import channels, eth  # noqa: E402
+from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_tx  # noqa: E402
 from x402seller.payments import Payments  # noqa: E402
-
-
-def selector(sig: str) -> str:
-    return eth.keccak256(sig.encode())[:4].hex()
 
 
 FACTORY_CALLS = {selector("createRollupFor(address,uint256,uint256,uint256,bytes)"): "createRollupFor"}
@@ -67,95 +63,26 @@ DA_CALLS = {selector(s): s.split("(")[0] for s in (
     "commitBatchFor(bytes32,uint256,bytes32,bytes,bytes,bytes)")}
 
 
-# ============ RLP and the EIP-1559 transaction ============
-
-def rlp(item) -> bytes:
-    if isinstance(item, list):
-        body = b"".join(rlp(i) for i in item)
-        return _rlp_len(len(body), 0xc0) + body
-    if isinstance(item, int):
-        item = item.to_bytes((item.bit_length() + 7) // 8, "big") if item else b""
-    if len(item) == 1 and item[0] < 0x80:
-        return item
-    return _rlp_len(len(item), 0x80) + item
-
-
-def _rlp_len(n, offset):
-    if n < 56:
-        return bytes([offset + n])
-    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
-    return bytes([offset + 55 + len(b)]) + b
-
-
-def signed_tx(key: bytes, chain_id, nonce, tip, max_fee, gas, to, data: bytes) -> bytes:
-    fields = [chain_id, nonce, tip, max_fee, gas, bytes.fromhex(to[2:]), 0, data, []]
-    sig = eth.sign(key, eth.keccak256(b"\x02" + rlp(fields)))
-    r, s, v = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:64], "big"), sig[64] - 27
-    return b"\x02" + rlp(fields + [v, r, s])
-
-
-# ============ The chain ============
-
-class RpcError(Exception):
-    def __init__(self, message, data=None):
-        super().__init__(message)
-        self.data = data
-
-
-class Chain:
-    def __init__(self, url):
-        self.url = url
-        self._id = 0
-
-    def call(self, method, *params):
-        self._id += 1
-        body = json.dumps({"jsonrpc": "2.0", "id": self._id, "method": method, "params": list(params)}).encode()
-        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json",
-                                                                   "User-Agent": "hpplite-relay/1"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            out = json.loads(r.read())
-        if "error" in out:
-            raise RpcError(out["error"].get("message", "error"), out["error"].get("data"))
-        return out["result"]
-
-    def view(self, to, sig, *words) -> str:
-        data = "0x" + selector(sig) + "".join(eth.word(w).hex() for w in words)
-        return self.call("eth_call", {"to": to, "data": data}, "latest")
-
-
-def revert_reason(err: RpcError) -> str:
-    """Error(string)'s message out of a revert's data, else the RPC's own text."""
-    data = err.data if isinstance(err.data, str) else (err.data or {}).get("data") if isinstance(err.data, dict) else None
-    if isinstance(data, str) and data.startswith("0x08c379a0") and len(data) >= 138:
-        try:
-            n = int(data[74:138], 16)
-            return bytes.fromhex(data[138:138 + 2 * n]).decode("utf-8", "replace")
-        except ValueError:
-            pass
-    return str(err)
-
-
 # ============ The relay ============
 
 class Relay:
     def __init__(self, args):
         self.args = args
-        self.chain = Chain(args.rpc)
+        self.chain = Chain(args.rpc, "hpplite-relay/1")
         with open(args.key_file) as f:
             self.key = bytes.fromhex(f.read().strip().replace("0x", ""))
         self.address = eth.address(self.key)
         self.chain_id = int(self.chain.call("eth_chainId"), 16)
         self.factory = args.factory.lower()
         pay_to = args.pay_to or self.address
-        settle_key = "0x" + self.key.hex() if args.facilitator == "mock" else None
         self.payments = Payments(args.facilitator, "eip155:%d" % self.chain_id, args.asset, pay_to,
-                                 args.asset_name, args.asset_version, args.rpc, settle_key)
-        self.lock = threading.Lock()          # one transaction at a time: the nonce, and the mock settle's own
+                                 args.asset_name, args.asset_version, args.rpc)
+        self.lock = threading.Lock()          # one transaction at a time on the relay's key: its nonce
         if self.payments.enabled and args.channels:
             # x402 batch-settlement beside exact (#179): a deposit once, a voucher per call charged at the gas it took
             os.makedirs(args.dir, exist_ok=True)
             self.payments.channels = channels.Channels(args.dir, self.payments, self.key, args.withdraw_delay, args.min_deposit,
-                                                       args.claim_interval, args.refund_idle, send_lock=self.lock)
+                                                       args.claim_interval, args.refund_idle)
             self.payments.channels.start()
         self.quotes = {}                      # keccak(to, data) -> (amount, gas, until): the 402's price holds for the retry
         self.submitted = 0
@@ -326,8 +253,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if p.enabled and not voucher:
                 settlement = p.settle(payload, requirements["accepts"][0])
         if voucher:
-            # paid on inclusion at what the call cost: the gas it used at the price it paid, within the quote. Outside
-            # the nonce lock: the channels' claim thread takes its book's lock, then this one to send (no inversion)
+            # paid on inclusion at what the call cost: the gas it used at the price it paid, within the quote
             used = int(rcpt.get("gasUsed") or "0x0", 16)
             price = int(rcpt.get("effectiveGasPrice") or "0x0", 16)
             actual = r.price(used, price) if used and price else amount
@@ -357,7 +283,7 @@ def main():
     ap.add_argument("--key-file", required=True, help="file with the hex key that pays the gas")
     ap.add_argument("--factory", required=True, help="the HPPLite factory whose rollups the relay serves (VERSION 10)")
     ap.add_argument("--pay-to", default=None, help="where payments land (default: the relay's own address)")
-    ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, 'mock' (anvil), or none: free")
+    ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, or none: free")
     ap.add_argument("--asset", default="0x401eCb1D350407f13ba348573E5630B83638E30D", help="the EIP-3009 token (USDC.e on HPP)")
     ap.add_argument("--asset-name", default="Bridged USDC")
     ap.add_argument("--asset-version", default="2")

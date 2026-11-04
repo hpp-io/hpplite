@@ -2,8 +2,8 @@
 """The relay's selftest on anvil (#170), run by tests/l1/anvil_test.sh: a
 wallet holding MockUSDC (EIP-3009, as USDC.e) and no ETH at all creates its
 rollup, takes the lease, anchors a range, renews and releases, every call
-through the relay and paid over x402 (the mock facilitator: the token itself
-checks the authorization). What the relay refuses costs nothing. The
+through the relay and paid over x402 (the mock facilitator anvil_test.sh
+starts, #183: the token itself checks the authorization). What the relay refuses costs nothing. The
 wallet's ETH balance is zero at the end.
 
     HPPLITE_ANVIL_RPC=... HPPLITE_ANVIL_FACTORY=... HPPLITE_ANVIL_USDC=... HPPLITE_ANVIL_KEY0=... \\
@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(here, "..", "conformance"))
 sys.path.insert(0, here)
 from x402seller import eth  # noqa: E402
 from buyer import Buyer  # noqa: E402
-from relay import Chain, selector  # noqa: E402
+from x402seller.chain import Chain, selector  # noqa: E402
 
 RPC = os.environ["HPPLITE_ANVIL_RPC"]
 FACTORY = os.environ["HPPLITE_ANVIL_FACTORY"]
@@ -107,7 +107,7 @@ def main():
     port = free_port()
     log = open(os.path.join(work, "relay.log"), "w")
     proc = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC,
-                             "--key-file", keyfile, "--factory", FACTORY, "--facilitator", "mock", "--asset", USDC,
+                             "--key-file", keyfile, "--factory", FACTORY, "--facilitator", os.environ["HPPLITE_ANVIL_FACILITATOR"], "--asset", USDC,
                              "--eth-usd", "30"],                 # anvil's gas costs ~100x HPP's (1 gwei vs 0.01)
                             stdout=log, stderr=log)
     url = "http://127.0.0.1:%d" % port

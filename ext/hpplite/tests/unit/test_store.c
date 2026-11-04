@@ -235,7 +235,7 @@ static void test_node_status(const char *url) {
 ** the chain commits (hash, CID) and nothing else. */
 /* #172: the node's quote of a put (store_price) is the price the store's 402
 ** asks: per put, per MiB-month for the retention bought, rounded up to a
-** whole unit. A paid service (the mock facilitator: its 402s need no chain) */
+** whole unit. A paid service (its 402s need no facilitator: none answers there) */
 static void test_quote(const char *dir) {
     TEST("the node quotes a put as the store's 402 does (#172): per put + per MiB-month x retention, rounded up to a whole unit");
     int port = test_free_port();
@@ -249,8 +249,8 @@ static void test_quote(const char *dir) {
         int fd = open("/dev/null", O_WRONLY);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", tpath("quote_pins"), "--signer-key", keyPath,
-               "--pay-to", "0x1111111111111111111111111111111111111111", "--facilitator", "mock", "--rpc", "http://127.0.0.1:1",
-               "--settle-key", "0x01", "--price-per-mib-month", "30.5", "--price-per-pin", "10", "--retention", "5184000", (char *)NULL);
+               "--pay-to", "0x1111111111111111111111111111111111111111", "--facilitator", "http://127.0.0.1:1",
+               "--price-per-mib-month", "30.5", "--price-per-pin", "10", "--retention", "5184000", (char *)NULL);
         _exit(127);
     }
     int up = 0;

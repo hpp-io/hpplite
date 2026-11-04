@@ -14,3 +14,4 @@ The canonical operators run the same protocol on Cloudflare Workers.
 
 The store and the relay are deployed separately: the relay holds a funded
 hot key and sends transactions, the store holds data.
+| `conformance/facilitator_mock.py` | An x402 facilitator for anvil (#183): both schemes, its own key, HPP's facilitator's habits. The services only ever talk to a facilitator URL |

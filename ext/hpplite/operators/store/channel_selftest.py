@@ -33,7 +33,8 @@ RPC = os.environ["HPPLITE_ANVIL_RPC"]
 USDC = os.environ.get("HPPLITE_ANVIL_USDC", "")
 ESCROW = os.environ.get("HPPLITE_ANVIL_ESCROW", "")
 KEY0 = os.environ["HPPLITE_ANVIL_KEY0"]                  # holds the MockUSDC supply
-SETTLE_KEY = os.environ["HPPLITE_ANVIL_KEY7"]            # the mock facilitator's funded key
+FACILITATOR = os.environ["HPPLITE_ANVIL_FACILITATOR"]     # the mock facilitator anvil_test.sh starts (#183)
+FACILITATOR_ADDR = os.environ["HPPLITE_ANVIL_FACILITATOR_ADDR"]
 CHAIN_ID = 31337
 fails = 0
 
@@ -168,11 +169,18 @@ def free_port():
     return p
 
 
+def mock_facilitator(**knobs):
+    """The mock facilitator's behaviour, as HPP's was found to behave (facilitator_mock.py)"""
+    req = urllib.request.Request(FACILITATOR + "/_mock", data=json.dumps(knobs).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
 def start_service(work, port, pay_to, extra=()):
     log = open(os.path.join(work, "service-%d.log" % port), "w")
     p = subprocess.Popen([sys.executable, "-I", os.path.join(here, "pin_service.py"), "--port", str(port), "--dir", os.path.join(work, "store"),
-                          "--signer-key", os.path.join(work, "signer.key"), "--pay-to", pay_to, "--facilitator", "mock",
-                          "--rpc", RPC, "--settle-key", SETTLE_KEY, "--network", "eip155:%d" % CHAIN_ID, "--asset", USDC,
+                          "--signer-key", os.path.join(work, "signer.key"), "--pay-to", pay_to, "--facilitator", FACILITATOR,
+                          "--rpc", RPC, "--network", "eip155:%d" % CHAIN_ID, "--asset", USDC,
                           "--withdraw-delay", "900", "--claim-interval", "200", "--min-deposit", "500"] + list(extra), stdout=log, stderr=log)
     for _ in range(100):
         try:
@@ -199,7 +207,7 @@ def main():
     buyer_key = secrets.token_bytes(32)
     buyer = eth.address(buyer_key)
     cast("send", "--private-key", KEY0, USDC, "transfer(address,uint256)", buyer, "5000000")
-    settle_addr = eth.address(bytes.fromhex(SETTLE_KEY[2:]))
+    settle_addr = FACILITATOR_ADDR
     port = free_port()
     svc = start_service(work, port, pay_to)
     url = "http://127.0.0.1:%d" % port
@@ -290,8 +298,9 @@ def main():
         # for the chain, the put is done once, one deposit; a buyer that deposits again into a channel that
         # already covers the put sends nothing to the chain (#135, seen on HPP Sepolia)
         svc.terminate(); svc.wait()
-        svc = start_service(work, port, pay_to, ["--mock-deposit-queued"])
+        svc = start_service(work, port, pay_to)
         procs.append(svc)
+        mock_facilitator(queueDeposits=True)
         k2 = secrets.token_bytes(32)
         cast("send", "--private-key", KEY0, USDC, "transfer(address,uint256)", eth.address(k2), "1000000")
         b2 = ChannelBuyer(url, k2, "0x" + eth.keccak256(b"hpplite" + bytes([2]) * 20).hex())
@@ -308,6 +317,7 @@ def main():
               "a deposit into a channel that covers the put: not sent, the put done (%d, tx %r)" % (st, r.get("transaction")))
         check(channel_on_chain(cid2)[0] == 500, "still one deposit in the channel")
     finally:
+        mock_facilitator(queueDeposits=False)
         for p in procs:
             if p.poll() is None:
                 p.terminate()

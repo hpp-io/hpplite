@@ -9,8 +9,8 @@ only; eth.py beside it does keccak, secp256k1 and EIP-712.
         --pay-to 0x... --facilitator https://facilitator-sepolia.hpp.io \
         --network eip155:181228 --asset 0x401eCb1D350407f13ba348573E5630B83638E30D
 
-    pin_service.py ... --facilitator mock --rpc http://127.0.0.1:8545 \
-        --asset <MockUSDC> --settle-key <hex>          # anvil: verify by eth_call, settle with cast send
+    pin_service.py ... --facilitator http://127.0.0.1:8440 --rpc http://127.0.0.1:8545 \
+        --asset <MockUSDC>          # anvil: operators/conformance/facilitator_mock.py (#183)
 
 Endpoints
   POST /put            bytes in; {cid, bytes, expires, receipt} out. Paid: the 402 quotes
@@ -276,12 +276,11 @@ class Service:
         self.chain_id = chain_id
         self.signer = Signer(key, chain_id, args.pay_to)
         self.payments = Payments(args.facilitator, args.network, args.asset, args.pay_to,
-                                 args.asset_name, args.asset_version, args.rpc, args.settle_key)
+                                 args.asset_name, args.asset_version, args.rpc)
         if self.payments.enabled and args.channels:
             # the receipt key authorizes claims and refunds too: one key speaks for this service
             self.payments.channels = channels.Channels(args.dir, self.payments, key, args.withdraw_delay, args.min_deposit,
                                                        args.claim_interval, args.refund_idle)
-            self.payments.channels.mock_queued = args.mock_deposit_queued
             self.payments.channels.start()
         self.started = int(time.time())
 
@@ -443,7 +442,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(403, {"error": "another signer holds this rollup's names", "signer": signer, "holder": holder})
             if self.service.store.get_named(name) == body:
                 return self.reply(200, {"name": name, "bytes": len(body) - 97, "signer": signer, "held": True})
-            if self.service.args.rpc and self.service.args.rpc != "mock":
+            if self.service.args.rpc:
                 wallet, leased = sequencer_lease(self.service.args.rpc, da)
                 if wallet and wallet.lower() != signer.lower():
                     return self.reply(403, {"error": "not the rollup's sequencer wallet", "signer": signer, "sequencer": wallet})
@@ -503,13 +502,12 @@ def main():
     ap.add_argument("--dir", default="./pin_store")
     ap.add_argument("--signer-key", required=True, help="file with the hex key that signs receipts")
     ap.add_argument("--pay-to", required=True, help="where payments land; also the receipt domain's verifyingContract")
-    ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, 'mock' (anvil), or none: free")
+    ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, or none: free")
     ap.add_argument("--network", default="eip155:181228")
     ap.add_argument("--asset", default="0x401eCb1D350407f13ba348573E5630B83638E30D", help="the EIP-3009 token (USDC.e on HPP)")
     ap.add_argument("--asset-name", default="Bridged USDC", help="the token's EIP-712 domain name (USDC.e on HPP: name() is \"Bridged USDC\", version \"2\")")
     ap.add_argument("--asset-version", default="2")
-    ap.add_argument("--rpc", default=None, help="mock facilitator: the chain to verify and settle on")
-    ap.add_argument("--settle-key", default=None, help="mock facilitator: the key that submits transferWithAuthorization")
+    ap.add_argument("--rpc", default=None, help="the chain, read: the rollup's lease for names, the channels' balances and refund nonces")
     ap.add_argument("--price-per-mib-month", type=float, default=30.0,
                     help="atomic units (USDC.e: 1e-6) per MiB per 30 days, fractions allowed; the default, $0.03 per GiB-month,"
                          " is R2's $0.015 plus 100%% (#172)")
@@ -524,12 +522,9 @@ def main():
     ap.add_argument("--min-deposit", type=int, default=100000, help="batch-settlement: the deposit asked for (atomic units; at least 10 puts' worth)")
     ap.add_argument("--claim-interval", type=int, default=3600, help="batch-settlement: seconds between claims (one transaction for all channels) and settlement")
     ap.add_argument("--refund-idle", type=int, default=7 * 24 * 3600, help="batch-settlement: give back what a channel idle this long holds beyond its charges")
-    ap.add_argument("--mock-deposit-queued", action="store_true", help=argparse.SUPPRESS)   # tests: a deposit answered "queued" (#135)
     ap.add_argument("--kubo", default=None, help="a Kubo node's RPC API (http://127.0.0.1:5001): pin there too")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
-    if args.facilitator == "mock" and not (args.rpc and args.settle_key):
-        ap.error("--facilitator mock needs --rpc and --settle-key")
     if not 900 <= args.withdraw_delay <= 30 * 24 * 3600:
         ap.error("--withdraw-delay is 900 seconds to 30 days (the escrow's bounds)")
     if args.claim_interval * 4 > args.withdraw_delay:

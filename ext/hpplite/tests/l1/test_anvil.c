@@ -34,6 +34,7 @@
 
 #define DIR "/tmp/hpplite_anvil"
 
+static const char *FACIL, *FACIL_ADDR;     /* the mock facilitator anvil_test.sh starts (#183) and its address */
 static const char *RPC, *FACTORY, *KEY0, *KEY1, *KEY2, *KEY3, *KEY4, *KEY5, *KEY6, *KEY7, *KEY8, *KEY9, *ANVIL_PID;
 
 static void chain_sleep(int seconds) {
@@ -1496,8 +1497,8 @@ static void test_chain_hash(void) {
 
 /* 18. The reference pin service (#125) paid over x402 on anvil: a MockUSDC
 ** with EIP-3009 (anvil_test.sh deploys it, KEY0 holds the supply), the
-** service's mock facilitator verifying each payment by eth_call and
-** settling it with cast send from KEY1, which is also the pay-to wallet.
+** mock facilitator anvil_test.sh starts (#183) verifying each payment by
+** eth_call and settling it with its own key; KEY1 is the pay-to wallet.
 ** The buyer drives put (402, pay, 200 with a receipt the signer signed),
 ** re-put (held, nothing paid), get, pin (paid, a new receipt), a tampered
 ** receipt, an unknown CID, a price over its cap (refused before signing);
@@ -1540,7 +1541,7 @@ static void test_pin_service(void) {
         int devnull = open(DIR "/pin_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", dirArg, "--signer-key", keyArg,
-               "--pay-to", payTo, "--facilitator", "mock", "--rpc", RPC, "--asset", usdc, "--settle-key", KEY1,
+               "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc,
                "--network", "eip155:31337", "--retention", "60", "--price-per-pin", "1000", "--price-per-byte", "1", (char *)NULL);
         _exit(127);
     }
@@ -1783,7 +1784,7 @@ static void test_store_commit(void) {
 }
 
 /* 20. The node pays the store (#11): the pin service on the mock facilitator
-** (MockUSDC, KEY1 the pay-to and settle key), store= and storecap= on the
+** (MockUSDC, KEY1 the pay-to, the harness's mock facilitator settling), store= and storecap= on the
 ** writer, KEY0 the payer (it holds the supply). Each batch's put is a 402
 ** paid in the exact scheme with the node's key; the pay-to wallet gains
 ** what settled; with storecap= below the price the put is refused before
@@ -1811,7 +1812,7 @@ static void test_store_paid(void) {
         int fd = open(DIR "/paid_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/paid_pins", "--signer-key", DIR "/paid_signer.key",
-               "--pay-to", payTo, "--facilitator", "mock", "--rpc", RPC, "--asset", usdc, "--settle-key", KEY1,
+               "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc,
                "--network", "eip155:31337", "--retention", "60", "--price-per-pin", "1000", "--price-per-byte", "1", (char *)NULL);
         _exit(127);
     }
@@ -2178,7 +2179,7 @@ static pid_t start_relay(const char *svc, const char *usdc, int port) {
         int fd = open(DIR "/relay.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key",
-               "--factory", FACTORY, "--facilitator", "mock", "--asset", usdc, "--eth-usd", "30", "--dir", DIR "/relay_state", (char *)NULL);
+               "--factory", FACTORY, "--facilitator", FACIL, "--asset", usdc, "--eth-usd", "30", "--dir", DIR "/relay_state", (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -2315,7 +2316,7 @@ static pid_t start_channel_service(const char *svc, const char *usdc, int port, 
         int fd = open(DIR "/chan_service.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/chan_pins", "--signer-key", DIR "/chan_signer.key",
-               "--pay-to", payTo, "--facilitator", "mock", "--rpc", RPC, "--asset", usdc, "--settle-key", KEY1,
+               "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc,
                "--network", "eip155:31337", "--withdraw-delay", "3600", "--claim-interval", claimInterval, "--min-deposit", "20000", (char *)NULL);
         _exit(127);
     }
@@ -2343,9 +2344,7 @@ static void test_store_channel(void) {
     snprintf(cmd, sizeof cmd, "cast wallet address %s", CKEY);
     if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
     wallet[strcspn(wallet, "\r\n")] = 0;
-    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
-    if (run_cmd(cmd, facil, sizeof facil) != 0) FAIL("cast wallet address");
-    facil[strcspn(facil, "\r\n")] = 0;
+    snprintf(facil, sizeof facil, "%s", FACIL_ADDR);
     /* ETH for the chain writes (no relay here), USDC.e for the store */
     snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s --value 10ether >/dev/null && cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 1000000 >/dev/null",
              RPC, KEY0, wallet, RPC, KEY0, usdc, wallet);
@@ -2447,7 +2446,7 @@ static void test_spend_cap(void) {
         int fd = open(DIR "/spend_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/spend_pins", "--signer-key", DIR "/spend_signer.key",
-               "--pay-to", "0x3030000000000000000000000000000000000030", "--facilitator", "mock", "--rpc", RPC, "--asset", usdc, "--settle-key", KEY1,
+               "--pay-to", "0x3030000000000000000000000000000000000030", "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc,
                "--network", "eip155:31337", "--price-per-pin", "1000", "--no-channels", (char *)NULL);
         _exit(127);
     }
@@ -2563,7 +2562,8 @@ int main(void) {
     KEY3 = getenv("HPPLITE_ANVIL_KEY3"); KEY4 = getenv("HPPLITE_ANVIL_KEY4"); ANVIL_PID = getenv("HPPLITE_ANVIL_PID");
     KEY5 = getenv("HPPLITE_ANVIL_KEY5"); KEY6 = getenv("HPPLITE_ANVIL_KEY6"); KEY7 = getenv("HPPLITE_ANVIL_KEY7");
     KEY8 = getenv("HPPLITE_ANVIL_KEY8"); KEY9 = getenv("HPPLITE_ANVIL_KEY9");
-    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3 || !KEY4 || !KEY5 || !KEY6 || !KEY7 || !KEY8 || !KEY9 || !ANVIL_PID) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
+    FACIL = getenv("HPPLITE_ANVIL_FACILITATOR"); FACIL_ADDR = getenv("HPPLITE_ANVIL_FACILITATOR_ADDR");
+    if (!RPC || !FACTORY || !KEY0 || !KEY1 || !KEY2 || !KEY3 || !KEY4 || !KEY5 || !KEY6 || !KEY7 || !KEY8 || !KEY9 || !ANVIL_PID || !FACIL || !FACIL_ADDR) { printf("run through tests/l1/anvil_test.sh\n"); return 77; }
     test_suite_init("anvil", NULL, DIR);
     reset_dir();
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
