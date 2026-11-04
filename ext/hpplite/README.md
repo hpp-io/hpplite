@@ -1,23 +1,39 @@
 # HPPLite
 
-**A crash-safe, encrypted, replayable write log for SQLite, mirrored to a chain.**
+**A crash-safe, encrypted, replayable write log for SQLite, kept at a store in seconds and anchored on a chain.**
 
-HPPLite is a SQLite extension. It captures every write statement inside the
-transaction that runs it, cuts the log into batches, seals them with a key
-derived from your wallet key and posts them to an Ethereum-compatible chain
-for data availability. Every N batches it anchors a SHA-256 of the whole
-database (the *state root*) on the same chain. Open an empty file with the
-same key and the database rebuilds itself from the chain; replay compares
-every posted root with what it computes and says so when they differ.
+HPPLite is a SQLite extension. It captures what each commit wrote: the
+database pages, by default for a new rollup (`capture=pages`), or row
+records or statements. It cuts that into batches and seals them with a key
+derived from your wallet key.
 
-Stock SQLite, loadable extension, no patches. One sequencer posts; the chain
-keeps the history; whoever holds the key can rebuild and check it.
+- **Soft tier:** each batch goes to a store within seconds (a pin service,
+  Kubo or S3), under its height and signed by the sequencer.
+- **Hard tier:** every 30 minutes, at HPP's own cadence, one transaction
+  anchors everything since the last anchor on an Ethereum-compatible chain:
+  the chain hash, the state root (a Merkle root over the database), and the
+  manifest.
 
-What v0.1 is **not**: not a multi-writer database, not a public verifier
-(batches are encrypted, so only key holders can replay; viewing keys are
-v0.2), not cheap DA (every batch is posted on a testnet chain; since #33 as
-log data rather than contract storage, eight times cheaper, but still on
-chain), and not for databases much beyond 100 MB. See [Versions](#versions).
+Open an empty file with the same key and the database rebuilds itself from
+the chain and the store, checking every root on the way. A replica follows
+the sequencer within a flush interval, not an anchor interval. A sequencer
+that dies loses at most what it hadn't flushed: its successor recovers the
+rest from the store.
+
+Stock SQLite, loadable extension, no patches. One sequencer posts. The
+store is paid per put over x402 in USDC.e: one deposit, then a signed
+voucher per put. A wallet with no ETH can run a rollup through a relay that
+sends its transactions, paid the same way.
+
+What HPPLite is **not**:
+- Not a multi-writer database: one sequencer per rollup.
+- Not a public log: batches are encrypted, so only the wallet key or a
+  granted viewing key can read and replay them.
+- Not trustless storage: a batch that never reached a store is the
+  sequencer's to lose, and one that reached a single store and wasn't
+  anchored yet is only as safe as that store (#180).
+
+See [Versions](#versions).
 
 ## Quick Start
 
@@ -37,7 +53,7 @@ sqlite3_exec(db, "INSERT INTO users VALUES(1, 'alice')", NULL, NULL, NULL);
 sqlite3_close(db);
 ```
 
-`l1=hpp-sepolia` selects the RPC endpoint, factory contract and batch interval (30 minutes, the chain's own cadence; `interval=5s` for development) for HPP Sepolia (see Contracts). On first open, the factory auto-deploys your rollup contracts (~3s). All writes are batched and submitted to L1 for data availability.
+`l1=hpp-sepolia` selects the RPC endpoint, factory contract and batch interval (30 minutes, the chain's own cadence; `interval=5s` for development) for HPP Sepolia (see Contracts). On first open, the factory auto-deploys your rollup contracts (~3s). Without a store, the batches go on the chain itself. With `store=` (a pin service, `kubo://` or `s3://`), they go to the store within seconds, and the chain gets one anchor per `anchor=` interval (see [Stores and commitments](#stores-and-commitments)).
 
 The same works from the stock `sqlite3` shell after `.load ./hpplite`, and
 from any language whose SQLite binding can load extensions.
@@ -45,30 +61,40 @@ from any language whose SQLite binding can load extensions.
 ## How it works
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  your process                                                        │
-│                                                                      │
-│  app ──► SQLite ──► _hpplite_pending (row records, inside your txn)  │
-│                           │                                          │
-│            timer / close  ▼                                          │
-│                     batch = JSON ──► ChaCha20-Poly1305 ──► L1 DA     │
-│                     every N batches: SHA-256(database) ──► L1 root   │
-└──────────────────────────────────────────────────────────────────────┘
-      rebuild: open empty file + same key ──► fetch, open, replay, compare roots
+┌──────────────────────────────────────────────────────────────────────────┐
+│  your process                                                            │
+│                                                                          │
+│  app ──► SQLite (WAL) ──► the commit's pages (or row records, statements)│
+│                                │                                         │
+│               timer / close    ▼                                         │
+│        batch = page diffs ──► deflate ──► ChaCha20-Poly1305              │
+│                                │                                         │
+│               ┌────────────────┴──────────────────┐                      │
+│               ▼ seconds (soft)                    ▼ every 30 min (hard)  │
+│     store: by content + under <rollup>-<height>,  chain: one range anchor│
+│     signed by the sequencer, paid over x402       (chain hash, Merkle    │
+│                                                   root, manifest)        │
+└──────────────────────────────────────────────────────────────────────────┘
+  replica: the chain up to the anchor, the store past it; rebuilds itself if
+           the chain later commits another batch than the store served
 ```
 
 - **Transparent** - `sqlite3_open_v2()` with URI parameters, or `.load`
 - **Stock SQLite** - no core patches; loadable extension against any SQLite >= 3.24
-- **Nothing to lose** - the log row is written inside your own transaction;
-  it commits and rolls back with your statement. A crash or a failed
-  submission never loses or duplicates a batch. A statement that *cannot*
-  be logged is refused (`SQLITE_INTERRUPT`) rather than applied unlogged
+- **Nothing to lose** - page capture reads each commit's pages from the WAL
+  before they can be checkpointed away. Row and statement capture write the
+  log row inside your own transaction, so it commits and rolls back with your
+  statement. A crash or a failed submission never loses or duplicates a
+  batch. A statement that *cannot* be logged is refused (`SQLITE_INTERRUPT`)
+  rather than applied unlogged
 - **Encrypted by default** - batches are sealed before they leave the
-  process with a key derived from your wallet key; the chain sees ciphertext
+  process, with a key derived from your wallet key; the store and the chain
+  see ciphertext. Readers can be granted their own viewing keys (#15)
 - **Factory deploy** - one wallet, one rollup, created on first open; a
   named database (`dbname=`) gets its own rollup under the same wallet
 - **Rebuild and check** - an empty file with the same key reconstructs from
-  the chain and compares every posted state root along the way
+  the chain and the store and compares every posted state root along the way;
+  `hpplite-verify` does it in a separate process and reports the soft tier too
 
 ### Page capture (`capture=pages`, the default for new rollups since v0.4, #146)
 
@@ -842,10 +868,19 @@ soak running through a store too. Key roles and viewing keys moved to v0.4.
 viewing keys and the public-key envelope (#15), page capture (#146) as the
 default for a new rollup, the application suites (WordPress, Ghost, Rails 8,
 Home Assistant) in containers and run under it, the OLTP benchmark per
-version (#140) and the three writer stalls it found, fixed. v0.5 is HPP
-economics: store-based persistence and soft commitment with the chain's
-hard commitment at HPP's 30-minute cadence (#162), then the HPP-only node
-and the multi-put payments (#126, #135), which wait on HPP's side.
+version (#140) and the three writer stalls it found, fixed. **v0.5 is
+complete, not yet tagged** (2026-11-04). It covers HPP economics:
+- **Persistence and commitment (#162):** the store in seconds (soft), one
+  range anchor every 30 minutes (hard); replicas that follow the soft tier
+  and rebuild on a disagreement (#166); recovery of a lost sequencer from the
+  store (#167).
+- **Payments:** the store and the relay paid by voucher over x402's
+  batch-settlement (#135, #179); store pricing per MiB-month (#172).
+- **A node that holds only USDC.e (#126):** its transactions go through a
+  relay (#170) on factory VERSION 10 (#171).
+- **Spending caps and low-balance warnings (#173).**
+
+Paying in the HPP token itself is open (#175).
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
@@ -853,7 +888,7 @@ and the multi-put payments (#126, #135), which wait on HPP's side.
 | v0.2 | Row capture by default (#19), validated on suites and real applications (WordPress, Ghost, Rails 8), several writers per file, `hpplite verify` (#5) | same | same |
 | v0.3 | Off-chain stores with L1 commitments (#11: pin service over x402, Kubo, S3), incremental (Merkle) state root (#9), batch compression (#12) | GB range | a store + L1 commitments |
 | v0.4 | Key roles and provisioning (#17), viewing keys and the public-key envelope (#15), page capture (#146: the pages each commit wrote, a Merkle root over the file's pages, the default for a new rollup) | same | same |
-| v0.5 | HPP economics: store-based persistence and soft commitment, chain-based hard commitment every 30 minutes (#162); an HPP-only node, commitments and the lease by relay over x402 and pinning priced in HPP (#126); one payment authorization for many puts (#135) | same | a store (soft) + one L1 commitment per 30 min (hard) |
+| v0.5 | HPP economics: store-based persistence and soft commitment, one chain anchor every 30 minutes (#162, #164-#167); replicas on the soft tier (#166); a node with USDC.e and no ETH through a relay (#126, #170); store and relay paid by voucher (#135, #179), spending caps (#173) | same | a store (soft) + one L1 commitment per 30 min (hard) |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: the state root is a content hash, O(database size) per
@@ -1130,6 +1165,19 @@ factory keep the old permissionless claim; there the node evicts a
 stranger's lease as owner, and a batch posted by someone else (it fails our
 authentication, so it is provably not ours) is stepped over by every key
 holder the same way instead of stopping reconstruction.
+
+**Soft and hard.** A batch at the store carries the sequencer's signature
+over its height and bytes, and the store's signed receipt. That is the
+sequencer's claim, checkable by anyone with the key against the wallet the
+coordinator names, but not yet settled. Two signed batches at one height are
+proof of equivocation. A pin service with `--rpc` refuses names from an
+instance that doesn't hold the lease, so a partitioned old sequencer can't
+write over its successor.
+
+The anchor settles the claim. A replica on the soft tier that finds the chain
+committing something else says so (`soft_disagreements`) and rebuilds itself
+to what the chain committed. What the anchor rules out is the sequencer
+changing its story at all.
 
 See [doc/architecture.md](doc/architecture.md) for details.
 
