@@ -25,7 +25,7 @@ this order and verifies every receipt before it believes it.
 | `POST /put` with the bytes | yes: `pricePerPin` + `pricePerMiBMonth` × size in MiB × retention in 30-day months, rounded up to a whole unit (+ `pricePerByte` × size, 0 by default), buys `retentionSeconds` (#172) | `{cid, bytes, expires, receipt, held}` |
 | `POST /pin/<cid>` | yes, the same price | retention extended, a new `receipt` |
 | `GET /get/<cid>` | no (`--paid-get` to charge) | the bytes |
-| `POST /name/<da>-<height>` with the bytes, then the sequencer instance (32 bytes) and its 65-byte EIP-712 `Batch` signature appended (#165) | no | `{name, bytes, signer}`; 403 when another signer holds the rollup's names, or (with `--rpc`) when the signer is not the coordinator's `sequencerWallet()` |
+| `POST /name/<da>-<height>` with the bytes, then the sequencer instance (32 bytes) and its 65-byte EIP-712 `Batch` signature appended (#165) | no | `{name, bytes, signer}`; 403 when another signer holds the rollup's names, or (with `--rpc`) when the signer is not the coordinator's `sequencerWallet()`; 409 (with `--rpc`) when the instance is not the one the lease names (`sequencerInstance()`): a sequencer that lost the lease, partitioned with the same key, can't write over its successor's names (#167); the same bytes again: 200 |
 | `GET /name/<da>-<height>` | no | the bytes with the instance and the signature appended; `X-HPPLite-Signer` the wallet it recovers to |
 | `GET /status` | no | prices, retention, the **signer** and the receipt's typed-data layout |
 

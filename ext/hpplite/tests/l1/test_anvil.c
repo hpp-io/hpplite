@@ -1658,9 +1658,33 @@ static void test_store_commit(void) {
             ok = bytes && nd && hpplite_store_batch_signer(daBytes, 31337, nd->instanceId, 2, bytes, n, sig, who) == 0 && memcmp(who, me, 20) == 0;
         }
         if (!ok) printf("(name %s: %s) ", name, st ? hpplite_store_error(st) : "no store");
-        free(bytes);
         if (st) hpplite_store_close(st);
-        if (!ok) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 2 under its rollup's name at the store, signed by the sequencer wallet"); }
+        if (!ok) { free(bytes); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 2 under its rollup's name at the store, signed by the sequencer wallet"); }
+        {
+            /* a partitioned old sequencer (#167): the same wallet, another instance - not the one the chain's lease
+            ** names - writes a different batch at height 2. The service refuses it; the name keeps the sequencer's */
+            unsigned char k[32], other[32];
+            uint8_t sig2[65], *again;
+            size_t n2 = 0;
+            static const char forged[] = "a batch the lease holder did not write";
+            HppliteStore *old;
+            HppliteNode *nd = hpplite_get_node(w);
+            hpplite_hex_to_bytes(KEY2 + 2, k, 32);
+            old = hpplite_store_open(url, k, 0);
+            memcpy(other, nd->instanceId, 32);
+            other[0] ^= 0xff;
+            int refused = old && hpplite_store_sign_batch(old, daBytes, 31337, other, 2, (const uint8_t *)forged, sizeof forged - 1, sig2) == 0
+                          && hpplite_store_put_named(old, name, other, (const uint8_t *)forged, sizeof forged - 1, sig2) != 0;
+            printf("(an old instance's batch at height 2: %s) ", refused ? hpplite_store_error(old) : "taken");
+            if (old) hpplite_store_close(old);
+            st = hpplite_store_open(url, NULL, 0);
+            again = st ? hpplite_store_get_named(st, name, &n2, sig2, NULL) : NULL;
+            int kept = again && n2 == n && memcmp(again, bytes, n) == 0;
+            free(again);
+            if (st) hpplite_store_close(st);
+            free(bytes);
+            if (!refused || !kept) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("a batch from an instance that does not hold the lease must be refused, the name kept (#167)"); }
+        }
     }
     /* the first anchor of a rollup writes its slots for the first time (three fresh slots, ~20k each); the cost of an anchor is the second one's */
     sqlite3_exec(w, "INSERT INTO s(v) VALUES('three')", NULL, NULL, NULL);

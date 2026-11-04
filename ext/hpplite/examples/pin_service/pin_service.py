@@ -378,8 +378,9 @@ def batch_digest(chain_id, name, instance, data):
     return eth.typed_digest(domain, BATCH_TYPE, bytes.fromhex(instance[2:]), int(height), eth.keccak256(data))
 
 
-def sequencer_wallet(rpc, da):
-    """The rollup's sequencer wallet, asked of the chain: HPPLiteDA.coordinator(), then HPPLite.sequencerWallet(); '' when unreachable."""
+def sequencer_lease(rpc, da):
+    """The rollup's sequencer wallet and the instance its lease names, asked of the chain: HPPLiteDA.coordinator(),
+    then HPPLite.sequencerWallet() and sequencerInstance(); ('', '') when unreachable."""
     def call(to, selector):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [{"to": to, "data": selector}, "latest"]}).encode()
         req = urllib.request.Request(rpc, data=body, headers={"Content-Type": "application/json"})
@@ -388,11 +389,12 @@ def sequencer_wallet(rpc, da):
     try:
         coord = call(da, "0x" + eth.keccak256(b"coordinator()")[:4].hex())
         if len(coord) < 66:
-            return ""
+            return "", ""
         wallet = call("0x" + coord[-40:], "0x" + eth.keccak256(b"sequencerWallet()")[:4].hex())
-        return "0x" + wallet[-40:] if len(wallet) >= 66 else ""
+        instance = call("0x" + coord[-40:], "0x" + eth.keccak256(b"sequencerInstance()")[:4].hex())
+        return ("0x" + wallet[-40:] if len(wallet) >= 66 else "", instance[:66].lower() if len(instance) >= 66 else "")
     except (OSError, ValueError):
-        return ""
+        return "", ""
 
 
 class Service:
@@ -570,10 +572,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             holder = self.service.store.name_signer(da)
             if holder and holder.lower() != signer.lower():
                 return self.reply(403, {"error": "another signer holds this rollup's names", "signer": signer, "holder": holder})
+            if self.service.store.get_named(name) == body:
+                return self.reply(200, {"name": name, "bytes": len(body) - 97, "signer": signer, "held": True})
             if self.service.args.rpc and self.service.args.rpc != "mock":
-                wallet = sequencer_wallet(self.service.args.rpc, da)
+                wallet, leased = sequencer_lease(self.service.args.rpc, da)
                 if wallet and wallet.lower() != signer.lower():
                     return self.reply(403, {"error": "not the rollup's sequencer wallet", "signer": signer, "sequencer": wallet})
+                if leased and leased != instance.lower():
+                    # the same wallet, another process: a sequencer that lost the lease (partitioned, #167) must not
+                    # write over the names of the one the chain now names
+                    sys.stderr.write("pin_service: refused %s from instance %s: the lease names %s\n" % (name, instance, leased))
+                    return self.reply(409, {"error": "not the instance the rollup's lease names", "instance": instance, "lease": leased})
             self.service.store.put_named(name, da, signer, body)
             return self.reply(200, {"name": name, "bytes": len(body) - 97, "signer": signer})
         if path == "/put":
