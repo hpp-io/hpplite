@@ -43,6 +43,27 @@ this order and verifies every receipt before it believes it.
   verifies the receipt (`buyer.receipt_ok`), keeps it, and commits it with
   the batch (`commitBatch`, #33), so anyone can later show what the provider
   undertook to hold until when.
+- **Retention is enforced.** Every `--expire-interval` seconds (default an
+  hour) a tick deletes what is past its `expires`: content, and named
+  batches, which are kept for the same `--retention` from their put (#186).
+  A node extends what it still needs with `POST /pin/<cid>`.
+
+## How it keeps its state (#186)
+
+As an object store would, so that several processes on one directory agree
+(the canonical store runs as Worker isolates on one R2 bucket). There is no
+global index; each object's metadata sits beside it:
+
+| Key | Holds |
+|-----|-------|
+| `<cid>` and `<cid>.json` | the bytes; `{bytes, expires, receipt}` |
+| `name-<da>-<height>` and `.json` | the signed batch; `{signer, expires}` (the signer recorded at the put, served as `X-HPPLite-Signer`) |
+| `rollup-<da>` | the first signer of the rollup's names, written only if absent (on R2 a conditional put, or a Durable Object per rollup). Read-after-write consistent: never an eventually consistent store such as Cloudflare KV, or a replica could miss a name just written |
+| `expiry/<day>/<key>` | what expires that UTC day, for the tick |
+
+A directory from before this, with one `index.json`, is migrated when the
+service starts. `/status` no longer counts what is held: an object store
+cannot count cheaply.
 
 ## What it charges (#172)
 

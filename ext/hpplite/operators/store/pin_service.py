@@ -20,7 +20,7 @@ Endpoints
                        receipt and no 402 (idempotent by CID).
   POST /pin/<cid>      extend retention by `retention`; paid; a new receipt.
   GET  /get/<cid>      the bytes; free unless --paid-get.
-  GET  /status         prices, retention, pinned count, the signer address and the receipt's
+  GET  /status         prices, retention, the signer address and the receipt's
                        typed-data layout: where a node learns which key signs receipts.
 
 The receipt is the provider's promise: EIP-712 over Receipt(bytes32 hash,
@@ -92,90 +92,154 @@ def cid_of(data: bytes) -> str:
 # ============ The store ============
 
 class Store:
-    """A directory: <cid> holds the bytes, index.json the expiry and receipt per CID."""
+    """A directory standing for an object store (R2), each object's metadata beside it and nothing global (#186), so
+    several processes on one directory (Worker isolates on one bucket) agree:
+      <cid>                 the bytes;  <cid>.json        {bytes, expires, receipt}
+      name-<da>-<height>    a signed batch (#165);  .json  {signer, expires}
+      rollup-<da>           the first signer of the rollup's names, created only if absent
+      expiry/<day>/<key>    what expires that day (UTC days since the epoch), for the expiry tick
+    """
 
     def __init__(self, directory):
         self.dir = directory
-        os.makedirs(directory, exist_ok=True)
-        self.lock = threading.Lock()
-        self.index_path = os.path.join(directory, "index.json")
+        os.makedirs(os.path.join(directory, "expiry"), exist_ok=True)
+        self._migrate()
+
+    # --- objects ---
+    def _path(self, key):
+        return os.path.join(self.dir, key)
+
+    def _write(self, key, data: bytes):
+        path = self._path(key)
+        tmp = "%s.tmp%d.%d" % (path, os.getpid(), threading.get_ident())
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    def _read(self, key):
         try:
-            with open(self.index_path) as f:
-                self.index = json.load(f)
-        except (OSError, ValueError):
-            self.index = {}
+            with open(self._path(key), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
 
-    def _save(self):
-        tmp = self.index_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.index, f)
-        os.replace(tmp, self.index_path)
+    def _meta(self, key):
+        raw = self._read(key + ".json")
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return None
 
+    def _set_meta(self, key, meta):
+        self._write(key + ".json", json.dumps(meta).encode())
+
+    def _mark(self, key, expires):
+        day = os.path.join(self.dir, "expiry", str(int(expires) // 86400))
+        os.makedirs(day, exist_ok=True)
+        open(os.path.join(day, key), "w").close()
+
+    def _delete(self, key):
+        for k in (key, key + ".json"):
+            try:
+                os.remove(self._path(k))
+            except OSError:
+                pass
+
+    # --- content by CID ---
     def has(self, cid):
-        with self.lock:
-            return cid in self.index and os.path.exists(os.path.join(self.dir, cid))
+        return self._meta(cid) is not None and os.path.exists(self._path(cid))
 
     def get(self, cid):
-        try:
-            with open(os.path.join(self.dir, cid), "rb") as f:
-                return f.read()
-        except OSError:
-            return None
+        return self._read(cid)
 
     def put(self, cid, data, expires, receipt):
-        with self.lock:
-            path = os.path.join(self.dir, cid)
-            tmp = path + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-            self.index[cid] = {"bytes": len(data), "expires": expires, "receipt": receipt}
-            self._save()
+        self._write(cid, data)
+        self._set_meta(cid, {"bytes": len(data), "expires": expires, "receipt": receipt})
+        self._mark(cid, expires)
 
     def extend(self, cid, expires, receipt):
-        with self.lock:
-            self.index[cid]["expires"] = expires
-            self.index[cid]["receipt"] = receipt
-            self._save()
+        meta = self._meta(cid) or {}
+        meta.update(expires=expires, receipt=receipt)
+        self._set_meta(cid, meta)
+        self._mark(cid, expires)
 
     def entry(self, cid):
-        with self.lock:
-            return dict(self.index.get(cid) or {})
+        return dict(self._meta(cid) or {})
 
-    # --- named entries (#165): <da>-<height> holds a batch's bytes with the sequencer's
-    # signature appended; the first signer seen for a DA contract holds its names ---
-    def name_path(self, name):
-        return os.path.join(self.dir, "name-" + name)
-
+    # --- named entries (#165): <da>-<height> holds a batch's bytes with the sequencer's signature appended; the
+    # first signer seen for a DA contract holds its names, decided by a create-if-absent (R2's conditional put) ---
     def name_signer(self, da):
-        with self.lock:
-            return (self.index.get("names") or {}).get(da.lower())
+        raw = self._read("rollup-" + da.lower()[2:])
+        return raw.decode() if raw else None
 
-    def put_named(self, name, da, signer, data):
-        with self.lock:
-            path = self.name_path(name)
-            tmp = path + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-            names = self.index.setdefault("names", {})
-            names.setdefault(da.lower(), signer)
-            self._save()
+    def claim_rollup(self, da, signer):
+        """The rollup's holder after this signer asks for it: itself if first, else whoever was"""
+        path = self._path("rollup-" + da.lower()[2:])
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            return self.name_signer(da)
+        with os.fdopen(fd, "w") as f:
+            f.write(signer.lower())
+            f.flush()
+            os.fsync(f.fileno())
+        return signer.lower()
+
+    def put_named(self, name, signer, data, expires):
+        self._write("name-" + name, data)
+        self._set_meta("name-" + name, {"signer": signer, "expires": expires})
+        self._mark("name-" + name, expires)
 
     def get_named(self, name):
-        try:
-            with open(self.name_path(name), "rb") as f:
-                return f.read()
-        except OSError:
-            return None
+        return self._read("name-" + name)
 
-    def count(self):
-        with self.lock:
-            return len(self.index)
+    def named_signer(self, name):
+        return (self._meta("name-" + name) or {}).get("signer")
+
+    # --- retention (#185, #186) ---
+    def expire(self, now=None):
+        """Delete what is past its expiry; the keys looked at are those marked for today or earlier. Returns the count"""
+        now = int(now or time.time())
+        root = os.path.join(self.dir, "expiry")
+        gone = 0
+        for day in sorted(os.listdir(root)):
+            if not day.isdigit() or int(day) > now // 86400:
+                continue
+            dpath = os.path.join(root, day)
+            for key in os.listdir(dpath):
+                meta = self._meta(key)
+                if meta is not None and int(meta.get("expires", 0)) >= now:
+                    if int(meta["expires"]) // 86400 == int(day):
+                        continue                      # today's, not yet: looked at again by a later tick
+                elif meta is not None:
+                    self._delete_content(key)
+                    gone += 1
+                os.remove(os.path.join(dpath, key))   # done with, or extended (marked again under its new day)
+            if int(day) < now // 86400 and not os.listdir(dpath):
+                os.rmdir(dpath)
+        return gone
+
+    def _delete_content(self, key):
+        self._delete(key)
+
+    def _migrate(self):
+        """A directory from before #186 kept one index.json: its entries become metadata beside each object"""
+        path = self._path("index.json")
+        try:
+            with open(path) as f:
+                index = json.load(f)
+        except (OSError, ValueError):
+            return
+        for da, signer in (index.pop("names", None) or {}).items():
+            if not self.name_signer(da):
+                self.claim_rollup(da, signer)
+        for cid, e in index.items():
+            if isinstance(e, dict) and "expires" in e and self._meta(cid) is None:
+                self._set_meta(cid, e)
+                self._mark(cid, e["expires"])
+        os.replace(path, path + ".migrated")
 
 
 class KuboStore(Store):
@@ -209,6 +273,14 @@ class KuboStore(Store):
             return self._rpc("cat", None, "?arg=" + cid)
         except (OSError, ValueError):
             return super().get(cid)
+
+    def _delete_content(self, key):
+        if not key.startswith("name-"):
+            try:
+                self._rpc("pin/rm", None, "?arg=" + key)        # Kubo's garbage collection frees it
+            except (OSError, ValueError):
+                pass
+        super()._delete_content(key)
 
 
 # ============ Receipts ============
@@ -284,6 +356,19 @@ class Service:
             self.payments.channels.start()
         self.started = int(time.time())
 
+    def start(self):
+        """The expiry tick from a timer thread; a Worker runs Store.expire from a Cron Trigger (#185, #186)"""
+        def loop():
+            while True:
+                time.sleep(self.args.expire_interval)
+                try:
+                    gone = self.store.expire()
+                    if gone and self.args.verbose:
+                        sys.stderr.write("pin_service: %d past their retention deleted\n" % gone)
+                except OSError as e:
+                    sys.stderr.write("pin_service: expiry tick failed: %s\n" % e)
+        threading.Thread(target=loop, daemon=True).start()
+
     def price_put(self, nbytes):
         """Whole units: the per-put fee, the storage for the retention bought, the legacy per-byte price (#172)."""
         months = self.args.retention / MONTH
@@ -303,7 +388,7 @@ class Service:
                         "facilitator": self.args.facilitator or "none (free)",
                         "schemes": ["exact"] + ([channels.SCHEME] if self.payments.channels else []),
                         "channels": self.payments.channels.status() if self.payments.channels else None} if self.payments.enabled else None,
-            "pinned": self.store.count(), "settled": self.payments.settled, "uptime": int(time.time()) - self.started,
+            "settled": self.payments.settled, "uptime": int(time.time()) - self.started,
         }
 
 
@@ -394,7 +479,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("X-HPPLite-Signer", eth.recover(batch_digest(self.service.chain_id, name, "0x" + data[-97:-65].hex(), data[:-97]), data[-65:]) if len(data) > 97 else "")
+            signer = self.service.store.named_signer(name) or (      # recorded at the put; recovered for one from before #186
+                eth.recover(batch_digest(self.service.chain_id, name, "0x" + data[-97:-65].hex(), data[:-97]), data[-65:]) if len(data) > 97 else "")
+            self.send_header("X-HPPLite-Signer", signer)
             self.end_headers()
             self.wfile.write(data)
             return
@@ -451,7 +538,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # write over the names of the one the chain now names
                     sys.stderr.write("pin_service: refused %s from instance %s: the lease names %s\n" % (name, instance, leased))
                     return self.reply(409, {"error": "not the instance the rollup's lease names", "instance": instance, "lease": leased})
-            self.service.store.put_named(name, da, signer, body)
+            holder = self.service.store.claim_rollup(da, signer)
+            if holder.lower() != signer.lower():
+                return self.reply(403, {"error": "another signer holds this rollup's names", "signer": signer, "holder": holder})
+            self.service.store.put_named(name, signer, body, int(time.time()) + self.service.args.retention)
             return self.reply(200, {"name": name, "bytes": len(body) - 97, "signer": signer})
         if path == "/put":
             if not body:
@@ -514,6 +604,7 @@ def main():
     ap.add_argument("--price-per-pin", type=int, default=10, help="atomic units per put or pin, whatever its size: the settlement")
     ap.add_argument("--price-per-byte", type=int, default=0, help="atomic units per byte on top (before #172 the only size price: 1)")
     ap.add_argument("--retention", type=int, default=30 * 24 * 3600, help="seconds a put or a pin buys")
+    ap.add_argument("--expire-interval", type=int, default=3600, help="seconds between expiry ticks: what is past its retention is deleted (#186)")
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--paid-get", action="store_true")
     ap.add_argument("--channels", action=argparse.BooleanOptionalAction, default=True,
@@ -530,6 +621,7 @@ def main():
     if args.claim_interval * 4 > args.withdraw_delay:
         ap.error("--claim-interval must be well inside --withdraw-delay: vouchers not claimed when a withdrawal finishes are lost")
     Handler.service = Service(args)
+    Handler.service.start()
     srv = Server(("127.0.0.1", args.port), Handler)
     print("pin_service: listening on 127.0.0.1:%d, signer %s, %s" % (
         args.port, Handler.service.signer.address, ("paid via " + args.facilitator) if args.facilitator else "free"), flush=True)
