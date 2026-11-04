@@ -90,6 +90,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_STORE_CHANNEL  40  /* batch-settlement (#135): the channel id the store is paid in; NULL with exact */
 #define STATUS_COL_STORE_LOCKED   41  /* ...what the channel holds not yet charged (atomic units) */
 #define STATUS_COL_SPENT_WINDOW   42  /* paid to the store and the relay in spendcap='s window (a day without one), #173 */
+#define STATUS_COL_SOFT_DISAGREE  45  /* ...times the chain named another batch than the store served, each followed by a rebuild */
 #define STATUS_COL_SOFT_HEIGHT    44  /* a verifier with a store (#166): the height it applied to, soft batches included; NULL otherwise */
 #define STATUS_COL_SPEND_WARNING  43  /* what runs out and when at the recent rate (lowbalance=); NULL when nothing does */
 
@@ -108,7 +109,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
-        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_channel TEXT, store_locked INTEGER, spent_window INTEGER, spend_warning TEXT, soft_height INTEGER)");
+        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_channel TEXT, store_locked INTEGER, spent_window INTEGER, spend_warning TEXT, soft_height INTEGER, soft_disagreements INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -400,6 +401,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         }
         case STATUS_COL_SOFT_HEIGHT:
             if (node->config.verifyOnly && node->store) sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_get_block_height(node->ctx));
+            break;
+        case STATUS_COL_SOFT_DISAGREE:
+            if (node->config.verifyOnly && node->store) sqlite3_result_int64(ctx, node->softDisagreements);
             break;
         case STATUS_COL_SPENT_WINDOW:
             if (node->spend) sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_spend_in_window(node->spend));

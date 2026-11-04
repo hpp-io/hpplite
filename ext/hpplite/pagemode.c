@@ -154,6 +154,16 @@ int hpplite_pagemode_applied(HpplitePageMode *pm, unsigned pgno, const unsigned 
   if (pm->pageSize == 0 && pgno == 1) { pm->pageSize = (page[16] << 8) | page[17]; if (pm->pageSize == 1) pm->pageSize = 65536; hpplite_pageroot_free(pm->pRoot); pm->pRoot = hpplite_pageroot_new(pm->pageSize); }
   return hpplite_pageroot_set(pm->pRoot, pgno, page);
 }
+/* A replica rebuilt in another file and copied over this one (#166): its page tree is this file's now */
+int hpplite_pagemode_take_root(HpplitePageMode *pm, HpplitePageMode *from) {
+  HpplitePageRoot *r;
+  if (!pm || !from || !from->pRoot) return SQLITE_MISUSE;
+  r = pm->pRoot; pm->pRoot = from->pRoot; from->pRoot = r;
+  pm->pageSize = from->pageSize;
+  pm->sizeThen = from->sizeThen;
+  return SQLITE_OK;
+}
+
 int hpplite_pagemode_applied_size(HpplitePageMode *pm, unsigned nPages) {
   if (!pm || !pm->pRoot) return SQLITE_MISUSE;
   pm->sizeThen = nPages;

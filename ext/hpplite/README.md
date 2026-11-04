@@ -549,8 +549,10 @@ batch-settlement channel the store is paid in, and what it holds that has
 not been charged yet), and `spent_window` and `spend_warning` (#173: what the
 store and the relay were paid in `spendcap=`'s window, a day without one,
 and what runs out and when at the recent rate, NULL when nothing does), and
-`soft_height` (#166: a verifier with a store, the height its soft batches
-reach; `height` stays the anchored one). `state` says what this node is doing about posting: `sequencing`,
+`soft_height` and `soft_disagreements` (#166: a verifier with a store, the
+height its soft batches reach, with `height` staying the anchored one; and
+how many times the chain committed another batch than the store served, each
+followed by a rebuild). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
@@ -686,9 +688,13 @@ batches up to it are hard.
 
 If it names another hash, the store served batches the chain didn't commit:
 a sequencer that equivocated, or a store that lost a batch and a successor
-that wrote another at that height. The replica stops, in `state` `error`,
-and says its soft state from that height on isn't the rollup's; it has to be
-rebuilt. `soft=off` keeps a replica at the anchored height.
+that wrote another at that height. The replica says so and rebuilds itself:
+a second verifier rebuilds it from the chain and the store in
+`<db>-rebuild.db`, and the result is copied into the replica's file.
+Statement and row capture use `sqlite3_backup`, which is atomic for readers
+and leaves other connections open. Page mode copies the pages as they are,
+plus the sidecar. `soft_disagreements` counts these events. `soft=off` keeps
+a replica at the anchored height.
 
 `hpplite-verify` verifies the hard tier as before. It then reports the soft
 tier ("stored to S, anchored to H"), or nothing past the anchor.

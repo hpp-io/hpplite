@@ -2855,6 +2855,111 @@ static int node_soft_recount(HppliteNode *node, uint64_t anchored) {
     return memcmp(chain, node->ctx->chainHash, 32) == 0 ? 0 : -1;
 }
 
+/* A page-mode replica's file from another one, page by page (#166): the sequencer's bytes as they are -
+** sqlite3_backup would move the schema cookie, and the next batch's diffs on page 1 would land on another
+** page than the sequencer's. Page 1's change counter moves past this file's, so its readers notice. */
+static int node_copy_pages_raw(HppliteNode *node, HppliteNode *from) {
+    const char *zFile = sqlite3_db_filename(node->db, "main");
+    sqlite3 *adb = NULL;
+    sqlite3_file *pf = NULL, *pf2 = NULL;
+    sqlite3_int64 size = 0, off;
+    unsigned char *page = NULL, hdr[100];
+    unsigned counter = 0;
+    int ps, rc;
+    if (!node->pm || !from->pm || (ps = hpplite_pagemode_page_size(from->pm)) <= 0) return SQLITE_MISUSE;
+    hpplite_internal_open_begin();
+    rc = sqlite3_open_v2(zFile, &adb, SQLITE_OPEN_READWRITE, NULL);
+    hpplite_internal_open_end();
+    if (rc != SQLITE_OK) { if (adb) sqlite3_close(adb); return rc; }
+    sqlite3_busy_timeout(adb, 5000);
+    rc = sqlite3_exec(adb, "BEGIN EXCLUSIVE", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_file_control(adb, "main", SQLITE_FCNTL_FILE_POINTER, &pf);
+    if (rc == SQLITE_OK) rc = sqlite3_file_control(from->db, "main", SQLITE_FCNTL_FILE_POINTER, &pf2);
+    if (rc == SQLITE_OK && (!pf || !pf->pMethods || !pf2 || !pf2->pMethods || !(page = sqlite3_malloc(ps)))) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = pf2->pMethods->xFileSize(pf2, &size);
+    if (rc == SQLITE_OK) {
+        int r1 = pf->pMethods->xRead(pf, hdr, 100, 0);
+        if (r1 == SQLITE_OK) counter = ((unsigned)hdr[24] << 24) | ((unsigned)hdr[25] << 16) | ((unsigned)hdr[26] << 8) | hdr[27];
+    }
+    for (off = 0; rc == SQLITE_OK && off < size; off += ps) {
+        rc = pf2->pMethods->xRead(pf2, page, ps, off);
+        if (rc == SQLITE_OK && off == 0) {
+            counter++;
+            page[24] = (unsigned char)(counter >> 24); page[25] = (unsigned char)(counter >> 16); page[26] = (unsigned char)(counter >> 8); page[27] = (unsigned char)counter;
+            memcpy(page + 92, page + 24, 4);
+            page[18] = page[19] = 1;
+        }
+        if (rc == SQLITE_OK) rc = pf->pMethods->xWrite(pf, page, ps, off);
+    }
+    if (rc == SQLITE_OK) rc = pf->pMethods->xTruncate(pf, size);
+    if (rc == SQLITE_OK) rc = pf->pMethods->xSync(pf, SQLITE_SYNC_NORMAL);
+    sqlite3_exec(adb, "ROLLBACK", NULL, NULL, NULL);             /* nothing of SQLite's to commit; the lock goes */
+    sqlite3_close(adb);
+    sqlite3_free(page);
+    return rc;
+}
+
+/* After a disagreement (#166 step 3): this replica again, from the chain and the store. A second
+** verifier builds it in <db>-rebuild.db with this node's key and chain connection; sqlite3_backup
+** copies it into this connection's database - atomic for readers, the connections stay open - or, a
+** page-mode file, its pages are copied as they are and the sidecar by backup; the bookkeeping is
+** reloaded. One edge: a page-mode copy keeps the sequencer's schema cookie, so another connection
+** holding a schema parsed at that same cookie number from the other history would not reparse it. 0, or -1 with this node as it was. */
+static int node_soft_rebuild(HppliteNode *node) {
+    HppliteNodeConfig cfg;
+    HppliteNode *n2;
+    char *zTmp;
+    static const char *aSuffix[] = { "", "-wal", "-shm", "-hpplite.db", "-hpplite.db-wal", "-hpplite.db-shm", NULL };
+    int rc = -1, saved, i;
+    if (!node->config.verifyOnly || !node->config.dbPath || !node->db) return -1;
+    zTmp = sqlite3_mprintf("%s-rebuild.db", node->config.dbPath);
+    if (!zTmp) return -1;
+    for (i = 0; aSuffix[i]; i++) { char *z = sqlite3_mprintf("%s%s", zTmp, aSuffix[i]); if (z) unlink(z); sqlite3_free(z); }
+    cfg = node->config;
+    cfg.dbPath = zTmp;
+    cfg.verifyOnly = 1;
+    cfg.softOff = 0;
+    n2 = hpplite_node_create(&cfg);
+    if (n2) {
+        if (node->hasViewKey) hpplite_node_set_view_key(n2, node->viewKey);
+        else if (node->hasEncKey && !node->config.hasPrivkey) hpplite_node_set_batch_key(n2, node->encKey);
+        hpplite_node_set_l1(n2, node->l1);
+        n2->ownsL1 = 0;
+        if (hpplite_node_sync_from_l1(n2, 1) >= 0 && n2->state != HPPLITE_STATE_ERROR) {
+            sqlite3_backup *b;
+            saved = hppliteInternalBegin(node->ctx);          /* HPPLite's own write: no capture, no commit-hook refusal */
+            if (node->pm && n2->pm) rc = node_copy_pages_raw(node, n2) == SQLITE_OK ? 0 : -1;
+            else {
+                b = sqlite3_backup_init(node->db, "main", n2->db, "main");
+                rc = b && sqlite3_backup_step(b, -1) == SQLITE_DONE ? 0 : -1;
+                if (b) sqlite3_backup_finish(b);
+            }
+            if (rc == 0 && node->ctx->bkDb && node->ctx->bkDb != node->db && n2->ctx->bkDb && n2->ctx->bkDb != n2->db) {
+                b = sqlite3_backup_init(node->ctx->bkDb, "main", n2->ctx->bkDb, "main");
+                rc = b && sqlite3_backup_step(b, -1) == SQLITE_DONE ? 0 : -1;
+                if (b) sqlite3_backup_finish(b);
+            }
+            hppliteInternalEnd(node->ctx, saved);
+            if (rc == 0) {
+                hppliteLoadMeta(node->ctx);
+                if (node->pm && n2->pm) hpplite_pagemode_take_root(node->pm, n2->pm);   /* the file's page tree is the copy's */
+                node_soft_clear(node);
+                for (size_t k = 0; k < n2->nSoft; k++) node_soft_push(node, n2->softFirst + k, n2->softChain[k]);
+                node->softStopped = 0;
+                node->state = HPPLITE_STATE_RUNNING;
+                hpplite_error_clear(node->ctx);
+                fprintf(stderr, "hpplite: rebuilt from the chain and the store: height %llu, soft to %llu\n",
+                        (unsigned long long)(node->softFirst ? node->softFirst : node->ctx->blockHeight), (unsigned long long)node->ctx->blockHeight);
+            }
+        }
+        n2->l1 = NULL;
+        hpplite_node_destroy(n2);
+    }
+    for (i = 0; aSuffix[i]; i++) { char *z = sqlite3_mprintf("%s%s", zTmp, aSuffix[i]); if (z) unlink(z); sqlite3_free(z); }
+    sqlite3_free(zTmp);
+    return rc;
+}
+
 /* The anchor moved to `anchored`: the soft batches up to it are hard if the chain names what was applied */
 static int node_soft_settle(HppliteNode *node, uint64_t anchored) {
     uint64_t end = node->softFirst + node->nSoft - 1;
@@ -2866,9 +2971,10 @@ static int node_soft_settle(HppliteNode *node, uint64_t anchored) {
         node->softStopped = 1;
         node->state = HPPLITE_STATE_ERROR;
         hpplite_error(node->ctx, "the chain's commitment at height %llu names another chain hash than the batches the store served past height %llu: "
-                      "this replica's soft state from %llu on is not the rollup's (equivocation, or a stale store); rebuild it",
+                      "this replica's soft state from %llu on is not the rollup's (equivocation, or a stale store); rebuilding it",
                       (unsigned long long)anchored, (unsigned long long)(node->softFirst - 1), (unsigned long long)node->softFirst);
-        return -1;
+        node->softDisagreements++;
+        return node_soft_rebuild(node) == 0 ? 1 : -1;
     }
     if (anchored == end) node_soft_clear(node);
     else {
@@ -2935,11 +3041,17 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         if (!node->softFirst && node->ctx->blockHeight > lastBatch + 1 && node_soft_recount(node, lastBatch) != 0) {
             node->softStopped = 1;
             node->state = HPPLITE_STATE_ERROR;
-            hpplite_error(node->ctx, "this replica is past the anchored height %llu and the store no longer serves the batches it applied there: rebuild it",
+            hpplite_error(node->ctx, "this replica is past the anchored height %llu and the store no longer serves the batches it applied there: rebuilding it",
                           (unsigned long long)lastBatch);
-            return -1;
+            node->softDisagreements++;
+            if (node_soft_rebuild(node) != 0) return -1;
+            return 1;
         }
-        if (node_soft_settle(node, lastBatch) != 0) return -1;
+        {
+            int settled = node_soft_settle(node, lastBatch);
+            if (settled < 0) return -1;
+            if (settled > 0) return 1;                  /* rebuilt: the copy is up to date */
+        }
     }
 
     while (node->ctx->blockHeight <= lastBatch) {

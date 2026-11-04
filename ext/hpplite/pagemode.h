@@ -40,6 +40,8 @@ int hpplite_pagemode_piece_more(HpplitePageMode *pm);   /* the batch just built 
 /* a replica: the pages a batch applied, into the root */
 int hpplite_pagemode_applied(HpplitePageMode *pm, unsigned pgno, const unsigned char *page);
 int hpplite_pagemode_applied_size(HpplitePageMode *pm, unsigned nPages);
+/* a replica copied over from another file it was rebuilt in (#166): that one's page tree taken */
+int hpplite_pagemode_take_root(HpplitePageMode *pm, HpplitePageMode *from);
 /* the built batch is finalized: its images are now the base for the next */
 void hpplite_pagemode_finalized(HpplitePageMode *pm);
 /* the built batch was not finalized: the root goes back, its commits return to the queue */

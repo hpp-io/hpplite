@@ -143,6 +143,7 @@ typedef struct HppliteNode {
     unsigned char (*softChain)[32]; /* the chain hash after each soft height, from softFirst */
     size_t nSoft, nSoftAlloc;
     int softStopped;                /* the soft tier disagreed with the chain: not followed (#166) */
+    int softDisagreements;          /* ...times it did, each followed by a rebuild (status soft_disagreements) */
     uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
     int storeChannelBound;          /* the store's batch-settlement channel bound to this rollup (#135) */
     struct HppliteSpend *spend;     /* what the store and the relay were paid, ETH samples (#173) */

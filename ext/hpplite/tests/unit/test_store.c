@@ -753,7 +753,7 @@ static void test_soft_replica(const char *url) {
 /* 12. ... and when the chain commits another batch than the one the store served (the store lost it, a
 ** successor wrote its own at that height), the verifier says its soft state is not the rollup's */
 static void test_soft_disagreement(const char *url) {
-    TEST("soft replica: the store served a batch the chain then did not commit (a successor wrote its own at that height): the verifier reports it");
+    TEST("soft replica: the store served a batch the chain then did not commit (a successor wrote its own at that height): the verifier says so and rebuilds itself to what the chain committed");
     static const unsigned char kseq[32] = { [31] = 0x67 };
     HppliteL1 *l1 = hpplite_l1_create_mock();
     TestNodeOpts o = { .storeUrl = url, .nodeId = "dis_a", .privkey = kseq };
@@ -784,14 +784,33 @@ static void test_soft_disagreement(const char *url) {
     if (!b) FAIL("open the successor");
     hpplite_node_exec(b, "INSERT INTO t(v) VALUES('the one the chain committed')", NULL);
     if (hpplite_node_flush_batch(b) < 1 || hpplite_node_anchor(b) != 2) { printf("(%s) ", status_text(b->db, "last_error")); FAIL("the successor's batch 2, anchored"); }
+    /* a reader of the replica's file, open across the rebuild (another connection, as an application's) */
+    sqlite3 *reader = NULL;
+    char seen[80] = "", seenAfter[80] = "";
+    sqlite3_open_v2(tpath("dis_r.db"), &reader, SQLITE_OPEN_READONLY, NULL);
+    text_of(reader, "SELECT v FROM t WHERE id = 1", seen, sizeof seen);
     hpplite_node_sync_from_l1(r, 1);
-    const char *err = status_text(r->db, "last_error");
-    printf("(the verifier: state %s, '%.90s') ", status_text(r->db, "state"), err);
-    int said = r->state == HPPLITE_STATE_ERROR && strstr(err, "soft state") != NULL;
+    text_of(reader, "SELECT v FROM t WHERE id = 1", seenAfter, sizeof seenAfter);
+    sqlite3_close(reader);
+    printf("(a reader open across it: '%s', then '%s') ", seen, seenAfter);
+    long long dis = status_int(r->db, "soft_disagreements"), hard = status_int(r->db, "height");
+    char v[80] = "";
+    text_of(r->db, "SELECT v FROM t WHERE id = 1", v, sizeof v);
+    int same = same_root(b, r);
+    printf("(the verifier: state %s, disagreements %lld, height %lld, row '%s', same root %d) ", status_text(r->db, "state"), dis, hard, v, same);
+    int ok = r->state != HPPLITE_STATE_ERROR && dis == 1 && hard == 3 && strcmp(v, "the one the chain committed") == 0 && same
+             && strcmp(seen, "the one the store served") == 0 && strcmp(seenAfter, "the one the chain committed") == 0;
+    /* rebuilt, it follows on: the successor's next batch is soft at once */
+    hpplite_node_exec(b, "INSERT INTO t(v) VALUES('after the rebuild')", NULL);
+    if (ok && hpplite_node_flush_batch(b) >= 1) {
+        hpplite_node_sync_from_l1(r, 1);
+        printf("(then: soft_height %lld, rows %d) ", status_int(r->db, "soft_height"), count_rows(r->db, "t"));
+        ok = status_int(r->db, "soft_height") == 4 && count_rows(r->db, "t") == 2;
+    }
     r->l1 = NULL; hpplite_node_destroy(r);
     b->ownsL1 = 0; hpplite_node_destroy(b);
     hpplite_l1_disconnect(l1);
-    if (!said) FAIL("the verifier should report that its soft state is not what the chain committed");
+    if (!ok) FAIL("the verifier should count the disagreement and hold, rebuilt, what the chain committed");
     PASS();
 }
 
