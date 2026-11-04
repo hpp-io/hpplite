@@ -330,12 +330,20 @@ class Channels:
         out = []
         with self.lock:
             for cid, st in list(self.book.items()):
+                if now - st.get("last", 0) < self.refund_idle or not st.get("signature"):
+                    continue
+                if self.p.facilitator == "mock" or self.p.rpc:
+                    # the chain's word on what the channel holds and the refund nonce it expects: a refund
+                    # by anyone else (or a deposit this book missed) moves them (#135)
+                    try:
+                        st["balance"], _, st["refundNonce"], _ = self._chain_state(cid)
+                    except RuntimeError as e:
+                        self.log("refund of %s: the chain could not be read: %s" % (cid, e))
+                        continue
                 left = st["balance"] - st["charged"]
-                if left <= 0 or now - st.get("last", 0) < self.refund_idle or not st.get("signature"):
+                if left <= 0:
                     continue
                 nonce = st.get("refundNonce", 0)
-                if self.p.facilitator == "mock":
-                    _, _, nonce, _ = self._chain_state(cid)
                 sig = "0x" + eth.sign(self.key, refund_digest(cid, nonce, left, self.chain_id)).hex()
                 try:
                     if self.p.facilitator == "mock":
