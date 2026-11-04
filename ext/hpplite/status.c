@@ -276,8 +276,10 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_SEQUENCER:
             sqlite3_result_int(ctx, node->follower ? 0 : 1);
             break;
-        case STATUS_COL_CAPTURE:              /* what this connection logs: records or statements (#83) */
-            sqlite3_result_text(ctx, node->pm ? "pages" : node->ctx->bRows ? "rows" : "text", -1, SQLITE_STATIC);
+        case STATUS_COL_CAPTURE:              /* what the file's history is captured as: records, statements or pages (#83) */
+            /* a follower or verify connection on a page-mode file runs no page machinery of its own, but the file is a
+            ** page-mode file: its configuration says so (#174) */
+            sqlite3_result_text(ctx, node->pm || node->config.capturePages ? "pages" : node->ctx->bRows ? "rows" : "text", -1, SQLITE_STATIC);
             break;
         case STATUS_COL_FOREIGN_WRITES:       /* the file changed with no HPPLite write to show for it (#37) */
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nForeignWrites);

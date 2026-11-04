@@ -675,6 +675,37 @@ static void test_pending_counts_foreign_commits(void) {
     PASS();
 }
 
+/* #174: a second connection on a page-mode file (the demo's role=verify one, opened while the
+** sequencer holds the file) captures nothing itself, but the file is a page-mode file and its
+** status says so - not the connection's default */
+static void test_follower_reports_pages(void) {
+    TEST("a verify connection on a page-mode file the sequencer holds reports capture = pages (#174)");
+    if (getenv("HPPLITE_CAPTURE")) { printf("SKIP (HPPLITE_CAPTURE says %s: nothing is automatic) ", getenv("HPPLITE_CAPTURE")); PASS(); return; }
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/held_pages.db", l1, 1, 1);
+    if (!s) FAIL("open the sequencer");
+    hpplite_node_exec(s, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(s) != 1) FAIL("flush");
+    HppliteNodeConfig config;
+    char cap[16];
+    memset(&config, 0, sizeof config);
+    config.nodeId = "vf"; config.dataDir = DIR; config.dbPath = DIR "/held_pages.db";
+    config.captureAuto = 1;                              /* nothing said: what stock Python opening the demo's file gets */
+    config.verifyOnly = 1;
+    HppliteNode *v = hpplite_node_create(&config);
+    if (!v) FAIL("open the verify connection");
+    hpplite_node_set_l1(v, l1); hpplite_node_sync_from_l1(v, 1); hpplite_node_start(v);
+    text_of(v->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
+    int follower = v->follower, hasPm = v->pm != NULL;
+    hpplite_node_destroy(v);
+    hpplite_node_destroy(s);
+    hpplite_l1_disconnect(l1);
+    printf("(follower %d, page machinery %d, capture %s) ", follower, hasPm, cap);
+    if (strcmp(cap, "pages") != 0) FAILF("hpplite_status.capture = %s on a page-mode file", cap);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -697,6 +728,7 @@ int main(void) {
     test_capture_auto();
     test_foreign_checkpoint_and_restart_lose_nothing();
     test_pending_counts_foreign_commits();
+    test_follower_reports_pages();
     remove_dir();
     return test_report();
 }
