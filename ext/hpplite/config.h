@@ -63,6 +63,7 @@ extern "C" {
 #define HPPLITE_ENV_STORE_CAP     "HPPLITE_STORE_CAP"
 #define HPPLITE_ENV_STORE_DEPOSIT "HPPLITE_STORE_DEPOSIT"
 #define HPPLITE_ENV_SPEND_CAP     "HPPLITE_SPEND_CAP"
+#define HPPLITE_ENV_RELAY_DEPOSIT "HPPLITE_RELAY_DEPOSIT"
 #define HPPLITE_ENV_LOW_BALANCE   "HPPLITE_LOW_BALANCE"
 #define HPPLITE_ENV_RELAY         "HPPLITE_RELAY"          /* a relay submits the signed forms of the writes, paid over x402 (#126) */
 #define HPPLITE_ENV_RELAY_CAP     "HPPLITE_RELAY_CAP"
@@ -94,6 +95,7 @@ extern "C" {
 #define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
 #define HPPLITE_URI_STORE_CAP     "storecap"    /* the most to pay the store per call, atomic units of its asset */
 #define HPPLITE_URI_STORE_DEPOSIT "storedeposit" /* batch-settlement (#135): the most left unspent in a channel at once */
+#define HPPLITE_URI_RELAY_DEPOSIT "relaydeposit" /* batch-settlement for the relay (#179): the most unspent in its channel */
 #define HPPLITE_URI_SPEND_CAP     "spendcap"    /* the most paid to the store and the relay per hour or day (#173): N/hour, N/day */
 #define HPPLITE_URI_LOW_BALANCE   "lowbalance"  /* warn when the money left lasts fewer hours than this at the recent rate (#173) */
 #define HPPLITE_URI_RELAY         "relay"       /* relay=http://host:port: the writes go to the chain through it, no ETH needed (#126) */
@@ -165,6 +167,7 @@ typedef struct HppliteConfig {
     uint64_t relayCap;               /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
     uint64_t storeCap;               /* storecap=: the most to pay the store per call (0 = pay nothing) */
     uint64_t storeDeposit;           /* storedeposit=: x402 batch-settlement, the most unspent in the channel (0 = exact per call, #135) */
+    uint64_t relayDeposit;           /* relaydeposit=: the relay paid by voucher, the most unspent in its channel (0 = exact, #179) */
     uint64_t spendCap, spendWindow;  /* spendcap=: the most paid in the window (seconds), store and relay together (0 = none, #173) */
     int lowBalanceHours;             /* lowbalance=: warn below this many hours of money at the recent rate (0 = the default, 72; -1 = off) */
     int storeFallback;               /* storefallback=off keeps a batch waiting while the store is down; on (default): the chain carries it */

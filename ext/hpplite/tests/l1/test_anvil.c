@@ -2178,7 +2178,7 @@ static pid_t start_relay(const char *svc, const char *usdc, int port) {
         int fd = open(DIR "/relay.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key",
-               "--factory", FACTORY, "--facilitator", "mock", "--asset", usdc, "--eth-usd", "30", (char *)NULL);
+               "--factory", FACTORY, "--facilitator", "mock", "--asset", usdc, "--eth-usd", "30", "--dir", DIR "/relay_state", (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -2499,6 +2499,64 @@ static void test_spend_cap(void) {
     PASS();
 }
 
+/* 31. The relay paid by voucher (#179): a wallet with USDC.e and no ETH and
+** relaydeposit=; the relay offers batch-settlement beside exact. Its rollup,
+** lease, batches and anchor go through the relay; the wallet's USDC.e falls
+** by one deposit and nothing else (no transfer per call); the relay's book
+** charged each call the gas it took, within its quote, and in all exactly
+** what the node counts as relay_spent; the wallet's ETH stays 0. */
+static void test_relay_channel(void) {
+    TEST("the relay paid by voucher (#179): a zero-ETH wallet's rollup, lease and anchor through the relay; one deposit, no transfer per call; each call charged its gas; relay_spent is the relay's count");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC"), *escrow = getenv("HPPLITE_ANVIL_ESCROW");
+    static const char VKEY[] = "0x3131313131313131313131313131313131313131313131313131313131313131";
+    if (!svc || !usdc || !usdc[0] || !escrow || !escrow[0]) { printf("SKIP (no pin service, MockUSDC or x402 escrow in the environment) "); PASS(); return; }
+    char cmd[2400], wallet[80], out[4096], extra[400];
+    int sport = test_free_port(), rport = test_free_port();
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", VKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 1000000000 >/dev/null", RPC, KEY0, usdc, wallet);
+    if (run_cmd(cmd, out, sizeof out) != 0) FAIL("fund the wallet with MockUSDC");
+    long long before = usdc_balance(usdc, wallet);
+    (void)!system("rm -rf " DIR "/relay_state");
+    pid_t store = start_pin_service_free(svc, sport);
+    if (store < 0) FAIL("the pin service did not come up");
+    pid_t relay = start_relay(svc, usdc, rport);
+#define STOP_SERVICES() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); } while (0)
+    if (relay < 0) { STOP_SERVICES(); FAIL("the relay did not come up (see relay.log)"); }
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead: see scenario 18 */
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&relaycap=200000000&relaydeposit=500000000&anchor=0", sport, rport);
+    sqlite3 *w = open_db("vr_writer.db", VKEY, extra);
+    if (!w) { STOP_SERVICES(); FAIL("open writer"); }
+    if (!status_text(w, "contract")[0] || status_int(w, "lease") != 1) {
+        printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); STOP_SERVICES(); FAIL("the rollup created and the lease taken through the relay");
+    }
+    sqlite3_exec(w, "CREATE TABLE v(id INTEGER PRIMARY KEY, x TEXT)", NULL, NULL, NULL);
+    int ok1 = scalar(w, "SELECT hpplite_flush()") > 0;
+    sqlite3_exec(w, "INSERT INTO v(x) VALUES('by voucher')", NULL, NULL, NULL);
+    int ok2 = scalar(w, "SELECT hpplite_flush()") > 0;
+    long long anchored = scalar(w, "SELECT hpplite_anchor()");
+    long long spent = status_int(w, "relay_spent");
+    char path[20];
+    snprintf(path, sizeof path, "%s", status_text(w, "last_tx_path"));
+    long long charged = -1, balance = -1, nCh = -1;
+    /* the relay's book now, before the close's lease release (one more call) */
+    snprintf(cmd, sizeof cmd, "python3 -I -c \"import json;b=json.load(open('" DIR "/relay_state/channels.json'));v=list(b.values());"
+                              "print(len(v), sum(s['charged'] for s in v), sum(s['balance'] for s in v))\"");
+    if (run_cmd(cmd, out, sizeof out) == 0) sscanf(out, "%lld %lld %lld", &nCh, &charged, &balance);
+    sqlite3_close(w);                                    /* the lease released through the relay */
+    long long after = usdc_balance(usdc, wallet), eth = eth_balance_of(wallet);
+    STOP_SERVICES();
+#undef STOP_SERVICES
+    printf("(anchored %lld via %s; relay_spent %lld, the relay's book: %lld channel(s), charged %lld, deposited %lld; the wallet's USDC.e fell %lld; ETH %lld) ",
+           anchored, path, spent, nCh, charged, balance, before - after, eth);
+    if (!ok1 || !ok2 || anchored <= 0 || strcmp(path, "relay") != 0) FAIL("batches at the store, the anchor through the relay");
+    if (nCh != 1 || charged != spent || spent <= 0) FAIL("one channel, its charges exactly the node's relay_spent");
+    if (before - after != balance) FAIL("the wallet's USDC.e should fall by the deposit alone: no transfer per call");
+    if (eth != 0) FAIL("the wallet's ETH should stay 0");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2540,6 +2598,7 @@ int main(void) {
     if (wanted(28)) test_relay_fallback();
     if (wanted(29)) test_store_channel();
     if (wanted(30)) test_spend_cap();
+    if (wanted(31)) test_relay_channel();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

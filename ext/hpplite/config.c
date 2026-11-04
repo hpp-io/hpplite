@@ -260,6 +260,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
     val = getenv(HPPLITE_ENV_STORE_DEPOSIT);
     if (val && atoll(val) > 0) cfg->storeDeposit = (uint64_t)atoll(val);
+    val = getenv(HPPLITE_ENV_RELAY_DEPOSIT);
+    if (val && atoll(val) > 0) cfg->relayDeposit = (uint64_t)atoll(val);
     val = getenv(HPPLITE_ENV_SPEND_CAP);
     if (val && val[0] && hpplite_spend_parse_cap(val, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: %s=%s: not N, N/hour or N/day; ignored\n", HPPLITE_ENV_SPEND_CAP, val);
     val = getenv(HPPLITE_ENV_LOW_BALANCE);
@@ -519,6 +521,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_STORE_DEPOSIT, buf, sizeof(buf)) && atoll(buf) > 0) {
         cfg->storeDeposit = (uint64_t)atoll(buf);
     }
+    if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->relayDeposit = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_SPEND_CAP, buf, sizeof(buf)) && buf[0]
         && hpplite_spend_parse_cap(buf, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: spendcap=%s: not N, N/hour or N/day; ignored\n", buf);
     if (get_uri_param(uri, HPPLITE_URI_LOW_BALANCE, buf, sizeof(buf)) && buf[0]) cfg->lowBalanceHours = atoi(buf) > 0 ? atoi(buf) : -1;
@@ -701,6 +704,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_DEPOSIT);
     if (val && atoll(val) > 0) cfg->storeDeposit = (uint64_t)atoll(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_DEPOSIT);
+    if (val && atoll(val) > 0) cfg->relayDeposit = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SPEND_CAP);
     if (val && val[0] && hpplite_spend_parse_cap(val, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: spendcap=%s: not N, N/hour or N/day; ignored\n", val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_LOW_BALANCE);

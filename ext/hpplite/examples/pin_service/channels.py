@@ -83,7 +83,7 @@ class Channels:
     """The seller's book of channels: what each has been charged, the latest voucher, the chain's view."""
 
     def __init__(self, directory, payments, receiver_key: bytes, withdraw_delay, min_deposit,
-                 claim_interval, refund_idle, log=None):
+                 claim_interval, refund_idle, log=None, send_lock=None):
         self.p = payments                   # pin_service.Payments: network, asset, pay_to, facilitator, rpc, settle_key
         self.key = receiver_key
         self.authorizer = eth.address(receiver_key)
@@ -98,6 +98,7 @@ class Channels:
         self.claimed_txs = 0
         self.settled_txs = 0
         self.mock_queued = False        # test knob: the mock facilitator sends a deposit and answers "queued", as HPP's may
+        self.send_lock = send_lock      # held around every transaction sent with --settle-key (the relay's own nonce)
         try:
             with open(self.path) as f:
                 self.book = json.load(f)
@@ -140,7 +141,11 @@ class Channels:
             cmd += ["--private-key", self.p.settle_key, "--json"]
         elif self.p.settle_key:
             cmd += ["--from", eth.address(bytes.fromhex(self.p.settle_key[2:] if self.p.settle_key.startswith("0x") else self.p.settle_key))]
-        r = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=120)
+        if send and self.send_lock is not None:
+            with self.send_lock:
+                r = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=120)
+        else:
+            r = subprocess.run(cmd + list(args), capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1][:300] if (r.stderr or r.stdout).strip() else "cast failed")
         return json.loads(r.stdout).get("transactionHash", "") if send else r.stdout.strip()
@@ -276,10 +281,11 @@ class Channels:
                 time.sleep(3)
         raise RuntimeError("%s %s" % (s.get("errorReason", "?"), s.get("errorMessage", "")))
 
-    def commit(self, payload, req, cid, deposit_tx):
-        """After the work: the charge counts, the voucher is the one to claim. The PAYMENT-RESPONSE body."""
+    def commit(self, payload, req, cid, deposit_tx, charge=None):
+        """After the work: the charge counts, the voucher is the one to claim. The PAYMENT-RESPONSE body.
+        charge: what the work actually cost, at most the price asked (the scheme's usage pricing; the relay's gas)"""
         voucher = payload["payload"]["voucher"]
-        amount = int(req["amount"])
+        amount = int(req["amount"]) if charge is None else min(int(charge), int(req["amount"]))
         with self.lock:
             st = self.book[cid]
             st["charged"] += amount

@@ -418,8 +418,8 @@ static char *chanPay(HppliteStore *s, cJSON *req, cJSON *acc, uint64_t amt, uint
         deposit = minDeposit > ceiling - s->balance ? minDeposit : ceiling - s->balance;
         if (unspent + deposit > s->depositCap) deposit = s->depositCap > unspent ? s->depositCap - unspent : 0;
         if (s->balance + deposit < ceiling) {
-            snprintf(s->error, sizeof s->error, "the %s's channel needs a deposit of %llu and storedeposit is %llu (%llu unspent in it): refused",
-                     s->isRelay ? "relay" : "store", (unsigned long long)(ceiling - s->balance), (unsigned long long)s->depositCap, (unsigned long long)unspent);
+            snprintf(s->error, sizeof s->error, "the %s's channel needs a deposit of %llu and %s is %llu (%llu unspent in it): refused",
+                     s->isRelay ? "relay" : "store", (unsigned long long)(ceiling - s->balance), s->isRelay ? "relaydeposit" : "storedeposit", (unsigned long long)s->depositCap, (unsigned long long)unspent);
             cJSON_Delete(config);
             return NULL;
         }

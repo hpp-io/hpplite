@@ -48,6 +48,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, "..", "pin_service"))
 import eth  # noqa: E402
 from pin_service import Payments  # noqa: E402
+import channels  # noqa: E402
 
 
 def selector(sig: str) -> str:
@@ -151,6 +152,12 @@ class Relay:
         self.payments = Payments(args.facilitator, "eip155:%d" % self.chain_id, args.asset, pay_to,
                                  args.asset_name, args.asset_version, args.rpc, settle_key)
         self.lock = threading.Lock()          # one transaction at a time: the nonce, and the mock settle's own
+        if self.payments.enabled and args.channels:
+            # x402 batch-settlement beside exact (#179): a deposit once, a voucher per call charged at the gas it took
+            os.makedirs(args.dir, exist_ok=True)
+            self.payments.channels = channels.Channels(args.dir, self.payments, self.key, args.withdraw_delay, args.min_deposit,
+                                                       args.claim_interval, args.refund_idle, send_lock=self.lock)
+            self.payments.channels.start()
         self.quotes = {}                      # keccak(to, data) -> (amount, gas, until): the 402's price holds for the retry
         self.submitted = 0
         self.started = int(time.time())
@@ -284,6 +291,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         p = r.payments
         payload = None
         requirements = None
+        voucher = None                                           # (channel id, deposit tx) when paid by voucher (#179)
         if p.enabled:
             requirements = p.requirements(amount, "http://%s/commit" % self.headers.get("Host", "localhost"),
                                           "%s, %d gas, submitted and paid for by the relay" % (name, gas))
@@ -293,6 +301,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = p.decode(header)
             if not payload or "payload" not in payload:
                 return self.reply(400, {"error": "PAYMENT-SIGNATURE is not a payment payload"})
+        if p.enabled and (payload.get("accepted") or {}).get("scheme") == channels.SCHEME and p.channels:
+            ok, cid, err, deposit_tx = p.channels.verify(payload, requirements["accepts"][-1])
+            if not ok:
+                if err == channels.MISMATCH:
+                    requirements = p.channels.corrective(requirements, cid)
+                else:
+                    requirements["error"] = err
+                return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
+            voucher = (cid, deposit_tx)
+        elif p.enabled:
             v = p.verify(payload, requirements["accepts"][0])
             if not v.get("isValid"):
                 requirements["error"] = v.get("invalidReason", "invalid payment") + (
@@ -306,8 +324,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(409 if rcpt else 502, {"error": err or "the transaction reverted", "tx": tx, "call": name,
                                                          "charged": False})
             settlement = None
-            if p.enabled:
+            if p.enabled and not voucher:
                 settlement = p.settle(payload, requirements["accepts"][0])
+        if voucher:
+            # paid on inclusion at what the call cost: the gas it used at the price it paid, within the quote. Outside
+            # the nonce lock: the channels' claim thread takes its book's lock, then this one to send (no inversion)
+            used = int(rcpt.get("gasUsed") or "0x0", 16)
+            price = int(rcpt.get("effectiveGasPrice") or "0x0", 16)
+            actual = r.price(used, price) if used and price else amount
+            settlement = p.channels.commit(payload, requirements["accepts"][-1], voucher[0], voucher[1], charge=actual)
         r.quotes.pop(key, None)
         out = {"tx": rcpt["transactionHash"], "block": int(rcpt["blockNumber"], 16), "gasUsed": int(rcpt["gasUsed"], 16),
                "call": name}
@@ -341,6 +366,13 @@ def main():
     ap.add_argument("--margin", type=float, default=0.2, help="on top of the gas, for the relay's risk and upkeep")
     ap.add_argument("--min-fee", type=int, default=100, help="atomic units (USDC.e: 1e-6) at least per call")
     ap.add_argument("--receipt-timeout", type=int, default=90)
+    ap.add_argument("--channels", action=argparse.BooleanOptionalAction, default=True,
+                    help="offer x402 batch-settlement beside exact (#179): a deposit once, a voucher per call at the gas it took")
+    ap.add_argument("--dir", default="./relay_state", help="batch-settlement: where the channels' book is kept")
+    ap.add_argument("--withdraw-delay", type=int, default=24 * 3600)
+    ap.add_argument("--min-deposit", type=int, default=1000000, help="batch-settlement: the deposit asked for (atomic units)")
+    ap.add_argument("--claim-interval", type=int, default=3600)
+    ap.add_argument("--refund-idle", type=int, default=7 * 24 * 3600)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     Handler.relay = Relay(args)
