@@ -256,6 +256,8 @@ numbers, on the VFS watch it replaced, were within 3% of these).
 
 Rerun before the v0.4.0 tag (2026-11-03, 86b85963d9, same harness, median of three): write_only plain 7757 tps, pages 7592, rows 3835; read_write plain 4385, pages 4600, rows 2373. Every figure within 3% of the table.
 
+Rerun for v0.5 (2026-11-04, 42a7bada24, same harness, median of three, with the demo running on the machine): write_only plain 7812 tps, pages 7523, rows 3864; read_write plain 4423, pages 4627, rows 2414. Every figure is within 2% of v0.4.0's. v0.5's additions on the write path include the pre-update hook on every row change under row and statement capture (#169, active here: the bench's SQLite has `SQLITE_ENABLE_PREUPDATE_HOOK`), the trace's own-text check (#176) and the spend check after a flush (#173); none of them shows.
+
 How to read it:
 
 - **Page capture costs the writer about 30 µs per transaction** (p50 0.127
