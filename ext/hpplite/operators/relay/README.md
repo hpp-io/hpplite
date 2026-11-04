@@ -34,7 +34,12 @@ relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file relay.key \
 3. **The price.** A `402` quotes the gas plus a quarter of headroom at the
    current fee (base plus tip), plus `--margin` (20%), converted at
    `--eth-usd`, and at least `--min-fee` units. The quote holds for two
-   minutes, so the paid retry pays exactly what was quoted.
+   minutes, so the paid retry pays exactly what was quoted. The quote is
+   carried in the offer itself (`extra.quote`: the gas, the expiry and a MAC
+   under a key derived from the relay's), and the paid retry names it back
+   in `accepted`, so the relay remembers nothing between the two: a restart,
+   or another process with the same key (a Worker isolate), honours it
+   (#184). A quote changed by the buyer does not verify, and is priced anew.
 4. **Paid:** the payment is verified, the transaction submitted, and the
    relay waits for its receipt. The payment is settled only once the
    transaction succeeded. A call that reverts on chain after all, for

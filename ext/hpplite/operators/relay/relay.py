@@ -16,7 +16,9 @@ Endpoints
   POST /commit   {"to": "0x...", "data": "0x..."}: one of the signed calls below, to the factory or
                  to a rollup it created. Simulated first (eth_estimateGas): a call that would revert
                  is answered 422 with the reason and costs nothing. Then 402 with the price (the gas
-                 at the current fee, a margin, converted at --eth-usd, at least --min-fee); paid, it is
+                 at the current fee, a margin, converted at --eth-usd, at least --min-fee; the quote
+                 MACed in the offer's extra, honoured for two minutes by any process with the key,
+                 #184); paid, it is
                  submitted and the answer waits for its receipt: 200 {tx, block, gasUsed}. The payment
                  is settled only once the transaction succeeded: a call that reverts on chain after
                  all (another one got in first) is answered 409 and not charged.
@@ -34,6 +36,8 @@ for whatever a caller sends.
 """
 import argparse
 import base64
+import hashlib
+import hmac
 import http.server
 import json
 import math
@@ -84,7 +88,9 @@ class Relay:
             self.payments.channels = channels.Channels(args.dir, self.payments, self.key, args.withdraw_delay, args.min_deposit,
                                                        args.claim_interval, args.refund_idle)
             self.payments.channels.start()
-        self.quotes = {}                      # keccak(to, data) -> (amount, gas, until): the 402's price holds for the retry
+        # the 402's price holds for the paid retry with nothing remembered between them (#184): the quote travels in
+        # the offer's extra, MACed under a key derived from the relay's own, so any process holding that key honours it
+        self.quote_key = eth.keccak256(b"hpplite-relay-quote" + self.key)
         self.submitted = 0
         self.started = int(time.time())
 
@@ -112,6 +118,23 @@ class Relay:
         return None, "not a call the relay takes"
 
     # --- what it costs ---
+    def _quote_mac(self, to, data, amount, gas, until):
+        msg = "%d|%s|%s|%d|%d|%d" % (self.chain_id, to.lower(), eth.keccak256(bytes.fromhex(data[2:])).hex(), int(amount), int(gas), int(until))
+        return hmac.new(self.quote_key, msg.encode(), hashlib.sha256).hexdigest()
+
+    def quote_extra(self, to, data, amount, gas, until):
+        return {"quote": {"gas": gas, "until": until, "mac": self._quote_mac(to, data, amount, gas, until)}}
+
+    def honoured(self, accepted, to, data, now):
+        """(amount, gas, until) of the quote the payment names, when this relay made it for this call and it holds; else None"""
+        try:
+            q = (accepted.get("extra") or {}).get("quote") or {}
+            amount, gas, until = int(accepted["amount"]), int(q["gas"]), int(q["until"])
+            ok = until >= now and hmac.compare_digest(str(q["mac"]), self._quote_mac(to, data, amount, gas, until))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        return (amount, gas, until) if ok else None
+
     def fees(self):
         base = int(self.chain.call("eth_getBlockByNumber", "latest", False).get("baseFeePerGas", "0x0"), 16)
         try:
@@ -200,33 +223,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name, why = r.classify(to, data)
         if not name:
             return self.reply(400, {"error": why})
-        key = eth.keccak256((to.lower() + data.lower()).encode())
-        now = time.time()
-        quote = r.quotes.get(key)
-        if not quote or quote[2] < now:
+        now = int(time.time())
+        p = r.payments
+        header = self.headers.get("PAYMENT-SIGNATURE") if p.enabled else None
+        payload = p.decode(header) if header else None
+        if header and (not payload or "payload" not in payload):
+            return self.reply(400, {"error": "PAYMENT-SIGNATURE is not a payment payload"})
+        # a payment for a quote this relay made, still good: its price and gas, as offered. Otherwise a fresh quote
+        # (and a payment for something else is checked against it, as any)
+        quote = r.honoured(payload.get("accepted"), to, data, now) if payload else None
+        if not quote:
             try:
                 gas = int(r.chain.call("eth_estimateGas", {"from": r.address, "to": to, "data": data}), 16)
             except RpcError as e:
                 return self.reply(422, {"error": "the call would revert: %s" % revert_reason(e), "call": name})
             gas = int(gas * 1.25) + 10000                        # headroom: the state moves between estimate and inclusion
-            fee = r.fees()[2]
-            quote = (r.price(gas, fee), gas, now + 120)
-            r.quotes = {k: q for k, q in r.quotes.items() if q[2] >= now}
-            r.quotes[key] = quote
-        amount, gas, _ = quote
-        p = r.payments
-        payload = None
+            quote = (r.price(gas, r.fees()[2]), gas, now + 120)
+        amount, gas, until = quote
         requirements = None
         voucher = None                                           # (channel id, deposit tx) when paid by voucher (#179)
         if p.enabled:
             requirements = p.requirements(amount, "http://%s/commit" % self.headers.get("Host", "localhost"),
-                                          "%s, %d gas, submitted and paid for by the relay" % (name, gas))
-            header = self.headers.get("PAYMENT-SIGNATURE")
+                                          "%s, %d gas, submitted and paid for by the relay" % (name, gas),
+                                          r.quote_extra(to, data, amount, gas, until))
             if not header:
                 return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
-            payload = p.decode(header)
-            if not payload or "payload" not in payload:
-                return self.reply(400, {"error": "PAYMENT-SIGNATURE is not a payment payload"})
         if p.enabled and (payload.get("accepted") or {}).get("scheme") == channels.SCHEME and p.channels:
             ok, cid, err, deposit_tx = p.channels.verify(payload, requirements["accepts"][-1])
             if not ok:
@@ -245,7 +266,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with r.lock:
             rcpt, err = r.submit(to, data, gas)
             if err or int(rcpt.get("status") or "0x0", 16) != 1:
-                r.quotes.pop(key, None)
                 tx = rcpt.get("transactionHash") if rcpt else None
                 return self.reply(409 if rcpt else 502, {"error": err or "the transaction reverted", "tx": tx, "call": name,
                                                          "charged": False})
@@ -258,7 +278,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             price = int(rcpt.get("effectiveGasPrice") or "0x0", 16)
             actual = r.price(used, price) if used and price else amount
             settlement = p.channels.commit(payload, requirements["accepts"][-1], voucher[0], voucher[1], charge=actual)
-        r.quotes.pop(key, None)
         out = {"tx": rcpt["transactionHash"], "block": int(rcpt["blockNumber"], 16), "gasUsed": int(rcpt["gasUsed"], 16),
                "call": name}
         headers = {}

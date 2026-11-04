@@ -27,8 +27,9 @@ class Payments:
     def enabled(self):
         return self.facilitator is not None
 
-    def requirements(self, amount: int, resource_url: str, description: str):
-        return {
+    def requirements(self, amount: int, resource_url: str, description: str, extra=None):
+        """The 402. extra: fields every offer carries besides the token's (the relay's signed quote, #184)"""
+        out = {
             "x402Version": 2,
             "error": "PAYMENT-SIGNATURE header is required",
             "resource": {"url": resource_url, "description": description, "mimeType": "application/json"},
@@ -37,6 +38,9 @@ class Payments:
                 "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": self.extra,
             }] + ([self.channels.requirement(amount)] if self.channels else []),
         }
+        for a in out["accepts"]:
+            a["extra"] = dict(a["extra"], **(extra or {}))
+        return out
 
     def decode(self, header: str):
         try:

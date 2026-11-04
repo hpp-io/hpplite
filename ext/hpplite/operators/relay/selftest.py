@@ -9,6 +9,7 @@ wallet's ETH balance is zero at the end.
     HPPLITE_ANVIL_RPC=... HPPLITE_ANVIL_FACTORY=... HPPLITE_ANVIL_USDC=... HPPLITE_ANVIL_KEY0=... \\
     HPPLITE_ANVIL_KEY9=... python3 -I selftest.py
 """
+import base64
 import json
 import os
 import secrets
@@ -106,23 +107,24 @@ def main():
     relay_addr = eth.address(bytes.fromhex(RELAY_KEY[2:]))
     port = free_port()
     log = open(os.path.join(work, "relay.log"), "w")
-    proc = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC,
-                             "--key-file", keyfile, "--factory", FACTORY, "--facilitator", os.environ["HPPLITE_ANVIL_FACILITATOR"], "--asset", USDC,
-                             "--eth-usd", "30"],                 # anvil's gas costs ~100x HPP's (1 gwei vs 0.01)
-                            stdout=log, stderr=log)
     url = "http://127.0.0.1:%d" % port
-    try:
+
+    def start_relay(eth_usd="30"):                           # anvil's gas costs ~100x HPP's (1 gwei vs 0.01)
+        p = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC,
+                              "--key-file", keyfile, "--factory", FACTORY, "--facilitator", os.environ["HPPLITE_ANVIL_FACILITATOR"],
+                              "--asset", USDC, "--eth-usd", eth_usd, "--dir", os.path.join(work, "relay_state")], stdout=log, stderr=log)
         for _ in range(100):
-            if proc.poll() is not None:
-                break
+            if p.poll() is not None:
+                return p, None
             try:
                 with urllib.request.urlopen(url + "/status", timeout=2) as r:
-                    status = json.loads(r.read())
-                    break
+                    return p, json.loads(r.read())
             except OSError:
                 time.sleep(0.1)
-        else:
-            status = None
+        return p, None
+
+    proc, status = start_relay()
+    try:
         if proc.poll() is not None or not status:
             print("FAIL: the relay did not start"); print(open(os.path.join(work, "relay.log")).read()); return 1
         check(status["address"].lower() == relay_addr.lower() and status["chainId"] == chain_id, "GET /status names the relay's address and the chain")
@@ -194,6 +196,29 @@ def main():
         st, _, _, paid, _ = commit(rollup, encode("releaseLeaseFor(bytes32,uint256,uint256,bytes)", instance, 2, deadline, lease("release", 2)))
         active = int(call_view(rollup, "isLeaseActive()"), 16)
         check(st == 200 and active == 0, "releaseLeaseFor through the relay: the lease is free")
+
+        # 6. the 402's price holds for the paid retry, whatever reaches it (#184): the relay restarted between the
+        # two (another Worker isolate has no memory of the quote) at a price 100 times higher; the payment for the
+        # quote is taken, and a quote the buyer changed is not
+        cbody = json.dumps({"to": rollup, "data": encode("claimSequencerFor(bytes32,uint256,uint256,bytes)", instance, 3, deadline,
+                                                         lease("claim", 3))}).encode()
+        st, hdrs, _ = buyer._request("POST", "/commit", cbody)
+        hdr = {k.upper(): v for k, v in hdrs.items()}.get("PAYMENT-REQUIRED", "")
+        offered = json.loads(base64.b64decode(hdr)) if hdr else {}
+        quoted = int(offered["accepts"][0]["amount"]) if offered else 0
+        check(st == 402 and quoted > 0, "a 402 for the claim: %d units" % quoted)
+        proc.terminate(); proc.wait()
+        proc, status = start_relay(eth_usd="3000")
+        check(status is not None, "the relay restarted, at 100 times the price")
+        forged = dict(offered, accepts=[dict(offered["accepts"][0], amount="1")])
+        u0 = balance_usdc(wallet)
+        st, _, _ = buyer._request("POST", "/commit", cbody, {"PAYMENT-SIGNATURE": buyer._payment(base64.b64encode(json.dumps(forged).encode()).decode())})
+        check(st == 402 and balance_usdc(wallet) == u0, "a quote changed by the buyer (1 unit): refused, nothing paid (%d)" % st)
+        st, _, _ = buyer._request("POST", "/commit", cbody, {"PAYMENT-SIGNATURE": buyer._payment(hdr)})
+        paid = u0 - balance_usdc(wallet)
+        holder = "0x" + call_view(rollup, "sequencerWallet()")[-40:]
+        check(st == 200 and paid == quoted and holder.lower() == wallet.lower(),
+              "paid at the quote after the restart: %d, the price quoted (%d units), the lease taken" % (st, paid))
 
         spent = 10_000_000 - balance_usdc(wallet)
         check(balance_eth(wallet) == 0, "the wallet's ETH balance is still 0; it spent %d units (%.4f USDC.e) in all" % (spent, spent / 1e6))
