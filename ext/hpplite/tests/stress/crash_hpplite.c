@@ -13,6 +13,13 @@
 ** for more random rounds. --l1 dir runs the same against the directory
 ** backend (l1=file://, #35) instead of the directory-backed mock: there the
 ** dead writer's lease is expired by the owner's right, not by a mock clock.
+**
+** --store <pin service dir> (ctest test_crash_store, #167): the writer puts
+** its batches at a pin service and anchors nothing; it is killed at random
+** between a flush and an anchor; a new sequencer with the key on a fresh file
+** recovers the batches from the store by name: nothing up to the last flush
+** that returned is lost, it anchors them, a replica from the chain and the
+** store equals it.
 */
 #include "hpplite.h"
 #include "node.h"
@@ -25,6 +32,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <fcntl.h>
 
 #define DIR "/tmp/hpplite_crash"
 #define L1DIR DIR "/l1"
@@ -35,6 +45,7 @@ static const unsigned char PRIVKEY[32] = {
 };
 static int failures = 0;
 static int useDir = 0;                           /* --l1 dir: the directory backend instead of the mock */
+static char storeUrl[64];                        /* --store: the pin service of this round (#167) */
 #define CHECK(cond, ...) do { if (!(cond)) { printf("    FAIL: " __VA_ARGS__); printf("\n"); failures++; } } while (0)
 
 /* The persistent L1 every process of a round shares */
@@ -79,6 +90,7 @@ static HppliteNode *open_node(const char *path, HppliteL1 *l1, int intervalMs, s
     config.checkpointInterval = 2;
     config.batchIntervalMs = intervalMs;
     config.maxBatchBytes = limit;
+    if (storeUrl[0]) config.storeUrl = storeUrl;
     HppliteNode *n = hpplite_node_create(&config);
     if (n) {
         hpplite_node_set_l1(n, l1);
@@ -217,13 +229,144 @@ static int run_child(const char *crashAt, int rows, int intervalMs, size_t limit
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+/* === --store (#167): a sequencer lost between a flush and an anchor === */
+#define PINDIR "/tmp/hpplite_crash_pins"
+static pid_t pinPid = -1;
+
+static int free_port(void) {
+    struct sockaddr_in a;
+    socklen_t n = sizeof a;
+    int fd = socket(AF_INET, SOCK_STREAM, 0), port = 0;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (fd >= 0 && bind(fd, (struct sockaddr *)&a, sizeof a) == 0 && getsockname(fd, (struct sockaddr *)&a, &n) == 0) port = ntohs(a.sin_port);
+    if (fd >= 0) close(fd);
+    return port;
+}
+
+/* a free pin service with a directory of its own for the round: no names left by another round */
+static int start_pins(const char *svc, int round) {
+    char dir[200], cmd[600], script[600], portStr[16];
+    int port = free_port();
+    snprintf(dir, sizeof dir, PINDIR "/round%d", round);
+    snprintf(cmd, sizeof cmd, "mkdir -p %s && echo 0x2020202020202020202020202020202020202020202020202020202020202020 > %s/signer.key", dir, dir);
+    if (system(cmd) != 0 || !port) return -1;
+    snprintf(script, sizeof script, "%s/pin_service.py", svc);
+    snprintf(portStr, sizeof portStr, "%d", port);
+    pinPid = fork();
+    if (pinPid == 0) {
+        char key[260];
+        int fd = open(PINDIR "/service.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        snprintf(key, sizeof key, "%s/signer.key", dir);
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", dir, "--signer-key", key,
+               "--pay-to", "0x1111111111111111111111111111111111111111", (char *)NULL);
+        _exit(127);
+    }
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", port);
+    for (int i = 0; i < 100; i++) {
+        snprintf(cmd, sizeof cmd, "curl -s -m 1 %s/status 2>/dev/null | grep -q signer", storeUrl);
+        if (waitpid(pinPid, NULL, WNOHANG) == pinPid) break;       /* the port was taken: never use another's service */
+        if (system(cmd) == 0) return 0;
+        usleep(100 * 1000);
+    }
+    return -1;
+}
+
+static void stop_pins(void) {
+    if (pinPid > 0) { kill(pinPid, SIGTERM); waitpid(pinPid, NULL, 0); }
+    pinPid = -1;
+}
+
+/* The writer: rows, a flush every five; after each flush that returned, the last id it holds goes to a file (fsync'd) */
+static void store_writer(int round) {
+    char path[200];
+    HppliteL1 *l1 = open_l1();
+    snprintf(path, sizeof path, DIR "/sa%d.db", round);
+    HppliteNode *n = open_node(path, l1, 0, 0);
+    if (!n) _exit(2);
+    sqlite3_exec(n->db, "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v)", NULL, NULL, NULL);
+    for (int i = 1; ; i++) {
+        char sql[128];
+        snprintf(sql, sizeof sql, "INSERT INTO t VALUES(%d, 'row %d before the crash')", i, i);
+        sqlite3_exec(n->db, sql, NULL, NULL, NULL);
+        if (i % 5 == 0 && hpplite_node_flush_batch(n) > 0) {
+            char line[32];
+            int fd = open(DIR "/flushed", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) { int k = snprintf(line, sizeof line, "%d\n", i); (void)!write(fd, line, (size_t)k); fsync(fd); close(fd); }
+        }
+    }
+}
+
+static void store_check(int round) {
+    char path[200], line[32] = "0";
+    int fd = open(DIR "/flushed", O_RDONLY), flushed;
+    if (fd >= 0) { (void)!read(fd, line, sizeof line - 1); close(fd); }
+    flushed = atoi(line);
+    HppliteL1 *l1 = open_l1();
+    expire_dead_lease(l1);
+    snprintf(path, sizeof path, DIR "/sb%d.db", round);              /* the machine is gone: a fresh file */
+    HppliteNode *n = open_node(path, l1, 0, 0);
+    CHECK(n != NULL, "store round %d: the successor did not open", round);
+    if (!n) { hpplite_l1_disconnect(l1); return; }
+    sqlite3_int64 rows = rows_of_t(n->db), maxId = rows > 0 ? scalar(n->db, "SELECT max(id) FROM t") : 0;
+    printf("(flushed %d, recovered %lld) ", flushed, (long long)rows);
+    CHECK(rows >= flushed, "store round %d: %lld rows recovered, %d were flushed before the kill (%s)", round, (long long)rows, flushed, n->ctx->zLastError);
+    CHECK(rows == maxId, "store round %d: the recovered ids are not contiguous (%lld rows, max id %lld)", round, (long long)rows, (long long)maxId);
+    sqlite3_exec(n->db, "INSERT INTO t VALUES(1000000, 'after the recovery')", NULL, NULL, NULL);
+    CHECK(hpplite_node_flush_batch(n) > 0, "store round %d: the successor's own flush", round);
+    CHECK(hpplite_node_anchor(n) > 0, "store round %d: the anchor of what was recovered (%s)", round, n->ctx->zLastError);
+    unsigned char rootW[32], rootR[32];
+    hpplite_node_get_state_root(n, rootW);
+    rows = rows_of_t(n->db);
+    hpplite_node_destroy(n);
+    HppliteL1 *l1r = open_l1();
+    snprintf(path, sizeof path, DIR "/sr%d.db", round);
+    HppliteNode *r = open_node(path, l1r, 0, 0);
+    CHECK(r != NULL, "store round %d: replica open", round);
+    if (r) {
+        hpplite_node_get_state_root(r, rootR);
+        CHECK(rows_of_t(r->db) == rows, "store round %d: replica rows %lld != %lld", round, (long long)rows_of_t(r->db), (long long)rows);
+        CHECK(memcmp(rootW, rootR, 32) == 0, "store round %d: replica root differs", round);
+        hpplite_node_destroy(r);
+    }
+    hpplite_l1_disconnect(l1r);
+    hpplite_l1_disconnect(l1);
+}
+
+static int store_rounds(const char *svc, int rounds) {
+    (void)!system("rm -rf " PINDIR);
+    mkdir(PINDIR, 0755);
+    for (int r = 0; r < rounds; r++) {
+        int before = failures, after = 60 + rand() % 400;
+        reset_dir();
+        if (start_pins(svc, r) != 0) { CHECK(0, "store round %d: the pin service did not start (see " PINDIR "/service.log)", r); stop_pins(); break; }
+        printf("  store: kill -9 after %3d ms, before any anchor (round %d) ", after, r + 1);
+        pid_t pid = fork();
+        if (pid == 0) { store_writer(r); _exit(0); }
+        usleep(after * 1000);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        store_check(r);
+        stop_pins();
+        printf("%s\n", failures == before ? "ok" : "FAIL");
+    }
+    if (!failures) (void)!system("rm -rf " PINDIR " " DIR);
+    printf("\n=== crash harness (store): %s ===\n", failures ? "FAILED" : "PASSED");
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     int rounds = 6;
+    const char *storeSvc = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--l1") && i + 1 < argc) useDir = !strcmp(argv[++i], "dir");
+        else if (!strcmp(argv[i], "--store") && i + 1 < argc) storeSvc = argv[++i];
     }
     srand((unsigned)getpid());
+    if (storeSvc) return store_rounds(storeSvc, rounds);
     printf("L1: %s\n", useDir ? "directory backend (l1=file://)" : "directory-backed mock");
 
     /* --- deterministic crash points --- */

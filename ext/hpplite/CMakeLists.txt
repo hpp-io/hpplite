@@ -426,6 +426,8 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_rows_e2e COMMAND test_rows_e2e)
         add_test(NAME test_blob_io COMMAND test_blob_io)
         add_test(NAME test_crash COMMAND crash_hpplite)
+        # a sequencer lost between a flush and an anchor, a successor recovering from the store by key (#167)
+        add_test(NAME test_crash_store COMMAND crash_hpplite --store ${CMAKE_CURRENT_SOURCE_DIR}/examples/pin_service)
 
         # Every suite above again with statement capture (capture=text, v0.1's;
         # rows are the default, #19): the cases about statement text run there
