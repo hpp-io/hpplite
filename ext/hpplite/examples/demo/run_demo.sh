@@ -18,9 +18,11 @@ fi
 unset HPPLITE_CONTRACT_ADDRESS HPPLITE_FACTORY_ADDRESS HPPLITE_L1_RPC HPPLITE_DATA_DIR
 cd "$here"
 # the app loads a copy: a rebuild of build_real (development goes on beside a
-# public demo) must not change the module under a running process
-mkdir -p "$here/data"
-cp "$ext" "$here/data/hpplite-module.dylib" && ext="$here/data/hpplite-module.dylib"
+# public demo) must not change the module under a running process. The copy
+# keeps the name hpplite.dylib: SQLite derives the entry point from the file's
+# name (hpplite-module.dylib would need sqlite3_hpplitemodule_init)
+mkdir -p "$here/data/module"
+cp "$ext" "$here/data/module/hpplite.dylib" && ext="$here/data/module/hpplite.dylib"
 # the store (#164): the batch bytes go to a pin service here (free mode, data/pins), the
 # chain gets one anchor per 30 minutes; the receipt key is the service's own, nothing valuable
 pinport=${PIN_PORT:-8788}
