@@ -18,4 +18,6 @@ The protocols they speak, and what a node expects of any implementation:
 
 The store and the relay are deployed separately: the relay holds a funded
 hot key and sends transactions, the store holds data.
+| `conformance/vectors.json` | Test vectors (#189): digests, signatures, CIDs, prices, quote MACs, selectors - what any implementation checks itself against. `vectors.py` checks the reference computes them |
+| `conformance/conformance.py` | The conformance suite (#189): the protocol docs, call by call, against any `--store` or `--relay` URL |
 | `conformance/facilitator_mock.py` | An x402 facilitator for anvil (#183): both schemes, its own key, HPP's facilitator's habits. The services only ever talk to a facilitator URL |

@@ -220,6 +220,11 @@ def main():
         check(st == 200 and paid == quoted and holder.lower() == wallet.lower(),
               "paid at the quote after the restart: %d, the price quoted (%d units), the lease taken" % (st, paid))
 
+        # 7. the conformance suite against this relay (#189)
+        import conformance
+        conformance.relay(url)
+        check(conformance.fails == 0, "the conformance suite (doc/relay-protocol.md) passes against the relay")
+
         spent = 10_000_000 - balance_usdc(wallet)
         check(balance_eth(wallet) == 0, "the wallet's ETH balance is still 0; it spent %d units (%.4f USDC.e) in all" % (spent, spent / 1e6))
     finally:

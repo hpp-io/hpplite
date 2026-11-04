@@ -44,7 +44,9 @@ changes a signed form changes this list; a relay serves one factory.
 
 The `402` quotes the call's gas (the estimate plus headroom) at the current
 fee, plus the relay's margin, converted to the asset's atomic units, at
-least its minimum fee. Offers as in the store protocol: `exact`, and
+least its minimum fee: `max(ceil(gas × fee × (1 + margin) × ethUsd × 10^6 /
+10^18), minFee)` in IEEE doubles in that order (cases in
+`operators/conformance/vectors.json`). Offers as in the store protocol: `exact`, and
 `batch-settlement` when the relay offers channels.
 
 Every offer's `extra.quote` is `{gas, until, mac}`: the gas the price was

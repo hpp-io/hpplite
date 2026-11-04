@@ -92,7 +92,9 @@ is asked (`hpplite_status.store_price`).
 A paid call without `PAYMENT-SIGNATURE` answers `402` with the requirements
 in the body and, base64, in `PAYMENT-REQUIRED`. The price of a put of `n`
 bytes is `pricePerPin + pricePerByte × n + ceil(pricePerMiBMonth × n / 2^20 ×
-retentionSeconds / 2592000)`, in the asset's atomic units (USDC.e: 10^-6).
+retentionSeconds / 2592000 − 10^-9)`, in the asset's atomic units (USDC.e:
+10^-6), computed in IEEE doubles in that order (the node quotes it the same
+way; `operators/conformance/vectors.json` has cases).
 
 `accepts` offers:
 

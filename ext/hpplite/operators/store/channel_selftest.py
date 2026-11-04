@@ -322,6 +322,14 @@ def main():
         check(st == 200 and nonce_of(settle_addr) == n5 + 1 and r.get("transaction") == "",
               "a deposit into a channel that covers the put: not sent, the put done (%d, tx %r)" % (st, r.get("transaction")))
         check(channel_on_chain(cid2)[0] == 500, "still one deposit in the channel")
+
+        # 10. the conformance suite against this paid store (#189), its content calls paid with exact
+        sys.path.insert(0, os.path.join(here, "..", "conformance"))
+        import conformance
+        k3 = secrets.token_bytes(32)
+        cast("send", "--private-key", KEY0, USDC, "transfer(address,uint256)", eth.address(k3), "1000000")
+        conformance.store(url, "0x" + k3.hex())
+        check(conformance.fails == 0, "the conformance suite (doc/store-protocol.md) passes against the paid store")
     finally:
         mock_facilitator(queueDeposits=False)
         for p in procs:

@@ -307,6 +307,14 @@ PROTOCOL = "hpplite-store/1"        # the version of doc/store-protocol.md this 
 MIB = 1024 * 1024
 MONTH = 30 * 24 * 3600
 
+
+def put_price(nbytes, per_pin, per_byte, per_mib_month, retention) -> int:
+    """Whole units: the per-put fee, the storage for the retention bought, the legacy per-byte price (#172). The
+    arithmetic in this order, in IEEE doubles, is the protocol's (doc/store-protocol.md; the vectors, #189)"""
+    months = retention / MONTH
+    storage = per_mib_month * nbytes / MIB * months
+    return per_pin + per_byte * nbytes + math.ceil(storage - 1e-9)
+
 # ============ The HTTP service ============
 
 NAME_RE = re.compile(r"^[0-9a-f]{40}-[0-9]{1,18}$")
@@ -371,10 +379,7 @@ class Service:
         threading.Thread(target=loop, daemon=True).start()
 
     def price_put(self, nbytes):
-        """Whole units: the per-put fee, the storage for the retention bought, the legacy per-byte price (#172)."""
-        months = self.args.retention / MONTH
-        storage = self.args.price_per_mib_month * nbytes / MIB * months
-        return self.args.price_per_pin + self.args.price_per_byte * nbytes + math.ceil(storage - 1e-9)
+        return put_price(nbytes, self.args.price_per_pin, self.args.price_per_byte, self.args.price_per_mib_month, self.args.retention)
 
     def status(self):
         return {

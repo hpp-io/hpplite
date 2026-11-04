@@ -69,6 +69,24 @@ DA_CALLS = {selector(s): s.split("(")[0] for s in (
 
 PROTOCOL = "hpplite-relay/1"        # the version of doc/relay-protocol.md this relay speaks (#188)
 
+
+def quote_key(relay_key: bytes) -> bytes:
+    """The MAC key of the relay's quotes, derived from its own: any process holding the relay's key honours them (#184)"""
+    return eth.keccak256(b"hpplite-relay-quote" + relay_key)
+
+
+def quote_mac(key: bytes, chain_id, to, data, amount, gas, until) -> str:
+    msg = "%d|%s|%s|%d|%d|%d" % (int(chain_id), to.lower(), eth.keccak256(bytes.fromhex(data[2:])).hex(), int(amount), int(gas), int(until))
+    return hmac.new(key, msg.encode(), hashlib.sha256).hexdigest()
+
+
+def call_price(gas, fee, margin, eth_usd, min_fee) -> int:
+    """Atomic units (USDC.e: 6 decimals) for gas at fee wei, the margin on top, converted at eth_usd; at least min_fee.
+    The arithmetic in this order, in IEEE doubles, is the protocol's (doc/relay-protocol.md; the vectors, #189)"""
+    wei = gas * fee * (1 + margin)
+    units = math.ceil(wei * eth_usd * 1e6 / 1e18)
+    return max(units, min_fee)
+
 # ============ The relay ============
 
 class Relay:
@@ -92,7 +110,7 @@ class Relay:
             self.payments.channels.start()
         # the 402's price holds for the paid retry with nothing remembered between them (#184): the quote travels in
         # the offer's extra, MACed under a key derived from the relay's own, so any process holding that key honours it
-        self.quote_key = eth.keccak256(b"hpplite-relay-quote" + self.key)
+        self.quote_key = quote_key(self.key)
         self.submitted = 0
         self.started = int(time.time())
 
@@ -121,8 +139,7 @@ class Relay:
 
     # --- what it costs ---
     def _quote_mac(self, to, data, amount, gas, until):
-        msg = "%d|%s|%s|%d|%d|%d" % (self.chain_id, to.lower(), eth.keccak256(bytes.fromhex(data[2:])).hex(), int(amount), int(gas), int(until))
-        return hmac.new(self.quote_key, msg.encode(), hashlib.sha256).hexdigest()
+        return quote_mac(self.quote_key, self.chain_id, to, data, amount, gas, until)
 
     def quote_extra(self, to, data, amount, gas, until):
         return {"quote": {"gas": gas, "until": until, "mac": self._quote_mac(to, data, amount, gas, until)}}
@@ -146,9 +163,7 @@ class Relay:
         return tip, 2 * base + tip, base + tip      # the tip, the cap the transaction carries, what it is expected to pay
 
     def price(self, gas, fee):
-        wei = gas * fee * (1 + self.args.margin)
-        units = math.ceil(wei * self.args.eth_usd * 1e6 / 1e18)    # USDC.e: 6 decimals
-        return max(units, self.args.min_fee)
+        return call_price(gas, fee, self.args.margin, self.args.eth_usd, self.args.min_fee)
 
     # --- doing it ---
     def submit(self, to, data, gas):
