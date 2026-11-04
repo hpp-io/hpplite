@@ -2416,6 +2416,89 @@ static void test_store_channel(void) {
     PASS();
 }
 
+/* 30. Spending over time (#173): spendcap= over a rolling window, the store
+** and the relay together. Two puts at about 1,001 units fit 2500/hour; the
+** third is refused before anything is signed and waits, saying spendcap;
+** spent_window says what the window holds; the ledger is in the data
+** directory, so a reopen does not reset it. A wallet with 5,000 units at
+** that rate gets spend_warning (lowbalance=). */
+static void test_spend_cap(void) {
+    TEST("spending over time (#173): spendcap= refuses the put past the window's cap before signing, the batch waits; a reopen keeps the window; spend_warning names the balance that runs out");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    static const char SKEY[] = "0x3030303030303030303030303030303030303030303030303030303030303030";
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
+    char cmd[2400], wallet[80], extra[400], err[300];
+    int port = test_free_port();
+    FILE *f = fopen(DIR "/spend_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s --value 10ether >/dev/null && cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 5000 >/dev/null",
+             RPC, KEY0, wallet, RPC, KEY0, usdc, wallet);
+    if (system(cmd) != 0) FAIL("fund the wallet");
+    pid_t pid = fork();
+    if (pid == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        snprintf(script, sizeof script, "%s/pin_service.py", svc);
+        int fd = open(DIR "/spend_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/spend_pins", "--signer-key", DIR "/spend_signer.key",
+               "--pay-to", "0x3030000000000000000000000000000000000030", "--facilitator", "mock", "--rpc", RPC, "--asset", usdc, "--settle-key", KEY1,
+               "--network", "eip155:31337", "--price-per-pin", "1000", "--no-channels", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        char out[400];
+        if (!test_child_alive(pid)) break;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
+        up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
+        if (!up) usleep(200 * 1000);
+    }
+    if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the pin service did not come up"); }
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead: see scenario 18 */
+    setenv("HPPLITE_SPEND_CHECK_SECONDS", "1", 1);          /* the warning's rate from a second of history, not five minutes */
+#define SP_FAIL(why) do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); unsetenv("HPPLITE_SPEND_CHECK_SECONDS"); FAIL(why); } while (0)
+    snprintf(extra, sizeof extra, "&dbname=spendcap&store=http://127.0.0.1:%d&storecap=5000&spendcap=2500/hour&lowbalance=1000", port);
+    sqlite3 *w = open_db("spend_writer.db", SKEY, extra);
+    if (!w) SP_FAIL("open writer");
+    sqlite3_exec(w, "CREATE TABLE s(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    int ok1 = scalar(w, "SELECT hpplite_flush()") > 0;
+    sqlite3_exec(w, "INSERT INTO s(v) VALUES('the second put')", NULL, NULL, NULL);
+    int ok2 = scalar(w, "SELECT hpplite_flush()") > 0;
+    if (!ok1 || !ok2) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); SP_FAIL("two puts within the cap"); }
+    long long spent = status_int(w, "store_spent"), window = status_int(w, "spent_window");
+    sqlite3_exec(w, "INSERT INTO s(v) VALUES('past the cap')", NULL, NULL, NULL);
+    long long h = scalar(w, "SELECT hpplite_flush()");
+    snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+    int refused = h == 0 && strstr(err, "spendcap") && scalar(w, "SELECT pending FROM hpplite_status") > 0 && strcmp(status_text(w, "store_state"), "over cap") == 0;
+    printf("(spent %lld, window %lld; third put: flush %lld, '%.80s') ", spent, window, h, err);
+    if (spent <= 2000 || window != spent || !refused) { sqlite3_close(w); SP_FAIL("the third put should wait over spendcap, the window holding the two"); }
+    usleep(1500 * 1000);
+    char warn[300];
+    snprintf(warn, sizeof warn, "%s", status_text(w, "spend_warning"));
+    printf("(spend_warning '%s') ", warn);
+    if (!strstr(warn, "USDC.e")) { sqlite3_close(w); SP_FAIL("5,000 units at this rate should warn"); }
+    sqlite3_close(w);
+    w = open_db("spend_writer.db", SKEY, extra);
+    if (!w) SP_FAIL("reopen writer");
+    sqlite3_exec(w, "INSERT INTO s(v) VALUES('after a reopen')", NULL, NULL, NULL);
+    h = scalar(w, "SELECT hpplite_flush()");
+    snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+    long long window2 = status_int(w, "spent_window");
+    sqlite3_close(w);
+    printf("(after a reopen: flush %lld, window %lld) ", h, window2);
+    if (h != 0 || !strstr(err, "spendcap") || window2 < spent) SP_FAIL("a reopen must not reset the window");
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    unsetenv("HPPLITE_STORE_VALID_FOR"); unsetenv("HPPLITE_SPEND_CHECK_SECONDS");
+#undef SP_FAIL
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2456,6 +2539,7 @@ int main(void) {
     if (wanted(27)) test_relay_no_eth();
     if (wanted(28)) test_relay_fallback();
     if (wanted(29)) test_store_channel();
+    if (wanted(30)) test_spend_cap();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

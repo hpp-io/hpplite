@@ -80,6 +80,8 @@ typedef struct HppliteNodeConfig {
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storeDeposit;          /* storedeposit=: batch-settlement, the most unspent in the channel (0 = exact, #135) */
+    uint64_t spendCap, spendWindow; /* spendcap=: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
+    int lowBalanceHours;            /* lowbalance=: warn below this many hours of money at the recent rate; 0 = 72, -1 = off */
     char *relayUrl;                 /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */
     uint64_t relayCap;              /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
     int storeFallback;              /* storefallback=: a store that does not answer lets the chain carry the bytes (default on) */
@@ -136,6 +138,9 @@ typedef struct HppliteNode {
     int softWalked;                 /* the store's names past the chain were read once (#167) */
     uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
     int storeChannelBound;          /* the store's batch-settlement channel bound to this rollup (#135) */
+    struct HppliteSpend *spend;     /* what the store and the relay were paid, ETH samples (#173) */
+    char spendWarning[200];         /* what runs out and when; "" when nothing does (status spend_warning) */
+    long spendCheckedAt;
     int storeBalanceOk;
     long storeBalanceAt;            /* seconds (time()) */
 
@@ -291,6 +296,8 @@ int hpplite_node_exec(HppliteNode *node, const char *sql, char **errMsg);
 ** batch could not be confirmed on L1 (pending rows are kept and retried).
 */
 uint64_t hpplite_node_flush_batch(HppliteNode *node);
+/* The money the node pays with, against its recent spending (#173): an ETH sample, spend_warning set, a stderr line when it starts or clears */
+void hpplite_node_spend_check(HppliteNode *node);
 
 /*
 ** Fetch the batch at `height` from L1 and decode it: opens the envelope

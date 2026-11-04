@@ -59,6 +59,8 @@ int eth_client_sign_hash(EthClient *client, const uint8_t hash[32], uint8_t sig[
 
 /* The address holds any ETH: 1, 0, or -1 when the balance cannot be read */
 int eth_client_has_balance(EthClient *client, const uint8_t address[20]);
+/* The wallet's ETH in wei (#173): 0, or -1 */
+int eth_client_balance(EthClient *client, const uint8_t address[20], double *pWei);
 
 /* Get current gas price */
 uint64_t eth_client_gas_price(EthClient *client);

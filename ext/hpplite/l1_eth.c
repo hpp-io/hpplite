@@ -1731,6 +1731,11 @@ static int eth_token_balance(HppliteL1 *l1, const unsigned char token[20], const
     return 0;
 }
 
+static int eth_eth_balance(HppliteL1 *l1, double *pWei) {
+    if (!l1 || !self->has_privkey) return -1;
+    return eth_client_balance(self->eth, self->address, pWei);
+}
+
 static void eth_set_relay(HppliteL1 *l1, HppliteStore *relay) {
     if (l1) self->relay = relay;
 }
@@ -1840,6 +1845,7 @@ const HppliteL1Ops hppliteL1EthOps = {
     .has_ranges = eth_has_ranges,
     .chain_id = eth_chain_id,
     .token_balance = eth_token_balance,
+    .eth_balance = eth_eth_balance,
     .set_relay = eth_set_relay,
     .last_tx_path = eth_last_tx_path,
     .relay_error = eth_relay_error,

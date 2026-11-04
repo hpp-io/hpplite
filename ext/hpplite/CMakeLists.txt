@@ -109,7 +109,7 @@ set(HPPLITE_SOURCES
 # L1 backends: every build has both; the endpoint picks one at run time (#35).
 # HPPLITE_USE_REAL_L1 now only decides whether the tests and examples that
 # need a chain (anvil, HPP Sepolia) are built, and keeps the test hooks out.
-list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c compress.c smt.c state_tree.c)
+list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c spend.c compress.c smt.c state_tree.c)
 if(HPPLITE_USE_REAL_L1)
     message(STATUS "L1 backends: eth + mock; chain tests and examples on")
 else()

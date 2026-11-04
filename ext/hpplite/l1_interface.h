@@ -206,6 +206,8 @@ uint64_t hpplite_l1_chain_id(HppliteL1 *l1);
 
 /* An ERC-20 balance on that chain (#11): balanceOf(owner) of token, 32 big-endian bytes. 0, or -1 when it cannot be read. */
 int hpplite_l1_token_balance(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]);
+/* The wallet's ETH balance in wei (#173): 0, or -1 when the backend has none or it cannot be read */
+int hpplite_l1_eth_balance(HppliteL1 *l1, double *pWei);
 
 /* A relay (#126, examples/relay): the node's writes go through it as their
 ** EIP-712 signed forms, paid over x402; the plain transaction only when the

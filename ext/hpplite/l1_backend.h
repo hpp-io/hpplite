@@ -91,6 +91,8 @@ struct HppliteL1Ops {
     ** when the backend has neither (the mock, a directory). */
     uint64_t (*chain_id)(HppliteL1 *l1);
     int (*token_balance)(HppliteL1 *l1, const unsigned char token[20], const unsigned char owner[20], uint8_t out[32]);
+    /* The wallet's ETH balance in wei (#173); NULL when the backend has no ETH (the mock, a directory) */
+    int (*eth_balance)(HppliteL1 *l1, double *pWei);
     /* A relay (#126): the signed forms of the writes go through it; NULL
     ** ops when the backend submits nothing (the mock, a directory) */
     void (*set_relay)(HppliteL1 *l1, struct HppliteStore *relay);

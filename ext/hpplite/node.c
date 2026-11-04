@@ -53,6 +53,8 @@ static int node_check_rollup(HppliteNode *node);
 #include <sys/file.h>
 #include <fcntl.h>
 #include "eth/keccak256.h"
+#include "eth/eth_client.h"
+#include "spend.h"
 
 /*
 ** Helper: duplicate a string using sqlite3_malloc
@@ -142,6 +144,9 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeUrl = node_strdup(config->storeUrl);
     node->config.storeCap = config->storeCap;
     node->config.storeDeposit = config->storeDeposit;
+    node->config.spendCap = config->spendCap;
+    node->config.spendWindow = config->spendWindow;
+    node->config.lowBalanceHours = config->lowBalanceHours;
     node->config.storeFallback = config->storeFallback;
     node->config.anchorIntervalMs = config->anchorIntervalMs;
     node->config.relayUrl = node_strdup(config->relayUrl);
@@ -163,6 +168,22 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
             fprintf(stderr, "hpplite: store=%s: not a store HPPLite knows (http://host:port of a pin service, kubo://host:port of a Kubo node, s3://bucket/prefix)\n", node->config.storeUrl);
             return -1;
         }
+    }
+    if (node->store || node->relay) {
+        /* what they are paid, over time (#173): a cap over a window, the rate a warning reads */
+        /* the wallet's money: one ledger per wallet in the data directory, whatever rollups it has there;
+        ** a node opened without its key (hpplite_key later, #17) keeps it in memory */
+        char *zLedger = NULL;
+        unsigned char me[20];
+        if (node->config.dataDir && config->hasPrivkey && eth_address_from_privkey(config->privkey, me) == 0) {
+            char hex[41];
+            hpplite_bytes_to_hex(me, 20, hex);
+            zLedger = sqlite3_mprintf("%s/spend-%s.json", node->config.dataDir, hex);
+        }
+        node->spend = hpplite_spend_open(zLedger, node->config.spendCap, node->config.spendWindow);
+        sqlite3_free(zLedger);
+        hpplite_store_set_spend(node->store, node->spend);
+        hpplite_store_set_spend(node->relay, node->spend);
     }
     node_cap_batch_limit(node);
     node->config.noEncrypt = config->noEncrypt;
@@ -953,6 +974,8 @@ void hpplite_node_destroy(HppliteNode *node) {
         hpplite_store_close(node->relay);
         node->relay = NULL;
     }
+    hpplite_spend_close(node->spend);           /* after the handles that wrote to it */
+    node->spend = NULL;
 
     /* Shutdown HPPLite context */
     if (node->ctx) {
@@ -2604,8 +2627,47 @@ uint64_t hpplite_node_flush_batch(HppliteNode *node) {
     node->leaseRecheckAt = 0;
     node->retryAt = 0;
     height = node_flush_unlocked(node);
+    hpplite_node_spend_check(node);
     if (mutex) pthread_mutex_unlock(mutex);
     return height;
+}
+
+void hpplite_node_spend_check(HppliteNode *node) {
+    time_t now = time(NULL);
+    char w[200] = "";
+    int hours = node && node->config.lowBalanceHours ? node->config.lowBalanceHours : 72;
+    double wei = -1;
+    uint64_t span = 0;
+    /* a rate from five minutes of history at least (a burst at start is not a rate), checked every 30 s;
+    ** HPPLITE_SPEND_CHECK_SECONDS sets both (tests) */
+    const char *zTest = getenv("HPPLITE_SPEND_CHECK_SECONDS");
+    long every = zTest && atol(zTest) > 0 ? atol(zTest) : 30;
+    uint64_t minSpan = zTest && atol(zTest) > 0 ? (uint64_t)atol(zTest) : 300;
+    if (!node || !node->l1 || !node->spend || now - node->spendCheckedAt < every) return;
+    node->spendCheckedAt = now;
+    if (hpplite_l1_eth_balance(node->l1, &wei) == 0) hpplite_spend_eth_sample(node->spend, wei);
+    else wei = -1;
+    if (hours > 0) {
+        uint64_t spent = hpplite_spend_since(node->spend, 86400, &span);
+        uint8_t b[32];
+        static const uint8_t zero24[24];
+        if (spent && span >= minSpan && hpplite_node_store_balance(node, b) == 0 && memcmp(b, zero24, 24) == 0) {
+            uint64_t bal = 0, charged = 0, inChannel = 0;
+            for (int i = 24; i < 32; i++) bal = (bal << 8) | b[i];
+            if (hpplite_store_channel(node->store, NULL, &charged, &inChannel, NULL) == 0 && inChannel > charged) bal += inChannel - charged;
+            double perHour = (double)spent * 3600.0 / (double)span, left = (double)bal / perHour;
+            if (left < hours) snprintf(w, sizeof w, "USDC.e for about %.0f h at the recent rate (%llu left, %.0f an hour)", left, (unsigned long long)bal, perHour);
+        }
+        double ethSpent = hpplite_spend_eth_spent(node->spend, &span);
+        if (ethSpent > 0 && span >= minSpan && wei >= 0) {
+            double perHour = ethSpent * 3600.0 / (double)span, left = wei / perHour;
+            size_t n = strlen(w);
+            if (left < hours) snprintf(w + n, sizeof w - n, "%sETH for about %.0f h at the recent rate (%.6f ETH left)", n ? "; " : "", left, wei / 1e18);
+        }
+    }
+    if (w[0] && strcmp(w, node->spendWarning) != 0 && !node->spendWarning[0]) fprintf(stderr, "hpplite: warning: %s (lowbalance=%d)\n", w, hours);
+    else if (!w[0] && node->spendWarning[0]) fprintf(stderr, "hpplite: the balance warning cleared\n");
+    snprintf(node->spendWarning, sizeof node->spendWarning, "%s", w);
 }
 
 /*

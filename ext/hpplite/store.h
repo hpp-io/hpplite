@@ -39,6 +39,9 @@ void hpplite_store_close(HppliteStore *store);
 long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *body, size_t len, char **pzOut);
 /* The handle is a relay's (#126): what it says names the relay and relaycap= */
 void hpplite_store_set_relay(HppliteStore *s);
+/* The node's spend ledger (#173, spend.h): checked before signing (spendcap=), charges recorded. Not owned. */
+struct HppliteSpend;
+void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp);
 
 /* x402 batch-settlement (#135): with depositCap > 0 the node pays a 402 that offers it by
 ** voucher in a channel of x402's escrow, depositing when the channel cannot cover the call,

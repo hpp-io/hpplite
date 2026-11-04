@@ -131,6 +131,10 @@ int hpplite_l1_token_balance(HppliteL1 *l1, const unsigned char token[20], const
     return (l1 && l1->ops->token_balance) ? l1->ops->token_balance(l1, token, owner, out) : -1;
 }
 
+int hpplite_l1_eth_balance(HppliteL1 *l1, double *pWei) {
+    return (l1 && pWei && l1->ops->eth_balance) ? l1->ops->eth_balance(l1, pWei) : -1;
+}
+
 uint64_t hpplite_l1_get_lease_time_remaining(HppliteL1 *l1) {
     return l1 ? l1->ops->get_lease_time_remaining(l1) : 0;
 }

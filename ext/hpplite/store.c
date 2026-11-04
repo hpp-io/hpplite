@@ -17,6 +17,7 @@
 #include "cJSON.h"
 #include "eth_client.h"
 #include "sha256.h"
+#include "spend.h"
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +68,7 @@ struct HppliteStore {
     uint64_t balance;               /* what the channel holds (deposits less refunds), as this node knows it */
     uint64_t deposited;             /* this process's deposits, for the status row */
     int nDeposits;
+    HppliteSpend *spend;            /* the node's ledger (#173): spendcap= checked before signing, charges recorded; not owned */
     int payKind;                    /* the payment just built: PAY_EXACT, PAY_VOUCHER, PAY_DEPOSIT */
     uint64_t payDeposit;            /* ...and the deposit in it */
     char error[256];
@@ -577,6 +579,16 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "batch-settlement") == 0 && !accBatch) accBatch = it;
     }
     if (accBatch && s->depositCap) acc = accBatch;          /* storedeposit=: a channel, a voucher per call (#135) */
+    if (acc && s->spend) {
+        /* spendcap= (#173): over the window's cap, nothing is signed; the batch waits as over storecap= */
+        uint64_t asked = strtoull(jstr(acc, "amount") ? jstr(acc, "amount") : "0", NULL, 10);
+        char why[200];
+        if (hpplite_spend_allow(s->spend, asked, why, sizeof why) != 0) {
+            snprintf(s->error, sizeof s->error, "the %s asks %llu: %s; refused", s->isRelay ? "relay" : "store", (unsigned long long)asked, why);
+            cJSON_Delete(req);
+            return NULL;
+        }
+    }
     if (!acc) { snprintf(s->error, sizeof s->error, "the store offers no exact-scheme payment"); cJSON_Delete(req); return NULL; }
     {
         cJSON *amount = cJSON_GetObjectItem(acc, "amount"), *asset = cJSON_GetObjectItem(acc, "asset"),
@@ -1110,6 +1122,7 @@ static char *kuboAdd(HppliteStore *s, const uint8_t *data, size_t len) {
 }
 
 void hpplite_store_set_relay(HppliteStore *s) { if (s) s->isRelay = 1; }
+void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp) { if (s) s->spend = sp; }
 
 /* A POST the provider may charge for: a 402 paid (exact, or a voucher in a channel), and, for a voucher,
 ** paid again once the seller's correction is taken (the running total, or a deposit the channel needs) */
@@ -1137,8 +1150,10 @@ static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, siz
         sqlite3_free(zRequired);
         zRequired = zAgain;
         if (status == 200) {
-            s->spent += kind == PAY_EXACT ? amount : chanPaid(s, zResponse, amount);
+            uint64_t paid = kind == PAY_EXACT ? amount : chanPaid(s, zResponse, amount);
+            s->spent += paid;
             s->calls++;
+            hpplite_spend_add(s->spend, paid);
             break;
         }
         if (status != 402 || kind == PAY_EXACT || !chanCorrect(s, zRequired, chainId)) {
@@ -1190,7 +1205,7 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
     }
     (void)zRequired; (void)zResponse;
     status = paidPost(s, "/put", data, len, &out);
-    if (status == 402 && (strstr(s->error, "storecap") || strstr(s->error, "storedeposit"))) {
+    if (status == 402 && (strstr(s->error, "storecap") || strstr(s->error, "storedeposit") || strstr(s->error, "spendcap"))) {
         s->lastFailure = HPPLITE_STORE_FAIL_CAP;            /* nothing signed past the caps: the batch waits */
         free(out.p);
         return NULL;

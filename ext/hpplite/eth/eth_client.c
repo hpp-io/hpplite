@@ -456,6 +456,30 @@ int eth_client_has_balance(EthClient *client, const uint8_t address[20]) {
     return has;
 }
 
+/* eth_getBalance in wei, as a double (exact to 2^53 wei; a warning's arithmetic needs no more): 0, or -1 */
+int eth_client_balance(EthClient *client, const uint8_t address[20], double *pWei) {
+    cJSON *params = cJSON_CreateArray(), *response, *result;
+    char *addr_hex = eth_hex_encode(address, 20);
+    int rc = -1;
+    cJSON_AddItemToArray(params, cJSON_CreateString(addr_hex));
+    cJSON_AddItemToArray(params, cJSON_CreateString("latest"));
+    free(addr_hex);
+    response = rpc_call(client, "eth_getBalance", params);
+    if (!response) return -1;
+    result = cJSON_GetObjectItem(response, "result");
+    if (result && cJSON_IsString(result) && strncmp(result->valuestring, "0x", 2) == 0) {
+        double v = 0;
+        for (const char *p = result->valuestring + 2; *p; p++) {
+            int d = (*p >= '0' && *p <= '9') ? *p - '0' : (*p >= 'a' && *p <= 'f') ? *p - 'a' + 10 : (*p >= 'A' && *p <= 'F') ? *p - 'A' + 10 : -1;
+            if (d < 0) { v = -1; break; }
+            v = v * 16 + d;
+        }
+        if (v >= 0) { *pWei = v; rc = 0; }
+    }
+    cJSON_Delete(response);
+    return rc;
+}
+
 uint64_t eth_client_gas_price(EthClient *client) {
     cJSON *response = rpc_call(client, "eth_gasPrice", NULL);
     if (!response) return (uint64_t)-1;

@@ -11,6 +11,7 @@
 #include "crypto.h"
 #include "l1_interface.h"
 #include "node.h"
+#include "spend.h"
 #include "store.h"
 #include <string.h>
 #include <stdio.h>
@@ -88,6 +89,8 @@ typedef struct StatusCursor {
 #define STATUS_COL_LAST_TX_PATH   39  /* "relay" or "direct": how the last write went to the chain; NULL before one */
 #define STATUS_COL_STORE_CHANNEL  40  /* batch-settlement (#135): the channel id the store is paid in; NULL with exact */
 #define STATUS_COL_STORE_LOCKED   41  /* ...what the channel holds not yet charged (atomic units) */
+#define STATUS_COL_SPENT_WINDOW   42  /* paid to the store and the relay in spendcap='s window (a day without one), #173 */
+#define STATUS_COL_SPEND_WARNING  43  /* what runs out and when at the recent rate (lowbalance=); NULL when nothing does */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -104,7 +107,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
-        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_channel TEXT, store_locked INTEGER)");
+        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_channel TEXT, store_locked INTEGER, spent_window INTEGER, spend_warning TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -393,6 +396,13 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
                 sqlite3_result_int64(ctx, (sqlite3_int64)(balance > charged ? balance - charged : 0));
             break;
         }
+        case STATUS_COL_SPENT_WINDOW:
+            if (node->spend) sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_spend_in_window(node->spend));
+            break;
+        case STATUS_COL_SPEND_WARNING:
+            hpplite_node_spend_check(node);
+            if (node->spendWarning[0]) sqlite3_result_text(ctx, node->spendWarning, -1, SQLITE_TRANSIENT);
+            break;
         default:
             sqlite3_result_null(ctx);
     }
