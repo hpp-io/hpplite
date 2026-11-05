@@ -6,8 +6,8 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hpplite-conf.XXXXXX")
-pids=""
-trap 'for p in $pids; do kill $p 2>/dev/null; wait $p 2>/dev/null; done; rm -rf "$work"' EXIT INT TERM
+# the stores' pids in a file: start runs in $(...)'s subshell, where a variable would not reach the trap (#196)
+trap 'for p in $(cat "$work/pids" 2>/dev/null); do kill $p 2>/dev/null; done; sleep 0.2; rm -rf "$work"' EXIT INT TERM
 port() { python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 echo 0x2020202020202020202020202020202020202020202020202020202020202020 > "$work/signer.key"
 start() {   # name, then the service's extra arguments
@@ -15,7 +15,7 @@ start() {   # name, then the service's extra arguments
     p=$(port)
     python3 -I "$here/../store/pin_service.py" --port "$p" --dir "$work/$name" --signer-key "$work/signer.key" \
         --pay-to 0x1111111111111111111111111111111111111111 "$@" > "$work/$name.log" 2>&1 &
-    pids="$pids $!"
+    echo $! >> "$work/pids"
     for i in $(seq 1 50); do curl -s -m 2 "http://127.0.0.1:$p/status" 2>/dev/null | grep -q signer && break; sleep 0.2; done
     echo "http://127.0.0.1:$p"
 }
