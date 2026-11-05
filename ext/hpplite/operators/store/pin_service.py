@@ -556,6 +556,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(403, {"error": "another signer holds this rollup's names", "signer": signer, "holder": holder})
             if self.service.store.get_named(name) == body:
                 return self.reply(200, {"name": name, "bytes": len(body) - 97, "signer": signer, "held": True})
+            if not self.service.store.has(cid_of(body[:-97])):
+                # names are free because the content put paid: a name for bytes this store does not hold would be unpaid
+                # storage, and would claim the rollup for whoever sent it (#199). A node puts the content first
+                return self.reply(412, {"error": "the batch's bytes are not held here: put them first", "cid": cid_of(body[:-97])})
             if self.service.args.rpc:
                 try:
                     wallet, leased = sequencer_lease(self.service.args.rpc, da)

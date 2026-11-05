@@ -1674,8 +1674,13 @@ static void test_store_commit(void) {
             old = hpplite_store_open(url, k, 0);
             memcpy(other, nd->instanceId, 32);
             other[0] ^= 0xff;
+            /* its bytes put first, as a node would (a name is taken only for bytes the service holds, #199), so what refuses
+            ** it is the lease (409), not the missing content */
+            char *zForged = old ? hpplite_store_put(old, (const uint8_t *)forged, sizeof forged - 1, NULL) : NULL;
+            sqlite3_free(zForged);
             int refused = old && hpplite_store_sign_batch(old, daBytes, 31337, other, 2, (const uint8_t *)forged, sizeof forged - 1, sig2) == 0
-                          && hpplite_store_put_named(old, name, other, (const uint8_t *)forged, sizeof forged - 1, sig2) != 0;
+                          && hpplite_store_put_named(old, name, other, (const uint8_t *)forged, sizeof forged - 1, sig2) != 0
+                          && strstr(hpplite_store_error(old), "409") != NULL;
             printf("(an old instance's batch at height 2: %s) ", refused ? hpplite_store_error(old) : "taken");
             if (old) hpplite_store_close(old);
             st = hpplite_store_open(url, NULL, 0);

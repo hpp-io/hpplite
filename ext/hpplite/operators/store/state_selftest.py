@@ -99,6 +99,7 @@ def main():
         da = secrets.token_bytes(20).hex()
         a, b = secrets.token_bytes(32), secrets.token_bytes(32)
         name, body = named(a, da, 1, b"sequencer a's batch")
+        post(u1 + "/put", b"sequencer a's batch")                 # the content first, as a node puts it (#199)
         check(post(u1 + "/name/" + name, body) == 200, "signer A puts %s-1 through the first process" % da[:8])
         name, body = named(b, da, 2, b"another key's batch")
         st = post(u2 + "/name/" + name, body)

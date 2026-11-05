@@ -31,8 +31,10 @@ required or refused (below); `403` a name refused (another signer holds the
 rollup's names, or with a chain, the signer is not the rollup's sequencer);
 `404` not held (never put, or past its retention); `409` a name from an
 instance the rollup's lease does not name; `413` over the service's size
-limit (16 MiB in the reference); `503` a name the store cannot check now (its
-chain unreadable, below). Error
+limit (16 MiB in the reference); `412` a name for bytes the store does not
+hold (below); `503` a name the store cannot check now (its chain unreadable,
+below), or a put refused while the store is full (a store may set quotas;
+space frees as retention ends). Error
 bodies are JSON with `error`.
 
 ### Content
@@ -48,7 +50,9 @@ bodies are JSON with `error`.
   payTo)` as `/status` gives it. The node checks it recovers to `/status`'s
   `signer` and commits it with the batch.
 - **Retention.** A put buys `retentionSeconds`; `/pin` extends from the later
-  of now and the current expiry. Past it the bytes may be deleted.
+  of now and the current expiry. Past it the bytes may be deleted. A store may
+  cap how far ahead an expiry reaches (pins stack): a pin past its cap is
+  refused, naming the furthest expiry it allows.
 
 ### Names (the soft tier, #165)
 
@@ -59,6 +63,10 @@ height. The body is the batch's bytes followed by the sequencer's instance id
 contract's domain `("HPPLiteDA", "3", chainId, da)`, `batchHash` the
 keccak-256 of the bytes.
 
+- A name is taken only for bytes the store holds as content - the CID of the
+  batch's bytes put (and not expired) - else `412` and nothing held: names
+  are free because the content put paid, and an unpaid name must not claim a
+  rollup (#199). A node puts the content first.
 - The first signer to put a name for a DA holds that DA's names; another
   signer is refused `403`. The decision must be atomic across everything that
   serves the store (a conditional create), and reads must see a name as soon

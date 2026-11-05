@@ -631,6 +631,14 @@ static void test_named(const char *url) {
     memset(da, 0xda, 20); memset(da2, 0xdb, 20); memset(inst, 0x1e, 32);
     if (!s1 || !s2) FAIL("open with keys");
     if (hpplite_store_sign_batch(s1, da, 181228, inst, 7, data, sizeof data, sig) != 0) FAIL("sign");
+    {
+        /* a name is taken only for bytes the service holds (#199): refused before the content put, taken after */
+        char *zRef;
+        if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", inst, data, sizeof data, sig) == 0 || !strstr(hpplite_store_error(s1), "412")) { printf("('%s') ", hpplite_store_error(s1)); FAIL("a name for bytes not held must be refused 412"); }
+        zRef = hpplite_store_put(s1, data, sizeof data, NULL);
+        if (!zRef) { printf("(%s) ", hpplite_store_error(s1)); FAIL("put the content"); }
+        sqlite3_free(zRef);
+    }
     if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", inst, data, sizeof data, sig) != 0) { printf("(%s) ", hpplite_store_error(s1)); FAIL("put named"); }
     back = hpplite_store_get_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", &n, got, NULL);
     if (!back || n != sizeof data || memcmp(back, data, n) != 0 || memcmp(got, sig, 65) != 0) { printf("(%s) ", hpplite_store_error(s1)); free(back); FAIL("get named: the bytes and the signature"); }

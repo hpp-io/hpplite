@@ -108,6 +108,7 @@ def main():
             procs.append(p)
             key, da = secrets.token_bytes(32), secrets.token_bytes(20).hex()
             name, body = named(key, da, 1, b"batch one")
+            post(url, "/put", b"batch one")                     # the content first, as a node puts it (#199)
             st, out = post(url, "/name/" + name, body)
             check(st == 503, "the RPC %s: a name put answered 503 (%d %s)" % (label, st, out.get("error", "")))
             r = urllib.request.Request(url + "/name/" + name)
@@ -119,6 +120,7 @@ def main():
             mode["value"] = "none"
             other = secrets.token_bytes(32)
             name2, body2 = named(other, da, 2, b"another signer")
+            post(url, "/put", b"another signer")
             st2, _ = post(url, "/name/" + name2, body2) if label == "answering an error" else (None, None)
             if label == "answering an error":
                 check(st2 == 200, "once the chain answers (no coordinator there): taken (%s) - the refused signer did not take the rollup" % st2)
