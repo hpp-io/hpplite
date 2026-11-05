@@ -336,14 +336,22 @@ def batch_digest(chain_id, name, instance, data):
     return eth.typed_digest(domain, BATCH_TYPE, bytes.fromhex(instance[2:]), int(height), eth.keccak256(data))
 
 
+class ChainUnreadable(Exception):
+    """The chain could not be asked (unreachable, or answering an error): a name cannot be checked (#198)"""
+
+
 def sequencer_lease(rpc, da):
     """The rollup's sequencer wallet and the instance its lease names, asked of the chain: HPPLiteDA.coordinator(),
-    then HPPLite.sequencerWallet() and sequencerInstance(); ('', '') when unreachable."""
+    then HPPLite.sequencerWallet() and sequencerInstance(); ('', '') when the DA has no coordinator (not an HPPLite
+    rollup). Raises ChainUnreadable when the chain cannot be asked: that is not the same as no rollup (#198)."""
     def call(to, selector):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "eth_call", "params": [{"to": to, "data": selector}, "latest"]}).encode()
         req = urllib.request.Request(rpc, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read()).get("result") or ""
+            out = json.loads(r.read())
+        if "error" in out:
+            raise ChainUnreadable(str((out["error"] or {}).get("message", out["error"]))[:200])
+        return out.get("result") or ""
     try:
         coord = call(da, "0x" + eth.keccak256(b"coordinator()")[:4].hex())
         if len(coord) < 66:
@@ -351,8 +359,8 @@ def sequencer_lease(rpc, da):
         wallet = call("0x" + coord[-40:], "0x" + eth.keccak256(b"sequencerWallet()")[:4].hex())
         instance = call("0x" + coord[-40:], "0x" + eth.keccak256(b"sequencerInstance()")[:4].hex())
         return ("0x" + wallet[-40:] if len(wallet) >= 66 else "", instance[:66].lower() if len(instance) >= 66 else "")
-    except (OSError, ValueError):
-        return "", ""
+    except (OSError, ValueError) as e:
+        raise ChainUnreadable(str(e)[:200])
 
 
 class Service:
@@ -549,7 +557,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.service.store.get_named(name) == body:
                 return self.reply(200, {"name": name, "bytes": len(body) - 97, "signer": signer, "held": True})
             if self.service.args.rpc:
-                wallet, leased = sequencer_lease(self.service.args.rpc, da)
+                try:
+                    wallet, leased = sequencer_lease(self.service.args.rpc, da)
+                except ChainUnreadable as e:
+                    # refused, not taken unchecked: the first signer of a rollup holds its names for good (#198)
+                    return self.reply(503, {"error": "the chain cannot be read to check the rollup's sequencer: %s" % e})
                 if wallet and wallet.lower() != signer.lower():
                     return self.reply(403, {"error": "not the rollup's sequencer wallet", "signer": signer, "sequencer": wallet})
                 if leased and leased != instance.lower():

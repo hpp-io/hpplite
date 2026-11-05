@@ -31,7 +31,8 @@ required or refused (below); `403` a name refused (another signer holds the
 rollup's names, or with a chain, the signer is not the rollup's sequencer);
 `404` not held (never put, or past its retention); `409` a name from an
 instance the rollup's lease does not name; `413` over the service's size
-limit (16 MiB in the reference). Error
+limit (16 MiB in the reference); `503` a name the store cannot check now (its
+chain unreadable, below). Error
 bodies are JSON with `error`.
 
 ### Content
@@ -64,7 +65,11 @@ keccak-256 of the bytes.
   as its put answered: a replica follows the names as they are written.
 - A store that reads the chain also refuses a signer that is not the
   rollup's `sequencerWallet()` (`403`), and an instance other than the
-  lease's `sequencerInstance()` (`409`, #167).
+  lease's `sequencerInstance()` (`409`, #167). When it cannot read the chain
+  (unreachable, or answering an error) it refuses the name `503` and holds
+  nothing, rather than take it unchecked: the first signer would hold the
+  rollup's names for good (#198). A DA with no coordinator is not an HPPLite
+  rollup's and is taken on the first-signer rule alone.
 - The same body again answers `200`.
 - `X-HPPLite-Signer` on a read is the wallet the signature recovers to.
 - Names are kept for the store's `retentionSeconds` from their put.
