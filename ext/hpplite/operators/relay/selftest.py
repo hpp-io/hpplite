@@ -95,6 +95,24 @@ def post_raw(url, body):
         return e.code, json.loads(e.read() or b"{}")
 
 
+def start_relay(work, port, keyfile, log, eth_usd="30"):
+    """The relay under test, on port: (process, its /status or None). Module level so another relay can be checked
+    by replacing it (hpp-io/hpplite-operators runs this selftest against the canonical relay Worker)"""
+    url = "http://127.0.0.1:%d" % port
+    p = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC,
+                          "--key-file", keyfile, "--factory", FACTORY, "--facilitator", os.environ["HPPLITE_ANVIL_FACILITATOR"],
+                          "--asset", USDC, "--eth-usd", eth_usd, "--dir", os.path.join(work, "relay_state")], stdout=log, stderr=log)
+    for _ in range(100):
+        if p.poll() is not None:
+            return p, None
+        try:
+            with urllib.request.urlopen(url + "/status", timeout=2) as r:
+                return p, json.loads(r.read())
+        except OSError:
+            time.sleep(0.1)
+    return p, None
+
+
 def main():
     if not USDC:
         print("SKIP: no MockUSDC on this chain")
@@ -109,21 +127,7 @@ def main():
     log = open(os.path.join(work, "relay.log"), "w")
     url = "http://127.0.0.1:%d" % port
 
-    def start_relay(eth_usd="30"):                           # anvil's gas costs ~100x HPP's (1 gwei vs 0.01)
-        p = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC,
-                              "--key-file", keyfile, "--factory", FACTORY, "--facilitator", os.environ["HPPLITE_ANVIL_FACILITATOR"],
-                              "--asset", USDC, "--eth-usd", eth_usd, "--dir", os.path.join(work, "relay_state")], stdout=log, stderr=log)
-        for _ in range(100):
-            if p.poll() is not None:
-                return p, None
-            try:
-                with urllib.request.urlopen(url + "/status", timeout=2) as r:
-                    return p, json.loads(r.read())
-            except OSError:
-                time.sleep(0.1)
-        return p, None
-
-    proc, status = start_relay()
+    proc, status = start_relay(work, port, keyfile, log)            # anvil's gas costs ~100x HPP's (1 gwei vs 0.01)
     try:
         if proc.poll() is not None or not status:
             print("FAIL: the relay did not start"); print(open(os.path.join(work, "relay.log")).read()); return 1
@@ -208,7 +212,7 @@ def main():
         quoted = int(offered["accepts"][0]["amount"]) if offered else 0
         check(st == 402 and quoted > 0, "a 402 for the claim: %d units" % quoted)
         proc.terminate(); proc.wait()
-        proc, status = start_relay(eth_usd="3000")
+        proc, status = start_relay(work, port, keyfile, log, eth_usd="3000")
         check(status is not None, "the relay restarted, at 100 times the price")
         forged = dict(offered, accepts=[dict(offered["accepts"][0], amount="1")])
         u0 = balance_usdc(wallet)
