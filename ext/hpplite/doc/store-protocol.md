@@ -121,4 +121,7 @@ A `402` to a paid request names the reason in `error`. The node acts on:
 | `invalid_batch_settlement_evm_deposit_pending` | the facilitator queued the deposit (#185); no other deposit is sent for the channel while it is pending | tries again later; the voucher is taken once the deposit lands |
 
 Nothing done is charged: a call that fails after a payment verified is not
-settled, and a voucher counts only once its call answered `200`.
+settled, and a voucher counts only once its call answered `200`. Nothing
+unpaid is kept: a put or a pin whose `exact` settlement fails after the work
+is taken back (the bytes not held, the retention not extended) and answered
+`402` (#194).

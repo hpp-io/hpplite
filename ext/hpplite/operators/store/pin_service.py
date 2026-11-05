@@ -168,6 +168,14 @@ class Store:
     def entry(self, cid):
         return dict(self._meta(cid) or {})
 
+    def remove(self, cid):
+        """A put taken back, its payment not settled (#194); its expiry marker goes with the next tick"""
+        self._delete_content(cid)
+
+    def restore(self, cid, meta):
+        """An extension taken back: the metadata as it was"""
+        self._set_meta(cid, meta)
+
     # --- named entries (#165): <da>-<height> holds a batch's bytes with the sequencer's signature appended; the
     # first signer seen for a DA contract holds its names, decided by a create-if-absent (R2's conditional put) ---
     def name_signer(self, da):
@@ -426,11 +434,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # --- x402, around one piece of work ---
     def paid(self, amount, description, work):
-        """402 until a payment for `amount` verifies; then the work, then settle, then the answer."""
+        """402 until a payment for `amount` verifies; then the work, then settle, then the answer. work() returns
+        (status, obj) or (status, obj, undo): undo takes the work back when the payment does not settle (#194)"""
         p = self.service.payments
         url = "http://%s%s" % (self.headers.get("Host", "localhost"), self.path)
         if not p.enabled or amount <= 0:
-            status, obj = work()
+            status, obj = work()[:2]
             return self.reply(status, obj)
         requirements = p.requirements(amount, url, description)
         header = self.headers.get("PAYMENT-SIGNATURE")
@@ -447,11 +456,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if v.get("invalidMessage"):
                 requirements["error"] += ": " + str(v["invalidMessage"])[:200]
             return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
-        status, obj = work()
+        done = work()
+        status, obj = done[:2]
         if status != 200:
             return self.reply(status, obj)          # nothing done, nothing charged
         s = p.settle(payload, requirements["accepts"][0])
         if not s.get("success"):
+            if len(done) > 2:
+                done[2]()                           # not paid: not held, not extended (#194)
             return self.reply(402, {"error": "settlement failed: " + s.get("errorReason", "?"), "settlement": s})
         return self.reply(200, obj, {"PAYMENT-RESPONSE": base64.b64encode(json.dumps(s).encode()).decode()})
 
@@ -466,7 +478,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 requirements["error"] = err
             return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
-        status, obj = work()
+        status, obj = work()[:2]
         if status != 200:
             return self.reply(status, obj)          # nothing done, nothing charged (a deposit stays the node's, in its channel)
         r = ch.commit(payload, req, cid, deposit_tx)
@@ -567,7 +579,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.service.store.put(cid, body, expires, receipt)
                 except (OSError, ValueError) as e:
                     return 500, {"error": str(e)}
-                return 200, {"cid": cid, "bytes": len(body), "expires": expires, "receipt": receipt, "held": False}
+                return 200, {"cid": cid, "bytes": len(body), "expires": expires, "receipt": receipt, "held": False}, \
+                    lambda: self.service.store.remove(cid)
             return self.paid(self.service.price_put(len(body)), "pin %d bytes for %d s" % (len(body), self.service.args.retention), work)
         if path.startswith("/pin/"):
             cid = path[5:]
@@ -583,7 +596,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return 404, {"error": "gone"}
                 receipt = self.service.signer.receipt(eth.keccak256(data), cid, expires)
                 self.service.store.extend(cid, expires, receipt)
-                return 200, {"cid": cid, "bytes": len(data), "expires": expires, "receipt": receipt}
+                return 200, {"cid": cid, "bytes": len(data), "expires": expires, "receipt": receipt}, \
+                    lambda: self.service.store.restore(cid, entry)
             return self.paid(self.service.price_put(entry.get("bytes", 0)), "extend " + cid, work)
         return self.reply(404, {"error": "no such endpoint"})
 
