@@ -271,6 +271,22 @@
    "pricePerMiBMonth": 30.0,
    "pricePerPin": 1000,
    "retentionSeconds": 60
+  },
+  {
+   "amount": 65,
+   "bytes": 26214400,
+   "pricePerByte": 0,
+   "pricePerMiBMonth": 1.1,
+   "pricePerPin": 10,
+   "retentionSeconds": 5184000
+  },
+  {
+   "amount": 175,
+   "bytes": 52428800,
+   "pricePerByte": 0,
+   "pricePerMiBMonth": 1.1,
+   "pricePerPin": 10,
+   "retentionSeconds": 7776000
   }
  ],
  "version": 1
