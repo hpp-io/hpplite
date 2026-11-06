@@ -23,17 +23,8 @@ cd "$here"
 # name (hpplite-module.dylib would need sqlite3_hpplitemodule_init)
 mkdir -p "$here/data/module"
 cp "$ext" "$here/data/module/hpplite.dylib" && ext="$here/data/module/hpplite.dylib"
-# the store (#164): the batch bytes go to a pin service here (free mode, data/pins), the
-# chain gets one anchor per 30 minutes; the receipt key is the service's own, nothing valuable
-pinport=${PIN_PORT:-8788}
-mkdir -p "$here/data/pins"
-[ -f "$here/data/pin_signer.key" ] || printf '0x%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$here/data/pin_signer.key"
-"$py" -I "$root/operators/store/pin_service.py" --port "$pinport" --dir "$here/data/pins" --signer-key "$here/data/pin_signer.key" \
-    --pay-to 0x1111111111111111111111111111111111111111 --network eip155:181228 >> "$here/data/pin.log" 2>&1 &
-pin=$!
-for i in $(seq 1 30); do curl -s -m 2 "http://127.0.0.1:$pinport/status" 2>/dev/null | grep -q signer && break; sleep 0.5; done
-export HPPLITE_DEMO_STORE="http://127.0.0.1:$pinport"
-echo "store: $HPPLITE_DEMO_STORE (log: data/pin.log)"
+# the batch bytes go to HPP Sepolia's store (store=on, hpplite-store/2), one anchor per 30 minutes; the store pulls
+# what the writes cost from the node's funding wallet (status: store_funder), which holds USDC.e sent to it once
 start_app() {
     "$py" app.py "$ext" "$port" >> "$here/data/app.log" 2>&1 &
     app=$!
@@ -53,7 +44,7 @@ echo "agents: $(curl -s -m 5 "http://localhost:$port/api/status" | sed -n 's/.*"
     sleep 5
   done ) &
 tunnel=$!
-trap 'kill $tunnel $app 2>/dev/null; wait $app 2>/dev/null; kill $pin 2>/dev/null' EXIT INT TERM
+trap 'kill $tunnel $app 2>/dev/null; wait $app 2>/dev/null' EXIT INT TERM
 # watchdog: the app once died without a word; a public demo must not stay dark
 while :; do
     sleep 15

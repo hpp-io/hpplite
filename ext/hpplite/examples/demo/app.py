@@ -20,8 +20,10 @@ DATA = os.path.join(HERE, "data")
 RPC = "https://sepolia.hpp.io"
 EXPLORER = "https://sepolia-explorer.hpp.io"
 SEL_GET_BATCH = "5ac44282"            # cast sig "getBatch(uint256)"
-STORE = os.environ.get("HPPLITE_DEMO_STORE")   # run_demo.sh starts a pin service: the bytes there, one anchor per 30 min (#164)
-URI = f"file:{DATA}/timeline.db?hpplite=on&l1=hpp-sepolia&interval=90s&checkpoint=5&datadir={DATA}" + (f"&store={STORE}&anchor=30m" if STORE else "")
+# the batch bytes at a store, one anchor per 30 min (#164): by default HPP Sepolia's canonical store (#192), paid from the
+# node's funding wallet by permit (hpplite-store/2); HPPLITE_STORE=off posts every batch on chain instead
+STORE = os.environ.get("HPPLITE_STORE", "on")
+URI = f"file:{DATA}/timeline.db?hpplite=on&l1=hpp-sepolia&interval=90s&checkpoint=5&dbname=timeline-v07&datadir={DATA}" + (f"&store={STORE}&anchor=30m" if STORE != "off" else "")
 MAX_ENTRIES = 50000                   # ~100 B each: nowhere near the v0.1 100 MB bound
 
 os.makedirs(DATA, exist_ok=True)
@@ -31,14 +33,6 @@ boot.enable_load_extension(True); boot.load_extension(os.path.splitext(EXT)[0]);
 db = sqlite3.connect(URI, uri=True, check_same_thread=False, isolation_level=None)
 lock = threading.Lock()
 
-def bookkeeping():
-    """Where HPPLite keeps its tables: the file itself (row capture), or the sidecar beside it (page capture, the
-    default for a new rollup, #146). The sidecar is the node's: a short busy timeout, never a wait on it."""
-    try:
-        db.execute("SELECT 1 FROM _hpplite_meta").fetchone()
-        return db
-    except sqlite3.OperationalError:
-        return sqlite3.connect(f"file:{DATA}/timeline.db-hpplite.db?mode=ro", uri=True, check_same_thread=False, timeout=0.2)
 with lock:
     db.execute("CREATE TABLE IF NOT EXISTS entries(id INTEGER PRIMARY KEY, name TEXT NOT NULL, body TEXT NOT NULL, posted_at INTEGER NOT NULL, ip_hash TEXT)")
     cols = [r[1] for r in db.execute("PRAGMA table_info(entries)")]
@@ -54,13 +48,14 @@ def status():
     with lock:
         r = db.execute("SELECT height, pending, state_root, last_checkpoint_height, lease, log_errors, "
                        "replay_skipped, encryption, keyed, nondeterministic, contract, da_contract, last_batch_tx, "
-                       "anchored, last_anchor_tx, store, store_state, store_calls, last_checkpoint_root "
-                       "FROM hpplite_status").fetchone()
+                       "anchored, last_anchor_tx, store, store_state, store_calls, last_checkpoint_root, "
+                       "store_funder, store_covered_until FROM hpplite_status").fetchone()
         n = db.execute("SELECT count(*) FROM entries").fetchone()[0]
         size = db.execute("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()").fetchone()[0]
     keys = ["height", "pending", "state_root", "last_checkpoint_height", "lease", "log_errors",
             "replay_skipped", "encryption", "keyed", "nondeterministic", "contract", "da_contract", "last_batch_tx",
-            "anchored", "last_anchor_tx", "store", "store_state", "store_calls", "last_checkpoint_root"]
+            "anchored", "last_anchor_tx", "store", "store_state", "store_calls", "last_checkpoint_root",
+            "store_funder", "store_covered_until"]
     d = dict(zip(keys, r)); d["entries"] = n; d["db_bytes"] = size; d["explorer"] = EXPLORER
     d["anchored_root"] = d["last_checkpoint_root"]
     d["batches"] = d["height"] - 1
@@ -111,17 +106,21 @@ def describe(height, raw, where):
             "sealed": raw.startswith(b"HPE")}
 
 def chain_batch(height):
-    """What holds one batch: the store (#164: by the reference the node kept until the anchor), else eth_call HPPLiteDA.getBatch(height)."""
+    """What holds one batch: the store (#164: by the content ID the node keeps until the anchor), else eth_call
+    HPPLiteDA.getBatch(height)."""
     s = status()
     if not s["da_contract"] or height < 1 or height >= s["height"]: return {"height": height, "error": "no such batch yet"}
-    if STORE:
-        with lock:
-            try:
-                row = bookkeeping().execute("SELECT ref FROM _hpplite_unanchored WHERE height = ?", (height,)).fetchone()
-            except Exception:
-                row = None
+    if s["store"]:
+        try:
+            # the node's sidecar (page capture, #146): read-only, a short busy timeout, never a wait on the node
+            side = sqlite3.connect(f"file:{DATA}/timeline.db-hpplite.db?mode=ro", uri=True, timeout=0.2)
+            row = side.execute("SELECT ref FROM _hpplite_unanchored WHERE height = ?", (height,)).fetchone()
+            side.close()
+        except sqlite3.Error:
+            row = None
         if row:
-            with urllib.request.urlopen(f"{STORE}/get/{row[0]}", timeout=20) as r:
+            req = urllib.request.Request(f"{s['store']}/get/{row[0]}", headers={"user-agent": "hpplite-demo/0.2"})
+            with urllib.request.urlopen(req, timeout=20) as r:
                 return describe(height, r.read(), f"the store, {row[0][:16]}…, waiting for the anchor")
         return {"height": height, "error": f"batch {height} is at the store, anchored on the chain in a range (bytes shown while they wait for the anchor)"}
     data = "0x" + SEL_GET_BATCH + format(height, "064x")

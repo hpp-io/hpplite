@@ -56,10 +56,10 @@ async function refresh(){
   try{st=await (await fetch('/api/status')).json();}catch(e){return}
   const ex=st.explorer;
   const link=(a,t)=>a?`<a target="_blank" href="${ex}/${t}/${a}">${a.slice(0,10)}…${a.slice(-4)}</a>`:'—';
-  $('#cards').innerHTML=card(st.store?'batches at the store':'batches on chain',st.batches)+(st.store?card('anchored on chain','batch '+st.anchored+' (every 30 min)'):'')+card('pending entries',st.pending,st.pending?'warn':'')+card('last checkpoint','batch '+st.last_checkpoint_height)
+  $('#cards').innerHTML=card(st.store?'batches at the store':'batches on chain',st.batches)+(st.store?card('anchored on chain','batch '+st.anchored+' (every 30 min)')+card('store paid until',st.store_covered_until?new Date(st.store_covered_until*1000).toISOString().slice(0,10):'—'):'')+card('pending entries',st.pending,st.pending?'warn':'')+card('last checkpoint','batch '+st.last_checkpoint_height)
    +card('entries',st.entries)+card('db size',(st.db_bytes/1024).toFixed(0)+' KB')+card('lease',st.lease?'held':'—',st.lease?'ok':'')
    +card('live state root (content hash now)',st.state_root?st.state_root.slice(0,18)+'…':'—','small')+card('anchored root (checkpoint '+st.last_checkpoint_height+')',st.anchored_root?st.anchored_root.slice(0,18)+'…':'—','small')+card('encryption',st.encryption,'small')
-   +card('rollup contract',link(st.contract,'address'),'small')+card('DA contract',link(st.da_contract,'address'),'small')+(st.store?card('last anchor tx',link(st.last_anchor_tx,'tx'),'small'):card('last batch tx',link(st.last_batch_tx,'tx'),'small'));
+   +card('rollup contract',link(st.contract,'address'),'small')+card('DA contract',link(st.da_contract,'address'),'small')+(st.store_funder?card('funding wallet (pays the store)',link(st.store_funder,'address'),'small'):'')+(st.store?card('last anchor tx',link(st.last_anchor_tx,'tx'),'small'):card('last batch tx',link(st.last_batch_tx,'tx'),'small'));
   const es=await (await fetch('/api/entries')).json();
   const em=Object.fromEntries((st.agents||[]).map(a=>[a.name,a.emoji]));
   $('#entries').innerHTML=es.map(e=>`<div class="entry ${e.kind==='agent'?'agent':''}"><span class="who">${e.kind==='agent'?(em[e.name]||'🤖')+' ':''}${esc(e.name)}</span>${e.kind==='agent'?'<span class="badge">agent</span>':''}<span class="when">${new Date(e.posted_at*1000).toLocaleString()} · #${e.id}</span><div class="body">${esc(e.body)}</div></div>`).join('')||'<span class="note">nothing yet</span>';
