@@ -242,6 +242,11 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         int ms = parse_duration_ms(val);
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
+    val = getenv("HPPLITE_SNAPSHOT");
+    if (val) {
+        int ms = parse_duration_ms(val);
+        if (ms >= 0) cfg->snapshotIntervalMs = ms;
+    }
 
     /* Encryption */
     val = getenv(HPPLITE_ENV_ENCRYPT);
@@ -498,6 +503,10 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         int ms = parse_duration_ms(buf);
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
+    if (get_uri_param(uri, "snapshot", buf, sizeof(buf))) {
+        int ms = parse_duration_ms(buf);
+        if (ms >= 0) cfg->snapshotIntervalMs = ms;
+    }
 
     /* Encryption */
     if (get_uri_param(uri, HPPLITE_URI_COMPRESS, buf, sizeof(buf))) {
@@ -696,6 +705,11 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val) {
         int ms = parse_duration_ms(val);
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
+    }
+    val = sqlite3_uri_parameter(filename, "snapshot");
+    if (val) {
+        int ms = parse_duration_ms(val);
+        if (ms >= 0) cfg->snapshotIntervalMs = ms;
     }
 
     /* Encryption */

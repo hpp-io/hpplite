@@ -94,6 +94,7 @@ typedef struct TestNodeOpts {
     const char *storeUrl;                    /* store= (#11): the batch bytes go there, the chain holds commitments */
     uint64_t storeCap;                       /* storecap= */
     int storeFallbackOff;                    /* storefallback=off: a store that does not answer keeps the batch waiting */
+    int snapshotMs;                          /* snapshot= (#221): a snapshot at an anchor when the last is older */
 } TestNodeOpts;
 HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpts *o);
 int same_root(HppliteNode *a, HppliteNode *b);

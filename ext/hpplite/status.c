@@ -94,6 +94,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_SOFT_HEIGHT    44  /* a verifier with a store (#166): the height it applied to, soft batches included; NULL otherwise */
 #define STATUS_COL_SPEND_WARNING  43  /* what runs out and when at the recent rate (lowbalance=); NULL when nothing does */
 #define STATUS_COL_STORE_BUCKET   46  /* ...the bucket's state at the store: covered, parked, deleted; NULL before one is known */
+#define STATUS_COL_SNAPSHOT       47  /* the latest snapshot's height: the one this sequencer's anchors name, or a replica started from (#221, #222); NULL: none */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -111,7 +112,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
         " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_funder TEXT, store_covered_until INTEGER, spent_window INTEGER, spend_warning TEXT, soft_height INTEGER, soft_disagreements INTEGER,"
-        " store_bucket TEXT)");
+        " store_bucket TEXT, snapshot_height INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -404,6 +405,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_STORE_BUCKET:
             if (node->store && hpplite_store_bucket_state(node->store)) sqlite3_result_text(ctx, hpplite_store_bucket_state(node->store), -1, SQLITE_TRANSIENT);
+            break;
+        case STATUS_COL_SNAPSHOT:
+            if (node->snapHeight) sqlite3_result_int64(ctx, (sqlite3_int64)node->snapHeight);
             break;
         case STATUS_COL_SOFT_HEIGHT:
             if (node->config.verifyOnly && node->store) sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_get_block_height(node->ctx));

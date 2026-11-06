@@ -930,6 +930,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->relayUrl = cfg->relayUrl;
     nc->relayCap = cfg->relayCap;
     nc->storeFallback = cfg->storeFallback;
+    nc->snapshotIntervalMs = cfg->snapshotIntervalMs;   /* snapshots at anchors (#221) */
     nc->anchorIntervalMs = cfg->anchorIntervalMs;   /* the anchor's cadence (#164) */
 
     /* Role removed - always sequencer in simplified model */

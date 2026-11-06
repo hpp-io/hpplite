@@ -91,6 +91,7 @@ typedef struct HppliteNodeConfig {
     char *relayUrl;                 /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */
     uint64_t relayCap;              /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
     int storeFallback;              /* storefallback=: a store that does not answer lets the chain carry the bytes (default on) */
+    int snapshotIntervalMs;         /* snapshot=: a snapshot at an anchor when the last is older than this (#221); 0: never */
     int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;
@@ -168,6 +169,13 @@ typedef struct HppliteNode {
     HppliteAnchorRow anchorRow;     /* the commitment of the batch being finalized, for _hpplite_unanchored */
     char *zAnchorRef;
     unsigned char anchorReceipt[114];   /* HPPLITE_RECEIPT_SIZE */
+    /* Snapshots (#221): the latest one the anchors name, carried forward to each new manifest */
+    uint64_t snapHeight;            /* 0: none */
+    char snapIndex[64];             /* the index's CID at the store */
+    unsigned char snapIndexSha[32]; /* ...and its sha-256, in the manifest: a reader checks the index it is served */
+    int64_t snapAt;                 /* when it was made (seconds) */
+    int snapLooked;                 /* the latest anchor's manifest was read for it (a process that did not make it) */
+    int warnedSnapshot;             /* said once why no snapshot is made */
     struct cJSON *manifest;         /* a replica: the manifest of the range it is reading */
     uint64_t manifestFrom, manifestTo;
 
@@ -323,6 +331,8 @@ void hpplite_node_spend_check(HppliteNode *node);
 ** key does not open it. Replay, adoption and tests all go through this.
 */
 HppliteBatch *hpplite_node_fetch_batch(HppliteNode *node, uint64_t height);
+/* bytes as posted at a height (a batch, or a snapshot sealed at it, #221), opened with this node's keys and decoded; NULL: not ours */
+HppliteBatch *hpplite_node_decode(HppliteNode *node, uint64_t height, const uint8_t *data, size_t len);
 
 /*
 ** Bring the local database up to date with L1: batches already on L1 that

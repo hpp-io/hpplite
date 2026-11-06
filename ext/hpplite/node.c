@@ -155,6 +155,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.lowBalanceHours = config->lowBalanceHours;
     node->config.storeFallback = config->storeFallback;
     node->config.anchorIntervalMs = config->anchorIntervalMs;
+    node->config.snapshotIntervalMs = config->snapshotIntervalMs;
     node->config.relayUrl = node_strdup(config->relayUrl);
     node->config.relayCap = config->relayCap;
     if (node->config.relayUrl) {
@@ -1418,6 +1419,10 @@ HppliteBatch *hpplite_node_fetch_batch(HppliteNode *node, uint64_t height) {
     return batch;
 }
 
+HppliteBatch *hpplite_node_decode(HppliteNode *node, uint64_t height, const uint8_t *data, size_t len) {
+    return node && data ? node_decode_batch(node, height, data, len) : NULL;
+}
+
 static HppliteBatch *node_fetch_batch(HppliteNode *node, uint64_t height) {
     return hpplite_node_fetch_batch(node, height);
 }
@@ -1905,13 +1910,174 @@ static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch) {
 
 static void hex32(const unsigned char *b, char out[67]) { out[0] = '0'; out[1] = 'x'; hpplite_bytes_to_hex(b, 32, out + 2); }
 
+/* The manifest the range commitment ending at `height` names, fetched by its digest's CID and checked against it; NULL: none */
+static cJSON *node_range_manifest(HppliteNode *node, uint64_t height) {
+    HppliteRange r;
+    unsigned char digest[32];
+    char cid[64];
+    uint8_t *text;
+    size_t n = 0;
+    cJSON *m = NULL;
+    memset(&r, 0, sizeof r);
+    if (!node->store || !node->l1 || height == 0 || hpplite_l1_get_range(node->l1, height, &r) != 0) return NULL;
+    hpplite_store_cid_from_sha256(r.manifestDigest, cid);
+    text = hpplite_store_get(node->store, cid, &n);
+    if (text) {
+        hpplite_store_sha256(text, n, digest);
+        if (memcmp(digest, r.manifestDigest, 32) == 0) m = cJSON_ParseWithLength((const char *)text, n);
+        free(text);
+    }
+    hpplite_l1_range_clear(&r);
+    return m;
+}
+
+/* the snapshot a manifest names: 0 and its height, -1 none */
+static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex[64], int64_t *pAt, unsigned char sha[32]) {
+    const cJSON *sn = m ? cJSON_GetObjectItemCaseSensitive(m, "snapshot") : NULL;
+    const cJSON *h = sn ? cJSON_GetObjectItemCaseSensitive(sn, "height") : NULL;
+    const cJSON *ix = sn ? cJSON_GetObjectItemCaseSensitive(sn, "index") : NULL;
+    const cJSON *at = sn ? cJSON_GetObjectItemCaseSensitive(sn, "at") : NULL;
+    const cJSON *sh = sn ? cJSON_GetObjectItemCaseSensitive(sn, "sha256") : NULL;
+    if (!cJSON_IsNumber(h) || h->valuedouble < 1 || !cJSON_IsString(ix) || strlen(ix->valuestring) >= 64
+        || !cJSON_IsString(sh) || strlen(sh->valuestring) != 66 || hpplite_hex_to_bytes(sh->valuestring + 2, sha, 32) != 32) return -1;
+    *pHeight = (uint64_t)h->valuedouble;
+    snprintf(zIndex, 64, "%s", ix->valuestring);
+    if (pAt) *pAt = cJSON_IsNumber(at) ? (int64_t)at->valuedouble : 0;
+    return 0;
+}
+
+#define HPPLITE_SNAPSHOT_CHUNK (8u << 20)     /* well under a store's size limit (16 MiB on Sepolia) */
+
+/*
+** A snapshot (#221): the database as of `height` - the anchored height, the
+** last batch finalized - from the page mode's images (exact by construction,
+** no read of the live file), a page batch with every page full, compressed
+** and sealed as a batch at that height is, to the same recipients. Its bytes
+** go to the store in chunks (content puts at the height), then an index
+** naming them with the height, the root, the chain hash and the block hash
+** there; the anchor's manifest names the index. 0 made, -1 not (said once).
+*/
+static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned char root[32]) {
+    HppliteCtx *ctx = node->ctx;
+    unsigned char *image = NULL, imgRoot[32];
+    uint8_t *packed = NULL, *sealed = NULL, *framed = NULL;
+    const uint8_t *payload;
+    size_t len = 0, payloadLen, off;
+    uint8_t encoding = HPPLITE_ENCODING_NONE;
+    cJSON *ix = NULL, *chunks;
+    char *text = NULL, *zRef = NULL, hx[67];
+    const char *why = NULL;
+    int rc = -1, prc;
+    if (!node->pm) why = "the rollup is not in page mode (capture=pages)";
+    else if (ctx->blockHeight != height + 1 || ctx->openTxnId) why = "a commit is cut over batches at the anchored height";
+    if (!why && (prc = hpplite_pagemode_image(node->pm, &image, &len, imgRoot)) != SQLITE_OK) why = prc == SQLITE_BUSY ? "the whole file is still queued" : "the image could not be built";
+    if (!why && memcmp(imgRoot, root, 32) != 0) why = "the image's root is not the anchored one";
+    if (why) {
+        if (!node->warnedSnapshot) { fprintf(stderr, "hpplite: no snapshot at height %llu: %s\n", (unsigned long long)height, why); node->warnedSnapshot = 1; }
+        sqlite3_free(image);
+        return -1;
+    }
+    payload = image; payloadLen = len;
+    if (!node->config.noCompress) {
+        size_t n = 0;
+        uint8_t *c = hpplite_deflate_level(payload, payloadLen, 6, &n);
+        if (c && n + HPPLITE_PLAIN_MAGIC_LEN < payloadLen) { packed = c; payload = c; payloadLen = n; encoding = HPPLITE_ENCODING_DEFLATE; } else free(c);
+    }
+    if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
+        uint8_t *aTo = NULL, dek[32];
+        int nTo = node_recipients(node, &aTo);
+        hpplite_random_bytes(dek, 32);                  /* its own data key: a batch series' is not disturbed */
+        if (aTo && nTo > 1) sealed = hpplite_envelope_seal_pk(node->cipher, dek, aTo, nTo, height, encoding, payload, payloadLen, &payloadLen);
+        free(aTo);
+        payload = sealed;
+    } else if (node->cipher) {
+        sealed = hpplite_envelope_seal(node->cipher, node->encKey, height, encoding, payload, payloadLen, &payloadLen);
+        payload = sealed;
+    } else if (encoding == HPPLITE_ENCODING_DEFLATE) {
+        framed = malloc(HPPLITE_PLAIN_MAGIC_LEN + payloadLen);
+        if (framed) { memcpy(framed, HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN); memcpy(framed + HPPLITE_PLAIN_MAGIC_LEN, payload, payloadLen); payloadLen += HPPLITE_PLAIN_MAGIC_LEN; }
+        payload = framed;
+    }
+    if (!payload) goto done;
+    ix = cJSON_CreateObject();
+    cJSON_AddNumberToObject(ix, "v", 1);
+    cJSON_AddNumberToObject(ix, "height", (double)height);
+    hex32(root, hx); cJSON_AddStringToObject(ix, "root", hx);
+    hex32(ctx->chainHash, hx); cJSON_AddStringToObject(ix, "chain", hx);
+    hex32(ctx->prevBlockHash, hx); cJSON_AddStringToObject(ix, "block", hx);
+    cJSON_AddNumberToObject(ix, "at", (double)time(NULL));
+    cJSON_AddNumberToObject(ix, "bytes", (double)payloadLen);
+    chunks = cJSON_AddArrayToObject(ix, "chunks");
+    node_store_bucket(node);
+    for (off = 0; off < payloadLen; off += HPPLITE_SNAPSHOT_CHUNK) {
+        size_t n = payloadLen - off < HPPLITE_SNAPSHOT_CHUNK ? payloadLen - off : HPPLITE_SNAPSHOT_CHUNK;
+        char *zReceipt = NULL;
+        zRef = hpplite_store_put_at(node->store, height, payload + off, n, &zReceipt);
+        sqlite3_free(zReceipt);
+        if (!zRef) { hpplite_error(ctx, "snapshot at %llu: the store did not take a chunk: %s", (unsigned long long)height, hpplite_store_error(node->store)); goto done; }
+        {
+            /* each chunk with its sha-256: a reader checks what any store serves (a Kubo CID of a large file is not one) */
+            cJSON *ch = cJSON_CreateObject();
+            unsigned char d[32];
+            hpplite_store_sha256(payload + off, n, d);
+            cJSON_AddStringToObject(ch, "ref", zRef);
+            hex32(d, hx); cJSON_AddStringToObject(ch, "sha256", hx);
+            cJSON_AddItemToArray(chunks, ch);
+        }
+        sqlite3_free(zRef); zRef = NULL;
+    }
+    text = cJSON_PrintUnformatted(ix);
+    if (!text) goto done;
+    {
+        char *zReceipt = NULL;
+        zRef = hpplite_store_put_at(node->store, height, (const uint8_t *)text, strlen(text), &zReceipt);
+        sqlite3_free(zReceipt);
+    }
+    if (!zRef || strlen(zRef) >= sizeof node->snapIndex) { hpplite_error(ctx, "snapshot at %llu: the store did not take its index: %s", (unsigned long long)height, hpplite_store_error(node->store)); goto done; }
+    node->snapHeight = height;
+    snprintf(node->snapIndex, sizeof node->snapIndex, "%s", zRef);
+    hpplite_store_sha256((const uint8_t *)text, strlen(text), node->snapIndexSha);
+    node->snapAt = (int64_t)time(NULL);
+    node->snapLooked = 1;
+    node->warnedSnapshot = 0;
+    rc = 0;
+done:
+    node->storeBalanceOk = 0;
+    sqlite3_free(zRef);
+    free(text);
+    cJSON_Delete(ix);
+    sqlite3_free(image); free(packed); free(sealed); free(framed);
+    return rc;
+}
+
+/* The snapshot this anchor's manifest names (#221): a new one when snapshot= says the last is old
+** enough, else the latest an earlier anchor named (read once from that anchor's manifest) */
+static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch, uint64_t to, const unsigned char root[32]) {
+    cJSON *sn;
+    if (!node->snapLooked) {
+        cJSON *prev = lastBatch ? node_range_manifest(node, lastBatch) : NULL;
+        if (prev && node_manifest_snapshot(prev, &node->snapHeight, node->snapIndex, &node->snapAt, node->snapIndexSha) != 0) node->snapHeight = 0;
+        cJSON_Delete(prev);
+        node->snapLooked = 1;
+    }
+    if (node->config.snapshotIntervalMs > 0
+        && (node->snapHeight == 0 || ((int64_t)time(NULL) - node->snapAt) * 1000 >= (int64_t)node->config.snapshotIntervalMs))
+        node_make_snapshot(node, to, root);
+    if (node->snapHeight == 0) return;
+    sn = cJSON_AddObjectToObject(m, "snapshot");
+    cJSON_AddNumberToObject(sn, "height", (double)node->snapHeight);
+    cJSON_AddStringToObject(sn, "index", node->snapIndex);
+    cJSON_AddNumberToObject(sn, "at", (double)node->snapAt);
+    { char hx[67]; hex32(node->snapIndexSha, hx); cJSON_AddStringToObject(sn, "sha256", hx); }
+}
+
 /*
 ** The anchor: every row of _hpplite_unanchored above the chain's height,
 ** in one manifest at the store and one commitment on the chain. 1 anchored,
 ** 0 nothing to anchor, -1 the chain or the store refused (the rows stay;
 ** the next tick tries again).
 */
-static int node_anchor(HppliteNode *node) {
+static int node_anchor_once(HppliteNode *node) {
     uint64_t lastBatch = 0, total = 0, from = 0, to = 0, expect;
     unsigned char latest[32], chainAfter[32], root[32], digest[32], payTo[20];
     uint8_t compact[HPPLITE_STATEMENT_SIZE];   /* the larger: a /1 receipt or a /2 statement */
@@ -1974,6 +2140,7 @@ static int node_anchor(HppliteNode *node) {
     cJSON_AddNumberToObject(m, "to", (double)to);
     hex32(chainAfter, hx); cJSON_AddStringToObject(m, "chain_after", hx);
     hex32(root, hx); cJSON_AddStringToObject(m, "root", hx);
+    node_anchor_snapshot(node, m, lastBatch, to, root);
     text = cJSON_PrintUnformatted(m);
     cJSON_Delete(m);
     if (!text) return -1;
@@ -2037,6 +2204,23 @@ static int node_anchor(HppliteNode *node) {
         rc = -1;
     }
     free(text); sqlite3_free(zRef); sqlite3_free(zReceipt);
+    return rc;
+}
+
+static int node_anchor(HppliteNode *node) {
+    uint64_t was = node->snapHeight;
+    char wasIndex[64];
+    unsigned char wasSha[32];
+    int64_t wasAt = node->snapAt;
+    int rc;
+    snprintf(wasIndex, sizeof wasIndex, "%s", node->snapIndex);
+    memcpy(wasSha, node->snapIndexSha, 32);
+    rc = node_anchor_once(node);
+    if (rc != 1 && node->snapHeight != was) {
+        /* a snapshot made for a range the chain did not take: no commitment ends at its height for a
+        ** replica to check it against; the one before stands, and the next anchor makes a new one */
+        node->snapHeight = was; snprintf(node->snapIndex, sizeof node->snapIndex, "%s", wasIndex); node->snapAt = wasAt; memcpy(node->snapIndexSha, wasSha, 32);
+    }
     return rc;
 }
 

@@ -221,6 +221,30 @@ void hpplite_pagemode_root(HpplitePageMode *pm, unsigned char out[32]) { hpplite
 
 static uint64_t now_ms(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000; }
 
+int hpplite_pagemode_image(HpplitePageMode *pm, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]) {
+  HpplitePageBatch b;
+  HpplitePageRec *recs;
+  unsigned i, n;
+  *ppBytes = NULL; *pLen = 0;
+  if (!pm || !pm->pRoot || pm->pageSize <= 0 || pm->pBuilding) return SQLITE_MISUSE;
+  n = pm->sizeThen;
+  for (i = 0; i < n; i++) if (i >= pm->nPrev || !pm->aPrev[i]) return SQLITE_BUSY;      /* a whole file queued, not yet finalized */
+  recs = sqlite3_malloc64((sqlite3_uint64)(n ? n : 1) * sizeof(*recs));
+  if (!recs) return SQLITE_NOMEM;
+  for (i = 0; i < n; i++) { recs[i].pgno = i + 1; recs[i].flags = HPPLITE_PAGE_FULL; recs[i].body = pm->aPrev[i]; }
+  memset(&b, 0, sizeof b);
+  b.pageSize = (unsigned)pm->pageSize; b.commitSize = n;
+  b.firstCommit = b.lastCommit = pm->nFinalized;
+  b.timestampMs = now_ms();
+  b.nPages = n; b.aPage = recs;
+  hpplite_pageroot_get(pm->pRoot, b.root); b.crc = hpplite_pageroot_crc(pm->pRoot);
+  memcpy(root, b.root, 32);
+  *ppBytes = hpplite_pagebatch_encode(&b, pLen);
+  sqlite3_free(recs);
+  return *ppBytes ? SQLITE_OK : SQLITE_NOMEM;
+}
+
+
 int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char **ppBytes, size_t *pLen, unsigned char root[32], int *pMore) {
   QCommit *q, *last = NULL;
   unsigned nTake = 0, maxPg = 0, i, pg, ps;

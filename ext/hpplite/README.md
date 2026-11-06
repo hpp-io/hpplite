@@ -177,6 +177,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
+| `snapshot` | No | With `store=` on a chain with ranges, page capture: how often the sequencer snapshots the database at an anchor - `24h`, `1h`; `0` (default) never (#221). The snapshot is the file at the anchored height, sealed like a batch, at the store in chunks under an index the anchor's manifest names, so a replica can start there instead of at batch 1. Also `HPPLITE_SNAPSHOT`. See Stores and commitments |
 | `soft` | No | `off`: a `role=verify` connection with `store=` stays at the anchored height instead of following the store's batches past it (#166). Also `HPPLITE_SOFT` |
 | `store` | No | `on` for the network's canonical store (`l1=hpp-sepolia`: `https://store.sepolia.hpplite.hpp.io`; a network without one refuses to open, #192), or `http://host:port` of a store speaking `hpplite-store/2` (`operators/store/hpplite_store.py`, or the canonical one): the rollup's bucket, kept while its funding wallet covers it (#214); `kubo://host:port` of a Kubo node's RPC; or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service). The batch bytes go there and the chain holds the commitment - hash, reference, and with each anchor the store's signed bucket statement (#11, #33). A replica needs the same `store=` to rebuild. The protocol: [doc/store-protocol.md](doc/store-protocol.md). Also `HPPLITE_STORE` |
 | `storecap` | No | The most the funding wallet pays the store by x402 at once (a top-up), in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing by x402. Also `HPPLITE_STORE_CAP` |
@@ -581,7 +582,8 @@ and what runs out and when at the recent rate, NULL when nothing does), and
 `soft_height` and `soft_disagreements` (#166: a verifier with a store, the
 height its soft batches reach, with `height` staying the anchored one; and
 how many times the chain committed another batch than the store served, each
-followed by a rebuild). `state` says what this node is doing about posting: `sequencing`,
+followed by a rebuild), and `snapshot_height` (#221: the latest snapshot the
+anchors name, NULL for none). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
@@ -690,6 +692,22 @@ hash, and fetches each batch by the manifest's reference, checked against
 its hash as before. `hpplite_status.anchored` is the chain's height; above
 it the store alone holds the batches, for one anchor interval at most. What
 a run leaves at the store, the next run anchors first.
+
+With `snapshot=` (page capture, #221), an anchor whose last snapshot is
+older than that makes a new one: the database as of the anchored height,
+taken from the images the page mode keeps after the last finalized batch
+(never a read of the live file, so it is that height's state exactly),
+encoded as a page batch with every page whole, compressed, and sealed as a
+batch at that height is (the same recipients: the wallet, the owner, the
+readers). It goes to the rollup's bucket in chunks of 8 MiB, then an index,
+`{v, height, root, chain, block, at, bytes, chunks: [{ref, sha256}]}`: the
+root and chain hash are the ones the range commitment ending at that height
+carries. The manifest names it, `"snapshot": {height, index, at, sha256}`
+(the index's hash: whatever store serves it, a reader checks it, and each
+chunk by its own), and every later
+manifest names the latest one, so the last anchor always does; a restart
+finds it in the last anchor's manifest. An anchor the chain refuses drops
+the snapshot it made. Each chunk is a write at a paid store.
 
 Each batch is also stored **under its rollup's name**, `<da contract hex>-<height>`,
 with the sequencer's EIP-712 `Batch` signature appended (#165: the one

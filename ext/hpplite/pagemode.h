@@ -46,6 +46,11 @@ int hpplite_pagemode_take_root(HpplitePageMode *pm, HpplitePageMode *from);
 void hpplite_pagemode_finalized(HpplitePageMode *pm);
 /* the built batch was not finalized: the root goes back, its commits return to the queue */
 void hpplite_pagemode_failed(HpplitePageMode *pm);
+/* The database as of the last finalized batch, from the images kept for the
+** diffs (no read of the live file): a page batch with every page full, its
+** root that batch's. A snapshot (#221). SQLITE_BUSY: a whole file is queued and
+** not yet finalized; the flush thread's, between batches. */
+int hpplite_pagemode_image(HpplitePageMode *pm, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]);
 /* the root after the last finalized batch */
 void hpplite_pagemode_root(HpplitePageMode *pm, unsigned char out[32]);
 int hpplite_pagemode_page_size(HpplitePageMode *pm);

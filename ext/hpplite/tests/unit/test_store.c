@@ -7,6 +7,8 @@
 */
 #include "test_lib.h"
 #include "store.h"
+#include "pages.h"
+#include "cJSON.h"
 #include "crypto.h"
 #include "eth_client.h"
 #include <unistd.h>
@@ -535,6 +537,111 @@ static void test_ranges(const char *url) {
     PASS();
 }
 
+/* the snapshot the manifest of the range ending at `to` names: its height and index CID; -1 none */
+static int range_snapshot(HppliteL1 *l1, HppliteStore *rs, uint64_t to, uint64_t *pH, char zIndex[64]) {
+    HppliteRange r;
+    char cid[64];
+    size_t n = 0;
+    uint8_t *text;
+    cJSON *m, *sn, *h, *ix;
+    int rc = -1;
+    memset(&r, 0, sizeof r);
+    if (hpplite_l1_get_range(l1, to, &r) != 0) return -1;
+    hpplite_store_cid_from_sha256(r.manifestDigest, cid);
+    hpplite_l1_range_clear(&r);
+    text = hpplite_store_get(rs, cid, &n);
+    m = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
+    free(text);
+    sn = m ? cJSON_GetObjectItemCaseSensitive(m, "snapshot") : NULL;
+    h = sn ? cJSON_GetObjectItemCaseSensitive(sn, "height") : NULL;
+    ix = sn ? cJSON_GetObjectItemCaseSensitive(sn, "index") : NULL;
+    if (cJSON_IsNumber(h) && cJSON_IsString(ix)) { *pH = (uint64_t)h->valuedouble; snprintf(zIndex, 64, "%s", ix->valuestring); rc = 0; }
+    cJSON_Delete(m);
+    return rc;
+}
+
+/* 6b. Snapshots (#221): a page-mode sequencer with snapshot= makes one at an anchor - the database as of the
+** anchored height, sealed as a batch, in chunks at the store under an index - and every later anchor names it */
+static void test_snapshot_made(const char *url) {
+    TEST("snapshots: snapshot= makes one at the anchor (the file at the anchored height, its root the range's), named by that manifest and every later one, a restart too");
+    static const unsigned char kseq[32] = { [31] = 0x79 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "snap_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 3600 * 1000 };
+    HppliteNode *w = test_open_node(tpath("sn_w.db"), l1, &o);
+    HppliteStore *rs;
+    HppliteRange r;
+    uint64_t h = 0;
+    char zIndex[64], cid[64];
+    int i;
+    if (!w) FAIL("open");
+    rs = hpplite_store_open(url, NULL, 0);
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES(randomblob(3000))", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("flush"); }
+    }
+    if (hpplite_node_anchor(w) != 3) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 1-3"); }
+    if (status_int(w->db, "snapshot_height") != 3 || range_snapshot(l1, rs, 3, &h, zIndex) != 0 || h != 3) {
+        printf("(status %lld, manifest %llu) ", (long long)status_int(w->db, "snapshot_height"), (unsigned long long)h);
+        hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor's manifest names a snapshot at 3");
+    }
+    {
+        /* the index: the height, the range's root and chain hash; the chunks joined open to the file at 3 */
+        size_t n = 0, total = 0;
+        uint8_t *text = hpplite_store_get(rs, zIndex, &n), *all = NULL;
+        cJSON *ix = text ? cJSON_ParseWithLength((const char *)text, n) : NULL, *c;
+        unsigned char root[32], chain[32];
+        const char *why = NULL;
+        HppliteBatch *b = NULL;
+        HpplitePageBatch *pb = NULL;
+        free(text);
+        memset(&r, 0, sizeof r);
+        hpplite_l1_get_range(l1, 3, &r);
+        if (!ix || cJSON_GetObjectItemCaseSensitive(ix, "height")->valuedouble != 3) why = "the index names height 3";
+        else if (hpplite_hex_to_bytes(cJSON_GetObjectItemCaseSensitive(ix, "root")->valuestring + 2, root, 32) != 32 || memcmp(root, r.stateRoot, 32) != 0) why = "the index's root is the range's";
+        else if (hpplite_hex_to_bytes(cJSON_GetObjectItemCaseSensitive(ix, "chain")->valuestring + 2, chain, 32) != 32 || memcmp(chain, r.chainHashAfter, 32) != 0) why = "the index's chain hash is the range's";
+        cJSON *chunks = why ? NULL : cJSON_GetObjectItemCaseSensitive(ix, "chunks");
+        cJSON_ArrayForEach(c, chunks) {
+            uint8_t *part = hpplite_store_get(rs, cJSON_GetObjectItemCaseSensitive(c, "ref")->valuestring, &n);
+            unsigned char d[32], want[32];
+            if (!part) { why = "every chunk at the store"; break; }
+            hpplite_store_sha256(part, n, d);
+            if (hpplite_hex_to_bytes(cJSON_GetObjectItemCaseSensitive(c, "sha256")->valuestring + 2, want, 32) != 32 || memcmp(d, want, 32) != 0) { free(part); why = "each chunk is the sha-256 the index names"; break; }
+            all = realloc(all, total + n); memcpy(all + total, part, n); total += n; free(part);
+        }
+        if (!why && total != (size_t)cJSON_GetObjectItemCaseSensitive(ix, "bytes")->valuedouble) why = "the chunks join to the index's size";
+        if (!why && !(b = hpplite_node_decode(w, 3, all, total))) why = "the snapshot opens with the sequencer's key at its height";
+        if (!why && (!b->bPages || !(pb = hpplite_pagebatch_decode(b->pPagesRaw, b->nPagesRaw)))) why = "the snapshot is a page batch";
+        if (!why && (pb->nPages != pb->commitSize || memcmp(pb->root, r.stateRoot, 32) != 0)) why = "every page of the file, its root the anchored one";
+        if (!why) for (i = 0; i < (int)pb->nPages; i++) if (pb->aPage[i].flags != HPPLITE_PAGE_FULL || pb->aPage[i].pgno != (unsigned)i + 1) { why = "every page whole, in order"; break; }
+        if (pb) hpplite_pagebatch_free(pb);
+        if (b) hpplite_batch_free(b);
+        free(all); cJSON_Delete(ix); hpplite_l1_range_clear(&r);
+        if (why) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL(why); }
+    }
+    /* two more batches: the next anchor names the same snapshot (snapshot= 1h: not yet another) */
+    for (i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('later')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 5 || range_snapshot(l1, rs, 5, &h, cid) != 0 || h != 3 || strcmp(cid, zIndex) != 0) {
+        hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the next anchor carries the snapshot at 3 forward");
+    }
+    /* a new process: it finds the snapshot in the last anchor's manifest and carries it on */
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    w = test_open_node(tpath("sn_w.db"), l1, &o);
+    if (!w) { hpplite_store_close(rs); hpplite_l1_disconnect(l1); FAIL("reopen"); }
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('after the restart')", NULL);
+    hpplite_node_flush_batch(w);
+    if (hpplite_node_anchor(w) != 6 || range_snapshot(l1, rs, 6, &h, cid) != 0 || h != 3 || strcmp(cid, zIndex) != 0 || status_int(w->db, "snapshot_height") != 3) {
+        printf("(%s) ", status_text(w->db, "last_error"));
+        hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("after a restart the anchor still names the snapshot at 3");
+    }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_store_close(rs);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 static void test_ranges_restart(const char *url) {
     TEST("ranges: a run that dies with batches at the store leaves rows for the chain; the next run anchors them before its own; a manifest with a swapped hash is refused");
     HppliteL1 *l1 = hpplite_l1_create_mock();
@@ -899,6 +1006,7 @@ int main(int argc, char **argv) {
     test_protocol(dir);
     test_ranges(url);
     test_ranges_restart(url);
+    test_snapshot_made(url);
     test_anchor_timer(url);
     test_recovery(url);
     test_soft_replica(url);
