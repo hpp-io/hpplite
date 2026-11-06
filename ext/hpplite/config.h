@@ -255,6 +255,7 @@ int hpplite_config_load_keystore(HppliteConfig *cfg, const char *path, const cha
 int hpplite_config_parse_privkey(HppliteConfig *cfg, const char *hex);
 int hpplite_config_parse_viewkey(HppliteConfig *cfg, const char *hex);   /* (#15) */
 int hpplite_config_parse_ownerkey(HppliteConfig *cfg, const char *hex);  /* (#209) */
+int hpplite_config_resolve_operators(HppliteConfig *cfg);                 /* store=on, relay=on (#192) */
 
 /*
 ** Parse hex contract address string.

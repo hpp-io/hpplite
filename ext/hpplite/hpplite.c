@@ -950,6 +950,7 @@ sqlite3 *hpplite_open(const char *uri) {
     /* Load configuration */
     HppliteConfig *config = hpplite_config_load(uri);
     if (!config) return NULL;
+    hpplite_config_resolve_operators(config);
     if (hpplite_config_error()) {
         fprintf(stderr, "hpplite: cannot open %s: %s\n", uri, hpplite_config_error());
         hpplite_config_free(config);
@@ -1331,6 +1332,7 @@ static int hpplite_auto_init(
     } else {
         return SQLITE_OK;                                   /* not an HPPLite database */
     }
+    hpplite_config_resolve_operators(config);
     if (hpplite_config_error()) {
         /* a setting that is not one of its values: not a default in its place (#80) */
         if (pzErrMsg) *pzErrMsg = sqlite3_mprintf("hpplite: cannot start on %s: %s", filename, hpplite_config_error());

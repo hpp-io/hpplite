@@ -17,5 +17,9 @@ for f in README.md examples/README.md test_util.h .env.example; do
     esac
   done
 done
-[ $rc -eq 0 ] && echo "check_docs: factory address consistent ($CODE)"
+# the canonical operators' URLs (#192): what store=on / relay=on take must be what the README says they take
+for u in $(grep -oE '"https://(store|relay)\.[a-z0-9.]+"' "$DIR/da_uri.c" | tr -d '"'); do
+  grep -q "$u" "$DIR/README.md" || { echo "check_docs: da_uri.c has $u, README.md does not name it"; rc=1; }
+done
+[ $rc -eq 0 ] && echo "check_docs: factory address and operator URLs consistent ($CODE)"
 exit $rc

@@ -826,6 +826,26 @@ int hpplite_config_load_keystore(HppliteConfig *cfg, const char *path, const cha
     return 0;
 }
 
+/* store=on and relay=on (#192): the network's canonical operators, once every source of settings is read and the
+** chain is known; an error when the network has none (a node asked for a store must not quietly post on chain) */
+int hpplite_config_resolve_operators(HppliteConfig *cfg) {
+    struct { char **pz; const char *(*url)(uint64_t); const char *what; } k[2] = {
+        { &cfg->storeUrl, hpplite_network_store_url, "store" }, { &cfg->relayUrl, hpplite_network_relay_url, "relay" } };
+    int i;
+    for (i = 0; i < 2; i++) {
+        if (!*k[i].pz || strcasecmp(*k[i].pz, "on") != 0) continue;
+        const char *url = cfg->chainId ? k[i].url(cfg->chainId) : NULL;
+        if (!url) {
+            snprintf(gConfigError, sizeof(gConfigError), "%s=on: no canonical %s for chain %llu (give its URL)", k[i].what, k[i].what,
+                     (unsigned long long)cfg->chainId);
+            return -1;
+        }
+        free(*k[i].pz);
+        *k[i].pz = strdup(url);
+    }
+    return 0;
+}
+
 int hpplite_config_parse_viewkey(HppliteConfig *cfg, const char *hex) {
     if (!cfg || !hex) return -1;
     if (hex_to_bytes(hex, cfg->viewkey, 32) == 0) { cfg->hasViewKey = 1; return 0; }

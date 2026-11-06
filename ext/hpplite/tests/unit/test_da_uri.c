@@ -284,6 +284,27 @@ static void test_alias_interval(void) {
     PASS();
 }
 
+/* store=on and relay=on take the network's canonical operators (#192): HPP Sepolia's; a URL given stays; a network
+** with none is an error, not a node that quietly posts on chain */
+static void test_operators_on(void) {
+    TEST("store=on and relay=on: the network's canonical operators");
+    HppliteConfig *cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&relay=on");
+    int ok = cfg && hpplite_config_resolve_operators(cfg) == 0 && cfg->storeUrl && cfg->relayUrl
+             && strcmp(cfg->storeUrl, "https://store.sepolia.hpplite.hpp.io") == 0 && strcmp(cfg->relayUrl, "https://relay.sepolia.hpplite.hpp.io") == 0;
+    if (cfg) { printf("  hpp-sepolia: store %s, relay %s\n", cfg->storeUrl ? cfg->storeUrl : "-", cfg->relayUrl ? cfg->relayUrl : "-"); hpplite_config_free(cfg); }
+    if (!ok) { FAIL("hpp-sepolia's store and relay"); }
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=http://127.0.0.1:9");
+    ok = cfg && hpplite_config_resolve_operators(cfg) == 0 && strcmp(cfg->storeUrl, "http://127.0.0.1:9") == 0;
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("a URL given stays"); }
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-mainnet&store=on");
+    ok = cfg && hpplite_config_resolve_operators(cfg) != 0 && hpplite_config_error() && strstr(hpplite_config_error(), "no canonical store");
+    printf("  hpp-mainnet: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)");
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("a network without a canonical store: an error"); }
+    PASS();
+}
+
 int main(void) {
     printf("test_da_uri: DA URI Scheme Tests\n");
     printf("================================\n\n");
@@ -297,6 +318,7 @@ int main(void) {
     test_uri_from_config();
     test_uri_parse_file();
     test_alias_interval();
+    test_operators_on();
 
     printf("\n================================\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);

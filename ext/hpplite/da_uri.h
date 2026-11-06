@@ -60,6 +60,8 @@ typedef struct HppliteNetworkAlias {
     size_t maxTxBytes;      /* Largest batch to post in one transaction (0 = unknown) */
     uint64_t maxTxGas;      /* Gas cap per transaction (0 = unknown) */
     int batchIntervalMs;    /* The chain's own cadence: the batch interval unless interval= says otherwise (0 = the default) */
+    const char *storeUrl;   /* the canonical store, what store=on takes (#192); NULL: none on this network */
+    const char *relayUrl;   /* the canonical relay, what relay=on takes */
 } HppliteNetworkAlias;
 
 /* The limits of a known chain, by chain id (0 = unknown) */
@@ -118,6 +120,9 @@ uint64_t hpplite_da_resolve_alias(const char *alias);
 ** Returns static string or NULL if not found.
 */
 const char *hpplite_da_get_rpc_url(uint64_t chainId);
+/* The network's canonical store and relay (#192): what store=on and relay=on take; NULL when it has none */
+const char *hpplite_network_store_url(uint64_t chainId);
+const char *hpplite_network_relay_url(uint64_t chainId);
 
 /*
 ** Get factory address for chain ID.

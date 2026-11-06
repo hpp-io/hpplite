@@ -23,11 +23,13 @@ const HppliteNetworkAlias HPPLITE_NETWORKS[] = {
     /* HPP anchors to L1 every 30 minutes: a batch posted more often only waits
     ** in its queue, and each costs a commitment (#162), so that is the interval
     ** on HPP unless interval= says otherwise */
-    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xbce61e56f84620bc4365e95126f82b51faed7b4e", 40000, 32000000, 30 * 60 * 1000},
-    {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL, 40000, 32000000, 30 * 60 * 1000},  /* Not deployed yet */
-    {"ethereum",    1,      "https://eth.llamarpc.com", NULL, 20000, 16777216, 0},
-    {"sepolia",     11155111, "https://sepolia.drpc.org", NULL, 20000, 16777216, 0},
-    {NULL, 0, NULL, NULL, 0, 0, 0}
+    /* the canonical operators (hpp-io/hpplite-operators): HPP's store and relay on the network, store=on / relay=on */
+    {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xbce61e56f84620bc4365e95126f82b51faed7b4e", 40000, 32000000, 30 * 60 * 1000,
+     "https://store.sepolia.hpplite.hpp.io", "https://relay.sepolia.hpplite.hpp.io"},
+    {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL, 40000, 32000000, 30 * 60 * 1000, NULL, NULL},  /* Not deployed yet */
+    {"ethereum",    1,      "https://eth.llamarpc.com", NULL, 20000, 16777216, 0, NULL, NULL},
+    {"sepolia",     11155111, "https://sepolia.drpc.org", NULL, 20000, 16777216, 0, NULL, NULL},
+    {NULL, 0, NULL, NULL, 0, 0, 0, NULL, NULL}
 };
 
 int hpplite_network_batch_interval_ms(uint64_t chainId) {
@@ -55,6 +57,18 @@ size_t hpplite_network_max_tx_bytes(uint64_t chainId) {
 }
 
 const int HPPLITE_NETWORKS_COUNT = 4;
+
+const char *hpplite_network_store_url(uint64_t chainId) {
+    int i;
+    for (i = 0; HPPLITE_NETWORKS[i].alias; i++) if (HPPLITE_NETWORKS[i].chainId == chainId) return HPPLITE_NETWORKS[i].storeUrl;
+    return NULL;
+}
+
+const char *hpplite_network_relay_url(uint64_t chainId) {
+    int i;
+    for (i = 0; HPPLITE_NETWORKS[i].alias; i++) if (HPPLITE_NETWORKS[i].chainId == chainId) return HPPLITE_NETWORKS[i].relayUrl;
+    return NULL;
+}
 
 const char *hpplite_da_scheme_str(HppliteDAScheme scheme) {
     switch (scheme) {
