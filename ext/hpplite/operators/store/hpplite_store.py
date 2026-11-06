@@ -261,6 +261,7 @@ class Ledger:
         self.rollups, self.token = rollups, token
         self.lock = threading.RLock()
         self.warnings = {}
+        self.seen = {}          # funder -> (what its permit could pull, when): the last read that worked
 
     # --- records ---
     def bucket(self, da):
@@ -298,7 +299,8 @@ class Ledger:
 
     def pullable(self, a, now=None):
         """what the permit can still pull: the wallet's balance, the allowance (or the permit not yet sent), before
-        its deadline. 0 without a chain or a permit; None when the chain cannot be read"""
+        its deadline. 0 without a chain or a permit. When the chain cannot be read, what the last read said (#219: a
+        failed read must not make the store sign or report less than it knows); None when it never could"""
         now = now or int(time.time())
         p = a.get("permit")
         if not self.token or not p or int(p["deadline"]) <= now:
@@ -307,7 +309,9 @@ class Ledger:
             bal = self.token.balance(a["funder"])
             allow = self.token.allowance(a["funder"]) if a.get("permitSent") else int(p["value"])
         except ChainUnreadable:
-            return None
+            seen = self.seen.get(a["funder"])
+            return seen[0] if seen else None
+        self.seen[a["funder"]] = (min(bal, allow), now)
         return min(bal, allow)
 
     def covered_until(self, a, now=None):

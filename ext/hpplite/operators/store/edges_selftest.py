@@ -11,6 +11,9 @@ settle and lease selftests (#194, #198) checked, as buckets have them.
   binding and a name are answered 503 and nothing is held or taken; a DA
   with no coordinator (the chain answers, no HPPLite rollup there) is not
   bound (404). A fake RPC in this process answers as told.
+- A store whose chain read fails does not sign less than it knows (#219):
+  with a permit read once (the wallet's balance), the bucket statement and
+  the account still say covered by it while the chain cannot be read.
 
 ctest test_store_edges.
 """
@@ -71,10 +74,29 @@ class Facilitator(Answer):
         return self.answer({"success": False, "errorReason": "invalid_exact_evm_nonce_used"})
 
 
+ROLLUP = {}      # "rollup" mode: what the chain says - coordinator, roles, the token
+
+
+def word(v):
+    return "0x" + (v if isinstance(v, str) else "%x" % v).replace("0x", "").rjust(64, "0")
+
+
 class Rpc(Answer):
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
-        if rpc_mode["value"] == "error":
+        if rpc_mode["value"] == "rollup" and req.get("method") == "eth_call":
+            call = req["params"][0]
+            to, sel = call["to"].lower(), call["data"][:10]
+            sels = {"0x" + eth.keccak256(n.encode())[:4].hex(): n for n in
+                    ("coordinator()", "sequencer()", "sequencerWallet()", "sequencerInstance()", "balanceOf(address)",
+                     "allowance(address,address)", "nonces(address)")}
+            name = sels.get(sel, "")
+            out = {"coordinator()": word(ROLLUP["coordinator"][2:]), "sequencer()": word(ROLLUP["sequencer"][2:]),
+                   "sequencerWallet()": word(ROLLUP["sequencer"][2:]), "sequencerInstance()": ROLLUP["instance"],
+                   "balanceOf(address)": word(ROLLUP["balance"]), "allowance(address,address)": word(0),
+                   "nonces(address)": word(0)}.get(name, "0x")
+            return self.answer({"jsonrpc": "2.0", "id": req.get("id"), "result": out})
+        if rpc_mode["value"] in ("error", "rollup"):
             return self.answer({"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32603, "message": "upstream unavailable"}})
         return self.answer({"jsonrpc": "2.0", "id": req.get("id"), "result": "0x"})   # the chain answers, no contract there
 
@@ -203,6 +225,38 @@ def main():
         rpc_mode["value"] = "none"
         code, _ = http_("POST", url2 + "/bucket/" + da2, bind_body(domain2, da2, seq, fund, int(time.time()) + 1))
         check(code == 404, "the chain answers, no HPPLite rollup at the DA: not bound, 404 (%s)" % code)
+
+        # --- a read once, then the chain unreadable: covered-until is what the store knew, not now (#219) ---
+        asset = "0x" + "77" * 20
+        p3, url3 = start_store(work, "covered", "--rpc", rpc_url, "--asset", asset, "--price-per-write", "10",
+                               "--price-per-mib-month", "30")
+        procs.append(p3)
+        st3 = http_("GET", url3 + "/status")[1]
+        domain3 = eth.domain_separator("HPPLiteStore", "2", CHAIN_ID, st3["domain"]["verifyingContract"])
+        da3, inst3 = eth.address(secrets.token_bytes(32)).lower(), "0x" + secrets.token_bytes(32).hex()
+        ROLLUP.update({"coordinator": eth.address(secrets.token_bytes(32)).lower(), "sequencer": eth.address(seq).lower(),
+                       "instance": inst3, "balance": 5000000})
+        rpc_mode["value"] = "rollup"
+        code, _ = http_("POST", url3 + "/bucket/" + da3, bind_body(domain3, da3, seq, fund, int(time.time())))
+        check(code == 200, "bound, the rollup's roles from the chain")
+        deadline = int(time.time()) + 365 * 86400
+        pd = eth.typed_digest(eth.domain_separator("Bridged USDC", "2", CHAIN_ID, asset),
+                              "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+                              fa, st3["buckets"]["spender"], 20000000, 0, deadline)
+        code, _ = http_("POST", url3 + "/account/%s/permit" % fa, json.dumps({"value": 20000000, "deadline": deadline,
+                        "signature": "0x" + eth.sign(fund, pd).hex()}).encode())
+        check(code == 200, "the permit taken")
+        data = b"a batch the permit pays for"
+        body = data + bytes.fromhex(inst3[2:]) + eth.sign(seq, batch_digest(CHAIN_ID, da3, inst3, 1, data))
+        code, _ = http_("POST", "%s/name/%s-1" % (url3, da3[2:]), body)
+        known = http_("GET", url3 + "/bucket/" + da3)[1].get("coveredUntil", 0)
+        check(code == 200 and known > time.time() + 30 * 86400, "a write the permit covers; covered well ahead (%s)" % known)
+        rpc_mode["value"] = "error"
+        b = http_("GET", url3 + "/bucket/" + da3)[1]
+        acct = http_("GET", url3 + "/account/" + fa)[1]
+        print("          (the chain unreadable: the statement's coveredUntil %s, the account's %s)" % ((b.get("statement") or {}).get("coveredUntil"), acct.get("coveredUntil")))
+        check((b.get("statement") or {}).get("coveredUntil", 0) > time.time() + 30 * 86400 and acct.get("coveredUntil", 0) > time.time() + 30 * 86400,
+              "the chain unreadable: the statement and the account still say covered by the permit, as last read (#219)")
     finally:
         for p in procs:
             p.terminate()

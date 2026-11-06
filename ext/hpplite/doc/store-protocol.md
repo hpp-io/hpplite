@@ -32,7 +32,9 @@ nothing to a service that names another, or none.
   content put signed for the bucket. A write into a bucket its account
   cannot cover answers `402` - pay it and the write goes through.
 - **Covered until**: when the account's credit, plus what the permit can
-  still pull, runs out at the current daily cost.
+  still pull, runs out at the current daily cost. What the permit can pull is
+  read from the chain; when a read fails the store goes by its last good
+  read, never signing or reporting less than it knows (#219).
 
 A store must read the chain (`--rpc`): who may bind, write and prune is the
 rollup's `sequencer()` - the key its owner names, so a rotation takes effect
