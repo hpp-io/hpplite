@@ -98,6 +98,7 @@ extern "C" {
 #define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
 #define HPPLITE_URI_STORE_CAP     "storecap"    /* the most to pay the store per call, atomic units of its asset */
 #define HPPLITE_URI_STORE_PERMIT "storepermit"  /* hpplite-store/2 (#214): what the funding wallet's permit lets the store pull; 0: none */
+#define HPPLITE_URI_FROM         "from"        /* where a new replica starts: snapshot (the latest the anchors name) or genesis (batch 1) (#222) */
 #define HPPLITE_URI_SYNC_TO      "syncto"      /* a verifier's stop: no batch past this height is applied (hpplite-verify --to, #206) */
 #define HPPLITE_URI_SYNC_AT      "syncat"      /* ...no batch written after this time, ms since the epoch (hpplite-verify --at, #205) */
 #define HPPLITE_URI_SOFT          "soft"        /* a verifier with a store follows the soft tier (#166); off: the anchored height only */
@@ -178,6 +179,7 @@ typedef struct HppliteConfig {
     uint64_t storePermit;            /* storepermit=: what the permit lets the store pull, atomic units (#214) */
     int storePermitSet;              /* ...given (0 is a value: no permit, the 402s paid) */
     int softOff;                     /* soft=off: a verifier stays at the anchored height (#166) */
+    int fromMode;                    /* from= (#222): 0 the default (a snapshot for a replica, batch 1 for a verifier), 1 snapshot, 2 genesis */
     uint64_t syncTo;                 /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;               /* syncat=: ...none written after this time, ms since the epoch (#205); 0: none */
     uint64_t relayDeposit;           /* relaydeposit=: the relay paid by voucher, the most unspent in its channel (0 = exact, #179) */

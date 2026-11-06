@@ -95,6 +95,7 @@ typedef struct TestNodeOpts {
     uint64_t storeCap;                       /* storecap= */
     int storeFallbackOff;                    /* storefallback=off: a store that does not answer keeps the batch waiting */
     int snapshotMs;                          /* snapshot= (#221): a snapshot at an anchor when the last is older */
+    int fromSnapshot;                        /* from=snapshot (#222): a new replica starts from the latest snapshot */
 } TestNodeOpts;
 HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpts *o);
 int same_root(HppliteNode *a, HppliteNode *b);

@@ -604,6 +604,38 @@ int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned ch
   return SQLITE_OK;
 }
 
+/* A replica started from a snapshot (#222): the bookkeeping as of its height - the block and chain
+** hashes and the root it carries, checked by the caller against the chain - with no batch applied */
+int hppliteSetMetaAt(HppliteCtx *pCtx, uint64_t height, const unsigned char *block, const unsigned char *chain, const unsigned char *root) {
+  sqlite3_stmt *pStmt = NULL;
+  int rc, saved;
+  if (!pCtx || !block || !chain || !root || height == 0) return SQLITE_MISUSE;
+  rc = hppliteBkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) return rc;
+  saved = hppliteBkEnter(pCtx);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "UPDATE _hpplite_meta SET next_height=?1, prev_block_hash=?2, chain_hash=?3, state_root=?4, open_txn=0, frag_id=0, frag_off=0, inflight_height=0, inflight_root=NULL WHERE id=1", -1, &pStmt, NULL);
+  if (rc == SQLITE_OK) {
+    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)(height + 1));
+    sqlite3_bind_blob(pStmt, 2, block, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(pStmt, 3, chain, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(pStmt, 4, root, HPPLITE_HASH_SIZE, SQLITE_TRANSIENT);
+    rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    sqlite3_finalize(pStmt);
+  }
+  hppliteBkLeave(pCtx, saved);
+  rc = hppliteBkEnd(pCtx, rc);
+  if (rc != SQLITE_OK) { hppliteLoadMeta(pCtx); return rc; }
+  pCtx->blockHeight = height + 1;
+  pCtx->openTxnId = 0; pCtx->fragId = 0; pCtx->fragOff = 0;
+  memcpy(pCtx->prevBlockHash, block, HPPLITE_HASH_SIZE);
+  memcpy(pCtx->chainHash, chain, HPPLITE_HASH_SIZE);
+  memcpy(pCtx->stateRoot, root, HPPLITE_HASH_SIZE);
+  pCtx->inflightHeight = 0;
+  { int i = pCtx->nRootAt % HPPLITE_ROOT_RING;
+    pCtx->aRootAt[i].height = height; memcpy(pCtx->aRootAt[i].root, root, 32); pCtx->nRootAt++; }
+  return SQLITE_OK;
+}
+
 int hppliteMarkInflightPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *root) {
   sqlite3_stmt *pStmt = NULL;
   int rc, saved;

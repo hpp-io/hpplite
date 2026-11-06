@@ -192,6 +192,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
 | `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min for a node without a store, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). With `store=` the chain's cadence goes to `anchor` instead and the interval stays 5 s: the batches reach the store in seconds, the chain gets one commitment per anchor (#164). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
+| `from` | No | Where a new replica (an empty file, page capture, `store=`) starts: `snapshot` (the default, except for `role=verify`) - the latest snapshot the anchors name (#222), checked against the root and chain hash the chain anchored at its height, then the batches after it; or `genesis` - every batch from 1. A verifier replays from batch 1 unless given `from=snapshot`; `syncto=`/`syncat=` before the snapshot start from batch 1. Also `HPPLITE_FROM` |
 | `compress` | No | `on` (default): the batch JSON is deflated before it is sealed or posted when that shrinks it, five to twelve times for SQL and row records (#12); `off`: posted as is. Every reader takes both forms, and batches from before stay readable. Also `HPPLITE_COMPRESS` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
@@ -708,6 +709,17 @@ chunk by its own), and every later
 manifest names the latest one, so the last anchor always does; a restart
 finds it in the last anchor's manifest. An anchor the chain refuses drops
 the snapshot it made. Each chunk is a write at a paid store.
+
+A new replica (`from=snapshot`, the default but for a verifier, #222)
+starts there: it reads the snapshot the last anchor's manifest names,
+checks the index against the manifest's hash and each chunk against the
+index's, the root and chain hash against the range commitment ending at
+that height on the chain, and the image's root before writing anything;
+then the file is the image, the bookkeeping is at that height (the root a
+checkpoint), and the sync goes on with the batches after it - a replica of
+a long history reads one image and an anchor interval or so of batches. A
+snapshot that fails a check is said on stderr and the replica replays from
+batch 1. `snapshot_height` in `hpplite_status` is the one it started from.
 
 Each batch is also stored **under its rollup's name**, `<da contract hex>-<height>`,
 with the sequencer's EIP-712 `Batch` signature appended (#165: the one

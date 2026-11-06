@@ -251,6 +251,7 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx);
 int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *posted, size_t nPosted, const unsigned char *root, int bSeriesOpen);   /* bSeriesOpen: a commit cut over batches has pieces still to come (#152) */
 /* before a page batch is submitted: the sidecar remembers it, so a process that dies after the submit knows the batch is its own */
 int hppliteMarkInflightPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *root);
+int hppliteSetMetaAt(HppliteCtx *pCtx, uint64_t height, const unsigned char *block, const unsigned char *chain, const unsigned char *root);   /* the bookkeeping as of a height a snapshot carries (#222) */
 /* Batches the writer keeps as posted, to post again after a reorg (#49) */
 #define HPPLITE_POSTED_KEEP 32
 /* A statement cut into pieces (#59): what the flag adds to an entry, what an

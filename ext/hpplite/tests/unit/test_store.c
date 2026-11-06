@@ -642,6 +642,50 @@ static void test_snapshot_made(const char *url) {
     PASS();
 }
 
+/* 6c. A replica from a snapshot (#222): it writes the snapshot the last anchor names, checked against the
+** chain, and replays only the batches after it; the state is the one a replay from batch 1 reaches */
+static void test_snapshot_replica(const char *url) {
+    TEST("snapshots: a replica with from=snapshot starts at the snapshot the last anchor names and replays only what follows; the same rows and root as one from batch 1");
+    static const unsigned char kseq[32] = { [31] = 0x7a };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "snaprep_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 3600 * 1000 };
+    HppliteNode *w = test_open_node(tpath("snr_w.db"), l1, &o);
+    int i;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 5; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES(randomblob(2000))", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { hpplite_node_destroy(w); FAIL("flush"); }
+        if (i == 2 && hpplite_node_anchor(w) != 3) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("the anchor 1-3, the snapshot at 3"); }
+    }
+    hpplite_node_exec(w, "UPDATE t SET v = 'changed after the snapshot' WHERE id = 2", NULL);
+    if (hpplite_node_flush_batch(w) < 1 || hpplite_node_anchor(w) != 6 || status_int(w->db, "snapshot_height") != 3) { hpplite_node_destroy(w); FAIL("the anchor 4-6 names the snapshot at 3"); }
+    {
+        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .capturePages = 1, .fromSnapshot = 1, .nodeId = "snaprep_s", .privkey = kseq };
+        TestNodeOpts go = { .storeUrl = url, .verifyOnly = 1, .capturePages = 1, .nodeId = "snaprep_g", .privkey = kseq };
+        HppliteNode *sp = test_open_node(tpath("snr_s.db"), l1, &so);
+        HppliteNode *gp = test_open_node(tpath("snr_g.db"), l1, &go);
+        int sRows = sp ? count_rows(sp->db, "t") : -1, gRows = gp ? count_rows(gp->db, "t") : -1;
+        int sSame = sp ? same_root(w, sp) : 0, gSame = gp ? same_root(w, gp) : 0;
+        sqlite3_int64 sSnap = sp ? status_int(sp->db, "snapshot_height") : -1, gSnap = gp ? status_int(gp->db, "snapshot_height") : -1;
+        sqlite3_int64 sCmp = sp ? status_int(sp->db, "roots_compared") : -1, gCmp = gp ? status_int(gp->db, "roots_compared") : -1;
+        sqlite3_int64 sH = sp ? status_int(sp->db, "height") : -1;
+        char changed[64] = "";
+        if (sp) { sqlite3_stmt *q; if (sqlite3_prepare_v2(sp->db, "SELECT v FROM t WHERE id = 2", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) snprintf(changed, sizeof changed, "%s", (const char *)sqlite3_column_text(q, 0)); sqlite3_finalize(q); }
+        if (sp) { sp->l1 = NULL; hpplite_node_destroy(sp); }
+        if (gp) { gp->l1 = NULL; hpplite_node_destroy(gp); }
+        printf("(from the snapshot: rows %d, root same %d, snapshot %lld, roots compared %lld, height %lld; from batch 1: rows %d, same %d, snapshot %lld, compared %lld) ",
+               sRows, sSame, (long long)sSnap, (long long)sCmp, (long long)sH, gRows, gSame, (long long)gSnap, (long long)gCmp);
+        if (sRows != 5 || !sSame || sSnap != 3 || sH != 7 || strcmp(changed, "changed after the snapshot") != 0) { hpplite_node_destroy(w); FAIL("the replica from the snapshot reaches the sequencer's state"); }
+        if (gRows != 5 || !gSame || gSnap != 0) { hpplite_node_destroy(w); FAIL("a verifier, by default, replays from batch 1"); }
+        if (sCmp >= gCmp) { hpplite_node_destroy(w); FAIL("the replica from the snapshot applied fewer batches"); }
+    }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 static void test_ranges_restart(const char *url) {
     TEST("ranges: a run that dies with batches at the store leaves rows for the chain; the next run anchors them before its own; a manifest with a swapped hash is refused");
     HppliteL1 *l1 = hpplite_l1_create_mock();
@@ -1007,6 +1051,7 @@ int main(int argc, char **argv) {
     test_ranges(url);
     test_ranges_restart(url);
     test_snapshot_made(url);
+    test_snapshot_replica(url);
     test_anchor_timer(url);
     test_recovery(url);
     test_soft_replica(url);

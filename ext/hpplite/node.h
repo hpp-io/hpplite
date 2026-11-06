@@ -83,6 +83,7 @@ typedef struct HppliteNodeConfig {
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storePermit;           /* storepermit=: what the funding wallet's permit lets the store pull (0: none, #214) */
     int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
+    int fromSnapshot;               /* from= (#222): a new replica starts from the latest snapshot */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;              /* syncat=: ...none written after this time (ms since the epoch, #205); 0: none */
     uint64_t relayDeposit;          /* relaydeposit=: the relay paid by voucher (#179); 0 = exact */
@@ -176,6 +177,8 @@ typedef struct HppliteNode {
     int64_t snapAt;                 /* when it was made (seconds) */
     int snapLooked;                 /* the latest anchor's manifest was read for it (a process that did not make it) */
     int warnedSnapshot;             /* said once why no snapshot is made */
+    int snapApply;                  /* a replica writing a snapshot (#222): the bookkeeping set to its height, not advanced by a batch */
+    unsigned char snapChain[32], snapBlock[32];
     struct cJSON *manifest;         /* a replica: the manifest of the range it is reading */
     uint64_t manifestFrom, manifestTo;
 

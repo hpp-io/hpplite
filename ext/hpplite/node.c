@@ -156,6 +156,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeFallback = config->storeFallback;
     node->config.anchorIntervalMs = config->anchorIntervalMs;
     node->config.snapshotIntervalMs = config->snapshotIntervalMs;
+    node->config.fromSnapshot = config->fromSnapshot;
     node->config.relayUrl = node_strdup(config->relayUrl);
     node->config.relayCap = config->relayCap;
     if (node->config.relayUrl) {
@@ -1763,7 +1764,8 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     }
     node->ctx->rootCmpHeight = batch->height;          /* for the verifier: compared with the on-chain checkpoint (#5) */
     memcpy(node->ctx->rootCmp, b->root, 32);
-    rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root, b->bMore);   /* the posted bytes: the chain hash (#33) */
+    if (node->snapApply) rc = hppliteSetMetaAt(node->ctx, batch->height, node->snapBlock, node->snapChain, b->root);   /* a snapshot: the bookkeeping at its height (#222) */
+    else rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root, b->bMore);   /* the posted bytes: the chain hash (#33) */
     hpplite_pagebatch_free(b);
     return rc;
 }
@@ -2069,6 +2071,106 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
     cJSON_AddStringToObject(sn, "index", node->snapIndex);
     cJSON_AddNumberToObject(sn, "at", (double)node->snapAt);
     { char hx[67]; hex32(node->snapIndexSha, hx); cJSON_AddStringToObject(sn, "sha256", hx); }
+}
+
+/* bytes the store holds under zRef, checked against a sha-256 from an authenticated source (#222) */
+static uint8_t *node_store_get_checked(HppliteNode *node, const char *zRef, const unsigned char want[32], size_t *pLen) {
+    unsigned char got[32];
+    uint8_t *data = hpplite_store_get(node->store, zRef, pLen);
+    if (!data) return NULL;
+    hpplite_store_sha256(data, *pLen, got);
+    if (memcmp(got, want, 32) != 0) { free(data); *pLen = 0; return NULL; }
+    return data;
+}
+
+/*
+** A new replica starts from the latest snapshot (#222): the one the last
+** anchor's manifest names, its index and chunks checked against the hashes
+** that manifest and index carry, its root and chain hash against the range
+** commitment ending at its height on the chain, its image's root against
+** that root before anything is written; then written as the file, the
+** bookkeeping at that height, and the sync goes on from the next batch.
+** 1 started there; 0 not (from batch 1; why said when a snapshot was
+** refused); -1 the file could not be written.
+*/
+static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch) {
+    HppliteCtx *ctx = node->ctx;
+    cJSON *m, *ix = NULL, *chunks = NULL, *c;
+    uint64_t h = 0;
+    int64_t at = 0;
+    char zIndex[64];
+    uint8_t *text = NULL, *all = NULL;
+    size_t n = 0, total = 0, want = 0;
+    unsigned char root[32], chain[32], block[32], ixSha[32];
+    HppliteRange r;
+    HppliteBatch *batch = NULL;
+    const char *why = NULL;
+    m = node_range_manifest(node, lastBatch);
+    if (!m || node_manifest_snapshot(m, &h, zIndex, &at, ixSha) != 0 || h < 2) { cJSON_Delete(m); return 0; }
+    cJSON_Delete(m);
+    if (node->syncTo && h > node->syncTo) return 0;                         /* a stop before it (#206): from batch 1 */
+    if (node->syncAtMs && (uint64_t)at * 1000 > node->syncAtMs) return 0;  /* ...or a time before it was made (#205) */
+    memset(&r, 0, sizeof r);
+    text = node_store_get_checked(node, zIndex, ixSha, &n);
+    ix = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
+    free(text);
+    if (!ix) why = "its index is not at the store, or not the one the anchor named";
+    else {
+        const cJSON *jh = cJSON_GetObjectItemCaseSensitive(ix, "height"), *jr = cJSON_GetObjectItemCaseSensitive(ix, "root"),
+                    *jc = cJSON_GetObjectItemCaseSensitive(ix, "chain"), *jb = cJSON_GetObjectItemCaseSensitive(ix, "block"),
+                    *jn = cJSON_GetObjectItemCaseSensitive(ix, "bytes");
+        chunks = cJSON_GetObjectItemCaseSensitive(ix, "chunks");
+        if (!cJSON_IsNumber(jh) || (uint64_t)jh->valuedouble != h || !cJSON_IsString(jr) || !cJSON_IsString(jc) || !cJSON_IsString(jb) || !cJSON_IsNumber(jn) || !cJSON_IsArray(chunks)
+            || hpplite_hex_to_bytes(jr->valuestring + 2, root, 32) != 32 || hpplite_hex_to_bytes(jc->valuestring + 2, chain, 32) != 32 || hpplite_hex_to_bytes(jb->valuestring + 2, block, 32) != 32)
+            why = "its index is malformed";
+        else if (hpplite_l1_get_range(node->l1, h, &r) != 0 || r.toHeight != h) why = "no range commitment ends at its height";
+        else if (memcmp(r.stateRoot, root, 32) != 0) why = "its root is not the one the chain anchored there";
+        else if (memcmp(r.chainHashAfter, chain, 32) != 0) why = "its chain hash is not the one the chain anchored there";
+        if (cJSON_IsNumber(jn)) want = (size_t)jn->valuedouble;
+    }
+    hpplite_l1_range_clear(&r);
+    if (!why) {
+        cJSON_ArrayForEach(c, chunks) {
+            const cJSON *ref = cJSON_GetObjectItemCaseSensitive(c, "ref"), *sha = cJSON_GetObjectItemCaseSensitive(c, "sha256");
+            unsigned char d[32];
+            uint8_t *part = NULL, *grown;
+            if (cJSON_IsString(ref) && cJSON_IsString(sha) && strlen(sha->valuestring) == 66 && hpplite_hex_to_bytes(sha->valuestring + 2, d, 32) == 32)
+                part = node_store_get_checked(node, ref->valuestring, d, &n);
+            if (!part) { why = "a chunk is not at the store, or not the one the index names"; break; }
+            grown = realloc(all, total + n);
+            if (!grown) { free(part); why = "out of memory"; break; }
+            all = grown; memcpy(all + total, part, n); total += n; free(part);
+        }
+        if (!why && total != want) why = "its chunks do not add up to its size";
+    }
+    if (!why && !(batch = node_decode_batch(node, h, all, total))) why = "it does not open with this node's keys";
+    if (!why && !batch->bPages) why = "it is not a page image";
+    if (!why) {
+        HpplitePageBatch *pb = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
+        if (!pb || pb->nPages != pb->commitSize || pb->bMore || memcmp(pb->root, root, 32) != 0) why = "its image is not the anchored state";
+        if (pb) hpplite_pagebatch_free(pb);
+    }
+    free(all);
+    cJSON_Delete(ix);
+    if (why) {
+        if (batch) hpplite_batch_free(batch);
+        fprintf(stderr, "hpplite: the snapshot at height %llu is not used (%s): replaying from batch 1\n", (unsigned long long)h, why);
+        return 0;
+    }
+    batch->height = h;
+    node->snapApply = 1; memcpy(node->snapChain, chain, 32); memcpy(node->snapBlock, block, 32);
+    if (node_apply_pages(node, batch) != SQLITE_OK) {
+        node->snapApply = 0;
+        hpplite_batch_free(batch);
+        return -1;
+    }
+    node->snapApply = 0;
+    hpplite_batch_free(batch);
+    hpplite_set_checkpoint(ctx, h, root);           /* the root the chain anchored there: as a checkpoint */
+    node->lastCheckpointHeight = h;
+    node->snapHeight = h;
+    fprintf(stderr, "hpplite: started from the snapshot at height %llu (anchored root matched); replaying from %llu\n", (unsigned long long)h, (unsigned long long)(h + 1));
+    return 1;
 }
 
 /*
@@ -3257,6 +3359,13 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
 
+    if (node->config.fromSnapshot && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2
+        && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0) {
+        /* a new replica: from the latest snapshot rather than batch 1 (#222) */
+        int started = node_start_from_snapshot(node, lastBatch);
+        if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
+        if (started > 0) synced++;
+    }
     while (node->ctx->blockHeight <= lastBatch && !(node->syncTo && node->ctx->blockHeight > node->syncTo) && !node->syncAtReached) {
         HppliteBatch *batch = node_fetch_batch(node, node->ctx->blockHeight);
         int rc;
