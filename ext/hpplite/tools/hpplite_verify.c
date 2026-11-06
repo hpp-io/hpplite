@@ -343,13 +343,13 @@ open_again:
                         verifies = hpplite_store_statement_verify(r.receipt, r.nReceipt, node->config.chainId, da, &stmt);
                 }
                 if (verifies == 0) {
-                    time_t t = (time_t)(stmt.coveredUntil > (uint64_t)INT32_MAX * 2 ? (uint64_t)INT32_MAX * 2 : stmt.coveredUntil);
+                    time_t t = (time_t)(stmt.coveredUntil >= HPPLITE_STATEMENT_FOREVER ? 0 : stmt.coveredUntil);
                     hpplite_bytes_to_hex(stmt.signer, 20, zs);
                     strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S UTC", gmtime(&t));
                     printf("bucket statement signed by 0x%s: holds the rollup's names %llu-%llu, covered until %s%s (signature verifies)\n",
                            zs, (unsigned long long)stmt.pruneHeight, (unsigned long long)stmt.height,
-                           stmt.coveredUntil == UINT64_MAX ? "no end (a free store)" : when,
-                           stmt.coveredUntil != UINT64_MAX && stmt.coveredUntil < (uint64_t)time(NULL) ? " <- PAST" : "");
+                           stmt.coveredUntil >= HPPLITE_STATEMENT_FOREVER ? "no end (a free store)" : when,
+                           stmt.coveredUntil < (uint64_t)time(NULL) ? " <- PAST" : "");
                 } else {
                     printf("bucket statement: the signature DOES NOT VERIFY\n");
                     rc = 1;

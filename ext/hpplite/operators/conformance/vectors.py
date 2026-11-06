@@ -51,7 +51,7 @@ def generate():
             ("Release", hpplite_store.RELEASE_TYPE, [da2, funder, 1800000001], 2),
             ("Content", hpplite_store.CONTENT_TYPE, [da2, 7, eth.keccak256(b"first batch")], 1),
             ("Prune", hpplite_store.PRUNE_TYPE, [da2, 5, 1800000002], 1),
-            ("BucketStatement", hpplite_store.STATEMENT_TYPE, [da2, 9, 5, 2 ** 64 - 1, 1800000003], 0)]
+            ("BucketStatement", hpplite_store.STATEMENT_TYPE, [da2, 9, 5, hpplite_store.FOREVER, 1800000003], 0)]
     v["bucketMessages"] = {"chainId": 181228, "payTo": pay_to, "messages": [
         {"type": t, "typeString": ts, "fields": [("0x" + f.hex()) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
          "digest": "0x" + eth.typed_digest(sdom, ts, *fields).hex(),

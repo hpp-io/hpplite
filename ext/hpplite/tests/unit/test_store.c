@@ -148,6 +148,11 @@ static void test_statement(HppliteStore *s, const char *url) {
         memset(daA, 0xa1, 20); memset(daB, 0xb2, 20);
         if (hpplite_store_statement_verify(st, sizeof st, chainId, daA, &fields) != 0 || memcmp(fields.signer, signer, 20) != 0
             || memcmp(fields.payTo, payTo, 20) != 0 || fields.coveredUntil == 0) FAIL("the statement verifies, its fields read back");
+        /* a free store's 'covered forever' is 2^53-1: exact through any JSON parser - a double, an int64, JavaScript (#216) */
+        if (fields.coveredUntil != 9007199254740991ULL || hpplite_store_covered_until(s) != 9007199254740991LL) {
+            printf("(coveredUntil %llu, covered_until %lld) ", (unsigned long long)fields.coveredUntil, (long long)hpplite_store_covered_until(s));
+            FAIL("a free store's statement says covered until 2^53-1, read back exactly");
+        }
         if (hpplite_store_statement_verify(st, sizeof st, chainId, daB, NULL) == 0) FAIL("verified for another rollup's DA");
         memcpy(bad, st, sizeof bad); bad[48] ^= 1;               /* the height */
         if (hpplite_store_statement_verify(bad, sizeof bad, chainId, daA, NULL) == 0) FAIL("verified with a changed height");

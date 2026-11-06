@@ -71,6 +71,8 @@ char *hpplite_store_put_at(HppliteStore *store, uint64_t height, const uint8_t *
 ** signer; its size, or -1.
 */
 #define HPPLITE_STATEMENT_SIZE 138
+/* coveredUntil when nothing is charged (a free store): 2^53-1, exact in a double, an int64 and any JSON (#216) */
+#define HPPLITE_STATEMENT_FOREVER 9007199254740991ULL
 void hpplite_store_set_bucket(HppliteStore *store, const unsigned char da[20], uint64_t permitCap);
 int hpplite_store_is_bucket(HppliteStore *store);
 int hpplite_store_funder(HppliteStore *store, unsigned char out[20]);

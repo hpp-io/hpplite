@@ -45,7 +45,7 @@ from x402seller.payments import Payments  # noqa: E402
 PROTOCOL = "hpplite-store/2"
 MIB = 1024 * 1024
 MONTH = 30 * 24 * 3600
-FOREVER = 2 ** 64 - 1           # coveredUntil when nothing is charged
+FOREVER = 2 ** 53 - 1           # coveredUntil when nothing is charged: exact in a double, an int64 and every JSON (#216)
 
 BIND_TYPE = "Bind(address da,address funder,uint256 issuedAt)"
 RELEASE_TYPE = "Release(address da,address funder,uint256 issuedAt)"

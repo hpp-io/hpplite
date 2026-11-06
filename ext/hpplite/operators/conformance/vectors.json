@@ -66,16 +66,16 @@
     "typeString": "Prune(address da,uint256 height,uint256 issuedAt)"
    },
    {
-    "digest": "0xb92c525d7393b1ff2718afee7a3b389e991a973e48d1ed6aebe59d0483efd7b1",
+    "digest": "0xf477472bb3f21ca6c437958305a3232e5088fd04603e6b256fe0e3ab05155b20",
     "fields": [
      "0xabababababababababababababababababababab",
      9,
      5,
-     18446744073709551615,
+     9007199254740991,
      1800000003
     ],
     "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
-    "signature": "0x0b9a8ca41cc6057a814de5f8a3a9d2fef93b226159037308b302904f8f512fdc350ab2a0208f2051d06c3c6557d82bff7bd81e1cfc9b105c57f431b82a816a8e1b",
+    "signature": "0x2d7d051d8488355ceebc7c626b7b40e9dc34d663cbdefb8dd15469f91c97bfe82cab0e6c1f248a77857763217e927f6f90093ddedf4bb51745031bfab3db5fbf1b",
     "type": "BucketStatement",
     "typeString": "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
    }
