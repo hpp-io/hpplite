@@ -144,6 +144,17 @@ def wait_for(cond, seconds=20):
     return cond()
 
 
+# hpp-io/hpplite-operators runs this selftest against its store Worker: it replaces start_store (its store under
+# wrangler dev, these flags as vars) and leaves out the sweep check, which writes into the reference's directory
+CHECK_SWEEP_FILES = True
+
+
+def start_store(work, port, args):
+    """the reference store with these flags, its log in work/store.log: an object with terminate() and wait()"""
+    log = open(os.path.join(work, "store.log"), "w")
+    return subprocess.Popen([sys.executable, "-I", os.path.join(here, "hpplite_store.py"), "--port", str(port)] + args, stdout=log, stderr=log)
+
+
 def main():
     k1, k3 = key_bytes(KEY1), key_bytes(KEY3)
     _, da = rollup_of(KEY1)
@@ -161,13 +172,11 @@ def main():
         f.write(KEY2)                                   # signs statements and pulls: anvil's ETH pays the gas
     port = free_port()
     url = "http://127.0.0.1:%d" % port
-    log = open(os.path.join(work, "store.log"), "w")
-    proc = subprocess.Popen([sys.executable, "-I", os.path.join(here, "hpplite_store.py"), "--port", str(port),
-                             "--dir", os.path.join(work, "store"), "--signer-key", os.path.join(work, "signer.key"),
-                             "--pay-to", pay_to, "--rpc", RPC, "--facilitator", FACILITATOR, "--network", "eip155:%d" % CHAIN_ID,
-                             "--asset", USDC, "--tick-interval", "0.5", "--price-per-mib-month", "1e12", "--price-per-write", "10",
-                             "--pull-threshold", "2000", "--pull-interval", "100000", "--retry-seconds", "1", "--park-seconds", "4",
-                             "--min-pay", "3000", "--sweep-age", "2"], stdout=log, stderr=log)
+    proc = start_store(work, port, ["--dir", os.path.join(work, "store"), "--signer-key", os.path.join(work, "signer.key"),
+                                    "--pay-to", pay_to, "--rpc", RPC, "--facilitator", FACILITATOR, "--network", "eip155:%d" % CHAIN_ID,
+                                    "--asset", USDC, "--tick-interval", "0.5", "--price-per-mib-month", "1e12", "--price-per-write", "10",
+                                    "--pull-threshold", "2000", "--pull-interval", "100000", "--retry-seconds", "1", "--park-seconds", "4",
+                                    "--min-pay", "3000", "--sweep-age", "2"])
     try:
         st = wait_for(lambda: http("GET", url + "/status")[1] if _up(url) else None)
         check(isinstance(st, dict) and st.get("protocol") == "hpplite-store/2", "the store speaks hpplite-store/2")
@@ -294,14 +303,14 @@ def main():
         check(code == 200 and out.get("state") == "parked", "released by its funder: parked (%s)" % code)
 
         # --- sweep ---
-        junk = os.path.join(work, "store", "c", _cid(b"interrupted"))
-        with open(junk, "wb") as f:
-            f.write(b"interrupted")
-        check(wait_for(lambda: not os.path.exists(junk), 15), "bytes in no bucket swept")
+        if CHECK_SWEEP_FILES:
+            junk = os.path.join(work, "store", "c", _cid(b"interrupted"))
+            with open(junk, "wb") as f:
+                f.write(b"interrupted")
+            check(wait_for(lambda: not os.path.exists(junk), 15), "bytes in no bucket swept")
     finally:
         proc.terminate()
         proc.wait()
-        log.close()
         if fails:
             sys.stdout.write(open(os.path.join(work, "store.log")).read()[-3000:])
     print("bucket selftest: %s" % ("FAIL (%d)" % fails if fails else "ok"))
