@@ -2,7 +2,7 @@
 ** hpplite-verify: rebuild a database from the chain alone and check it.
 **
 **   HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" \
-**     hpplite-verify [--db /path/to/live.db] [--keep <dir>] [--to <height>]
+**     hpplite-verify [--db /path/to/live.db] [--keep <dir>] [--to <height> | --at <time>]
 **
 ** Opens an empty file with role=verify and the same parameters the
 ** application uses (l1=/rpc=/factory=/contract=, the key, dbname=): every
@@ -20,11 +20,19 @@
 ** of that height stays; the checkpoints passed are checked, and whether the
 ** stop height carries a root of its own is said.
 **
+** --at <time> (unix seconds, or YYYY-MM-DDTHH:MM:SSZ): point-in-time recovery
+** (#205) - every batch its writer wrote by then, by the time each batch
+** carries; a transaction in flight at that moment is completed, never left
+** halfway. With --keep, the database as of that time stays.
+**
 ** Exit 0: verified (and the live file equals the chain, with --db);
 ** 1: a root mismatch, a sync that stopped short, or a live file that
 ** differs; 2: cannot run (parameters, chain, no rollup).
 */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE        /* strptime, timegm (--at) */
+#endif
 #include "hpplite.h"
 #include "node.h"
 #include "l1_interface.h"
@@ -148,13 +156,31 @@ static int report_table_differences(sqlite3 *a, sqlite3 *b) {
     return nDiff;
 }
 
+/* --at's time: unix seconds, or YYYY-MM-DDTHH:MM:SS(Z), in UTC; ms since the epoch, 0 when it is neither */
+static uint64_t parse_time_ms(const char *z) {
+    struct tm tm;
+    const char *end;
+    if (!z || !z[0]) return 0;
+    if (strspn(z, "0123456789") == strlen(z)) return (uint64_t)atoll(z) * 1000;
+    memset(&tm, 0, sizeof tm);
+    end = strptime(z, "%Y-%m-%dT%H:%M:%S", &tm);
+    if (!end || (*end && strcmp(end, "Z") != 0)) return 0;
+    return (uint64_t)timegm(&tm) * 1000;
+}
+
+static void fmt_time(uint64_t ms, char *out, size_t n) {
+    time_t t = (time_t)(ms / 1000);
+    strftime(out, n, "%Y-%m-%d %H:%M:%S UTC", gmtime(&t));
+}
+
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: HPPLITE_PARAMS=\"l1=...&keyfile=...\" %s [--db <live database>] [--keep <dir>] [--to <height>]\n", argv0);
+    fprintf(stderr, "usage: HPPLITE_PARAMS=\"l1=...&keyfile=...\" %s [--db <live database>] [--keep <dir>] [--to <height> | --at <time>]\n", argv0);
     return 2;
 }
 
 int main(int argc, char **argv) {
     uint64_t stopAt = 0;            /* --to (#206) */
+    uint64_t atMs = 0;              /* --at (#205) */
     const char *zLive = NULL, *zKeep = NULL;
     char dir[1024];
     int rc = 0, i;
@@ -162,6 +188,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) zLive = argv[++i];
         else if (strcmp(argv[i], "--keep") == 0 && i + 1 < argc) zKeep = argv[++i];
         else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc && atoll(argv[i + 1]) > 0) stopAt = (uint64_t)atoll(argv[++i]);
+        else if (strcmp(argv[i], "--at") == 0 && i + 1 < argc && (atMs = parse_time_ms(argv[i + 1])) > 0) i++;
         else return usage(argv[0]);
     }
     const char *params = getenv("HPPLITE_PARAMS");
@@ -186,6 +213,7 @@ open_again:
     /* the hard tier first: soft=off keeps the rebuild at the anchored height, the soft tier is reported after (#166) */
     { char to[40] = "";
       if (stopAt) snprintf(to, sizeof to, "&syncto=%llu", (unsigned long long)stopAt);    /* the stop, from the first sync at open */
+      else if (atMs) snprintf(to, sizeof to, "&syncat=%llu", (unsigned long long)atMs);
       char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s&%s%s%s", dir, dir, params, zCapture, to);
       db = uri ? hpplite_open(uri) : NULL;
       sqlite3_free(uri); }
@@ -210,6 +238,7 @@ open_again:
         target = stopAt && stopAt < onChain ? stopAt : onChain;
         height = scalar(db, "SELECT height FROM hpplite_status");   /* next batch number */
         rebuilt = height > 0 ? (uint64_t)height - 1 : 0;
+        if (atMs && node->syncAtReached) target = rebuilt;           /* the next batch was written after the time */
         if (rebuilt >= target || node->state == HPPLITE_STATE_ERROR) break;
         if (hpplite_node_sync_from_l1(node, 1) <= 0) break;
     }
@@ -242,6 +271,16 @@ open_again:
     }
     printf("rollup %s: %llu batches on chain, %llu replayed", contract, (unsigned long long)onChain, (unsigned long long)rebuilt);
     if (stopAt) printf(" (--to %llu)", (unsigned long long)stopAt);
+    if (atMs) {
+        char want[40], wrote[40];
+        fmt_time(atMs, want, sizeof want);
+        if (rebuilt == 0) printf("\nthe database as of %s: no batch written by then", want);
+        else {
+            fmt_time(node->lastAppliedMs, wrote, sizeof wrote);
+            printf("\nthe database as of %s: through batch %llu, written %s%s", want, (unsigned long long)rebuilt, wrote,
+                   node->lastAppliedMs > atMs ? " (it completes a transaction in flight at that time)" : "");
+        }
+    }
     if (rebuilt < target) {
         printf("\nhpplite-verify: sync stopped at batch %llu: %s\n", (unsigned long long)rebuilt + 1, zErr[0] ? zErr : zState);
         rc = 1;
@@ -390,7 +429,7 @@ open_again:
 
     /* the soft tier (#166): what the store holds under the rollup's names past the anchor, signed by the
     ** sequencer and applying on the rebuilt history - stored to here, anchored to there */
-    if (rc == 0 && !stopAt && node->store && hpplite_l1_has_ranges(node->l1)) {
+    if (rc == 0 && !stopAt && !atMs && node->store && hpplite_l1_has_ranges(node->l1)) {
         uint64_t before = hpplite_get_block_height(node->ctx);
         node->config.softOff = 0;
         hpplite_node_sync_from_l1(node, 1);

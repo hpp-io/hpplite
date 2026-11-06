@@ -149,6 +149,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.relayDeposit = config->relayDeposit;
     node->config.softOff = config->softOff;
     node->syncTo = config->syncTo;
+    node->syncAtMs = config->syncAtMs;
     node->config.spendCap = config->spendCap;
     node->config.spendWindow = config->spendWindow;
     node->config.lowBalanceHours = config->lowBalanceHours;
@@ -3072,9 +3073,20 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
 
-    while (node->ctx->blockHeight <= lastBatch && !(node->syncTo && node->ctx->blockHeight > node->syncTo)) {
+    while (node->ctx->blockHeight <= lastBatch && !(node->syncTo && node->ctx->blockHeight > node->syncTo) && !node->syncAtReached) {
         HppliteBatch *batch = node_fetch_batch(node, node->ctx->blockHeight);
         int rc;
+        if (batch && node->syncAtMs) {
+            /* a stop by time (#205): no batch written after it begins; one that continues a transaction in flight
+            ** at that time is applied, so the database is never left halfway through one */
+            uint64_t ms = 0;
+            int more = 0;
+            if (batch->bPages) hpplite_pagebatch_meta(batch->pPagesRaw, batch->nPagesRaw, &ms, &more);
+            else { ms = batch->timestamp * 1000; more = batch->openTxn || batch->partial; }
+            if (ms > node->syncAtMs && !node->syncAtInFlight) { hpplite_batch_free(batch); node->syncAtReached = 1; break; }
+            node->syncAtInFlight = more;
+            node->lastAppliedMs = ms;
+        }
         if (!batch) {
             if (node->lastFetchForeign && node_skip_foreign_height(node, node->ctx->blockHeight) == 0) {
                 synced++;

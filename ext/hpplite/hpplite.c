@@ -923,6 +923,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->relayDeposit = cfg->relayDeposit;
     nc->softOff = cfg->softOff;
     nc->syncTo = nc->verifyOnly ? cfg->syncTo : 0;      /* a stop for a verifier only: a sequencer must replay all (#206) */
+    nc->syncAtMs = nc->verifyOnly ? cfg->syncAtMs : 0;
     nc->spendCap = cfg->spendCap;
     nc->spendWindow = cfg->spendWindow;
     nc->lowBalanceHours = cfg->lowBalanceHours;

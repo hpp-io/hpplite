@@ -84,6 +84,7 @@ typedef struct HppliteNodeConfig {
     uint64_t storePermit;           /* storepermit=: what the funding wallet's permit lets the store pull (0: none, #214) */
     int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
+    uint64_t syncAtMs;              /* syncat=: ...none written after this time (ms since the epoch, #205); 0: none */
     uint64_t relayDeposit;          /* relaydeposit=: the relay paid by voucher (#179); 0 = exact */
     uint64_t spendCap, spendWindow; /* spendcap=: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
     int lowBalanceHours;            /* lowbalance=: warn below this many hours of money at the recent rate; 0 = 72, -1 = off */
@@ -159,6 +160,10 @@ typedef struct HppliteNode {
     int64_t anchorAt;               /* the timer anchors at this time (ms, monotonic); 0 = not yet decided */
     uint64_t anchoredHeight;        /* the chain's last height as last read: above it, the store alone holds the batches */
     uint64_t syncTo;                /* a verifier's stop (hpplite-verify --to, #206): no batch past it is applied; 0: none */
+    uint64_t syncAtMs;              /* ...by time (--at, #205): no batch written after it begins (a transaction in flight completes) */
+    uint64_t lastAppliedMs;         /* the writer's time of the last batch applied (ms) */
+    int syncAtReached;              /* the batch after the time was met: nothing more is applied */
+    int syncAtInFlight;             /* the last batch applied leaves a transaction open: its rest follows */
     char lastAnchorTx[80];
     HppliteAnchorRow anchorRow;     /* the commitment of the batch being finalized, for _hpplite_unanchored */
     char *zAnchorRef;

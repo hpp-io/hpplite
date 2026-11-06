@@ -531,6 +531,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->relayDeposit = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf)) && buf[0]) cfg->softOff = strcasecmp(buf, "off") == 0 || strcmp(buf, "0") == 0;
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
+    if (get_uri_param(uri, HPPLITE_URI_SYNC_AT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncAtMs = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_SPEND_CAP, buf, sizeof(buf)) && buf[0]
         && hpplite_spend_parse_cap(buf, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: spendcap=%s: not N, N/hour or N/day; ignored\n", buf);
     if (get_uri_param(uri, HPPLITE_URI_LOW_BALANCE, buf, sizeof(buf)) && buf[0]) cfg->lowBalanceHours = atoi(buf) > 0 ? atoi(buf) : -1;
@@ -720,6 +721,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && val[0]) cfg->softOff = strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_TO);
     if (val && atoll(val) > 0) cfg->syncTo = (uint64_t)atoll(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_AT);
+    if (val && atoll(val) > 0) cfg->syncAtMs = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_DEPOSIT);
     if (val && atoll(val) > 0) cfg->relayDeposit = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SPEND_CAP);

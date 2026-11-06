@@ -52,6 +52,8 @@ typedef struct HpplitePageBatch {
 } HpplitePageBatch;
 /* is this a page batch (before any parse)? */
 int hpplite_pagebatch_is(const unsigned char *p, size_t n);
+/* A page batch's writer time (ms) and whether its commit continues in the next batch, from its header (#205): 0, or -1 */
+int hpplite_pagebatch_meta(const unsigned char *p, size_t n, uint64_t *pTimestampMs, int *pMore);
 /* the bytes of a batch; sqlite3_free */
 unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen);
 /* a batch from its bytes: the records point into p, which must outlive it; sqlite3_free the batch */

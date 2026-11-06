@@ -2489,6 +2489,54 @@ static void test_sealed_to_owner(void) {
     PASS();
 }
 
+/* 34. Point-in-time recovery (#205): hpplite-verify --at <time> rebuilds what the writer had written by then, by the
+** time each batch carries - three batches two seconds apart, the database as of a moment between the second and the
+** third (kept, read back: two rows), as of before the first (nothing), and in ISO form. KEY6. */
+static void test_verify_at(void) {
+    TEST("hpplite-verify --at <time> (#205): the database as of a time, by the writer's time in each batch; before the first, nothing");
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    sqlite3 *w = open_db("va_writer.db", KEY6, "&dbname=verifyat");
+    if (!w) FAIL("open writer");
+    sqlite3_exec(w, "CREATE TABLE a(n INTEGER)", NULL, NULL, NULL);
+    long long t0 = (long long)time(NULL), between = 0;
+    for (int i = 1; i <= 3; i++) {
+        char sql[80];
+        snprintf(sql, sizeof sql, "INSERT INTO a VALUES(%d)", i);
+        sqlite3_exec(w, sql, NULL, NULL, NULL);
+        if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); FAIL("a batch"); }
+        if (i == 2) { sleep(2); between = (long long)time(NULL); sleep(2); }
+        else if (i == 1) sleep(2);
+    }
+    sqlite3_close(w);
+    char params[400], out[4096], extra[300], dir[200], path[300];
+    snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=verifyat", RPC, FACTORY, KEY6);
+    snprintf(dir, sizeof dir, DIR "/va_keep");
+    snprintf(extra, sizeof extra, "--at %lld --keep %s", between, dir);
+    out[0] = 0;
+    int rc = run_verify_with(params, extra, out, sizeof out);
+    snprintf(path, sizeof path, "%s/rebuilt.db", dir);
+    sqlite3 *kept = NULL;
+    long long rows = -1;
+    if (sqlite3_open_v2(path, &kept, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) rows = scalar(kept, "SELECT count(*) FROM a");
+    sqlite3_close(kept);
+    printf("(--at between the second and third: exit %d, rows %lld) ", rc, rows);
+    if (rc != 0 || rows != 2 || !strstr(out, "through batch 2, written") || !strstr(out, "\nverified")) FAILF("--at %lld:\n%s", between, out);
+    snprintf(extra, sizeof extra, "--at %lld", t0 - 3600);
+    out[0] = 0;
+    rc = run_verify_with(params, extra, out, sizeof out);
+    if (rc != 0 || !strstr(out, "no batch written by then")) FAILF("--at an hour before:\n%s", out);
+    {
+        char iso[40];
+        time_t t = (time_t)between;
+        strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
+        snprintf(extra, sizeof extra, "--at %s", iso);
+        out[0] = 0;
+        rc = run_verify_with(params, extra, out, sizeof out);
+        if (rc != 0 || !strstr(out, "through batch 2, written")) FAILF("--at %s:\n%s", iso, out);
+    }
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2534,6 +2582,7 @@ int main(void) {
     if (wanted(31)) test_relay_channel();
     if (wanted(32)) test_verify_to();
     if (wanted(33)) test_sealed_to_owner();
+    if (wanted(34)) test_verify_at();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

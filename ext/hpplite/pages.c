@@ -192,6 +192,13 @@ unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen)
   return p;
 }
 
+int hpplite_pagebatch_meta(const unsigned char *p, size_t n, uint64_t *pTimestampMs, int *pMore) {
+  if (!hpplite_pagebatch_is(p, n) || n < 64) return -1;
+  if (pTimestampMs) *pTimestampMs = r64(p + 40);
+  if (pMore) *pMore = r32(p + 4) == 1u ? 0 : (int)(r32(p + 60) & 1u);
+  return 0;
+}
+
 HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n) {
   HpplitePageBatch *b;
   size_t rec, o;
