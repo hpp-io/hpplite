@@ -2,7 +2,7 @@
 ** hpplite-verify: rebuild a database from the chain alone and check it.
 **
 **   HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" \
-**     hpplite-verify [--db /path/to/live.db] [--keep <dir>]
+**     hpplite-verify [--db /path/to/live.db] [--keep <dir>] [--to <height>]
 **
 ** Opens an empty file with role=verify and the same parameters the
 ** application uses (l1=/rpc=/factory=/contract=, the key, dbname=): every
@@ -15,6 +15,10 @@
 ** --db <file>: also compare the live database with the rebuilt one - the
 ** same content hash as the state root; when they differ and nothing is
 ** pending in the live file, the tables that differ are named.
+**
+** --to <height>: stop after that batch (#206): with --keep, the database as
+** of that height stays; the checkpoints passed are checked, and whether the
+** stop height carries a root of its own is said.
 **
 ** Exit 0: verified (and the live file equals the chain, with --db);
 ** 1: a root mismatch, a sync that stopped short, or a live file that
@@ -145,17 +149,19 @@ static int report_table_differences(sqlite3 *a, sqlite3 *b) {
 }
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: HPPLITE_PARAMS=\"l1=...&keyfile=...\" %s [--db <live database>] [--keep <dir>]\n", argv0);
+    fprintf(stderr, "usage: HPPLITE_PARAMS=\"l1=...&keyfile=...\" %s [--db <live database>] [--keep <dir>] [--to <height>]\n", argv0);
     return 2;
 }
 
 int main(int argc, char **argv) {
+    uint64_t stopAt = 0;            /* --to (#206) */
     const char *zLive = NULL, *zKeep = NULL;
     char dir[1024];
     int rc = 0, i;
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) zLive = argv[++i];
         else if (strcmp(argv[i], "--keep") == 0 && i + 1 < argc) zKeep = argv[++i];
+        else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc && atoll(argv[i + 1]) > 0) stopAt = (uint64_t)atoll(argv[++i]);
         else return usage(argv[0]);
     }
     const char *params = getenv("HPPLITE_PARAMS");
@@ -178,7 +184,9 @@ int main(int argc, char **argv) {
     sqlite3 *db;
 open_again:
     /* the hard tier first: soft=off keeps the rebuild at the anchored height, the soft tier is reported after (#166) */
-    { char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s&%s%s", dir, dir, params, zCapture);
+    { char to[40] = "";
+      if (stopAt) snprintf(to, sizeof to, "&syncto=%llu", (unsigned long long)stopAt);    /* the stop, from the first sync at open */
+      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s&%s%s%s", dir, dir, params, zCapture, to);
       db = uri ? hpplite_open(uri) : NULL;
       sqlite3_free(uri); }
     if (!db) {
@@ -195,13 +203,14 @@ open_again:
 
     /* A long rebuild races the sequencer: batches posted meanwhile are
     ** replayed too, until the chain and the rebuild agree or a sync stops */
-    uint64_t onChain = 0, total = 0, rebuilt = 0;
+    uint64_t onChain = 0, total = 0, rebuilt = 0, target = 0;
     for (i = 0; i < 100; i++) {
         sqlite3_int64 height;
         hpplite_l1_get_da_state(node->l1, &onChain, &total, NULL);
+        target = stopAt && stopAt < onChain ? stopAt : onChain;
         height = scalar(db, "SELECT height FROM hpplite_status");   /* next batch number */
         rebuilt = height > 0 ? (uint64_t)height - 1 : 0;
-        if (rebuilt >= onChain || node->state == HPPLITE_STATE_ERROR) break;
+        if (rebuilt >= target || node->state == HPPLITE_STATE_ERROR) break;
         if (hpplite_node_sync_from_l1(node, 1) <= 0) break;
     }
     const char *zState = status_text(db, "state");
@@ -226,8 +235,14 @@ open_again:
     char contract[43] = "", da[43] = "";
     hpplite_l1_get_addresses(node->l1, contract, da);
 
+    if (stopAt && stopAt > onChain) {
+        fprintf(stderr, "hpplite-verify: --to %llu is past the chain's height %llu\n", (unsigned long long)stopAt, (unsigned long long)onChain);
+        rc = 2;
+        goto close;
+    }
     printf("rollup %s: %llu batches on chain, %llu replayed", contract, (unsigned long long)onChain, (unsigned long long)rebuilt);
-    if (rebuilt < onChain) {
+    if (stopAt) printf(" (--to %llu)", (unsigned long long)stopAt);
+    if (rebuilt < target) {
         printf("\nhpplite-verify: sync stopped at batch %llu: %s\n", (unsigned long long)rebuilt + 1, zErr[0] ? zErr : zState);
         rc = 1;
     } else {
@@ -245,7 +260,21 @@ open_again:
     /* the root the contract anchors, against the rebuilt content at that height */
     {
         HppliteL1State *st = hpplite_l1_get_state(node->l1);
-        if (st && st->lastCheckpointHeight > 0) {
+        if (stopAt && rebuilt == stopAt) {
+            /* the database as of the stop height: its own root, if one was posted there, else the last checked */
+            unsigned char at[32];
+            char got[65];
+            if (hpplite_root_at(node->ctx, stopAt, at) == 0) {
+                hex(at, got);
+                printf("the database as of batch %llu: state root %s, posted at that height and matched\n", (unsigned long long)stopAt, got);
+            } else {
+                printf("the database as of batch %llu: no root posted at that height; the last checked was at batch %llu\n",
+                       (unsigned long long)stopAt, (unsigned long long)node->ctx->rootCmpHeight);
+            }
+        }
+        if (st && st->lastCheckpointHeight > 0 && stopAt && st->lastCheckpointHeight > stopAt) {
+            printf("on-chain checkpoint at batch %llu: past --to %llu, not compared\n", (unsigned long long)st->lastCheckpointHeight, (unsigned long long)stopAt);
+        } else if (st && st->lastCheckpointHeight > 0) {
             char want[65], got[65];
             hex(st->lastStateRoot, want);
             unsigned char at[32];
@@ -361,7 +390,7 @@ open_again:
 
     /* the soft tier (#166): what the store holds under the rollup's names past the anchor, signed by the
     ** sequencer and applying on the rebuilt history - stored to here, anchored to there */
-    if (rc == 0 && node->store && hpplite_l1_has_ranges(node->l1)) {
+    if (rc == 0 && !stopAt && node->store && hpplite_l1_has_ranges(node->l1)) {
         uint64_t before = hpplite_get_block_height(node->ctx);
         node->config.softOff = 0;
         hpplite_node_sync_from_l1(node, 1);

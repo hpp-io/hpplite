@@ -146,6 +146,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storePermit = config->storePermit;
     node->config.relayDeposit = config->relayDeposit;
     node->config.softOff = config->softOff;
+    node->syncTo = config->syncTo;
     node->config.spendCap = config->spendCap;
     node->config.spendWindow = config->spendWindow;
     node->config.lowBalanceHours = config->lowBalanceHours;
@@ -3052,7 +3053,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
 
-    while (node->ctx->blockHeight <= lastBatch) {
+    while (node->ctx->blockHeight <= lastBatch && !(node->syncTo && node->ctx->blockHeight > node->syncTo)) {
         HppliteBatch *batch = node_fetch_batch(node, node->ctx->blockHeight);
         int rc;
         if (!batch) {

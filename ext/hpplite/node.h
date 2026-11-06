@@ -81,6 +81,7 @@ typedef struct HppliteNodeConfig {
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storePermit;           /* storepermit=: what the funding wallet's permit lets the store pull (0: none, #214) */
     int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
+    uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t relayDeposit;          /* relaydeposit=: the relay paid by voucher (#179); 0 = exact */
     uint64_t spendCap, spendWindow; /* spendcap=: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
     int lowBalanceHours;            /* lowbalance=: warn below this many hours of money at the recent rate; 0 = 72, -1 = off */
@@ -155,6 +156,7 @@ typedef struct HppliteNode {
     /* Ranges (#164): the store holds the batches, the chain one commitment per anchor */
     int64_t anchorAt;               /* the timer anchors at this time (ms, monotonic); 0 = not yet decided */
     uint64_t anchoredHeight;        /* the chain's last height as last read: above it, the store alone holds the batches */
+    uint64_t syncTo;                /* a verifier's stop (hpplite-verify --to, #206): no batch past it is applied; 0: none */
     char lastAnchorTx[80];
     HppliteAnchorRow anchorRow;     /* the commitment of the batch being finalized, for _hpplite_unanchored */
     char *zAnchorRef;

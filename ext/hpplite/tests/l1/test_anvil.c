@@ -2398,6 +2398,49 @@ static void test_relay_channel(void) {
     PASS();
 }
 
+/* 32. hpplite-verify --to (#206): the database as of a height - a rollup with a checkpoint every two
+** batches and one row per batch, rebuilt to 2 (a checkpoint) and to 3 (between two: the chain's checkpoint at 4
+** is past it, not compared), each with its own posted root matched, kept with --keep and read back; --to past
+** the chain is refused. KEY5. */
+static void test_verify_to(void) {
+    TEST("hpplite-verify --to <height> (#206): the database as of a checkpoint and between two, kept and read back; past the chain refused");
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    sqlite3 *w = open_db("vt_writer.db", KEY5, "&dbname=verifyto&checkpoint=2");
+    if (!w) FAIL("open writer");
+    sqlite3_exec(w, "CREATE TABLE v(n INTEGER)", NULL, NULL, NULL);
+    for (int i = 1; i <= 5; i++) {
+        char sql[80];
+        snprintf(sql, sizeof sql, "INSERT INTO v VALUES(%d)", i);
+        sqlite3_exec(w, sql, NULL, NULL, NULL);
+        if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); FAIL("a batch"); }
+    }
+    sqlite3_close(w);
+    char params[400], out[4096], extra[300];
+    snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=verifyto", RPC, FACTORY, KEY5);
+    static const struct { int to; const char *says; } cases[] = {
+        { 2, "the database as of batch 2: state root" }, { 3, "on-chain checkpoint at batch 4: past --to 3, not compared" } };
+    for (int k = 0; k < 2; k++) {
+        char dir[200];
+        snprintf(dir, sizeof dir, DIR "/vt_keep%d", cases[k].to);
+        snprintf(extra, sizeof extra, "--to %d --keep %s", cases[k].to, dir);
+        out[0] = 0;
+        int rc = run_verify_with(params, extra, out, sizeof out);
+        char path[300];
+        snprintf(path, sizeof path, "%s/rebuilt.db", dir);
+        sqlite3 *kept = NULL;
+        long long rows = -1;
+        if (sqlite3_open_v2(path, &kept, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) rows = scalar(kept, "SELECT count(*) FROM v");
+        sqlite3_close(kept);
+        printf("(--to %d: exit %d, rows %lld) ", cases[k].to, rc, rows);
+        if (rc != 0 || !strstr(out, cases[k].says) || !strstr(out, "posted at that height and matched") || !strstr(out, "\nverified")
+            || rows != cases[k].to) FAILF("--to %d:\n%s", cases[k].to, out);
+    }
+    out[0] = 0;
+    int rc = run_verify_with(params, "--to 9", out, sizeof out);
+    if (rc != 2 || !strstr(out, "past the chain's height")) FAILF("--to past the chain: exit %d\n%s", rc, out);
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2441,6 +2484,7 @@ int main(void) {
     /* 29: the store paid by voucher, gone with hpplite-store/1 (#214): a /2 bucket is paid by permit or x402 top-ups (20) */
     if (wanted(30)) test_spend_cap();
     if (wanted(31)) test_relay_channel();
+    if (wanted(32)) test_verify_to();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

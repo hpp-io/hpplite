@@ -639,6 +639,8 @@ live database (the same content hash as the state root) and, when they
 differ and nothing is pending, names the tables that differ. Exit 0 verified,
 1 not (a root mismatch, a sync that stopped short, a live file that
 differs), 2 could not run. The rebuilt file is deleted unless `--keep <dir>`.
+`--to <height>` stops after that batch (#206): with `--keep`, the database as of that
+height stays, its own posted root matched; checkpoints past it are not compared.
 A verifier never posts, never claims the lease and never creates a rollup;
 `role=verify` is also usable from any connection that only wants to audit.
 It needs the wallet key (batches are encrypted); a viewing key is v0.3 (#15).
