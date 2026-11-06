@@ -2441,6 +2441,54 @@ static void test_verify_to(void) {
     PASS();
 }
 
+/* 33. Every batch sealed to the owner too (#209): the owner (KEY8) creates a rollup and names another wallet
+** (KEY9) its sequencer without handing over the batch key; that node, told the owner's public key (ownerkey=),
+** writes two batches; the owner rebuilds them with its own key alone - a recovery key no node holds. */
+static void test_sealed_to_owner(void) {
+    TEST("every batch sealed to the owner too (#209): a sequencer named without the batch key writes; the owner reads it all with its own key");
+    char contract[80], uri[1200], sql[200], seqHex[48], ownerPubHex[70];
+    unsigned char raw[32], pub[33];
+    HppliteCrypto *c = hpplite_crypto_init();
+    HppliteKeypair seq;
+    hpplite_hex_to_bytes(KEY9, raw, 32);
+    if (hpplite_crypto_keypair_from_privkey(c, &seq, raw) != 0) FAIL("keypair");
+    seqHex[0] = '0'; seqHex[1] = 'x'; hpplite_bytes_to_hex(seq.address, 20, seqHex + 2);
+    hpplite_hex_to_bytes(KEY8, raw, 32);
+    if (hpplite_pk_pubkey(raw, pub) != 0) FAIL("the owner's pubkey");
+    ownerPubHex[0] = '0'; ownerPubHex[1] = 'x'; hpplite_bytes_to_hex(pub, 33, ownerPubHex + 2);
+    hpplite_crypto_free(c);
+    sqlite3 *w = open_db("so_owner.db", KEY8, "&dbname=sealowner");
+    if (!w) FAIL("open the owner's node");
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    snprintf(sql, sizeof sql, "SELECT hpplite_set_sequencer('%s')", seqHex);
+    int rotated = exec_sql(w, sql) == SQLITE_OK;
+    sqlite3_close(w);
+    if (!rotated) FAIL("the owner names the sequencer");
+    snprintf(uri, sizeof uri, "file:" DIR "/so_seq.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&privkey=%s&ownerkey=%s&datadir=" DIR "&interval=0",
+             RPC, contract, KEY9, ownerPubHex);
+    sqlite3 *s = NULL;
+    if (sqlite3_open_v2(uri, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(s); FAIL("open the sequencer's node"); }
+    sqlite3_exec(s, "CREATE TABLE so(x); INSERT INTO so VALUES('one')", NULL, NULL, NULL);
+    long long h1 = scalar(s, "SELECT hpplite_flush()");
+    sqlite3_exec(s, "INSERT INTO so VALUES('two')", NULL, NULL, NULL);
+    long long h2 = scalar(s, "SELECT hpplite_flush()");
+    printf("(sequencer: flush %lld, %lld; %s) ", h1, h2, status_text(s, "last_error"));
+    sqlite3_close(s);
+    if (h1 != 1 || h2 != 2) FAIL("the named sequencer writes two batches");
+    snprintf(uri, sizeof uri, "file:" DIR "/so_replica.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&privkey=%s&role=verify&datadir=" DIR "&interval=0", RPC, contract, KEY8);
+    sqlite3 *r = NULL;
+    long long rows = -1;
+    char err[200] = "";
+    if (sqlite3_open_v2(uri, &r, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+        rows = scalar(r, "SELECT count(*) FROM so");
+        snprintf(err, sizeof err, "%s", status_text(r, "last_error"));
+    }
+    sqlite3_close(r);
+    printf("(the owner's rebuild: rows %lld, '%.80s') ", rows, err);
+    if (rows != 2) FAIL("the owner, with its own key alone, reads every batch the sequencer wrote");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2485,6 +2533,7 @@ int main(void) {
     if (wanted(30)) test_spend_cap();
     if (wanted(31)) test_relay_channel();
     if (wanted(32)) test_verify_to();
+    if (wanted(33)) test_sealed_to_owner();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

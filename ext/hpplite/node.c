@@ -125,6 +125,8 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.hasPrivkey = config->hasPrivkey;
     memcpy(node->config.viewkey, config->viewkey, 32);
     node->config.hasViewKey = config->hasViewKey;
+    memcpy(node->config.ownerPub, config->ownerPub, 33);
+    node->config.hasOwnerPub = config->hasOwnerPub;
     if (config->hasViewKey) { memcpy(node->viewKey, config->viewkey, 32); node->hasViewKey = 1; }
     node->config.dataDir = node_strdup(config->dataDir);
     node->config.dbPath = node_strdup(config->dbPath);
@@ -276,10 +278,29 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
 */
 /* Tell the capture path how long a statement may be: what fits in one DA
 ** batch after the envelope and the JSON framing. */
-/* What the envelope adds: the symmetric one, or the public-key one when readers are granted (#15) */
+/* Who a batch is sealed to with the public-key envelope (#15): the wallet first, the owner when it is another
+** key (ownerkey=, #209: a recovery key no node holds), then the readers granted (the owner once). The count, and
+** the keys (malloc'd, 33 bytes each) when aTo is given; 1 means the wallet alone: the symmetric envelope */
+static int node_recipients(HppliteNode *node, uint8_t **paTo) {
+    int n = 1, owner = node->config.hasOwnerPub && memcmp(node->config.ownerPub, node->keypair.pubkey, 33) != 0, i;
+    uint8_t *a;
+    if (owner) n++;
+    for (i = 0; i < node->nReaders; i++) if (!owner || memcmp(node->aReaders + 33 * i, node->config.ownerPub, 33) != 0) n++;
+    if (!paTo) return n;
+    *paTo = a = malloc((size_t)n * 33);
+    if (!a) return 0;
+    memcpy(a, node->keypair.pubkey, 33);
+    n = 1;
+    if (owner) memcpy(a + 33 * n++, node->config.ownerPub, 33);
+    for (i = 0; i < node->nReaders; i++)
+        if (!owner || memcmp(node->aReaders + 33 * i, node->config.ownerPub, 33) != 0) memcpy(a + 33 * n++, node->aReaders + 33 * i, 33);
+    return n;
+}
+
+/* What the envelope adds: the symmetric one, or the public-key one when the batch has readers besides the wallet */
 static size_t node_envelope_overhead(HppliteNode *node) {
     if (!node->cipher) return 0;
-    if (node->nReaders > 0 && node->config.hasPrivkey) return hpplite_envelope_pk_overhead(node->cipher, node->nReaders + 1);
+    if (node->config.hasPrivkey && node_recipients(node, NULL) > 1) return hpplite_envelope_pk_overhead(node->cipher, node_recipients(node, NULL));
     return hpplite_envelope_overhead(node->cipher);
 }
 
@@ -2172,15 +2193,14 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         }
         break;
     }
-    if (node->cipher && node->nReaders > 0 && node->config.hasPrivkey) {
-        /* readers besides the wallet (#15): sealed to every one of them and to
-        ** the wallet, under the series' data key, as the row flush does (#150) */
-        uint8_t *aTo = malloc((size_t)(node->nReaders + 1) * 33);
-        if (aTo) {
-            memcpy(aTo, node->keypair.pubkey, 33);
-            memcpy(aTo + 33, node->aReaders, (size_t)node->nReaders * 33);
+    if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
+        /* readers besides the wallet (#15) - the owner (#209), the keys granted: sealed to every one of them and
+        ** to the wallet, under the series' data key, as the row flush does (#150) */
+        uint8_t *aTo = NULL;
+        int nTo = node_recipients(node, &aTo);
+        if (aTo && nTo > 1) {
             if (!node->seriesDekValid) { hpplite_random_bytes(node->seriesDek, 32); node->seriesDekValid = 1; }
-            sealed = hpplite_envelope_seal_pk(node->cipher, node->seriesDek, aTo, node->nReaders + 1, height, encoding, payload, payloadLen, &payloadLen);
+            sealed = hpplite_envelope_seal_pk(node->cipher, node->seriesDek, aTo, nTo, height, encoding, payload, payloadLen, &payloadLen);
             free(aTo);
             if (!*pMore) node->seriesDekValid = 0;       /* the series ends with this batch: a new key next */
         }
@@ -2389,15 +2409,14 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                     free(c);
                 }
             }
-            if (node->cipher && node->nReaders > 0 && node->config.hasPrivkey) {
-                /* readers besides the wallet (#15): sealed to every one of them and to
-                ** the wallet, under the series' data key */
-                uint8_t *aTo = malloc((size_t)(node->nReaders + 1) * 33);
-                if (aTo) {
-                    memcpy(aTo, node->keypair.pubkey, 33);
-                    memcpy(aTo + 33, node->aReaders, (size_t)node->nReaders * 33);
+            if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
+                /* readers besides the wallet (#15) - the owner (#209), the keys granted: sealed to every one of
+                ** them and to the wallet, under the series' data key */
+                uint8_t *aTo = NULL;
+                int nTo = node_recipients(node, &aTo);
+                if (aTo && nTo > 1) {
                     if (!node->seriesDekValid) { hpplite_random_bytes(node->seriesDek, 32); node->seriesDekValid = 1; }
-                    sealed = hpplite_envelope_seal_pk(node->cipher, node->seriesDek, aTo, node->nReaders + 1, height,
+                    sealed = hpplite_envelope_seal_pk(node->cipher, node->seriesDek, aTo, nTo, height,
                                                       encoding, payload, payloadLen, &payloadLen);
                     free(aTo);
                     if (!batch->partial) node->seriesDekValid = 0;       /* the series ends with this batch: a new key next */

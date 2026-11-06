@@ -48,6 +48,8 @@ typedef struct HppliteNodeConfig {
     int hasPrivkey;                 /* Whether privkey is set */
     unsigned char viewkey[32];      /* A viewing key (#15): opens batches sealed to its public key; signs nothing */
     int hasViewKey;
+    unsigned char ownerPub[33];     /* ownerkey= (#209): the owner's public key, a recipient of every batch */
+    int hasOwnerPub;
 
     /* Paths */
     char *dataDir;                  /* Data directory */

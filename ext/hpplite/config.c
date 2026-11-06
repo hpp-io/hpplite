@@ -214,6 +214,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val) {
         hpplite_config_parse_viewkey(cfg, val);
     }
+    val = getenv(HPPLITE_ENV_OWNERKEY);
+    if (val && val[0] && hpplite_config_parse_ownerkey(cfg, val) != 0) fprintf(stderr, "hpplite: %s: not a compressed public key (0x02/0x03 + 64 hex); ignored\n", HPPLITE_ENV_OWNERKEY);
 
     /* Data dir */
     val = getenv(HPPLITE_ENV_DATA_DIR);
@@ -472,6 +474,8 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_VIEWKEY, buf, sizeof(buf))) {
         hpplite_config_parse_viewkey(cfg, buf);
     }
+    if (get_uri_param(uri, HPPLITE_URI_OWNERKEY, buf, sizeof(buf)) && buf[0] && hpplite_config_parse_ownerkey(cfg, buf) != 0)
+        fprintf(stderr, "hpplite: ownerkey=: not a compressed public key (0x02/0x03 + 64 hex); ignored\n");
 
     /* Data dir */
     if (get_uri_param(uri, HPPLITE_URI_DATA_DIR, buf, sizeof(buf))) {
@@ -663,6 +667,9 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val) {
         hpplite_config_parse_viewkey(cfg, val);
     }
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_OWNERKEY);
+    if (val && val[0] && hpplite_config_parse_ownerkey(cfg, val) != 0)
+        fprintf(stderr, "hpplite: ownerkey=: not a compressed public key (0x02/0x03 + 64 hex); ignored\n");
 
     /* Data dir */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DATA_DIR);
@@ -822,6 +829,13 @@ int hpplite_config_load_keystore(HppliteConfig *cfg, const char *path, const cha
 int hpplite_config_parse_viewkey(HppliteConfig *cfg, const char *hex) {
     if (!cfg || !hex) return -1;
     if (hex_to_bytes(hex, cfg->viewkey, 32) == 0) { cfg->hasViewKey = 1; return 0; }
+    return -1;
+}
+
+int hpplite_config_parse_ownerkey(HppliteConfig *cfg, const char *hex) {
+    if (!cfg || !hex) return -1;
+    if (hex_to_bytes(hex, cfg->ownerPub, 33) == 0 && (cfg->ownerPub[0] == 2 || cfg->ownerPub[0] == 3)) { cfg->hasOwnerPub = 1; return 0; }
+    cfg->hasOwnerPub = 0;
     return -1;
 }
 

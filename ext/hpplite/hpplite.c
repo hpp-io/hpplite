@@ -896,6 +896,8 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->hasPrivkey = cfg->hasPrivkey;
     memcpy(nc->viewkey, cfg->viewkey, 32);
     nc->hasViewKey = cfg->hasViewKey;
+    memcpy(nc->ownerPub, cfg->ownerPub, 33);
+    nc->hasOwnerPub = cfg->hasOwnerPub;
     memcpy(nc->factory, cfg->factory, 20);
     nc->hasFactory = cfg->hasFactory;
     memcpy(nc->contract, cfg->contract, 20);

@@ -47,6 +47,7 @@ extern "C" {
 #define HPPLITE_ENV_PRIVKEY_FILE  "HPPLITE_PRIVATE_KEY_FILE"
 #define HPPLITE_ENV_KEYSTORE      "HPPLITE_KEYSTORE"
 #define HPPLITE_ENV_VIEWKEY       "HPPLITE_VIEW_KEY"
+#define HPPLITE_ENV_OWNERKEY      "HPPLITE_OWNER_KEY"
 #define HPPLITE_ENV_KEYSTORE_PASSWORD "HPPLITE_KEYSTORE_PASSWORD"
 #define HPPLITE_ENV_DATA_DIR      "HPPLITE_DATA_DIR"
 #define HPPLITE_ENV_NODE_ID       "HPPLITE_NODE_ID"
@@ -81,6 +82,7 @@ extern "C" {
 #define HPPLITE_URI_PRIVKEY       "privkey"
 #define HPPLITE_URI_PRIVKEY_FILE  "keyfile"
 #define HPPLITE_URI_KEYSTORE      "keystore"
+#define HPPLITE_URI_OWNERKEY      "ownerkey"      /* the rollup owner's public key (33 bytes, compressed): every batch sealed to it too (#209) */
 #define HPPLITE_URI_VIEWKEY       "viewkey"       /* a viewing key's private key (#15) */     /* an Ethereum keystore V3 file (#17); passphrase from HPPLITE_KEYSTORE_PASSWORD */
 #define HPPLITE_URI_DATA_DIR      "datadir"
 #define HPPLITE_URI_ENCRYPT       "encrypt"
@@ -133,6 +135,8 @@ typedef struct HppliteConfig {
     int hasPrivkey;                  /* Whether privkey is set */
     unsigned char viewkey[32];       /* A viewing key (#15): reads batches sealed to its public key, signs nothing */
     int hasViewKey;
+    unsigned char ownerPub[33];      /* ownerkey= (#209): the owner's public key, a recipient of every batch */
+    int hasOwnerPub;
 
     /* L1 connection */
     uint64_t chainId;                /* Chain ID */
@@ -250,6 +254,7 @@ int hpplite_config_load_keystore(HppliteConfig *cfg, const char *path, const cha
 */
 int hpplite_config_parse_privkey(HppliteConfig *cfg, const char *hex);
 int hpplite_config_parse_viewkey(HppliteConfig *cfg, const char *hex);   /* (#15) */
+int hpplite_config_parse_ownerkey(HppliteConfig *cfg, const char *hex);  /* (#209) */
 
 /*
 ** Parse hex contract address string.
