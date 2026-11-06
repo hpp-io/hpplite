@@ -686,6 +686,58 @@ static void test_snapshot_replica(const char *url) {
     PASS();
 }
 
+/* 6c'. A snapshot over one chunk (#221, #222): a 9 MB database is two chunks at the store; a replica joins
+** them, each checked by the index's sha-256, and reaches the sequencer's state */
+static void test_snapshot_chunks(const char *url) {
+    TEST("snapshots: a database over 8 MiB is a snapshot in two chunks; a replica joins them and reaches the sequencer's state");
+    static const unsigned char kseq[32] = { [31] = 0x7c };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "snapch_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 3600 * 1000 };
+    HppliteNode *w = test_open_node(tpath("snc_w.db"), l1, &o);
+    HppliteStore *rs;
+    uint64_t h = 0, a = 0;
+    char zIndex[64];
+    int nChunks = -1;
+    if (!w) FAIL("open");
+    rs = hpplite_store_open(url, NULL, 0);
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES(randomblob(9000000))", NULL);     /* does not compress: two chunks */
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the 9 MB batch"); }
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('small')", NULL);
+    hpplite_node_flush_batch(w);
+    {
+        /* the 9 MB commit is cut over batches (#152): the anchor is at the last of them */
+        int rsn;
+        a = hpplite_node_anchor(w);
+        rsn = range_snapshot(l1, rs, a, &h, zIndex);
+        if (a < 2 || rsn != 0 || h != a) { printf("(anchor %llu, manifest %d, snapshot %llu, height %lld: %s) ", (unsigned long long)a, rsn, (unsigned long long)h, (long long)status_int(w->db, "height"), status_text(w->db, "last_error")); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor with a snapshot at its height"); }
+    }
+    {
+        size_t n = 0;
+        uint8_t *text = hpplite_store_get(rs, zIndex, &n);
+        cJSON *ix = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
+        nChunks = ix ? cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(ix, "chunks")) : -1;
+        free(text); cJSON_Delete(ix);
+    }
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('after')", NULL);
+    hpplite_node_flush_batch(w);
+    if (hpplite_node_anchor(w) != a + 1) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the next anchor"); }
+    {
+        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .capturePages = 1, .fromSnapshot = 1, .nodeId = "snapch_s", .privkey = kseq };
+        HppliteNode *sp = test_open_node(tpath("snc_s.db"), l1, &so);
+        int rows = sp ? count_rows(sp->db, "t") : -1, same = sp ? same_root(w, sp) : 0;
+        sqlite3_int64 snap = sp ? status_int(sp->db, "snapshot_height") : -1;
+        if (sp) { sp->l1 = NULL; hpplite_node_destroy(sp); }
+        printf("(snapshot at %llu in %d chunks; replica rows %d, same root %d, from %lld) ", (unsigned long long)a, nChunks, rows, same, (long long)snap);
+        if (nChunks != 2 || rows != 3 || !same || snap != (sqlite3_int64)a) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("two chunks, joined by a replica from the snapshot"); }
+    }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_store_close(rs);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 /* the reference of batch `h` in the manifest of the range ending at `to` */
 static int range_batch_ref(HppliteL1 *l1, HppliteStore *rs, uint64_t to, uint64_t h, char zRef[128]) {
     HppliteRange r;
@@ -1131,6 +1183,7 @@ int main(int argc, char **argv) {
     test_ranges_restart(url);
     test_snapshot_made(url);
     test_snapshot_replica(url);
+    test_snapshot_chunks(url);
     test_keep(url);
     test_anchor_timer(url);
     test_recovery(url);
