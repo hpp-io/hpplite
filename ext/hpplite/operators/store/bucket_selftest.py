@@ -296,6 +296,23 @@ def main():
         deleted = wait_for(lambda: http("GET", url + "/bucket/" + da2)[1].get("state") == "deleted", 20)
         check(deleted and http("GET", "%s/name/%s-1" % (url, da2[2:]))[0] == 404, "parkSeconds later: deleted, its names gone")
 
+        # --- the owner rotates the sequencer key (#208): the new key takes the bucket, the old one is refused ---
+        rollup1 = cast("call", FACTORY, "getRollup(address)(address)", eth.address(k1))
+        k2 = key_bytes(KEY2)
+        send(KEY1, rollup1, "setSequencer(address)", eth.address(k2))
+        code, out, _ = S.bind(da, k2, F)
+        check(code == 200, "after setSequencer: the new key rebinds the bucket with its funder (%s %s)" % (code, out))
+        inst_new = secrets.token_bytes(32)
+        send(KEY2, rollup1, "claimSequencer(bytes32)", "0x" + inst_new.hex())
+        code, _, _ = http("POST", "%s/name/%s-5" % (url, da[2:]), name_body(da, 5, b"by the new key", inst_new, k2))
+        check(code == 200, "the new key's name at 5: 200 (%s)" % code)
+        code, _, _ = http("POST", "%s/name/%s-6" % (url, da[2:]), name_body(da, 6, b"by the rotated-out key", instance, k1))
+        check(code in (403, 409), "the rotated-out key's name: refused (%s)" % code)
+        old_blob = b"content by the rotated-out key"
+        sig = eth.sign(k1, S.digest(CONTENT, da, 6, eth.keccak256(old_blob)))
+        code, _, _ = http("POST", "%s/put?bucket=%s&height=6" % (url, da), old_blob, {"X-HPPLite-Signature": "0x" + sig.hex()})
+        check(code == 403, "the rotated-out key's content put: 403 (%s)" % code)
+
         # --- release ---
         issued = int(time.time()) + 1
         rsig = eth.sign(F, S.digest(RELEASE, da, fa, issued))
