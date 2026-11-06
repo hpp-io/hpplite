@@ -217,7 +217,11 @@ class Token:
         try:
             self.chain.call("eth_call", call, "latest")
         except RpcError as e:
-            return "refused", revert_reason(e)
+            # the call itself reverting is the funder's refusal; the RPC failing (a rate limit, an upstream error) is
+            # the store's own trouble, which never parks a bucket (#220)
+            if e.data or "revert" in str(e).lower():
+                return "refused", revert_reason(e)
+            return "failed", "simulation: %s" % revert_reason(e)
         except (OSError, ValueError) as e:
             return "failed", "simulation: %s" % e
         with self.lock:

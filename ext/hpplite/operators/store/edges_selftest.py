@@ -11,6 +11,8 @@ settle and lease selftests (#194, #198) checked, as buckets have them.
   binding and a name are answered 503 and nothing is held or taken; a DA
   with no coordinator (the chain answers, no HPPLite rollup there) is not
   bound (404). A fake RPC in this process answers as told.
+- A store does not take an RPC failure for the funder's refusal (#220): a
+  pull whose simulation the RPC rate-limits leaves the bucket covered.
 - A store whose chain read fails does not sign less than it knows (#219):
   with a permit read once (the wallet's balance), the bucket statement and
   the account still say covered by it while the chain cannot be read.
@@ -87,6 +89,10 @@ class Rpc(Answer):
         if rpc_mode["value"] == "rollup" and req.get("method") == "eth_call":
             call = req["params"][0]
             to, sel = call["to"].lower(), call["data"][:10]
+            if ROLLUP.get("limit_sends") and call.get("from") and sel in ("0x" + eth.keccak256(b"permit(address,address,uint256,uint256,uint8,bytes32,bytes32)")[:4].hex(),
+                                                                         "0x" + eth.keccak256(b"transferFrom(address,address,uint256)")[:4].hex()):
+                return self.answer({"jsonrpc": "2.0", "id": req.get("id"),
+                                    "error": {"code": -32005, "message": "Rate Limit Exceeded. Please get an api key"}})
             sels = {"0x" + eth.keccak256(n.encode())[:4].hex(): n for n in
                     ("coordinator()", "sequencer()", "sequencerWallet()", "sequencerInstance()", "balanceOf(address)",
                      "allowance(address,address)", "nonces(address)")}
@@ -257,6 +263,36 @@ def main():
         print("          (the chain unreadable: the statement's coveredUntil %s, the account's %s)" % ((b.get("statement") or {}).get("coveredUntil"), acct.get("coveredUntil")))
         check((b.get("statement") or {}).get("coveredUntil", 0) > time.time() + 30 * 86400 and acct.get("coveredUntil", 0) > time.time() + 30 * 86400,
               "the chain unreadable: the statement and the account still say covered by the permit, as last read (#219)")
+
+        # --- a pull's simulation rate-limited: the store's failure, not the funder's refusal (#220) ---
+        p4, url4 = start_store(work, "pulls", "--rpc", rpc_url, "--asset", asset, "--price-per-write", "1000",
+                               "--price-per-mib-month", "30", "--pull-threshold", "500", "--tick-interval", "0.3")
+        procs.append(p4)
+        st4 = http_("GET", url4 + "/status")[1]
+        domain4 = eth.domain_separator("HPPLiteStore", "2", CHAIN_ID, st4["domain"]["verifyingContract"])
+        fund4 = secrets.token_bytes(32)
+        fa4 = eth.address(fund4).lower()
+        da4 = eth.address(secrets.token_bytes(32)).lower()
+        rpc_mode["value"] = "rollup"
+        ROLLUP["limit_sends"] = True
+        code, _ = http_("POST", url4 + "/bucket/" + da4, bind_body(domain4, da4, seq, fund4, int(time.time())))
+        pd4 = eth.typed_digest(eth.domain_separator("Bridged USDC", "2", CHAIN_ID, asset),
+                               "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+                               fa4, st4["buckets"]["spender"], 20000000, 0, deadline)
+        http_("POST", url4 + "/account/%s/permit" % fa4, json.dumps({"value": 20000000, "deadline": deadline,
+              "signature": "0x" + eth.sign(fund4, pd4).hex()}).encode())
+        data4 = b"a write the store will try to pull for"
+        body4 = data4 + bytes.fromhex(inst3[2:]) + eth.sign(seq, batch_digest(CHAIN_ID, da4, inst3, 1, data4))
+        code, _ = http_("POST", "%s/name/%s-1" % (url4, da4[2:]), body4)
+        check(code == 200, "a write the permit covers, owing past the pull threshold")
+        time.sleep(2.5)                                   # several ticks: each tries the pull, its simulation rate-limited
+        acct4 = http_("GET", url4 + "/account/" + fa4)[1]
+        b4 = http_("GET", url4 + "/bucket/" + da4)[1]
+        warned = "pull" in (http_("GET", url4 + "/status")[1].get("warnings") or {})
+        print("          (the account: %s %s; the bucket: %s; a warning: %s)" % (acct4.get("state"), acct4.get("why"), b4.get("state"), warned))
+        check(acct4.get("state") == "covered" and b4.get("state") == "covered" and warned,
+              "a pull whose simulation the RPC rate-limits: the store's failure - covered, a warning, nothing parked (#220)")
+        ROLLUP["limit_sends"] = False
     finally:
         for p in procs:
             p.terminate()
