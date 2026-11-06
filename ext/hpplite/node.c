@@ -635,6 +635,7 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     if (!all) return 0;
     n = hpplite_l1_factory_list_my_rollups(config->rpcUrl, factoryHex, config->privkey, all, 256);
     char *zOthers = NULL;                 /* the wallet's databases, for the message below (#79) */
+    int nUnread = 0;                      /* ...and how many could not be read (#228) */
     for (i = 0; i < n; i++) {
         char hex[43];
         HppliteL1 *l1;
@@ -643,9 +644,15 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
         l1 = hpplite_l1_connect(config->rpcUrl, hex);
         if (l1) {
             size_t len = 0;
-            uint8_t *data = node_fetch_bytes(node, l1, 1, &len);
-            HppliteBatch *b = data ? node_decode_batch(node, 1, data, len) : NULL;
-            char *zSnap = (!b && hpplite_l1_has_ranges(l1)) ? node_snapshot_name(node, l1) : NULL;   /* batch 1 pruned: the snapshot names it (#226) */
+            uint8_t *data;
+            HppliteBatch *b;
+            char *zSnap;
+            node->ctx->quiet = 1;                    /* another rollup's bytes, or ours pruned: not this open's failure (#228) */
+            data = node_fetch_bytes(node, l1, 1, &len);
+            b = data ? node_decode_batch(node, 1, data, len) : NULL;
+            zSnap = (!b && hpplite_l1_has_ranges(l1)) ? node_snapshot_name(node, l1) : NULL;   /* batch 1 pruned: the snapshot names it (#226) */
+            node->ctx->quiet = 0;
+            if (!b && !zSnap) nUnread++;
             const char *zHas = b && b->zDbName ? b->zDbName : zSnap;
             int match = zHas && strcmp(zHas, zName) == 0;
             if (zHas && !match) zOthers = sqlite3_mprintf("%z%s\"%s\"", zOthers, zOthers ? ", " : "", zHas);
@@ -685,14 +692,14 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
         if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) != 1) return 0;
     }
     if (node->config.verifyOnly) {
-        fprintf(stderr, "hpplite: role=verify: no rollup of this wallet is database \"%s\" (its databases: %s); nothing to verify\n",
-                zName, zOthers ? zOthers : "none named");
+        hpplite_error(node->ctx, "role=verify: no rollup of this wallet is database \"%s\" (its databases: %s%s%s); nothing to verify",
+                      zName, zOthers ? zOthers : "none named", nUnread ? "; some could not be read: " : "", nUnread ? node->ctx->zQuietError : "");
         sqlite3_free(zOthers);
         return 0;
     }
     /* a misspelt name would be a new database: say which exist (#79) */
-    fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet (its databases: %s); creating one\n",
-            zName, zOthers ? zOthers : "none named");
+    fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet (its databases: %s%s%s); creating one\n",
+            zName, zOthers ? zOthers : "none named", nUnread ? "; some could not be read: " : "", nUnread ? node->ctx->zQuietError : "");
     sqlite3_free(zOthers);
     if (node->relay) {
         int rc = hpplite_l1_factory_create_rollup_for(config->rpcUrl, factoryHex, config->privkey, node->relay,

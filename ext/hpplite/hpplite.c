@@ -192,6 +192,7 @@ void hpplite_error(HppliteCtx *pCtx, const char *zFmt, ...) {
   va_start(ap, zFmt);
   vsnprintf(z, sizeof z, zFmt, ap);
   va_end(ap);
+  if (pCtx && pCtx->quiet) { snprintf(pCtx->zQuietError, sizeof pCtx->zQuietError, "%s", z); return; }
   fprintf(stderr, "hpplite: %s\n", z);
   if (pCtx) snprintf(pCtx->zLastError, sizeof(pCtx->zLastError), "%s", z);
 }

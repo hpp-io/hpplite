@@ -189,6 +189,8 @@ struct HppliteCtx {
   const char *zDenyWhy;       /* Why the statement being prepared was denied (for the error message) */
   char zLastRefusal[400];     /* Reason and statement of the last refusal (hpplite_status.last_refusal) */
   char zLastError[512];       /* The last failure said on stderr, until the next success (hpplite_status.last_error, #32) */
+  int quiet;                  /* reading what is not this rollup (the named lookup, #228): failures are not said, only kept here: */
+  char zQuietError[256];
   uint64_t nLogErrors;        /* Statements that could not be logged */
   uint64_t nReplaySkipped;    /* Replayed statements that failed and were skipped */
   uint64_t nForeignBatches;   /* L1 heights skipped because the batch there is not ours */
