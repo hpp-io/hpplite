@@ -41,6 +41,9 @@ typedef struct HppliteSigner {
     unsigned char address[20];
 } HppliteSigner;
 
+/* a snapshot an anchor's manifest names (#221) */
+typedef struct HppliteSnapRef { uint64_t height; char index[64]; unsigned char sha[32]; int64_t at; } HppliteSnapRef;
+
 typedef struct HppliteNodeConfig {
     /* Identity */
     char *nodeId;                   /* Human-readable node ID */
@@ -83,6 +86,7 @@ typedef struct HppliteNodeConfig {
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storePermit;           /* storepermit=: what the funding wallet's permit lets the store pull (0: none, #214) */
     int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
+    int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
     int fromSnapshot;               /* from= (#222): a new replica starts from the latest snapshot */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;              /* syncat=: ...none written after this time (ms since the epoch, #205); 0: none */
@@ -177,6 +181,9 @@ typedef struct HppliteNode {
     int64_t snapAt;                 /* when it was made (seconds) */
     int snapLooked;                 /* the latest anchor's manifest was read for it (a process that did not make it) */
     int warnedSnapshot;             /* said once why no snapshot is made */
+    HppliteSnapRef aEarlier[64];    /* keep= (#223): the older snapshots still kept, oldest first */
+    int nEarlier;
+    uint64_t prunedHeight;          /* the last Prune the store took (#223); 0: none */
     int snapApply;                  /* a replica writing a snapshot (#222): the bookkeeping set to its height, not advanced by a batch */
     unsigned char snapChain[32], snapBlock[32];
     struct cJSON *manifest;         /* a replica: the manifest of the range it is reading */

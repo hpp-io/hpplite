@@ -190,6 +190,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
 | `anchor` | No | With `store=` on a chain that takes ranges (VERSION 9 and later, #164, the `hpp-sepolia` factory): how often the batches the store holds are anchored on the chain in one commitment: `5m`, `30m` (default: HPP's cadence), `1h`; `0` = at close and on `hpplite_anchor()` only. Also `HPPLITE_ANCHOR`. See Stores and commitments |
 | `datadir` | No | Accepted and unused: HPPLite keeps all its state in the database file itself (`_hpplite_*` tables) |
+| `keep` | No | With `snapshot=`: how long the store keeps the history behind a snapshot - `all` (default: every batch, an audit log) or `7d`, `24h`, `30m` (#223). After each anchor the sequencer signs a `Prune` at the newest snapshot made at least that long ago; the store lets go of the batches and older snapshots below it. The current state stays provable (that snapshot's root is anchored, then the batches after it); what is lost is replaying how the state got there, and `hpplite-verify --to`/`--at` before it. Also `HPPLITE_KEEP` |
 | `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min for a node without a store, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). With `store=` the chain's cadence goes to `anchor` instead and the interval stays 5 s: the batches reach the store in seconds, the chain gets one commitment per anchor (#164). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `from` | No | Where a new replica (an empty file, page capture, `store=`) starts: `snapshot` (the default, except for `role=verify`) - the latest snapshot the anchors name (#222), checked against the root and chain hash the chain anchored at its height, then the batches after it; or `genesis` - every batch from 1. A verifier replays from batch 1 unless given `from=snapshot`; `syncto=`/`syncat=` before the snapshot start from batch 1. Also `HPPLITE_FROM` |
@@ -720,6 +721,15 @@ checkpoint), and the sync goes on with the batches after it - a replica of
 a long history reads one image and an anchor interval or so of batches. A
 snapshot that fails a check is said on stderr and the replica replays from
 batch 1. `snapshot_height` in `hpplite_status` is the one it started from.
+
+With `keep=<duration>` (#223) the history is bounded: the manifests also
+name the older snapshots still kept (`"earlier": [...]`, oldest first),
+and after each anchor the sequencer signs a `Prune` (hpplite-store/2) at
+the height of the newest snapshot made at least `keep` ago - the store
+deletes the bucket's batches, names and older snapshots below it, never
+on its own judgement. The bucket then holds the database about once per
+snapshot kept plus the window's batches. With `keep=all` (the default)
+nothing is pruned and snapshots only speed replicas up.
 
 Each batch is also stored **under its rollup's name**, `<da contract hex>-<height>`,
 with the sequencer's EIP-712 `Batch` signature appended (#165: the one

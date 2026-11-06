@@ -157,6 +157,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.anchorIntervalMs = config->anchorIntervalMs;
     node->config.snapshotIntervalMs = config->snapshotIntervalMs;
     node->config.fromSnapshot = config->fromSnapshot;
+    node->config.keepSeconds = config->keepSeconds;
     node->config.relayUrl = node_strdup(config->relayUrl);
     node->config.relayCap = config->relayCap;
     if (node->config.relayUrl) {
@@ -2059,18 +2060,84 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
     if (!node->snapLooked) {
         cJSON *prev = lastBatch ? node_range_manifest(node, lastBatch) : NULL;
         if (prev && node_manifest_snapshot(prev, &node->snapHeight, node->snapIndex, &node->snapAt, node->snapIndexSha) != 0) node->snapHeight = 0;
+        if (prev && node->snapHeight) {
+            /* keep= (#223): the older snapshots still kept */
+            const cJSON *e, *list = cJSON_GetObjectItemCaseSensitive(prev, "earlier");
+            node->nEarlier = 0;
+            cJSON_ArrayForEach(e, list) {
+                cJSON *one = cJSON_CreateObject();
+                cJSON_AddItemReferenceToObject(one, "snapshot", (cJSON *)e);
+                if (node->nEarlier < (int)(sizeof node->aEarlier / sizeof node->aEarlier[0])
+                    && node_manifest_snapshot(one, &node->aEarlier[node->nEarlier].height, node->aEarlier[node->nEarlier].index,
+                                              &node->aEarlier[node->nEarlier].at, node->aEarlier[node->nEarlier].sha) == 0) node->nEarlier++;
+                cJSON_Delete(one);
+            }
+        }
         cJSON_Delete(prev);
         node->snapLooked = 1;
     }
     if (node->config.snapshotIntervalMs > 0
-        && (node->snapHeight == 0 || ((int64_t)time(NULL) - node->snapAt) * 1000 >= (int64_t)node->config.snapshotIntervalMs))
-        node_make_snapshot(node, to, root);
+        && (node->snapHeight == 0 || ((int64_t)time(NULL) - node->snapAt) * 1000 >= (int64_t)node->config.snapshotIntervalMs)) {
+        uint64_t ph = node->snapHeight;
+        char pIndex[64];
+        unsigned char pSha[32];
+        int64_t pAt = node->snapAt;
+        snprintf(pIndex, sizeof pIndex, "%s", node->snapIndex);
+        memcpy(pSha, node->snapIndexSha, 32);
+        if (node_make_snapshot(node, to, root) == 0 && ph && node->config.keepSeconds > 0) {
+            /* keep= (#223): the one it replaces stays named until a prune passes it */
+            int cap = (int)(sizeof node->aEarlier / sizeof node->aEarlier[0]);
+            if (node->nEarlier == cap) { memmove(node->aEarlier, node->aEarlier + 1, sizeof node->aEarlier[0] * (size_t)(cap - 1)); node->nEarlier--; }
+            node->aEarlier[node->nEarlier].height = ph;
+            snprintf(node->aEarlier[node->nEarlier].index, sizeof node->aEarlier[0].index, "%s", pIndex);
+            memcpy(node->aEarlier[node->nEarlier].sha, pSha, 32);
+            node->aEarlier[node->nEarlier].at = pAt;
+            node->nEarlier++;
+        }
+    }
     if (node->snapHeight == 0) return;
     sn = cJSON_AddObjectToObject(m, "snapshot");
     cJSON_AddNumberToObject(sn, "height", (double)node->snapHeight);
     cJSON_AddStringToObject(sn, "index", node->snapIndex);
     cJSON_AddNumberToObject(sn, "at", (double)node->snapAt);
     { char hx[67]; hex32(node->snapIndexSha, hx); cJSON_AddStringToObject(sn, "sha256", hx); }
+    if (node->config.keepSeconds > 0 && node->nEarlier > 0) {
+        cJSON *list = cJSON_AddArrayToObject(m, "earlier");
+        int i;
+        for (i = 0; i < node->nEarlier; i++) {
+            cJSON *e = cJSON_CreateObject();
+            char hx[67];
+            cJSON_AddNumberToObject(e, "height", (double)node->aEarlier[i].height);
+            cJSON_AddStringToObject(e, "index", node->aEarlier[i].index);
+            cJSON_AddNumberToObject(e, "at", (double)node->aEarlier[i].at);
+            hex32(node->aEarlier[i].sha, hx); cJSON_AddStringToObject(e, "sha256", hx);
+            cJSON_AddItemToArray(list, e);
+        }
+    }
+}
+
+/*
+** keep= (#223): after an anchor, the history behind the newest snapshot made
+** at least `keep` ago is let go - the sequencer signs a Prune at its height,
+** the store deletes the bucket's batches and older snapshots below it. The
+** state stays provable from that snapshot on; the commitments stay on chain.
+*/
+static void node_prune(HppliteNode *node) {
+    int64_t cutoff;
+    uint64_t p = 0;
+    int i, k;
+    if (node->config.keepSeconds <= 0 || !node->store || !node->snapHeight) return;
+    cutoff = (int64_t)time(NULL) - node->config.keepSeconds;
+    for (i = 0; i < node->nEarlier; i++) if (node->aEarlier[i].at <= cutoff && node->aEarlier[i].height > p) p = node->aEarlier[i].height;
+    if (node->snapAt <= cutoff && node->snapHeight > p) p = node->snapHeight;
+    if (p <= node->prunedHeight) return;
+    if (hpplite_store_prune(node->store, p) != 0) {
+        fprintf(stderr, "hpplite: keep=: the store did not prune below the snapshot at %llu: %s\n", (unsigned long long)p, hpplite_store_error(node->store));
+        return;
+    }
+    node->prunedHeight = p;
+    for (i = 0, k = 0; i < node->nEarlier; i++) if (node->aEarlier[i].height >= p) node->aEarlier[k++] = node->aEarlier[i];
+    node->nEarlier = k;
 }
 
 /* bytes the store holds under zRef, checked against a sha-256 from an authenticated source (#222) */
@@ -2314,11 +2381,15 @@ static int node_anchor(HppliteNode *node) {
     char wasIndex[64];
     unsigned char wasSha[32];
     int64_t wasAt = node->snapAt;
-    int rc;
+    int rc, wasN = node->nEarlier;
+    HppliteSnapRef wasEarlier[64];
     snprintf(wasIndex, sizeof wasIndex, "%s", node->snapIndex);
     memcpy(wasSha, node->snapIndexSha, 32);
+    memcpy(wasEarlier, node->aEarlier, sizeof wasEarlier);
     rc = node_anchor_once(node);
+    if (rc == 1) node_prune(node);
     if (rc != 1 && node->snapHeight != was) {
+        memcpy(node->aEarlier, wasEarlier, sizeof wasEarlier); node->nEarlier = wasN;
         /* a snapshot made for a range the chain did not take: no commitment ends at its height for a
         ** replica to check it against; the one before stands, and the next anchor makes a new one */
         node->snapHeight = was; snprintf(node->snapIndex, sizeof node->snapIndex, "%s", wasIndex); node->snapAt = wasAt; memcpy(node->snapIndexSha, wasSha, 32);

@@ -84,6 +84,21 @@ static int parse_duration_ms(const char *str) {
     return -1;
 }
 
+/* keep= (#223): "all" (0: every batch kept), or N with s, m, h or d (no unit: days) - in seconds; -1 malformed */
+static int64_t parse_keep_seconds(const char *str) {
+    char *end = NULL;
+    long long v;
+    if (!str) return -1;
+    if (strcmp(str, "all") == 0) return 0;
+    v = strtoll(str, &end, 10);
+    if (v <= 0 || end == str) return -1;
+    if (*end == 's' || *end == 'S') return v;
+    if (*end == 'm' || *end == 'M') return v * 60;
+    if (*end == 'h' || *end == 'H') return v * 3600;
+    if (*end == 'd' || *end == 'D' || *end == 0) return v * 86400;
+    return -1;
+}
+
 HppliteConfigRole hpplite_config_parse_role(const char *str) {
     if (!str) return HPPLITE_CFG_ROLE_UNKNOWN;
     if (strcmp(str, "sequencer") == 0) return HPPLITE_CFG_ROLE_SEQUENCER;
@@ -242,6 +257,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         int ms = parse_duration_ms(val);
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
+    val = getenv("HPPLITE_KEEP");
+    if (val && parse_keep_seconds(val) >= 0) cfg->keepSeconds = parse_keep_seconds(val);
     val = getenv("HPPLITE_FROM");
     if (val) cfg->fromMode = strcmp(val, "snapshot") == 0 ? 1 : strcmp(val, "genesis") == 0 ? 2 : cfg->fromMode;
     val = getenv("HPPLITE_SNAPSHOT");
@@ -542,6 +559,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->relayDeposit = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf)) && buf[0]) cfg->softOff = strcasecmp(buf, "off") == 0 || strcmp(buf, "0") == 0;
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
+    if (get_uri_param(uri, "keep", buf, sizeof(buf)) && parse_keep_seconds(buf) >= 0) cfg->keepSeconds = parse_keep_seconds(buf);
     if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) cfg->fromMode = strcmp(buf, "snapshot") == 0 ? 1 : strcmp(buf, "genesis") == 0 ? 2 : cfg->fromMode;
     if (get_uri_param(uri, HPPLITE_URI_SYNC_AT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncAtMs = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_SPEND_CAP, buf, sizeof(buf)) && buf[0]
@@ -738,6 +756,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && val[0]) cfg->softOff = strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_TO);
     if (val && atoll(val) > 0) cfg->syncTo = (uint64_t)atoll(val);
+    val = sqlite3_uri_parameter(filename, "keep");
+    if (val && parse_keep_seconds(val) >= 0) cfg->keepSeconds = parse_keep_seconds(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_FROM);
     if (val) cfg->fromMode = strcmp(val, "snapshot") == 0 ? 1 : strcmp(val, "genesis") == 0 ? 2 : cfg->fromMode;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_AT);

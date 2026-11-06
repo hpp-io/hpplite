@@ -171,8 +171,9 @@ store never deletes for its own failures.
 History is what makes a rollup verifiable, so a store never prunes at its
 own judgement. A `Prune` at `height` lets go of the bucket's names below it
 and its content put with a lower `height`. The node signs one after an
-anchored snapshot at or below `height` (#203), as its setting says (keep
-everything; or keep N days for point-in-time recovery, #205). The store
+anchored snapshot at or below `height` (#203), as its setting says (`keep=all`,
+everything; or `keep=<duration>`, #223: the newest snapshot at least that old,
+the window behind it kept for point-in-time recovery, #205). The store
 deletes them (it may keep more) and reports `pruneHeight`.
 
 Bytes that are in no bucket (an interrupted put, #200) are the store's to

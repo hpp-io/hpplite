@@ -686,6 +686,85 @@ static void test_snapshot_replica(const char *url) {
     PASS();
 }
 
+/* the reference of batch `h` in the manifest of the range ending at `to` */
+static int range_batch_ref(HppliteL1 *l1, HppliteStore *rs, uint64_t to, uint64_t h, char zRef[128]) {
+    HppliteRange r;
+    char cid[64];
+    size_t n = 0;
+    uint8_t *text;
+    cJSON *m, *b;
+    int rc = -1;
+    memset(&r, 0, sizeof r);
+    if (hpplite_l1_get_range(l1, to, &r) != 0) return -1;
+    hpplite_store_cid_from_sha256(r.manifestDigest, cid);
+    text = hpplite_store_get(rs, cid, &n);
+    m = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
+    free(text);
+    b = m ? cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(m, "batches"), (int)(h - r.fromHeight)) : NULL;
+    if (b && cJSON_IsString(cJSON_GetObjectItemCaseSensitive(b, "ref"))) { snprintf(zRef, 128, "%s", cJSON_GetObjectItemCaseSensitive(b, "ref")->valuestring); rc = 0; }
+    hpplite_l1_range_clear(&r);
+    cJSON_Delete(m);
+    return rc;
+}
+
+static int store_has(HppliteStore *rs, const char *zRef) {
+    size_t n = 0;
+    uint8_t *d = hpplite_store_get(rs, zRef, &n);
+    free(d);
+    return d != NULL;
+}
+
+/* 6d. keep= (#223): the history behind the newest snapshot made at least `keep` ago is pruned at the store;
+** a replica still starts from the snapshot, and the earlier snapshots still kept are named */
+static void test_keep(const char *url) {
+    TEST("keep=: after an anchor, the batches and snapshots below the newest snapshot older than keep are pruned at the store; the snapshot and what follows stay; a replica still starts there");
+    static const unsigned char kseq[32] = { [31] = 0x7b };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "keep_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 1, .keepSeconds = 3 };
+    HppliteNode *w = test_open_node(tpath("kp_w.db"), l1, &o);
+    HppliteStore *rs;
+    char b1[128], b3[128], b4[128], zIndex3[64], zIndex[64];
+    uint64_t h = 0;
+    int i;
+    if (!w) FAIL("open");
+    rs = hpplite_store_open(url, NULL, 0);
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('one of the first three')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 3 || range_snapshot(l1, rs, 3, &h, zIndex3) != 0 || h != 3) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 1-3 with a snapshot at 3"); }
+    if (range_batch_ref(l1, rs, 3, 1, b1) != 0 || range_batch_ref(l1, rs, 3, 3, b3) != 0 || !store_has(rs, b1)) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("batch 1 at the store: nothing older than keep yet"); }
+    sleep(4);                                   /* keep=3s, by whole seconds: a margin over the boundary */
+    for (i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four and five')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 5 || range_snapshot(l1, rs, 5, &h, zIndex) != 0 || h != 5) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 4-5 with a new snapshot at 5"); }
+    /* the snapshot at 3 is older than keep: below it is pruned; it and what follows stay */
+    range_batch_ref(l1, rs, 5, 4, b4);
+    if (store_has(rs, b1) || !store_has(rs, b3) || !store_has(rs, b4) || !store_has(rs, zIndex3)) {
+        printf("(batch 1 %d, batch 3 %d, batch 4 %d, snapshot 3 %d) ", store_has(rs, b1), store_has(rs, b3), store_has(rs, b4), store_has(rs, zIndex3));
+        hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("pruned below the snapshot at 3: batch 1 gone; batch 3, batch 4 and the snapshot at 3 kept");
+    }
+    sleep(4);                                   /* keep=3s, by whole seconds: a margin over the boundary */
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('six')", NULL); hpplite_node_flush_batch(w);
+    if (hpplite_node_anchor(w) != 6) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 6"); }
+    /* now the snapshot at 5 is older than keep: the one at 3 and batches 3-4 go */
+    if (store_has(rs, zIndex3) || store_has(rs, b3) || store_has(rs, b4)) {
+        printf("(snapshot 3 %d, batch 3 %d, batch 4 %d) ", store_has(rs, zIndex3), store_has(rs, b3), store_has(rs, b4));
+        hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("pruned below the snapshot at 5: the snapshot at 3 and batches 3-4 gone");
+    }
+    {
+        /* a replica starts from the latest snapshot and reaches the sequencer's state; one from batch 1 cannot */
+        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .capturePages = 1, .fromSnapshot = 1, .nodeId = "keep_s", .privkey = kseq };
+        HppliteNode *sp = test_open_node(tpath("kp_s.db"), l1, &so);
+        int rows = sp ? count_rows(sp->db, "t") : -1, same = sp ? same_root(w, sp) : 0;
+        sqlite3_int64 snap = sp ? status_int(sp->db, "snapshot_height") : -1;
+        if (sp) { sp->l1 = NULL; hpplite_node_destroy(sp); }
+        if (rows != 6 || !same || snap < 5) { printf("(rows %d, same %d, snapshot %lld) ", rows, same, (long long)snap); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("a replica from the snapshot after the prune"); }
+    }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_store_close(rs);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 static void test_ranges_restart(const char *url) {
     TEST("ranges: a run that dies with batches at the store leaves rows for the chain; the next run anchors them before its own; a manifest with a swapped hash is refused");
     HppliteL1 *l1 = hpplite_l1_create_mock();
@@ -1052,6 +1131,7 @@ int main(int argc, char **argv) {
     test_ranges_restart(url);
     test_snapshot_made(url);
     test_snapshot_replica(url);
+    test_keep(url);
     test_anchor_timer(url);
     test_recovery(url);
     test_soft_replica(url);

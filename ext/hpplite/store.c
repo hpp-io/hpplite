@@ -1295,6 +1295,39 @@ static int ensureBucket(HppliteStore *s) {
     return 0;
 }
 
+int hpplite_store_prune(HppliteStore *s, uint64_t height) {
+    unsigned char words[96], digest[32], sig[65];
+    char da[43], path[128], sigHex[133];
+    cJSON *body;
+    Buf out = {0};
+    long status;
+    uint64_t issued = (uint64_t)time(NULL);
+    if (!s || !s->v2 || !s->hasBucket || !s->hasKey || height == 0) return -1;
+    if (ensureBucket(s) != 0) return -1;
+    lowerHex(s->bucketDa, 20, da);
+    snprintf(path, sizeof path, "/bucket/%s/prune", da);
+    memset(words, 0, 96);
+    memcpy(words + 12, s->bucketDa, 20);
+    wordInt(height, words + 32);
+    wordInt(issued, words + 64);
+    storeDigest(s, "Prune(address da,uint256 height,uint256 issuedAt)", words, 3, digest);
+    if (signWith(s, &s->kp, digest, sig) != 0) { snprintf(s->error, sizeof s->error, "the prune could not be signed"); return -1; }
+    lowerHex(sig, 65, sigHex);
+    body = cJSON_CreateObject();
+    cJSON_AddNumberToObject(body, "height", (double)height);
+    cJSON_AddNumberToObject(body, "issuedAt", (double)issued);
+    cJSON_AddStringToObject(body, "signature", sigHex);
+    status = postJson(s, path, body, &out);
+    cJSON_Delete(body);
+    if (status != 200) {
+        snprintf(s->error, sizeof s->error, "the store did not take the prune at %llu: %ld %.160s", (unsigned long long)height, status, out.p ? out.p : "");
+        free(out.p);
+        return -1;
+    }
+    free(out.p);
+    return 0;
+}
+
 void hpplite_store_set_bucket(HppliteStore *s, const unsigned char da[20], uint64_t permitCap) {
     if (!s || !da) return;
     if (!s->hasBucket || memcmp(s->bucketDa, da, 20) != 0) s->bound = 0;

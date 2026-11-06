@@ -179,6 +179,7 @@ typedef struct HppliteConfig {
     uint64_t storePermit;            /* storepermit=: what the permit lets the store pull, atomic units (#214) */
     int storePermitSet;              /* ...given (0 is a value: no permit, the 402s paid) */
     int softOff;                     /* soft=off: a verifier stays at the anchored height (#166) */
+    int64_t keepSeconds;             /* keep= (#223): how long the store keeps the history behind the latest snapshot; 0: all of it */
     int fromMode;                    /* from= (#222): 0 the default (a snapshot for a replica, batch 1 for a verifier), 1 snapshot, 2 genesis */
     uint64_t syncTo;                 /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;               /* syncat=: ...none written after this time, ms since the epoch (#205); 0: none */
