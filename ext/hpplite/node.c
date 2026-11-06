@@ -34,6 +34,7 @@ static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch);
 static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
 static int node_switch_to_rows(HppliteNode *node);
 static int node_check_rollup(HppliteNode *node);
+static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1);
 static void node_checkpoint_wal(HppliteNode *node, int64_t now);
 #include "da_uri.h"
 #include "capture_rows.h"
@@ -644,8 +645,11 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
             size_t len = 0;
             uint8_t *data = node_fetch_bytes(node, l1, 1, &len);
             HppliteBatch *b = data ? node_decode_batch(node, 1, data, len) : NULL;
-            int match = b && b->zDbName && strcmp(b->zDbName, zName) == 0;
-            if (b && b->zDbName && !match) zOthers = sqlite3_mprintf("%z%s\"%s\"", zOthers, zOthers ? ", " : "", b->zDbName);
+            char *zSnap = (!b && hpplite_l1_has_ranges(l1)) ? node_snapshot_name(node, l1) : NULL;   /* batch 1 pruned: the snapshot names it (#226) */
+            const char *zHas = b && b->zDbName ? b->zDbName : zSnap;
+            int match = zHas && strcmp(zHas, zName) == 0;
+            if (zHas && !match) zOthers = sqlite3_mprintf("%z%s\"%s\"", zOthers, zOthers ? ", " : "", zHas);
+            sqlite3_free(zSnap);
             hpplite_batch_free(b);
             free(data);
             hpplite_l1_disconnect(l1);
@@ -1914,7 +1918,7 @@ static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch) {
 static void hex32(const unsigned char *b, char out[67]) { out[0] = '0'; out[1] = 'x'; hpplite_bytes_to_hex(b, 32, out + 2); }
 
 /* The manifest the range commitment ending at `height` names, fetched by its digest's CID and checked against it; NULL: none */
-static cJSON *node_range_manifest(HppliteNode *node, uint64_t height) {
+static cJSON *node_range_manifest_on(HppliteNode *node, HppliteL1 *l1, uint64_t height) {
     HppliteRange r;
     unsigned char digest[32];
     char cid[64];
@@ -1922,7 +1926,7 @@ static cJSON *node_range_manifest(HppliteNode *node, uint64_t height) {
     size_t n = 0;
     cJSON *m = NULL;
     memset(&r, 0, sizeof r);
-    if (!node->store || !node->l1 || height == 0 || hpplite_l1_get_range(node->l1, height, &r) != 0) return NULL;
+    if (!node->store || !l1 || height == 0 || hpplite_l1_get_range(l1, height, &r) != 0) return NULL;
     hpplite_store_cid_from_sha256(r.manifestDigest, cid);
     text = hpplite_store_get(node->store, cid, &n);
     if (text) {
@@ -1933,6 +1937,8 @@ static cJSON *node_range_manifest(HppliteNode *node, uint64_t height) {
     hpplite_l1_range_clear(&r);
     return m;
 }
+
+static cJSON *node_range_manifest(HppliteNode *node, uint64_t height) { return node_range_manifest_on(node, node->l1, height); }
 
 /* the snapshot a manifest names: 0 and its height, -1 none */
 static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex[64], int64_t *pAt, unsigned char sha[32]) {
@@ -1951,6 +1957,73 @@ static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex
 
 #define HPPLITE_SNAPSHOT_CHUNK (8u << 20)     /* well under a store's size limit (16 MiB on Sepolia) */
 
+/* bytes compressed (at this deflate level) and sealed as a batch at `height` is - the same recipients, its own
+** data key - or framed plain without a key (#221); malloc'd, NULL on failure */
+static uint8_t *node_seal_at(HppliteNode *node, uint64_t height, const uint8_t *in, size_t len, int level, size_t *pLen) {
+    const uint8_t *payload = in;
+    size_t payloadLen = len;
+    uint8_t *packed = NULL, *out = NULL;
+    uint8_t encoding = HPPLITE_ENCODING_NONE;
+    if (!node->config.noCompress) {
+        size_t n = 0;
+        uint8_t *c = hpplite_deflate_level(payload, payloadLen, level, &n);
+        if (c && n + HPPLITE_PLAIN_MAGIC_LEN < payloadLen) { packed = c; payload = c; payloadLen = n; encoding = HPPLITE_ENCODING_DEFLATE; } else free(c);
+    }
+    if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
+        uint8_t *aTo = NULL, dek[32];
+        int nTo = node_recipients(node, &aTo);
+        hpplite_random_bytes(dek, 32);                  /* its own data key: a batch series' is not disturbed */
+        if (aTo && nTo > 1) out = hpplite_envelope_seal_pk(node->cipher, dek, aTo, nTo, height, encoding, payload, payloadLen, &payloadLen);
+        free(aTo);
+    } else if (node->cipher) {
+        out = hpplite_envelope_seal(node->cipher, node->encKey, height, encoding, payload, payloadLen, &payloadLen);
+    } else {
+        out = malloc((encoding == HPPLITE_ENCODING_DEFLATE ? HPPLITE_PLAIN_MAGIC_LEN : 0) + payloadLen);
+        if (out && encoding == HPPLITE_ENCODING_DEFLATE) { memcpy(out, HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN); memcpy(out + HPPLITE_PLAIN_MAGIC_LEN, payload, payloadLen); payloadLen += HPPLITE_PLAIN_MAGIC_LEN; }
+        else if (out) memcpy(out, payload, payloadLen);
+    }
+    free(packed);
+    *pLen = out ? payloadLen : 0;
+    return out;
+}
+
+/* A rollup's name from its latest snapshot (#226): batch 1, which names it (#160), may be pruned (keep=, #223).
+** The manifest the last anchor names, its snapshot's index, the sealed name object - each checked by its hash. */
+static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1) {
+    uint64_t last = 0, total = 0, h = 0;
+    unsigned char latest[32], ixSha[32], d[32];
+    char zIndex[64], *zName = NULL;
+    int64_t at = 0;
+    cJSON *m = NULL, *ix = NULL;
+    uint8_t *text = NULL, *bytes = NULL;
+    size_t n = 0;
+    const cJSON *nm, *ref, *sha;
+    if (!node->store || !l1 || hpplite_l1_get_da_state(l1, &last, &total, latest) != 0 || last == 0) return NULL;
+    m = node_range_manifest_on(node, l1, last);
+    if (!m || node_manifest_snapshot(m, &h, zIndex, &at, ixSha) != 0) goto done;
+    text = hpplite_store_get(node->store, zIndex, &n);
+    if (!text) goto done;
+    hpplite_store_sha256(text, n, d);
+    if (memcmp(d, ixSha, 32) != 0) goto done;
+    ix = cJSON_ParseWithLength((const char *)text, n);
+    nm = ix ? cJSON_GetObjectItemCaseSensitive(ix, "name") : NULL;
+    ref = nm ? cJSON_GetObjectItemCaseSensitive(nm, "ref") : NULL;
+    sha = nm ? cJSON_GetObjectItemCaseSensitive(nm, "sha256") : NULL;
+    if (!cJSON_IsString(ref) || !cJSON_IsString(sha) || strlen(sha->valuestring) != 66 || hpplite_hex_to_bytes(sha->valuestring + 2, latest, 32) != 32) goto done;
+    bytes = hpplite_store_get(node->store, ref->valuestring, &n);
+    if (!bytes) goto done;
+    hpplite_store_sha256(bytes, n, d);
+    if (memcmp(d, latest, 32) == 0) {
+        HppliteBatch *b = node_decode_batch(node, h, bytes, n);
+        if (b && b->zDbName) zName = sqlite3_mprintf("%s", b->zDbName);
+        hpplite_batch_free(b);
+    }
+done:
+    free(bytes); free(text);
+    cJSON_Delete(ix); cJSON_Delete(m);
+    return zName;
+}
+
 /*
 ** A snapshot (#221): the database as of `height` - the anchored height, the
 ** last batch finalized - from the page mode's images (exact by construction,
@@ -1963,10 +2036,9 @@ static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex
 static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned char root[32]) {
     HppliteCtx *ctx = node->ctx;
     unsigned char *image = NULL, imgRoot[32];
-    uint8_t *packed = NULL, *sealed = NULL, *framed = NULL;
+    uint8_t *sealed = NULL;
     const uint8_t *payload;
     size_t len = 0, payloadLen, off;
-    uint8_t encoding = HPPLITE_ENCODING_NONE;
     cJSON *ix = NULL, *chunks;
     char *text = NULL, *zRef = NULL, hx[67];
     const char *why = NULL;
@@ -1980,27 +2052,7 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
         sqlite3_free(image);
         return -1;
     }
-    payload = image; payloadLen = len;
-    if (!node->config.noCompress) {
-        size_t n = 0;
-        uint8_t *c = hpplite_deflate_level(payload, payloadLen, 6, &n);
-        if (c && n + HPPLITE_PLAIN_MAGIC_LEN < payloadLen) { packed = c; payload = c; payloadLen = n; encoding = HPPLITE_ENCODING_DEFLATE; } else free(c);
-    }
-    if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
-        uint8_t *aTo = NULL, dek[32];
-        int nTo = node_recipients(node, &aTo);
-        hpplite_random_bytes(dek, 32);                  /* its own data key: a batch series' is not disturbed */
-        if (aTo && nTo > 1) sealed = hpplite_envelope_seal_pk(node->cipher, dek, aTo, nTo, height, encoding, payload, payloadLen, &payloadLen);
-        free(aTo);
-        payload = sealed;
-    } else if (node->cipher) {
-        sealed = hpplite_envelope_seal(node->cipher, node->encKey, height, encoding, payload, payloadLen, &payloadLen);
-        payload = sealed;
-    } else if (encoding == HPPLITE_ENCODING_DEFLATE) {
-        framed = malloc(HPPLITE_PLAIN_MAGIC_LEN + payloadLen);
-        if (framed) { memcpy(framed, HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN); memcpy(framed + HPPLITE_PLAIN_MAGIC_LEN, payload, payloadLen); payloadLen += HPPLITE_PLAIN_MAGIC_LEN; }
-        payload = framed;
-    }
+    payload = sealed = node_seal_at(node, height, image, len, 6, &payloadLen);
     if (!payload) goto done;
     ix = cJSON_CreateObject();
     cJSON_AddNumberToObject(ix, "v", 1);
@@ -2029,6 +2081,35 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
         }
         sqlite3_free(zRef); zRef = NULL;
     }
+    if (ctx->zDbName && ctx->zDbName[0]) {
+        /* the database's name (#160) as batch 1 carries it, sealed: a named rollup is found by it once
+        ** batch 1 is pruned (#226) - a page batch with no pages, small to read for a lookup */
+        HpplitePageBatch nb;
+        unsigned char *nbytes;
+        size_t nlen = 0, slen = 0;
+        uint8_t *nsealed;
+        memset(&nb, 0, sizeof nb);
+        nb.pageSize = (unsigned)hpplite_pagemode_page_size(node->pm);
+        memcpy(nb.root, root, 32);
+        nb.zName = ctx->zDbName; nb.nName = (unsigned)strlen(ctx->zDbName);
+        nbytes = hpplite_pagebatch_encode(&nb, &nlen);
+        nsealed = nbytes ? node_seal_at(node, height, nbytes, nlen, 1, &slen) : NULL;
+        sqlite3_free(nbytes);
+        if (nsealed) {
+            char *zReceipt = NULL;
+            zRef = hpplite_store_put_at(node->store, height, nsealed, slen, &zReceipt);
+            sqlite3_free(zReceipt);
+            if (zRef) {
+                cJSON *nm = cJSON_AddObjectToObject(ix, "name");
+                unsigned char d[32];
+                hpplite_store_sha256(nsealed, slen, d);
+                cJSON_AddStringToObject(nm, "ref", zRef);
+                hex32(d, hx); cJSON_AddStringToObject(nm, "sha256", hx);
+                sqlite3_free(zRef); zRef = NULL;
+            }
+            free(nsealed);
+        }
+    }
     text = cJSON_PrintUnformatted(ix);
     if (!text) goto done;
     {
@@ -2049,7 +2130,7 @@ done:
     sqlite3_free(zRef);
     free(text);
     cJSON_Delete(ix);
-    sqlite3_free(image); free(packed); free(sealed); free(framed);
+    sqlite3_free(image); free(sealed);
     return rc;
 }
 

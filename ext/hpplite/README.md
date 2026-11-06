@@ -702,7 +702,7 @@ taken from the images the page mode keeps after the last finalized batch
 encoded as a page batch with every page whole, compressed, and sealed as a
 batch at that height is (the same recipients: the wallet, the owner, the
 readers). It goes to the rollup's bucket in chunks of 8 MiB, then an index,
-`{v, height, root, chain, block, at, bytes, chunks: [{ref, sha256}]}`: the
+`{v, height, root, chain, block, at, bytes, chunks: [{ref, sha256}], name}`: the
 root and chain hash are the ones the range commitment ending at that height
 carries. The manifest names it, `"snapshot": {height, index, at, sha256}`
 (the index's hash: whatever store serves it, a reader checks it, and each
@@ -727,7 +727,10 @@ name the older snapshots still kept (`"earlier": [...]`, oldest first),
 and after each anchor the sequencer signs a `Prune` (hpplite-store/2) at
 the height of the newest snapshot made at least `keep` ago - the store
 deletes the bucket's batches, names and older snapshots below it, never
-on its own judgement. The bucket then holds the database about once per
+on its own judgement. Batch 1, which
+names a `dbname=` database (#160), goes too: the index's `name` - the name
+sealed like a batch, as a page batch with no pages - is where a named
+lookup finds it then (#226). The bucket then holds the database about once per
 snapshot kept plus the window's batches. With `keep=all` (the default)
 nothing is pruned and snapshots only speed replicas up.
 
