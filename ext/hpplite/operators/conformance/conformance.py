@@ -106,6 +106,7 @@ def store(url, da=None, sequencer_key=None, instance=None):
         return
     domain = eth.domain_separator("HPPLiteStore", "2", int(dom["chainId"]), dom["verifyingContract"])
     free = b["pricePerWrite"] == 0 and b["pricePerMiBMonth"] == 0
+    given = bool(da and sequencer_key)
     seq = bytes.fromhex(sequencer_key[2:]) if sequencer_key else secrets.token_bytes(32)
     da = (da or eth.address(secrets.token_bytes(32))).lower()
     funder_key = secrets.token_bytes(32)
@@ -139,6 +140,11 @@ def store(url, da=None, sequencer_key=None, instance=None):
                          {"X-HPPLite-Signature": "0x" + eth.sign(seq, eth.typed_digest(domain, CONTENT, da, 1, eth.keccak256(b"before any binding"))).hex()})
     check(st == 402 and (as_json(out) or {}).get("error") == "bucket_unbound", "a write into a bucket never bound: 402 bucket_unbound (%d)" % st)
     st, _, out = bind(seq, funder_key, now)
+    if st == 404 and not given and status.get("chain"):
+        # a store that reads the chain binds only a real rollup's bucket: what it must answer for a DA with none
+        check("rollup" in str((as_json(out) or {}).get("error", "")), "a store that reads the chain: a DA with no rollup is not bound (404)")
+        print("          the calls past the binding need a real rollup: --da, --sequencer-key, --instance")
+        return
     if not check(st == 200 and (as_json(out) or {}).get("funder") == funder,
                  "bound by the sequencer and the funder: 200 (%d %s)" % (st, (as_json(out) or {}).get("error", ""))):
         if st in (401, 404):
