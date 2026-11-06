@@ -724,10 +724,11 @@ batch 1. `snapshot_height` in `hpplite_status` is the one it started from.
 
 With `keep=<duration>` (#223) the history is bounded: the manifests also
 name the older snapshots still kept (`"earlier": [...]`, oldest first),
-and after each anchor the sequencer signs a `Prune` (hpplite-store/2) at
-the height of the newest snapshot made at least `keep` ago - the store
-deletes the bucket's batches, names and older snapshots below it, never
-on its own judgement. Batch 1, which
+and at each anchor the sequencer signs a `Prune` (hpplite-store/2) at the
+height of the newest snapshot an earlier anchor named that is at least
+`keep` old - before that anchor's manifest is written, so it names only
+what is kept (#227) - and the store deletes the bucket's batches, names
+and older snapshots below it, never on its own judgement. Batch 1, which
 names a `dbname=` database (#160), goes too: the index's `name` - the name
 sealed like a batch, as a page batch with no pages - is where a named
 lookup finds it then (#226). The bucket then holds the database about once per
