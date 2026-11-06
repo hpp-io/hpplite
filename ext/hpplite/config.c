@@ -260,7 +260,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv("HPPLITE_KEEP");
     if (val && parse_keep_seconds(val) >= 0) cfg->keepSeconds = parse_keep_seconds(val);
     val = getenv("HPPLITE_FROM");
-    if (val) cfg->fromMode = strcmp(val, "snapshot") == 0 ? 1 : strcmp(val, "genesis") == 0 ? 2 : cfg->fromMode;
+    if (val) cfg->fromMode = strcmp(val, "snapshot") == 0 ? 1 : strcmp(val, "genesis") == 0 ? 2 : strcmp(val, "earliest") == 0 ? 3 : cfg->fromMode;
     val = getenv("HPPLITE_SNAPSHOT");
     if (val) {
         int ms = parse_duration_ms(val);
@@ -560,7 +560,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf)) && buf[0]) cfg->softOff = strcasecmp(buf, "off") == 0 || strcmp(buf, "0") == 0;
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
     if (get_uri_param(uri, "keep", buf, sizeof(buf)) && parse_keep_seconds(buf) >= 0) cfg->keepSeconds = parse_keep_seconds(buf);
-    if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) cfg->fromMode = strcmp(buf, "snapshot") == 0 ? 1 : strcmp(buf, "genesis") == 0 ? 2 : cfg->fromMode;
+    if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) cfg->fromMode = strcmp(buf, "snapshot") == 0 ? 1 : strcmp(buf, "genesis") == 0 ? 2 : strcmp(buf, "earliest") == 0 ? 3 : cfg->fromMode;
     if (get_uri_param(uri, HPPLITE_URI_SYNC_AT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncAtMs = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_SPEND_CAP, buf, sizeof(buf)) && buf[0]
         && hpplite_spend_parse_cap(buf, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: spendcap=%s: not N, N/hour or N/day; ignored\n", buf);
@@ -759,7 +759,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, "keep");
     if (val && parse_keep_seconds(val) >= 0) cfg->keepSeconds = parse_keep_seconds(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_FROM);
-    if (val) cfg->fromMode = strcmp(val, "snapshot") == 0 ? 1 : strcmp(val, "genesis") == 0 ? 2 : cfg->fromMode;
+    if (val) cfg->fromMode = strcmp(val, "snapshot") == 0 ? 1 : strcmp(val, "genesis") == 0 ? 2 : strcmp(val, "earliest") == 0 ? 3 : cfg->fromMode;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_AT);
     if (val && atoll(val) > 0) cfg->syncAtMs = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_DEPOSIT);

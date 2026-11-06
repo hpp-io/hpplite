@@ -2246,7 +2246,7 @@ static uint8_t *node_store_get_checked(HppliteNode *node, const char *zRef, cons
 ** 1 started there; 0 not (from batch 1; why said when a snapshot was
 ** refused); -1 the file could not be written.
 */
-static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch) {
+static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, int latestOnly) {
     HppliteCtx *ctx = node->ctx;
     cJSON *m, *ix = NULL, *chunks = NULL, *c;
     uint64_t h = 0;
@@ -2260,6 +2260,19 @@ static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch) {
     const char *why = NULL;
     m = node_range_manifest(node, lastBatch);
     if (!m || node_manifest_snapshot(m, &h, zIndex, &at, ixSha) != 0 || h < 2) { cJSON_Delete(m); return 0; }
+    if (node->config.fromSnapshot == 2 && !latestOnly) {
+        /* from=earliest (#224): the oldest snapshot still kept (keep=, #223) - the most history verified */
+        const cJSON *first = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(m, "earlier"), 0);
+        if (first) {
+            cJSON *one = cJSON_CreateObject();
+            uint64_t eh = 0; int64_t eat = 0; char eIndex[64]; unsigned char eSha[32];
+            cJSON_AddItemReferenceToObject(one, "snapshot", (cJSON *)first);
+            if (node_manifest_snapshot(one, &eh, eIndex, &eat, eSha) == 0 && eh >= 2 && eh < h) {
+                h = eh; at = eat; snprintf(zIndex, sizeof zIndex, "%s", eIndex); memcpy(ixSha, eSha, 32);
+            }
+            cJSON_Delete(one);
+        }
+    }
     cJSON_Delete(m);
     if (node->syncTo && h > node->syncTo) return 0;                         /* a stop before it (#206): from batch 1 */
     if (node->syncAtMs && (uint64_t)at * 1000 > node->syncAtMs) return 0;  /* ...or a time before it was made (#205) */
@@ -2324,6 +2337,12 @@ static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch) {
     node->snapHeight = h;
     fprintf(stderr, "hpplite: started from the snapshot at height %llu (anchored root matched); replaying from %llu\n", (unsigned long long)h, (unsigned long long)(h + 1));
     return 1;
+}
+
+static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch) {
+    int rc = node_start_from_snapshot_at(node, lastBatch, 0);
+    if (rc == 0 && node->config.fromSnapshot == 2) rc = node_start_from_snapshot_at(node, lastBatch, 1);   /* the oldest was not usable: the latest (#224) */
+    return rc;
 }
 
 /*

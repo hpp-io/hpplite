@@ -87,7 +87,7 @@ typedef struct HppliteNodeConfig {
     uint64_t storePermit;           /* storepermit=: what the funding wallet's permit lets the store pull (0: none, #214) */
     int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
-    int fromSnapshot;               /* from= (#222): a new replica starts from the latest snapshot */
+    int fromSnapshot;               /* from= (#222): a new replica starts from the latest snapshot (1) or the oldest still kept (2, #224) */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;              /* syncat=: ...none written after this time (ms since the epoch, #205); 0: none */
     uint64_t relayDeposit;          /* relaydeposit=: the relay paid by voucher (#179); 0 = exact */

@@ -2537,6 +2537,60 @@ static void test_verify_at(void) {
     PASS();
 }
 
+/* 35. Snapshots and pruning on a chain (#203: #221-#224): a page-mode sequencer at the reference store
+** (reading the rollup's sequencer from the chain) makes a snapshot at each anchor and keeps 3 s of history;
+** the store takes its Prune (the sequencer's signature, checked against the chain); hpplite-verify cannot read
+** batch 1, starts from the oldest snapshot still kept - its root the one the chain anchored - and verifies the
+** rest; --to before it is refused with the reason. KEY4, its own named database. */
+static void test_snapshots_on_chain(void) {
+    TEST("snapshots and keep= on a chain (#221-#224): pruned at the store by the sequencer's Prune; hpplite-verify verifies from the oldest snapshot kept; --to before it cannot be met");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    int port = test_free_port();
+    pid_t pid = start_pin_service_free(svc, port);
+    if (pid < 0) FAIL("the store did not come up");
+    char extra[300], params[500], out[8192], da[43], cmd[200], bucket[2000] = "";
+    snprintf(extra, sizeof extra, "&dbname=snapshots&capture=pages&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms&keep=3s", port);
+    sqlite3 *w = open_db("sn_writer.db", KEY4, extra);
+    if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open writer"); }
+    sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    static const int ends[] = { 3, 5, 6 };
+    int b = 0;
+    for (int k = 0; k < 3; k++) {
+        if (k) sleep(4);                           /* keep=3s, by whole seconds */
+        while (b < ends[k]) {
+            sqlite3_exec(w, "INSERT INTO n(v) VALUES(hex(randomblob(500)))", NULL, NULL, NULL);
+            if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("a batch through the store"); }
+            b++;
+        }
+        if (scalar(w, "SELECT hpplite_anchor()") != ends[k] || scalar(w, "SELECT snapshot_height FROM hpplite_status") != ends[k]) {
+            printf("(anchor %d: %s) ", ends[k], status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("an anchor with a snapshot at its height");
+        }
+    }
+    long long rows = scalar(w, "SELECT count(*) FROM n");
+    snprintf(da, sizeof da, "%s", status_text(w, "da_contract"));
+    for (char *p = da; *p; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+    sqlite3_close(w);
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 http://127.0.0.1:%d/bucket/%s", port, da);
+    run_cmd(cmd, bucket, sizeof bucket);
+    if (!strstr(bucket, "\"pruneHeight\": 5") && !strstr(bucket, "\"pruneHeight\":5")) { printf("(%s) ", bucket); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the store took the Prune at the snapshot at 5"); }
+    snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=snapshots&store=http://127.0.0.1:%d", RPC, FACTORY, KEY4, port);
+    out[0] = 0;
+    int rc = run_verify_with(params, "--keep " DIR "/sn_keep", out, sizeof out);
+    sqlite3 *kept = NULL;
+    long long keptRows = -1;
+    if (sqlite3_open_v2(DIR "/sn_keep/rebuilt.db", &kept, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) keptRows = scalar(kept, "SELECT count(*) FROM n");
+    sqlite3_close(kept);
+    printf("(rows %lld, rebuilt %lld) ", rows, keptRows);
+    if (rc != 0 || !strstr(out, "verified from the snapshot at 5") || !strstr(out, "\nverified") || keptRows != rows) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("hpplite-verify from the oldest snapshot kept: exit %d\n%s", rc, out); }
+    out[0] = 0;
+    rc = run_verify_with(params, "--to 2", out, sizeof out);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (rc == 0 || !strstr(out, "cannot be rebuilt")) FAILF("--to 2, below the snapshot kept: exit %d\n%s", rc, out);
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2583,6 +2637,7 @@ int main(void) {
     if (wanted(32)) test_verify_to();
     if (wanted(33)) test_sealed_to_owner();
     if (wanted(34)) test_verify_at();
+    if (wanted(35)) test_snapshots_on_chain();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }
