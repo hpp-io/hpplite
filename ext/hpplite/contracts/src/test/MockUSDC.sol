@@ -6,7 +6,8 @@ pragma solidity ^0.8.19;
  * @notice A stand-in for USDC.e on anvil (#125): an ERC-20 with EIP-3009
  *         transferWithAuthorization, which is what x402's `exact` scheme
  *         settles with, and receiveWithAuthorization, which batch-settlement's
- *         deposit collector pulls a channel's deposit with (#135). Six decimals; the deployer gets the supply.
+ *         deposit collector pulls a channel's deposit with (#135), and EIP-2612
+ *         permit, which hpplite-store/2's pulls are funded by (#212). Six decimals; the deployer gets the supply.
  *         Not for any chain that matters. The EIP-712 domain is the real
  *         token's: name "Bridged USDC", version "2" (its symbol is USDC.e;
  *         HPP's facilitator checks the name against the token, #11).
@@ -19,11 +20,14 @@ contract MockUSDC {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
     mapping(address => mapping(bytes32 => bool)) public authorizationState;
+    mapping(address => uint256) public nonces;
 
     bytes32 public constant TRANSFER_WITH_AUTHORIZATION_TYPEHASH =
         keccak256("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
     bytes32 public constant RECEIVE_WITH_AUTHORIZATION_TYPEHASH =
         keccak256("ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)");
+    bytes32 public constant PERMIT_TYPEHASH =
+        keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
     bytes32 private constant DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
 
@@ -57,6 +61,17 @@ contract MockUSDC {
         allowance[from][msg.sender] -= value;
         _move(from, to, value);
         return true;
+    }
+
+    /// EIP-2612: `owner` signed an allowance for `spender`, anyone submits it, its nonce once
+    function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+        require(block.timestamp <= deadline, "permit expired");
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonces[owner]++, deadline))));
+        address signer = ecrecover(digest, v, r, s);
+        require(signer != address(0) && signer == owner, "invalid signature");
+        allowance[owner][spender] = value;
+        emit Approval(owner, spender, value);
     }
 
     /// EIP-3009: `from` signed it, anyone submits it, the nonce is used once
