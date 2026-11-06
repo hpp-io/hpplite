@@ -258,8 +258,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
     val = getenv(HPPLITE_ENV_STORE_CAP);
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
-    val = getenv(HPPLITE_ENV_STORE_DEPOSIT);
-    if (val && atoll(val) > 0) cfg->storeDeposit = (uint64_t)atoll(val);
+    val = getenv(HPPLITE_ENV_STORE_PERMIT);
+    if (val && val[0] >= '0' && val[0] <= '9') { cfg->storePermit = (uint64_t)atoll(val); cfg->storePermitSet = 1; }
     val = getenv(HPPLITE_ENV_SOFT);
     if (val && val[0]) cfg->softOff = strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0;
     val = getenv(HPPLITE_ENV_RELAY_DEPOSIT);
@@ -520,8 +520,9 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_STORE_CAP, buf, sizeof(buf)) && atoll(buf) > 0) {
         cfg->storeCap = (uint64_t)atoll(buf);
     }
-    if (get_uri_param(uri, HPPLITE_URI_STORE_DEPOSIT, buf, sizeof(buf)) && atoll(buf) > 0) {
-        cfg->storeDeposit = (uint64_t)atoll(buf);
+    if (get_uri_param(uri, HPPLITE_URI_STORE_PERMIT, buf, sizeof(buf)) && buf[0] >= '0' && buf[0] <= '9') {
+        cfg->storePermit = (uint64_t)atoll(buf);
+        cfg->storePermitSet = 1;
     }
     if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->relayDeposit = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf)) && buf[0]) cfg->softOff = strcasecmp(buf, "off") == 0 || strcmp(buf, "0") == 0;
@@ -705,8 +706,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_CAP);
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_DEPOSIT);
-    if (val && atoll(val) > 0) cfg->storeDeposit = (uint64_t)atoll(val);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_PERMIT);
+    if (val && val[0] >= '0' && val[0] <= '9') { cfg->storePermit = (uint64_t)atoll(val); cfg->storePermitSet = 1; }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SOFT);
     if (val && val[0]) cfg->softOff = strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_DEPOSIT);

@@ -917,7 +917,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->checkpointInterval = cfg->checkpointInterval;
     nc->storeUrl = cfg->storeUrl;
     nc->storeCap = cfg->storeCap;
-    nc->storeDeposit = cfg->storeDeposit;
+    nc->storePermit = cfg->storePermitSet ? cfg->storePermit : 20000000;   /* 20 USDC.e by default (#214) */
     nc->relayDeposit = cfg->relayDeposit;
     nc->softOff = cfg->softOff;
     nc->spendCap = cfg->spendCap;

@@ -245,14 +245,14 @@ static int free_port(void) {
     return port;
 }
 
-/* a free pin service with a directory of its own for the round: no names left by another round */
+/* a free store (hpplite-store/2, #214) with a directory of its own for the round: no buckets left by another round */
 static int start_pins(const char *svc, int round) {
     char dir[200], cmd[600], script[600], portStr[16];
     int port = free_port();
     snprintf(dir, sizeof dir, PINDIR "/round%d", round);
     snprintf(cmd, sizeof cmd, "mkdir -p %s && echo 0x2020202020202020202020202020202020202020202020202020202020202020 > %s/signer.key", dir, dir);
     if (system(cmd) != 0 || !port) return -1;
-    snprintf(script, sizeof script, "%s/pin_service.py", svc);
+    snprintf(script, sizeof script, "%s/hpplite_store.py", svc);
     snprintf(portStr, sizeof portStr, "%d", port);
     pinPid = fork();
     if (pinPid == 0) {
@@ -261,7 +261,8 @@ static int start_pins(const char *svc, int round) {
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         snprintf(key, sizeof key, "%s/signer.key", dir);
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", dir, "--signer-key", key,
-               "--pay-to", "0x1111111111111111111111111111111111111111", (char *)NULL);
+               "--pay-to", "0x1111111111111111111111111111111111111111", "--price-per-write", "0", "--price-per-mib-month", "0",
+               (char *)NULL);
         _exit(127);
     }
     snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", port);

@@ -45,7 +45,7 @@ void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp);
 
 /* x402 batch-settlement (#135): with depositCap > 0 the node pays a 402 that offers it by
 ** voucher in a channel of x402's escrow, depositing when the channel cannot cover the call,
-** never leaving more than depositCap unspent there (storedeposit=). The channel's salt binds
+** never leaving more than depositCap unspent there (relaydeposit=; a /2 store offers no channels, #214). The channel's salt binds
 ** it to the rollup (da); the running total survives a restart in zStatePath (NULL: memory
 ** only, the seller's corrective 402 restores it). 0 turns it off: exact per call. */
 void hpplite_store_set_channel(HppliteStore *s, uint64_t depositCap, const unsigned char da[20], const char *zStatePath);
@@ -56,6 +56,27 @@ int hpplite_store_channel(HppliteStore *s, char zId[67], uint64_t *pCharged, uin
 ** provider signed one, its receipt as compact JSON (sqlite3_mprintf, or
 ** NULL). NULL on failure; hpplite_store_error() says why. */
 char *hpplite_store_put(HppliteStore *store, const uint8_t *data, size_t len, char **pzReceipt);
+/* ...at a batch height: a hpplite-store/2 store takes the bytes into the rollup's bucket, signed for that
+** height (what a prune point counts); put is put_at height 0. No receipt at /2: the bucket statement is */
+char *hpplite_store_put_at(HppliteStore *store, uint64_t height, const uint8_t *data, size_t len, char **pzReceipt);
+/*
+** hpplite-store/2 (#214, doc/store-buckets.md): the rollup's bucket at the store, paid from a funding
+** wallet whose key is derived from the node's. set_bucket names the rollup (its DA) and what the
+** funding wallet's permit lets the store pull (storepermit=, atomic units; 0: no permit, the store's
+** 402s are paid instead); the bucket is bound and the permit given at the first write. is_bucket: the
+** store speaks /2. funder: the funding wallet's address (send USDC.e there). covered_until and
+** bucket_state: from the last statement (-1 / NULL when not known). statement: the store's signed
+** BucketStatement in the compact form an anchor commits (version 2 | signer | payTo | height |
+** pruneHeight | coveredUntil | issuedAt, 8 bytes each | signature), checked against the store's
+** signer; its size, or -1.
+*/
+#define HPPLITE_STATEMENT_SIZE 138
+void hpplite_store_set_bucket(HppliteStore *store, const unsigned char da[20], uint64_t permitCap);
+int hpplite_store_is_bucket(HppliteStore *store);
+int hpplite_store_funder(HppliteStore *store, unsigned char out[20]);
+int64_t hpplite_store_covered_until(HppliteStore *store);
+const char *hpplite_store_bucket_state(HppliteStore *store);
+int hpplite_store_statement(HppliteStore *store, uint8_t out[HPPLITE_STATEMENT_SIZE]);
 
 /* Get the bytes a reference names: malloc'd, terminated, *pLen set; NULL when not there */
 uint8_t *hpplite_store_get(HppliteStore *store, const char *zRef, size_t *pLen);

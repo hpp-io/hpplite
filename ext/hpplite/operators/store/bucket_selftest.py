@@ -213,6 +213,15 @@ def main():
         check(code in (401, 403), "a content put whose signature is not over its bytes: refused (%s)" % code)
         code, data, _ = http("GET", "%s/get/%s" % (url, _cid(blob)))
         check(code == 200 and data == blob, "the content reads back by CID")
+        before_bytes = http("GET", url + "/bucket/" + da)[1]["bytes"]
+        same_bytes = (b"batch %d " % 4) * 30
+        sig = eth.sign(k1, S.digest(CONTENT, da, 4, eth.keccak256(same_bytes)))
+        code, out, _ = http("POST", "%s/put?bucket=%s&height=4" % (url, da), same_bytes, {"X-HPPLite-Signature": "0x" + sig.hex()})
+        check(code == 200 and out.get("held") and http("GET", url + "/bucket/" + da)[1]["bytes"] == before_bytes,
+              "a content put of a name's bytes: held already, counted once")
+        acct = http("GET", url + "/account/" + fa)[1]
+        check(acct.get("permitNonce") == 0 and st["buckets"].get("assetDomain", {}).get("name") == "Bridged USDC",
+              "the account view gives the permit nonce; /status the token's domain")
 
         # --- the store pulls what accrues ---
         before = usdc_of(pay_to)

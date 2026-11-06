@@ -1,14 +1,15 @@
 /*
-** HPPLite stores (#11): the pin-service store over HTTP.
+** HPPLite stores (#11): a hpplite-store/2 store over HTTP (#214, doc/store-buckets.md).
 **
-** put: POST <url>/put with the bytes; the provider answers {cid, receipt,
-** ...} or 402 with PAYMENT-REQUIRED (x402). A 402 is paid once: the exact
-** scheme's EIP-3009 TransferWithAuthorization signed with the node's key
-** for the quoted amount, sent back in PAYMENT-SIGNATURE; above storecap=
-** the call is refused before anything is signed.
-** With storedeposit= the node takes x402's batch-settlement instead when the
-** 402 offers it (#135): one deposit into a channel in x402's escrow, then a
-** signed cumulative voucher per put, nothing on the chain per put.
+** The rollup's bucket: bound at the first write with the node's key (the rollup's sequencer) and a
+** funding key derived from it, given an EIP-2612 permit (storepermit=) the store pulls what it is owed
+** with. put: POST <url>/put?bucket=<da>&height=<n> with the bytes and the sequencer's Content
+** signature; names: POST /name/<da>-<height>. A 402 (a write the account cannot cover) is paid once
+** from the funding wallet in x402's exact scheme, an EIP-3009 TransferWithAuthorization for the quoted
+** top-up, sent back in PAYMENT-SIGNATURE; above storecap= the call is refused before anything is
+** signed. The relay is paid the same way from the node's own key, and with relaydeposit= by voucher
+** in x402's batch-settlement (#135, #179): one deposit into a channel in x402's escrow, then a signed
+** cumulative voucher per call, nothing on the chain per call.
 ** get: GET <url>/get/<ref>: the bytes.
 */
 #include "store.h"
@@ -60,7 +61,7 @@ struct HppliteStore {
     int isRelay;                    /* opened for relay= (#126): its messages name the relay and relaycap */
     char protocol[48];              /* what /status says it speaks ("hpplite-store/1"; empty: a service from before #188) */
     /* x402 batch-settlement (#135): a channel in x402's escrow, a voucher per put */
-    uint64_t depositCap;            /* storedeposit=: the most left unspent in the escrow at once; 0: exact per put */
+    uint64_t depositCap;            /* relaydeposit=: the most left unspent in the escrow at once; 0: exact per call */
     unsigned char salt[32];         /* the channel's salt: keccak256("hpplite" || the rollup's DA address) */
     char *statePath;                /* where the running total survives a restart (NULL: memory only) */
     int hasChan;                    /* chanId below is the channel the state is for */
@@ -70,6 +71,22 @@ struct HppliteStore {
     uint64_t deposited;             /* this process's deposits, for the status row */
     int nDeposits;
     HppliteSpend *spend;            /* the node's ledger (#173): spendcap= checked before signing, charges recorded; not owned */
+    /* hpplite-store/2 (#214, doc/store-buckets.md): the rollup's bucket, paid from a funding wallet */
+    int v2;                         /* /status says hpplite-store/2 */
+    int hasBucket;                  /* bucketDa below is set (hpplite_store_set_bucket) */
+    unsigned char bucketDa[20];
+    int bound;                      /* the store has the bucket bound to this node's funding wallet */
+    time_t boundChecked;            /* when that was last asked */
+    int hasFund;                    /* the funding key: derived from the node's key */
+    HppliteKeypair fundKp;
+    unsigned char fundAddr[20];
+    uint64_t permitCap;             /* storepermit=: what the permit lets the store pull (0: none, the 402s are paid) */
+    time_t permitChecked;
+    unsigned char spender[20];      /* who the permit names (/status buckets.spender) */
+    char assetName[64], assetVersion[16];   /* the asset's EIP-712 domain, for the permit */
+    uint64_t pricePerWrite;
+    int64_t coveredUntil;           /* from the last statement or bucket read; -1: not known */
+    char bucketState[16];
     int payKind;                    /* the payment just built: PAY_EXACT, PAY_VOUCHER, PAY_DEPOSIT */
     uint64_t payDeposit;            /* ...and the deposit in it */
     char error[256];
@@ -78,6 +95,12 @@ struct HppliteStore {
 };
 
 typedef struct Buf { char *p; size_t n; } Buf;
+
+static void deriveFund(HppliteStore *s, const uint8_t privkey[32]);
+static int ensureBucket(HppliteStore *s);
+static void storeDigest(HppliteStore *s, const char *zType, const unsigned char *words, size_t nWords, unsigned char out[32]);
+static int signWith(HppliteStore *s, HppliteKeypair *kp, const unsigned char digest[32], unsigned char sig[65]);
+static void lowerHex(const unsigned char *b, size_t n, char *out);
 
 static size_t bufWrite(void *data, size_t size, size_t nmemb, void *arg) {
     Buf *b = (Buf *)arg;
@@ -117,7 +140,18 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
         curl_easy_setopt(c, CURLOPT_POST, 1L);
         curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, 0L);
     }
-    if (extraHeader) hdrs = curl_slist_append(hdrs, extraHeader);
+    if (extraHeader) {
+        /* one header per line */
+        const char *h = extraHeader, *nl;
+        for (; *h; h = nl ? nl + 1 : h + strlen(h)) {
+            char *line;
+            nl = strchr(h, '\n');
+            line = sqlite3_mprintf("%.*s", (int)(nl ? (size_t)(nl - h) : strlen(h)), h);   /* a payment header runs to kilobytes */
+            if (line && line[0]) hdrs = curl_slist_append(hdrs, line);
+            sqlite3_free(line);
+            if (!nl) break;
+        }
+    }
     if (hdrs) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
     if (curl_easy_perform(c) != CURLE_OK) {
         snprintf(s->error, sizeof s->error, "store unreachable: %s", url);
@@ -579,7 +613,7 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "exact") == 0 && !acc) acc = it;
         if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "batch-settlement") == 0 && !accBatch) accBatch = it;
     }
-    if (accBatch && s->depositCap) acc = accBatch;          /* storedeposit=: a channel, a voucher per call (#135) */
+    if (accBatch && s->depositCap) acc = accBatch;          /* relaydeposit=: a channel, a voucher per call (#135, #179) */
     if (acc && s->spend) {
         /* spendcap= (#173): over the window's cap, nothing is signed; the batch waits as over storecap= */
         uint64_t asked = strtoull(jstr(acc, "amount") ? jstr(acc, "amount") : "0", NULL, 10);
@@ -605,6 +639,8 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         }
         amt = strtoull(amount->valuestring, NULL, 10);
         if (!s->hasKey) { snprintf(s->error, sizeof s->error, "the store asks %llu and this node has no key to pay with", (unsigned long long)amt); cJSON_Delete(req); return NULL; }
+        HppliteKeypair *payKp = s->v2 && s->hasFund ? &s->fundKp : &s->kp;          /* /2: the funding wallet pays (#214) */
+        const unsigned char *payAddr = s->v2 && s->hasFund ? s->fundAddr : s->address;
         if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the %s asks %llu, %s is %llu: refused", s->isRelay ? "relay" : "store",
                                      (unsigned long long)amt, s->isRelay ? "relaycap" : "storecap", (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
         if (strncmp(network->valuestring, "eip155:", 7) == 0) chainId = strtoull(network->valuestring + 7, NULL, 10);
@@ -632,12 +668,12 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
             unsigned char seed[84];
             static unsigned counter;
             wordInt(now, seed);
-            memcpy(seed + 32, s->address, 20);
+            memcpy(seed + 32, payAddr, 20);
             wordInt(++counter + (uint64_t)(uintptr_t)s, seed + 52);
             hpplite_keccak256(seed, sizeof seed, nonce);
         }
         hpplite_keccak256((const unsigned char *)zTransferType, sizeof(zTransferType) - 1, w);
-        memset(w + 32, 0, 32); memcpy(w + 32 + 12, s->address, 20);
+        memset(w + 32, 0, 32); memcpy(w + 32 + 12, payAddr, 20);
         if (wordAddress(payTo->valuestring, w + 64) != 0) { snprintf(s->error, sizeof s->error, "bad payTo in the 402"); cJSON_Delete(req); return NULL; }
         wordInt(amt, w + 96);
         wordInt(validAfter, w + 128);
@@ -655,7 +691,7 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         {
             HppliteSignature hs;
             unsigned char v;
-            if (hpplite_crypto_sign(s->crypto, &s->kp, digest, &hs) != 0) { snprintf(s->error, sizeof s->error, "could not sign the payment"); cJSON_Delete(req); return NULL; }
+            if (hpplite_crypto_sign(s->crypto, payKp, digest, &hs) != 0) { snprintf(s->error, sizeof s->error, "could not sign the payment"); cJSON_Delete(req); return NULL; }
             hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);   /* r, s, then v: the 65-byte form ecrecover expects */
             sig[64] = v;
         }
@@ -665,7 +701,7 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
             cJSON *payload = cJSON_CreateObject(), *inner = cJSON_CreateObject(), *auth = cJSON_CreateObject();
             char num[32];
             snprintf(fromHex, sizeof fromHex, "0x");
-            hpplite_bytes_to_hex(s->address, 20, fromHex + 2);
+            hpplite_bytes_to_hex(payAddr, 20, fromHex + 2);
             snprintf(nonceHex, sizeof nonceHex, "0x");
             hpplite_bytes_to_hex(nonce, 32, nonceHex + 2);
             snprintf(sigHex, sizeof sigHex, "0x");
@@ -887,6 +923,72 @@ static uint8_t *s3Get(HppliteStore *s, const char *zRef, size_t *pLen) {
 
 /* === The API === */
 
+/* The provider's /status: its protocol, which key signs, in which domain, what it charges. The HTTP status */
+static long statusRead(HppliteStore *s) {
+    long code;
+    /* the provider's /status: which key signs its receipts, in which domain */
+    Buf out = {0};
+    if ((code = storeRequest(s, "GET", "/status", NULL, 0, NULL, &out, NULL, NULL)) == 200 && out.p) {
+        cJSON *st = cJSON_Parse(out.p);
+        cJSON *signer = st ? cJSON_GetObjectItem(st, "signer") : NULL;
+        cJSON *pay = st ? cJSON_GetObjectItem(st, "payment") : NULL;
+        if (pay && cJSON_IsObject(pay)) {
+            /* what it charges, for the status row: asset, chain, the price of a put */
+            cJSON *asset = cJSON_GetObjectItem(pay, "asset"), *network = cJSON_GetObjectItem(pay, "network"),
+                  *perByte = cJSON_GetObjectItem(pay, "pricePerByte"), *perPin = cJSON_GetObjectItem(pay, "pricePerPin"),
+                  *perMiB = cJSON_GetObjectItem(pay, "pricePerMiBMonth"), *retention = cJSON_GetObjectItem(pay, "retentionSeconds");
+            if (asset && cJSON_IsString(asset) && strlen(asset->valuestring) == 42
+                && hpplite_hex_to_bytes(asset->valuestring + 2, s->asset, 20) >= 0
+                && network && cJSON_IsString(network) && strncmp(network->valuestring, "eip155:", 7) == 0) {
+                s->payChainId = strtoull(network->valuestring + 7, NULL, 10);
+                s->pricePerByte = (perByte && cJSON_IsNumber(perByte)) ? (uint64_t)perByte->valuedouble : 0;
+                s->pricePerPin = (perPin && cJSON_IsNumber(perPin)) ? (uint64_t)perPin->valuedouble : 0;
+                s->pricePerMiBMonth = (perMiB && cJSON_IsNumber(perMiB) && perMiB->valuedouble > 0) ? perMiB->valuedouble : 0;
+                s->retentionSeconds = (retention && cJSON_IsNumber(retention) && retention->valuedouble > 0) ? (uint64_t)retention->valuedouble : 0;
+                s->hasPayment = 1;
+            }
+        }
+        cJSON *proto = st ? cJSON_GetObjectItem(st, "protocol") : NULL;
+        if (proto && cJSON_IsString(proto)) snprintf(s->protocol, sizeof s->protocol, "%s", proto->valuestring);
+        cJSON *receipt = st ? cJSON_GetObjectItem(st, "receipt") : NULL;
+        cJSON *domain = receipt ? cJSON_GetObjectItem(receipt, "domain") : NULL;
+        if (strcmp(s->protocol, "hpplite-store/2") == 0) {
+            /* /2: the store's domain, the bucket terms; prices for the status row */
+            cJSON *bk = cJSON_GetObjectItem(st, "buckets"), *ad = bk ? cJSON_GetObjectItem(bk, "assetDomain") : NULL;
+            const char *zAsset = jstr(bk, "asset"), *zSpender = jstr(bk, "spender");
+            s->v2 = 1;
+            domain = cJSON_GetObjectItem(st, "domain");
+            if (zAsset && strlen(zAsset) == 42 && hpplite_hex_to_bytes(zAsset + 2, s->asset, 20) >= 0) s->hasPayment = 1;
+            if (zSpender && strlen(zSpender) == 42) hpplite_hex_to_bytes(zSpender + 2, s->spender, 20);
+            snprintf(s->assetName, sizeof s->assetName, "%s", jstr(ad, "name") ? jstr(ad, "name") : "Bridged USDC");
+            snprintf(s->assetVersion, sizeof s->assetVersion, "%s", jstr(ad, "version") ? jstr(ad, "version") : "2");
+            s->pricePerWrite = jnum(bk, "pricePerWrite");
+            {
+                cJSON *pm = bk ? cJSON_GetObjectItem(bk, "pricePerMiBMonth") : NULL;
+                s->pricePerMiBMonth = (pm && cJSON_IsNumber(pm) && pm->valuedouble > 0) ? pm->valuedouble : 0;
+            }
+            s->pricePerPin = s->pricePerWrite;
+            s->retentionSeconds = 30 * 24 * 3600;      /* a write's month of storage, for the status row's quote */
+            {
+                cJSON *cid = domain ? cJSON_GetObjectItem(domain, "chainId") : NULL;
+                if (cid && cJSON_IsNumber(cid)) s->payChainId = (uint64_t)cid->valuedouble;
+            }
+        }
+        cJSON *chainId = domain ? cJSON_GetObjectItem(domain, "chainId") : NULL;
+        cJSON *contract = domain ? cJSON_GetObjectItem(domain, "verifyingContract") : NULL;
+        if (signer && cJSON_IsString(signer) && strlen(signer->valuestring) == 42
+            && contract && cJSON_IsString(contract) && strlen(contract->valuestring) == 42 && chainId
+            && hpplite_hex_to_bytes(signer->valuestring + 2, s->signer, 20) >= 0
+            && hpplite_hex_to_bytes(contract->valuestring + 2, s->payTo, 20) >= 0) {
+            s->chainId = cJSON_IsNumber(chainId) ? (uint64_t)chainId->valuedouble : strtoull(chainId->valuestring ? chainId->valuestring : "0", NULL, 10);
+            s->hasSigner = 1;
+        }
+        cJSON_Delete(st);
+    }
+    free(out.p);
+    return code;
+}
+
 HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64_t cap) {
     HppliteStore *s;
     size_t n;
@@ -936,48 +1038,13 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
         if (hpplite_crypto_keypair_from_privkey(s->crypto, &s->kp, privkey) == 0) {
             memcpy(s->address, s->kp.address, 20);
             s->hasKey = 1;
+            deriveFund(s, privkey);
         }
     }
+    s->coveredUntil = -1;
     curl_global_init(CURL_GLOBAL_DEFAULT);
     if (kind == STORE_PIN) {
-        /* the provider's /status: which key signs its receipts, in which domain */
-        Buf out = {0};
-        if (storeRequest(s, "GET", "/status", NULL, 0, NULL, &out, NULL, NULL) == 200 && out.p) {
-            cJSON *st = cJSON_Parse(out.p);
-            cJSON *signer = st ? cJSON_GetObjectItem(st, "signer") : NULL;
-            cJSON *pay = st ? cJSON_GetObjectItem(st, "payment") : NULL;
-            if (pay && cJSON_IsObject(pay)) {
-                /* what it charges, for the status row: asset, chain, the price of a put */
-                cJSON *asset = cJSON_GetObjectItem(pay, "asset"), *network = cJSON_GetObjectItem(pay, "network"),
-                      *perByte = cJSON_GetObjectItem(pay, "pricePerByte"), *perPin = cJSON_GetObjectItem(pay, "pricePerPin"),
-                      *perMiB = cJSON_GetObjectItem(pay, "pricePerMiBMonth"), *retention = cJSON_GetObjectItem(pay, "retentionSeconds");
-                if (asset && cJSON_IsString(asset) && strlen(asset->valuestring) == 42
-                    && hpplite_hex_to_bytes(asset->valuestring + 2, s->asset, 20) >= 0
-                    && network && cJSON_IsString(network) && strncmp(network->valuestring, "eip155:", 7) == 0) {
-                    s->payChainId = strtoull(network->valuestring + 7, NULL, 10);
-                    s->pricePerByte = (perByte && cJSON_IsNumber(perByte)) ? (uint64_t)perByte->valuedouble : 0;
-                    s->pricePerPin = (perPin && cJSON_IsNumber(perPin)) ? (uint64_t)perPin->valuedouble : 0;
-                    s->pricePerMiBMonth = (perMiB && cJSON_IsNumber(perMiB) && perMiB->valuedouble > 0) ? perMiB->valuedouble : 0;
-                    s->retentionSeconds = (retention && cJSON_IsNumber(retention) && retention->valuedouble > 0) ? (uint64_t)retention->valuedouble : 0;
-                    s->hasPayment = 1;
-                }
-            }
-            cJSON *proto = st ? cJSON_GetObjectItem(st, "protocol") : NULL;
-            if (proto && cJSON_IsString(proto)) snprintf(s->protocol, sizeof s->protocol, "%s", proto->valuestring);
-            cJSON *receipt = st ? cJSON_GetObjectItem(st, "receipt") : NULL;
-            cJSON *domain = receipt ? cJSON_GetObjectItem(receipt, "domain") : NULL;
-            cJSON *chainId = domain ? cJSON_GetObjectItem(domain, "chainId") : NULL;
-            cJSON *contract = domain ? cJSON_GetObjectItem(domain, "verifyingContract") : NULL;
-            if (signer && cJSON_IsString(signer) && strlen(signer->valuestring) == 42
-                && contract && cJSON_IsString(contract) && strlen(contract->valuestring) == 42 && chainId
-                && hpplite_hex_to_bytes(signer->valuestring + 2, s->signer, 20) >= 0
-                && hpplite_hex_to_bytes(contract->valuestring + 2, s->payTo, 20) >= 0) {
-                s->chainId = cJSON_IsNumber(chainId) ? (uint64_t)chainId->valuedouble : strtoull(chainId->valuestring ? chainId->valuestring : "0", NULL, 10);
-                s->hasSigner = 1;
-            }
-            cJSON_Delete(st);
-        }
-        free(out.p);
+        statusRead(s);
         s->error[0] = 0;
     }
     return s;
@@ -1044,11 +1111,261 @@ int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char
     return 0;
 }
 
+/* === hpplite-store/2 (#214, doc/store-buckets.md): the rollup's bucket and its funding wallet ===
+** The funding key is derived from the node's (keccak256("hpplite funding key" || key)): backing up
+** the node's key backs up the wallet too. The node binds the bucket with both keys, gives the store
+** a permit to pull from the funding wallet (storepermit=) and pays any 402 from it. */
+
+static void lowerHex(const unsigned char *b, size_t n, char *out) {
+    size_t i;
+    out[0] = '0'; out[1] = 'x';
+    hpplite_bytes_to_hex(b, n, out + 2);
+    for (i = 2; i < 2 + 2 * n; i++) if (out[i] >= 'A' && out[i] <= 'F') out[i] += 32;
+}
+
+static void deriveFund(HppliteStore *s, const uint8_t privkey[32]) {
+    static const char zTag[] = "hpplite funding key";
+    unsigned char in[sizeof zTag - 1 + 32], k[32];
+    int i;
+    memcpy(in, zTag, sizeof zTag - 1);
+    memcpy(in + sizeof zTag - 1, privkey, 32);
+    hpplite_keccak256(in, sizeof in, k);
+    for (i = 0; i < 4 && hpplite_crypto_keypair_from_privkey(s->crypto, &s->fundKp, k) != 0; i++) hpplite_keccak256(k, 32, k);
+    if (i < 4) { memcpy(s->fundAddr, s->fundKp.address, 20); s->hasFund = 1; }
+    memset(in, 0, sizeof in);
+    memset(k, 0, sizeof k);
+}
+
+static int signWith(HppliteStore *s, HppliteKeypair *kp, const unsigned char digest[32], unsigned char sig[65]) {
+    HppliteSignature hs;
+    unsigned char v;
+    if (hpplite_crypto_sign(s->crypto, kp, digest, &hs) != 0) return -1;
+    hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);
+    sig[64] = v;
+    return 0;
+}
+
+/* ("HPPLiteStore", "2", chainId, payTo) and a struct of words: the digest the store recovers */
+static void storeDigest(HppliteStore *s, const char *zType, const unsigned char *words, size_t nWords, unsigned char out[32]) {
+    unsigned char domain[32], c[32], buf[32 * 8], h[32];
+    memset(c, 0, 32); memcpy(c + 12, s->payTo, 20);
+    domainOf("HPPLiteStore", "2", s->chainId, c, domain);
+    hpplite_keccak256((const unsigned char *)zType, strlen(zType), buf);
+    memcpy(buf + 32, words, 32 * nWords);
+    hpplite_keccak256(buf, 32 * (nWords + 1), h);
+    typedHash(domain, h, out);
+}
+
+static long getJson(HppliteStore *s, const char *path, cJSON **pOut) {
+    Buf out = {0};
+    long status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+    *pOut = (status == 200 && out.p) ? cJSON_Parse(out.p) : NULL;
+    free(out.p);
+    return status;
+}
+
+static long postJson(HppliteStore *s, const char *path, cJSON *body, Buf *out) {
+    char *z = cJSON_PrintUnformatted(body);
+    long status;
+    if (!z) return 0;
+    status = storeRequest(s, "POST", path, (const uint8_t *)z, strlen(z), "Content-Type: application/json", out, NULL, NULL);
+    free(z);
+    return status;
+}
+
+/* The permit: given when there is none, it nears its deadline (30 days) or its allowance runs low (a quarter) */
+static void ensurePermit(HppliteStore *s) {
+    char fund[43], path[80], sigHex[133], num[32];
+    cJSON *a = NULL, *p, *body;
+    uint64_t now = (uint64_t)time(NULL), deadline = now + 365ull * 86400, nonce;
+    unsigned char w[32 * 5], domain[32], c[32], h[32], digest[32], sig[65];
+    static const char zPermit[] = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)";
+    Buf out = {0};
+    if (!s->permitCap || !s->hasFund || (s->pricePerWrite == 0 && s->pricePerMiBMonth == 0)) return;
+    if (s->permitChecked && now - (uint64_t)s->permitChecked < 3600) return;
+    s->permitChecked = (time_t)now;
+    lowerHex(s->fundAddr, 20, fund);
+    snprintf(path, sizeof path, "/account/%s", fund);
+    if (getJson(s, path, &a) != 200 && a == NULL) {
+        /* no account yet: nothing given; the nonce is the chain's first */
+    }
+    p = a ? cJSON_GetObjectItem(a, "permit") : NULL;
+    if (p && cJSON_IsObject(p)) {
+        cJSON *sent = cJSON_GetObjectItem(p, "sent");
+        uint64_t value = jnum(p, "value"), dl = jnum(p, "deadline"), allow = jnum(a, "allowance");
+        int ok = dl > now + 30ull * 86400 && value >= s->permitCap;
+        if (ok && sent && cJSON_IsTrue(sent) && allow < s->permitCap / 4) ok = 0;
+        if (ok) { cJSON_Delete(a); return; }
+    }
+    nonce = a ? jnum(a, "permitNonce") : 0;
+    cJSON_Delete(a);
+    memset(c, 0, 32); memcpy(c + 12, s->asset, 20);
+    domainOf(s->assetName, s->assetVersion, s->chainId, c, domain);
+    hpplite_keccak256((const unsigned char *)zPermit, sizeof zPermit - 1, w);
+    memset(w + 32, 0, 32); memcpy(w + 44, s->fundAddr, 20);
+    memset(w + 64, 0, 32); memcpy(w + 76, s->spender, 20);
+    wordInt(s->permitCap, w + 96);
+    wordInt(nonce, w + 128);
+    {
+        unsigned char ww[32 * 6];
+        memcpy(ww, w, 160);
+        wordInt(deadline, ww + 160);
+        hpplite_keccak256(ww, 192, h);
+    }
+    typedHash(domain, h, digest);
+    if (signWith(s, &s->fundKp, digest, sig) != 0) return;
+    lowerHex(sig, 65, sigHex);
+    body = cJSON_CreateObject();
+    snprintf(num, sizeof num, "%llu", (unsigned long long)s->permitCap);
+    cJSON_AddStringToObject(body, "value", num);
+    snprintf(num, sizeof num, "%llu", (unsigned long long)deadline);
+    cJSON_AddStringToObject(body, "deadline", num);
+    cJSON_AddStringToObject(body, "signature", sigHex);
+    snprintf(path, sizeof path, "/account/%s/permit", fund);
+    if (postJson(s, path, body, &out) != 200) {
+        fprintf(stderr, "hpplite: the store did not take the funding wallet's permit: %.200s\n", out.p ? out.p : "no answer");
+        s->permitChecked = 0;
+    }
+    cJSON_Delete(body);
+    free(out.p);
+}
+
+/* The bucket bound to this node's funding wallet: asked, and bound with both keys when it is not. 0 when bound */
+static int ensureBucket(HppliteStore *s) {
+    char da[43], fund[43], path[80], sigHex[133];
+    cJSON *b = NULL, *body;
+    time_t now = time(NULL);
+    Buf out = {0};
+    long status;
+    if (!s->v2) return 0;
+    if (!s->hasBucket || !s->hasKey || !s->hasFund) {
+        snprintf(s->error, sizeof s->error, "the store keeps buckets (hpplite-store/2): %s",
+                 !s->hasKey ? "this node has no key to sign for its bucket" : "the rollup's address is not known yet");
+        return -1;
+    }
+    if (s->bound && now - s->boundChecked < 600) { ensurePermit(s); return 0; }
+    lowerHex(s->bucketDa, 20, da);
+    lowerHex(s->fundAddr, 20, fund);
+    snprintf(path, sizeof path, "/bucket/%s", da);
+    status = getJson(s, path, &b);
+    if (status == 200 && b) {
+        const char *f = jstr(b, "funder"), *st = jstr(b, "state");
+        if (st) snprintf(s->bucketState, sizeof s->bucketState, "%s", st);
+        if (cJSON_GetObjectItem(b, "coveredUntil")) {
+            uint64_t cu = jnum(b, "coveredUntil");
+            s->coveredUntil = (int64_t)(cu > (uint64_t)INT64_MAX ? (uint64_t)INT64_MAX : cu);
+        }
+        s->bound = f && strcasecmp(f, fund) == 0 && st && strcmp(st, "deleted") != 0;
+    } else {
+        s->bound = 0;
+    }
+    cJSON_Delete(b);
+    if (!s->bound) {
+        unsigned char words[96], digest[32], sig[65];
+        uint64_t issued = (uint64_t)now;
+        memset(words, 0, 96);
+        memcpy(words + 12, s->bucketDa, 20);
+        memcpy(words + 44, s->fundAddr, 20);
+        wordInt(issued, words + 64);
+        storeDigest(s, "Bind(address da,address funder,uint256 issuedAt)", words, 3, digest);
+        body = cJSON_CreateObject();
+        cJSON_AddStringToObject(body, "funder", fund);
+        cJSON_AddNumberToObject(body, "issuedAt", (double)issued);
+        if (signWith(s, &s->kp, digest, sig) == 0) { lowerHex(sig, 65, sigHex); cJSON_AddStringToObject(body, "sequencerSignature", sigHex); }
+        if (signWith(s, &s->fundKp, digest, sig) == 0) { lowerHex(sig, 65, sigHex); cJSON_AddStringToObject(body, "funderSignature", sigHex); }
+        status = postJson(s, path, body, &out);
+        cJSON_Delete(body);
+        if (status != 200) {
+            snprintf(s->error, sizeof s->error, "the store did not bind the rollup's bucket: %ld %.160s", status, out.p ? out.p : "");
+            s->lastFailure = status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;
+            free(out.p);
+            return -1;
+        }
+        {
+            cJSON *r = out.p ? cJSON_Parse(out.p) : NULL;
+            const char *st = jstr(r, "state");
+            if (st) snprintf(s->bucketState, sizeof s->bucketState, "%s", st);
+            cJSON_Delete(r);
+        }
+        free(out.p);
+        s->bound = 1;
+    }
+    s->boundChecked = now;
+    ensurePermit(s);
+    return 0;
+}
+
+void hpplite_store_set_bucket(HppliteStore *s, const unsigned char da[20], uint64_t permitCap) {
+    if (!s || !da) return;
+    if (!s->hasBucket || memcmp(s->bucketDa, da, 20) != 0) s->bound = 0;
+    memcpy(s->bucketDa, da, 20);
+    s->hasBucket = 1;
+    s->permitCap = permitCap;
+}
+
+int hpplite_store_is_bucket(HppliteStore *s) { return s && s->v2; }
+
+int hpplite_store_funder(HppliteStore *s, unsigned char out[20]) {
+    if (!s || !s->v2 || !s->hasFund) return -1;
+    memcpy(out, s->fundAddr, 20);
+    return 0;
+}
+
+int64_t hpplite_store_covered_until(HppliteStore *s) { return s && s->v2 ? s->coveredUntil : -1; }
+const char *hpplite_store_bucket_state(HppliteStore *s) { return s && s->v2 && s->bucketState[0] ? s->bucketState : NULL; }
+
+/* The bucket statement in its compact form (HPPLITE_STATEMENT_SIZE), checked against the store's signer */
+int hpplite_store_statement(HppliteStore *s, uint8_t out[HPPLITE_STATEMENT_SIZE]) {
+    char da[43], path[80];
+    cJSON *b = NULL, *st;
+    unsigned char words[160], digest[32], sig[65], who[20], pub[33];
+    uint64_t height, prune, covered, issued;
+    const char *zSig, *zState;
+    HppliteSignature hs;
+    int i;
+    if (!s || !s->v2 || !s->hasBucket || !s->hasSigner) return -1;
+    lowerHex(s->bucketDa, 20, da);
+    snprintf(path, sizeof path, "/bucket/%s", da);
+    if (getJson(s, path, &b) != 200 || !b) { snprintf(s->error, sizeof s->error, "the store gave no bucket statement"); cJSON_Delete(b); return -1; }
+    zState = jstr(b, "state");
+    if (zState) snprintf(s->bucketState, sizeof s->bucketState, "%s", zState);
+    st = cJSON_GetObjectItem(b, "statement");
+    zSig = jstr(st, "signature");
+    height = jnum(st, "height"); prune = jnum(st, "pruneHeight"); covered = jnum(st, "coveredUntil"); issued = jnum(st, "issuedAt");
+    s->coveredUntil = (int64_t)(covered > (uint64_t)INT64_MAX ? (uint64_t)INT64_MAX : covered);
+    if (!zSig || strlen(zSig) != 132 || hpplite_hex_to_bytes(zSig + 2, sig, 65) < 0) { cJSON_Delete(b); snprintf(s->error, sizeof s->error, "the bucket statement is unsigned"); return -1; }
+    cJSON_Delete(b);
+    memset(words, 0, 32); memcpy(words + 12, s->bucketDa, 20);
+    wordInt(height, words + 32); wordInt(prune, words + 64); wordInt(covered, words + 96); wordInt(issued, words + 128);
+    storeDigest(s, "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)", words, 5, digest);
+    memcpy(hs.sig, sig, 64);
+    hs.recid = sig[64] >= 27 ? sig[64] - 27 : sig[64];
+    if (hs.recid > 1 || hpplite_crypto_recover_pubkey(s->crypto, digest, &hs, pub) != 0
+        || eth_address_from_compressed_pubkey(pub, who) != 0 || memcmp(who, s->signer, 20) != 0) {
+        snprintf(s->error, sizeof s->error, "the bucket statement does not verify against the store's published signer");
+        return -1;
+    }
+    /* version 2 | signer | payTo | height | pruneHeight | coveredUntil | issuedAt (8 each, big-endian) | signature */
+    out[0] = 2;
+    memcpy(out + 1, s->signer, 20);
+    memcpy(out + 21, s->payTo, 20);
+    for (i = 0; i < 8; i++) {
+        out[41 + i] = (uint8_t)(height >> (56 - 8 * i));
+        out[49 + i] = (uint8_t)(prune >> (56 - 8 * i));
+        out[57 + i] = (uint8_t)(covered >> (56 - 8 * i));
+        out[65 + i] = (uint8_t)(issued >> (56 - 8 * i));
+    }
+    memcpy(out + 73, sig, 65);
+    return HPPLITE_STATEMENT_SIZE;
+}
+
 int hpplite_store_set_key(HppliteStore *s, const uint8_t privkey[32]) {
     if (!s || !privkey || !s->crypto) return -1;
     if (hpplite_crypto_keypair_from_privkey(s->crypto, &s->kp, privkey) != 0) return -1;
     memcpy(s->address, s->kp.address, 20);
     s->hasKey = 1;
+    deriveFund(s, privkey);
+    s->bound = 0;
     return 0;
 }
 const char *hpplite_store_error(HppliteStore *s) { return s ? s->error : "no store"; }
@@ -1130,17 +1447,30 @@ void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp) { if (s) 
 /* The protocols this build speaks (doc/store-protocol.md, doc/relay-protocol.md, #188): a service that names
 ** another - a later version, or the other kind (a relay given as store=) - is written nothing. One that names
 ** none predates #188 and is taken as version 1. 0 when it may be written to, else -1 with the reason in s->error */
-#define HPPLITE_STORE_PROTOCOL 1
+#define HPPLITE_STORE_PROTOCOL 2
 #define HPPLITE_RELAY_PROTOCOL 1
 static int protocolOk(HppliteStore *s) {
     const char *want = s->isRelay ? "hpplite-relay" : "hpplite-store";
     int max = s->isRelay ? HPPLITE_RELAY_PROTOCOL : HPPLITE_STORE_PROTOCOL;
     size_t n = strlen(want);
     const char *v;
-    if (!s->protocol[0] || s->kind != STORE_PIN) return 0;
+    if (s->kind != STORE_PIN) return 0;
+    if (!s->protocol[0] && !s->isRelay && statusRead(s) == 0) {
+        /* not answering at open, nor now: the chain may carry the bytes meanwhile (storefallback) */
+        s->lastFailure = HPPLITE_STORE_FAIL_UNREACHABLE;
+        return -1;
+    }
+    if (!s->protocol[0]) {
+        if (s->isRelay) return 0;                       /* a relay from before #188 speaks version 1 */
+        snprintf(s->error, sizeof s->error, "the store at %s names no protocol: this build speaks hpplite-store/2", s->url);
+        s->lastFailure = HPPLITE_STORE_FAIL_OTHER;
+        return -1;
+    }
     v = strncmp(s->protocol, want, n) == 0 && s->protocol[n] == '/' ? s->protocol + n + 1 : NULL;
-    if (v && atoi(v) >= 1 && atoi(v) <= max) return 0;
-    if (v) snprintf(s->error, sizeof s->error, "the %s at %s speaks %s; this build speaks up to %s/%d: upgrade HPPLite",
+    if (v && atoi(v) >= (s->isRelay ? 1 : 2) && atoi(v) <= max) return 0;   /* hpplite-store/1 is gone (#214) */
+    if (v && atoi(v) < max && !s->isRelay)
+        snprintf(s->error, sizeof s->error, "the store at %s speaks %s; this build speaks %s/%d only (buckets)", s->url, s->protocol, want, max);
+    else if (v) snprintf(s->error, sizeof s->error, "the %s at %s speaks %s; this build speaks up to %s/%d: upgrade HPPLite",
                     s->isRelay ? "relay" : "store", s->url, s->protocol, want, max);
     else snprintf(s->error, sizeof s->error, "%s speaks %s, not %s: is it a %s?", s->url, s->protocol, want,
                   s->isRelay ? "store given as relay=" : "relay given as store=");
@@ -1150,9 +1480,9 @@ static int protocolOk(HppliteStore *s) {
 
 /* A POST the provider may charge for: a 402 paid (exact, or a voucher in a channel), and, for a voucher,
 ** paid again once the seller's correction is taken (the running total, or a deposit the channel needs) */
-static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, size_t len, Buf *out) {
+static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, size_t len, const char *zHeader, Buf *out) {
     char *zRequired = NULL, *zResponse = NULL;
-    long status = storeRequest(s, "POST", path, body, len, NULL, out, &zRequired, NULL);
+    long status = storeRequest(s, "POST", path, body, len, zHeader, out, &zRequired, NULL);
     int tries;
     for (tries = 0; status == 402 && zRequired && tries < 3; tries++) {
         uint64_t amount = 0, chainId = 0;
@@ -1169,6 +1499,7 @@ static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, siz
         }
         free(out->p); out->p = NULL; out->n = 0;
         sqlite3_free(zResponse); zResponse = NULL;
+        if (zHeader) { char *z = sqlite3_mprintf("%s\n%s", zHeader, zPay); sqlite3_free(zPay); zPay = z; }
         status = storeRequest(s, "POST", path, body, len, zPay, out, &zAgain, &zResponse);
         sqlite3_free(zPay);
         sqlite3_free(zRequired);
@@ -1207,7 +1538,7 @@ long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *b
     s->error[0] = 0;
     if (protocolOk(s) != 0) return 0;
     (void)zRequired; (void)zResponse;
-    status = paidPost(s, path, body, len, &out);
+    status = paidPost(s, path, body, len, NULL, &out);
     if (status == 200) s->nOk++;
     if (pzOut && out.p) *pzOut = sqlite3_mprintf("%.*s", (int)out.n, out.p);
     free(out.p);
@@ -1215,8 +1546,12 @@ long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *b
 }
 
 char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char **pzReceipt) {
+    return hpplite_store_put_at(s, 0, data, len, pzReceipt);
+}
+
+char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data, size_t len, char **pzReceipt) {
     Buf out = {0};
-    char *zRequired = NULL, *zResponse = NULL, *zRef = NULL;
+    char *zRequired = NULL, *zResponse = NULL, *zRef = NULL, *zHeader = NULL, path[160];
     long status;
     if (pzReceipt) *pzReceipt = NULL;
     if (!s || !data || !len) return NULL;
@@ -1230,8 +1565,25 @@ char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char *
         return zRef;                              /* no receipt: a Kubo node or a bucket promises nothing */
     }
     (void)zRequired; (void)zResponse;
-    status = paidPost(s, "/put", data, len, &out);
-    if (status == 402 && (strstr(s->error, "storecap") || strstr(s->error, "storedeposit") || strstr(s->error, "spendcap"))) {
+    snprintf(path, sizeof path, "/put");
+    if (s->v2) {
+        /* /2: Content(da, height, keccak256(bytes)) signed by the sequencer, into the rollup's bucket */
+        unsigned char words[96], digest[32], sig[65];
+        char da[43], sigHex[133];
+        if (ensureBucket(s) != 0) return NULL;
+        memset(words, 0, 32); memcpy(words + 12, s->bucketDa, 20);
+        wordInt(height, words + 32);
+        hpplite_keccak256(data, len, words + 64);
+        storeDigest(s, "Content(address da,uint256 height,bytes32 hash)", words, 3, digest);
+        if (signWith(s, &s->kp, digest, sig) != 0) { snprintf(s->error, sizeof s->error, "could not sign the put"); return NULL; }
+        lowerHex(s->bucketDa, 20, da);
+        lowerHex(sig, 65, sigHex);
+        snprintf(path, sizeof path, "/put?bucket=%s&height=%llu", da, (unsigned long long)height);
+        zHeader = sqlite3_mprintf("X-HPPLite-Signature: %s", sigHex);
+    }
+    status = paidPost(s, path, data, len, zHeader, &out);
+    sqlite3_free(zHeader);
+    if (status == 402 && (strstr(s->error, "storecap") || strstr(s->error, "relaydeposit") || strstr(s->error, "spendcap"))) {
         s->lastFailure = HPPLITE_STORE_FAIL_CAP;            /* nothing signed past the caps: the batch waits */
         free(out.p);
         return NULL;
@@ -1408,8 +1760,10 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
     } else {
         char path[120];
         snprintf(path, sizeof path, "/name/%s", zName);
-        status = storeRequest(s, "POST", path, body, len + 97, NULL, &out, NULL, NULL);
+        if (s->v2 && ensureBucket(s) != 0) status = -1;                 /* /2: a write into the bucket, paid as a put (#214) */
+        else status = s->v2 ? paidPost(s, path, body, len + 97, NULL, &out) : storeRequest(s, "POST", path, body, len + 97, NULL, &out, NULL, NULL);
         if (status == 200) rc = 0;
+        else if (status == -1) { /* the reason is in s->error */ }
         else if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s: %.120s", status, zName, out.p ? out.p : "");
     }
     free(body);

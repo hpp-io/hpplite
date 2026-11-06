@@ -1,8 +1,9 @@
 /*
-** The pin-service store client (#11): put bytes, get them back by the
-** reference, the receipt the provider signed, and the errors. Against the
-** reference pin service in free mode (operators/store), started here;
-** argv[1] is that directory. The paid path (x402) is anvil scenario 19.
+** The store client (#11): put bytes into the rollup's bucket and get them back
+** by the reference, the bucket statement, names, and the errors. Against the
+** reference store, hpplite-store/2 (operators/store/hpplite_store.py, #214),
+** free and without a chain, started here; argv[1] is that directory. The paid
+** path (permit pulls, x402 top-ups) is anvil scenario 19.
 */
 #include "test_lib.h"
 #include "store.h"
@@ -12,6 +13,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <math.h>
 
 static pid_t g_pid;
 
@@ -21,7 +23,7 @@ static int start_service(const char *dir, int port) {
     snprintf(portStr, sizeof portStr, "%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/pins", test_dir());
     snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
-    snprintf(script, sizeof script, "%s/pin_service.py", dir);
+    snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
     f = fopen(keyPath, "w");
     if (!f) return -1;
     fputs("0x2020202020202020202020202020202020202020202020202020202020202020\n", f);
@@ -31,7 +33,8 @@ static int start_service(const char *dir, int port) {
         int fd = open("/dev/null", O_WRONLY);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", storeDir, "--signer-key", keyPath,
-               "--pay-to", "0x1111111111111111111111111111111111111111", (char *)NULL);
+               "--pay-to", "0x1111111111111111111111111111111111111111", "--price-per-write", "0", "--price-per-mib-month", "0",
+               (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -104,25 +107,21 @@ static void stop_service(void) {
 }
 
 static void test_roundtrip(HppliteStore *s) {
-    TEST("put bytes, get them back by the reference, the receipt names the hash");
+    TEST("put bytes into the rollup's bucket (bound at the first put), get them back by the reference; no per-item receipt at /2");
     const uint8_t data[] = "a sealed batch, as the node would post it";
-    char *zReceipt = NULL, *zRef = hpplite_store_put(s, data, sizeof(data) - 1, &zReceipt);
+    char *zReceipt = NULL, *zRef = hpplite_store_put_at(s, 1, data, sizeof(data) - 1, &zReceipt);
     if (!zRef) FAILF("put: %s", hpplite_store_error(s));
     if (strncmp(zRef, "bafkrei", 7) != 0) { sqlite3_free(zRef); FAIL("the reference is not a CIDv1 raw sha-256"); }
-    if (!zReceipt || !strstr(zReceipt, "\"signature\"")) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("no signed receipt came back"); }
-    {
-        unsigned char h[32];
-        char hex[67] = "0x";
-        hpplite_keccak256(data, sizeof(data) - 1, h);
-        hpplite_bytes_to_hex(h, 32, hex + 2);
-        if (!strstr(zReceipt, hex)) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAILF("the receipt's hash is not keccak of the bytes: %s", zReceipt); }
+    if (zReceipt) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("a /2 put carries no receipt"); }
+    if (!hpplite_store_is_bucket(s) || !hpplite_store_bucket_state(s) || strcmp(hpplite_store_bucket_state(s), "covered") != 0) {
+        sqlite3_free(zRef); FAIL("the bucket is bound and covered");
     }
     size_t n = 0;
     uint8_t *back = hpplite_store_get(s, zRef, &n);
     if (!back || n != sizeof(data) - 1 || memcmp(back, data, n) != 0 || back[n] != 0) { free(back); sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("get: bytes or terminator"); }
     free(back);
     /* the same bytes again: the same reference, held already */
-    char *zRef2 = hpplite_store_put(s, data, sizeof(data) - 1, NULL);
+    char *zRef2 = hpplite_store_put_at(s, 1, data, sizeof(data) - 1, NULL);
     if (!zRef2 || strcmp(zRef, zRef2) != 0) { sqlite3_free(zRef); sqlite3_free(zRef2); sqlite3_free(zReceipt); FAIL("a second put of the same bytes should give the same reference"); }
     sqlite3_free(zRef);
     sqlite3_free(zRef2);
@@ -131,36 +130,26 @@ static void test_roundtrip(HppliteStore *s) {
     PASS();
 }
 
-static void test_receipt(HppliteStore *s) {
-    TEST("the receipt's signature recovers to the provider's published signer; a changed byte or another signer does not verify");
-    const uint8_t data[] = "bytes under a receipt";
-    unsigned char signer[20], payTo[20], h[32];
+static void test_statement(HppliteStore *s, const char *url) {
+    TEST("the bucket statement: version 2, the store's published signer, checked; another key cannot bind or write the bucket");
+    static const unsigned char k2[32] = { [31] = 0x02 };
+    unsigned char signer[20], payTo[20], da[20];
     uint64_t chainId = 0;
-    uint8_t compact[HPPLITE_RECEIPT_SIZE];
-    if (hpplite_store_signer(s, signer) != 0 || hpplite_store_domain(s, payTo, &chainId) != 0) FAIL("the service's /status should name its signer and domain");
-    char *zReceipt = NULL, *zRef = hpplite_store_put(s, data, sizeof(data) - 1, &zReceipt);
-    if (!zRef || !zReceipt) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAILF("put: %s", hpplite_store_error(s)); }
-    if (hpplite_store_receipt_compact(zReceipt, payTo, compact) != HPPLITE_RECEIPT_SIZE) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("compact"); }
-    hpplite_keccak256(data, sizeof(data) - 1, h);
-    if (hpplite_store_receipt_verify(compact, sizeof compact, h, zRef, chainId, signer) != 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("a good receipt does not verify"); }
-    {
-        unsigned char other[20];
-        memset(other, 0x42, 20);
-        if (hpplite_store_receipt_verify(compact, sizeof compact, h, zRef, chainId, other) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified against another signer"); }
-        uint8_t bad[HPPLITE_RECEIPT_SIZE];
-        memcpy(bad, compact, sizeof bad);
-        bad[41 + 7] ^= 1;                                  /* the expiry */
-        if (hpplite_store_receipt_verify(bad, sizeof bad, h, zRef, chainId, signer) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified with a changed expiry"); }
-        memcpy(bad, compact, sizeof bad);
-        bad[60] ^= 1;                                      /* a signature byte */
-        if (hpplite_store_receipt_verify(bad, sizeof bad, h, zRef, chainId, signer) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified with a changed signature"); }
-        unsigned char h2[32];
-        memcpy(h2, h, 32); h2[0] ^= 1;
-        if (hpplite_store_receipt_verify(compact, sizeof compact, h2, zRef, chainId, signer) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified for other bytes"); }
-        if (hpplite_store_receipt_verify(compact, sizeof compact, h, zRef, chainId + 1, signer) == 0) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("verified on another chain"); }
-    }
+    uint8_t st[HPPLITE_STATEMENT_SIZE];
+    if (hpplite_store_signer(s, signer) != 0 || hpplite_store_domain(s, payTo, &chainId) != 0) FAIL("the store's /status should name its signer and domain");
+    if (hpplite_store_statement(s, st) != HPPLITE_STATEMENT_SIZE) FAILF("statement: %s", hpplite_store_error(s));
+    if (st[0] != 2 || memcmp(st + 1, signer, 20) != 0 || memcmp(st + 21, payTo, 20) != 0) FAIL("version 2, the signer, the domain's payTo");
+    if (hpplite_store_covered_until(s) <= 0) FAIL("a free store covers the bucket");
+    HppliteStore *other = hpplite_store_open(url, k2, 0);
+    memset(da, 0xa1, 20);
+    hpplite_store_set_bucket(other, da, 0);
+    char *zRef = other ? hpplite_store_put_at(other, 2, (const uint8_t *)"not yours", 9, NULL) : NULL;
+    const char *why = other ? hpplite_store_error(other) : "open";
+    printf("(another key: %s) ", zRef ? "taken" : why);
     sqlite3_free(zRef);
-    sqlite3_free(zReceipt);
+    int refused = !zRef && strstr(why, "bind");
+    if (other) hpplite_store_close(other);
+    if (!refused) FAIL("another key must not bind a bucket the first binder holds");
     PASS();
 }
 
@@ -237,12 +226,12 @@ static void test_node_status(const char *url) {
 ** asks: per put, per MiB-month for the retention bought, rounded up to a
 ** whole unit. A paid service (its 402s need no facilitator: none answers there) */
 static void test_quote(const char *dir) {
-    TEST("the node quotes a put as the store's 402 does (#172): per put + per MiB-month x retention, rounded up to a whole unit");
+    TEST("the node quotes a write as a /2 store prices it (#172, #214): the write fee and a month of the bytes' storage, rounded up to a whole unit");
     int port = test_free_port();
     char portStr[16], script[600], url[64], keyPath[600];
     static const size_t sizes[] = { 183, 40000, 3 * 1048576 + 17 };
     snprintf(portStr, sizeof portStr, "%d", port);
-    snprintf(script, sizeof script, "%s/pin_service.py", dir);
+    snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
     snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
     pid_t pid = fork();
     if (pid == 0) {
@@ -250,34 +239,26 @@ static void test_quote(const char *dir) {
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", tpath("quote_pins"), "--signer-key", keyPath,
                "--pay-to", "0x1111111111111111111111111111111111111111", "--facilitator", "http://127.0.0.1:1",
-               "--price-per-mib-month", "30.5", "--price-per-pin", "10", "--retention", "5184000", (char *)NULL);
+               "--price-per-mib-month", "30.5", "--price-per-write", "10", (char *)NULL);
         _exit(127);
     }
     int up = 0;
     for (int i = 0; i < 50 && !up; i++) {
         char cmd[200];
         if (!test_child_alive(pid)) break;
-        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status 2>/dev/null | grep -q pricePerPin", port);
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status 2>/dev/null | grep -q pricePerWrite", port);
         up = system(cmd) == 0;
         if (!up) usleep(200 * 1000);
     }
-    if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the paid pin service did not start"); }
+    if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the paid store did not start"); }
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     HppliteStore *st = hpplite_store_open(url, (const uint8_t *)"0123456789abcdef0123456789abcdef", 0);
     const char *why = st ? NULL : "open";
     for (size_t k = 0; !why && k < sizeof sizes / sizeof sizes[0]; k++) {
-        char cmd[400], out[2000], *p;
-        snprintf(cmd, sizeof cmd, "head -c %zu /dev/urandom > %s && curl -s -m 10 -X POST --data-binary @%s http://127.0.0.1:%d/put",
-                 sizes[k], tpath("quote.bin"), tpath("quote.bin"), port);
-        FILE *f = popen(cmd, "r");
-        size_t n = f ? fread(out, 1, sizeof out - 1, f) : 0;
-        if (f) pclose(f);
-        out[n] = 0;
-        p = strstr(out, "\"amount\": \"");
-        long long asked = p ? atoll(p + 11) : -1;
+        long long want = 10 + (long long)ceil(30.5 * (double)sizes[k] / 1048576.0 - 1e-9);
         long long quoted = (long long)hpplite_store_quote(st, sizes[k]);
-        printf("(%zu bytes: 402 asks %lld, node quotes %lld) ", sizes[k], asked, quoted);
-        if (asked <= 0 || asked != quoted) why = "the node's quote is not the store's price";
+        printf("(%zu bytes: %lld) ", sizes[k], quoted);
+        if (quoted != want) why = "the node's quote is not the store's price";
     }
     if (st) hpplite_store_close(st);
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
@@ -620,7 +601,7 @@ static void test_anchor_timer(const char *url) {
 /* 9. Named entries (#165): a batch under <da>-<height> with the sequencer's signature; the first
 ** signer holds a rollup's names at the pin service; a reader recovers the signer. */
 static void test_named(const char *url) {
-    TEST("named entries: put a signed batch under <da>-<height>, read it back with its signature, the signer recovers; another key is refused for that rollup, a bad signature too");
+    TEST("named entries: a signed batch under <da>-<height> is the write (no content put first), read back with its signature and by its CID; another key is refused for that rollup, a bad signature too");
     static const unsigned char k1[32] = { [31] = 0x11 }, k2[32] = { [31] = 0x22 };
     unsigned char da[20], da2[20], inst[32], me1[20], me2[20], who[20];
     uint8_t sig[65], sig2[65], got[65], bad[65];
@@ -631,18 +612,22 @@ static void test_named(const char *url) {
     memset(da, 0xda, 20); memset(da2, 0xdb, 20); memset(inst, 0x1e, 32);
     if (!s1 || !s2) FAIL("open with keys");
     if (hpplite_store_sign_batch(s1, da, 181228, inst, 7, data, sizeof data, sig) != 0) FAIL("sign");
-    {
-        /* a name is taken only for bytes the service holds (#199): refused before the content put, taken after */
-        char *zRef;
-        if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", inst, data, sizeof data, sig) == 0 || !strstr(hpplite_store_error(s1), "412")) { printf("('%s') ", hpplite_store_error(s1)); FAIL("a name for bytes not held must be refused 412"); }
-        zRef = hpplite_store_put(s1, data, sizeof data, NULL);
-        if (!zRef) { printf("(%s) ", hpplite_store_error(s1)); FAIL("put the content"); }
-        sqlite3_free(zRef);
-    }
+    hpplite_store_set_bucket(s1, da, 0);
+    hpplite_store_set_bucket(s2, da, 0);
     if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", inst, data, sizeof data, sig) != 0) { printf("(%s) ", hpplite_store_error(s1)); FAIL("put named"); }
     back = hpplite_store_get_named(s1, "dadadadadadadadadadadadadadadadadadadada-7", &n, got, NULL);
     if (!back || n != sizeof data || memcmp(back, data, n) != 0 || memcmp(got, sig, 65) != 0) { printf("(%s) ", hpplite_store_error(s1)); free(back); FAIL("get named: the bytes and the signature"); }
     free(back);
+    {
+        /* the name's bytes are content too: read by their CID */
+        unsigned char sh[32];
+        char cid[64];
+        hpplite_store_sha256(data, sizeof data, sh);
+        hpplite_store_cid_from_sha256(sh, cid);
+        back = hpplite_store_get(s1, cid, &n);
+        if (!back || n != sizeof data || memcmp(back, data, n) != 0) { free(back); FAIL("a name's bytes by their CID"); }
+        free(back);
+    }
     if (hpplite_store_batch_signer(da, 181228, inst, 7, data, sizeof data, sig, me1) != 0) FAIL("the signer recovers");
     {
         /* and the service refuses a signature made for another chain: its domain is the chain it serves */
@@ -652,7 +637,9 @@ static void test_named(const char *url) {
     if (hpplite_store_sign_batch(s2, da, 181228, inst, 8, data, sizeof data, sig2) != 0 || hpplite_store_batch_signer(da, 181228, inst, 8, data, sizeof data, sig2, me2) != 0) FAIL("sign with the second key");
     if (memcmp(me1, me2, 20) == 0) FAIL("two keys, two signers");
     /* the second key on the first rollup's names: refused; on its own rollup: taken */
-    if (hpplite_store_put_named(s2, "dadadadadadadadadadadadadadadadadadadada-8", inst, data, sizeof data, sig2) == 0 || !strstr(hpplite_store_error(s2), "403")) { printf("('%s') ", hpplite_store_error(s2)); FAIL("another signer must be refused for a rollup whose names are held"); }
+    if (hpplite_store_put_named(s2, "dadadadadadadadadadadadadadadadadadadada-8", inst, data, sizeof data, sig2) == 0) { FAIL("another signer must be refused for a rollup whose bucket is held"); }
+    printf("(another key: %s) ", hpplite_store_error(s2));
+    hpplite_store_set_bucket(s2, da2, 0);
     if (hpplite_store_sign_batch(s2, da2, 181228, inst, 1, data, sizeof data, sig2) != 0 || hpplite_store_put_named(s2, "dbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdb-1", inst, data, sizeof data, sig2) != 0) { printf("(%s) ", hpplite_store_error(s2)); FAIL("the second key on its own rollup"); }
     memcpy(bad, sig, 65); bad[10] ^= 1;
     if (hpplite_store_put_named(s1, "dadadadadadadadadadadadadadadadadadadada-9", inst, data, sizeof data, bad) == 0) FAIL("a signature that does not recover to the holder must be refused");
@@ -781,7 +768,7 @@ static void test_soft_disagreement(const char *url) {
     hpplite_l1_get_addresses(l1, c, d);
     snprintf(name, sizeof name, "%.40s-2", (d[0] ? d : c) + 2);
     for (char *p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
-    snprintf(path, sizeof path, "%s/pins/name-%s", test_dir(), name);
+    snprintf(path, sizeof path, "%s/pins/b/0x%.40s/n/2", test_dir(), name);
     hpplite_node_stop_timer(a); a->ownsL1 = 0; a->l1 = NULL; hpplite_node_destroy(a);
     if (unlink(path) != 0) { printf("(%s) ", path); FAIL("the name file of batch 2"); }
     hpplite_l1_mock_advance_time(l1, 400);
@@ -825,13 +812,13 @@ static void test_soft_disagreement(const char *url) {
 /* #188: the services say which protocol they speak (/status "protocol": "hpplite-store/1"); the node puts
 ** nothing to a store speaking a version it does not know, or to a relay given as store= */
 static void test_protocol(const char *dir) {
-    static const char *claims[] = { "hpplite-store/2", "hpplite-relay/1" };
-    TEST("the node refuses a store speaking another protocol (#188): hpplite-store/2, or a relay given as store=");
+    static const char *claims[] = { "hpplite-store/1", "hpplite-relay/1" };
+    TEST("the node refuses a store speaking another protocol (#188): hpplite-store/1 (per-item, gone with #214), or a relay given as store=");
     for (int k = 0; k < 2; k++) {
         int port = test_free_port();
         char portStr[16], script[600], url[64], keyPath[600], tag[32];
         snprintf(portStr, sizeof portStr, "%d", port);
-        snprintf(script, sizeof script, "%s/pin_service.py", dir);
+        snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
         snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
         snprintf(tag, sizeof tag, "proto_pins%d", k);
         pid_t pid = fork();
@@ -850,7 +837,7 @@ static void test_protocol(const char *dir) {
             up = system(cmd) == 0;
             if (!up) usleep(200 * 1000);
         }
-        if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the pin service did not start"); }
+        if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the store did not start"); }
         snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
         HppliteStore *st = hpplite_store_open(url, NULL, 0);
         char *receipt = NULL;
@@ -876,10 +863,14 @@ int main(int argc, char **argv) {
     if (start_service(dir, port) != 0) { stop_service(); printf("FAIL: the pin service did not start\n"); return 1; }
     char url[64];
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
-    HppliteStore *s = hpplite_store_open(url, NULL, 0);
+    static const unsigned char k0[32] = { [31] = 0x01 };
+    unsigned char da0[20];
+    HppliteStore *s = hpplite_store_open(url, k0, 0);
     if (!s) { stop_service(); printf("FAIL: open\n"); return 1; }
+    memset(da0, 0xa1, 20);
+    hpplite_store_set_bucket(s, da0, 0);
     test_roundtrip(s);
-    test_receipt(s);
+    test_statement(s, url);
     test_errors(s);
     hpplite_store_close(s);
     test_named(url);

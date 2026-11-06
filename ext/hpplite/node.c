@@ -143,7 +143,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.maxTxGas = config->maxTxGas;
     node->config.storeUrl = node_strdup(config->storeUrl);
     node->config.storeCap = config->storeCap;
-    node->config.storeDeposit = config->storeDeposit;
+    node->config.storePermit = config->storePermit;
     node->config.relayDeposit = config->relayDeposit;
     node->config.softOff = config->softOff;
     node->config.spendCap = config->spendCap;
@@ -1367,7 +1367,7 @@ int hpplite_node_store_balance(HppliteNode *node, uint8_t out[32]) {
     if (hpplite_store_payment(node->store, asset, &chainId, NULL, NULL) != 0) return -1;
     if (chainId == 0 || hpplite_l1_chain_id(node->l1) != chainId) return -1;      /* the asset is on another chain: not from here */
     if (!node->storeBalanceOk || now - node->storeBalanceAt >= 30) {
-        if (hpplite_l1_get_my_address(node->l1, me) != 0) return -1;
+        if (hpplite_store_funder(node->store, me) != 0 && hpplite_l1_get_my_address(node->l1, me) != 0) return -1;
         if (hpplite_l1_token_balance(node->l1, asset, me, node->storeBalance) != 0) return -1;
         node->storeBalanceOk = 1;
         node->storeBalanceAt = now;
@@ -1827,20 +1827,18 @@ static void node_anchor_row(HppliteNode *node, const unsigned char hash[32], con
     }
 }
 
-/* The store's channel (#135) is the rollup's: its salt from the DA address, its running total
-** in the data directory. Bound before the first put, once the addresses are known. */
-static void node_store_channel(HppliteNode *node) {
-    char c[43], d[43], *zPath = NULL;
+/* The store's bucket is the rollup's (hpplite-store/2, #214): named by the DA address, bound and
+** given the funding wallet's permit (storepermit=) at the first write, once the addresses are known. */
+static void node_store_bucket(HppliteNode *node) {
+    char c[43], d[43];
     const char *zDa;
     unsigned char da[20];
-    if (node->storeChannelBound || !node->store || !node->config.storeDeposit) return;
+    if (node->storeBucketSet || !node->store || !hpplite_store_is_bucket(node->store)) return;
     if (!node->l1 || hpplite_l1_get_addresses(node->l1, c, d) != 0) return;
     zDa = d[0] ? d : c;
     if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return;
-    if (node->config.dataDir) zPath = sqlite3_mprintf("%s/store-channel-%s.json", node->config.dataDir, zDa + 2);
-    hpplite_store_set_channel(node->store, node->config.storeDeposit, da, zPath);
-    sqlite3_free(zPath);
-    node->storeChannelBound = 1;
+    hpplite_store_set_bucket(node->store, da, node->config.storePermit);
+    node->storeBucketSet = 1;
 }
 
 /* The batch under its rollup's name at the store (#165): the bytes with the sequencer's
@@ -1893,7 +1891,7 @@ static void hex32(const unsigned char *b, char out[67]) { out[0] = '0'; out[1] =
 static int node_anchor(HppliteNode *node) {
     uint64_t lastBatch = 0, total = 0, from = 0, to = 0, expect;
     unsigned char latest[32], chainAfter[32], root[32], digest[32], payTo[20];
-    uint8_t compact[HPPLITE_RECEIPT_SIZE];
+    uint8_t compact[HPPLITE_STATEMENT_SIZE];   /* the larger: a /1 receipt or a /2 statement */
     cJSON *m = NULL, *batches;
     sqlite3_stmt *q = NULL;
     char *text = NULL, *zRef = NULL, *zReceipt = NULL, *txHash = NULL, cid[64], hx[67];
@@ -1958,8 +1956,8 @@ static int node_anchor(HppliteNode *node) {
     if (!text) return -1;
     hpplite_store_sha256((const uint8_t *)text, strlen(text), digest);
     hpplite_store_cid_from_sha256(digest, cid);
-    node_store_channel(node);
-    zRef = hpplite_store_put(node->store, (const uint8_t *)text, strlen(text), &zReceipt);
+    node_store_bucket(node);
+    zRef = hpplite_store_put_at(node->store, to, (const uint8_t *)text, strlen(text), &zReceipt);
     node->storeBalanceOk = 0;
     if (!zRef) {
         hpplite_error(ctx, "anchor: the store did not take the manifest of batches %llu-%llu: %s", (unsigned long long)from, (unsigned long long)to, hpplite_store_error(node->store));
@@ -1970,7 +1968,8 @@ static int node_anchor(HppliteNode *node) {
         hpplite_error(ctx, "anchor: the store names the manifest %s, not its digest's CID %s: replicas could not find it; not anchored", zRef, cid);
         free(text); sqlite3_free(zRef); sqlite3_free(zReceipt); return -1;
     }
-    nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0) ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
+    if (hpplite_store_is_bucket(node->store)) nCompact = hpplite_store_statement(node->store, compact);   /* /2: the bucket statement (#214) */
+    else nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0) ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
     memset(&r, 0, sizeof r);
     r.fromHeight = from; r.toHeight = to;
     memcpy(r.chainHashAfter, chainAfter, 32);
@@ -2202,8 +2201,8 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
             /* the bytes to the store, the commitment to the chain (#11), as the row flush does */
             char *zReceipt = NULL;
             char *zRef;
-            node_store_channel(node);
-            zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
+            node_store_bucket(node);
+            zRef = hpplite_store_put_at(node->store, height, payload, payloadLen, &zReceipt);
             node->storeBalanceOk = 0;
             if (!zRef) {
                 if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
@@ -2425,8 +2424,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                     /* the bytes to the store, the commitment to the chain (#11) */
                     char *zReceipt = NULL;
                     char *zRef;
-            node_store_channel(node);
-            zRef = hpplite_store_put(node->store, payload, payloadLen, &zReceipt);
+            node_store_bucket(node);
+            zRef = hpplite_store_put_at(node->store, height, payload, payloadLen, &zReceipt);
                     node->storeBalanceOk = 0;                 /* a put may have paid: the status row reads the balance again */
                     if (!zRef) {
                         if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
@@ -2668,9 +2667,8 @@ void hpplite_node_spend_check(HppliteNode *node) {
         uint8_t b[32];
         static const uint8_t zero24[24];
         if (spent && span >= minSpan && hpplite_node_store_balance(node, b) == 0 && memcmp(b, zero24, 24) == 0) {
-            uint64_t bal = 0, charged = 0, inChannel = 0;
+            uint64_t bal = 0;
             for (int i = 24; i < 32; i++) bal = (bal << 8) | b[i];
-            if (hpplite_store_channel(node->store, NULL, &charged, &inChannel, NULL) == 0 && inChannel > charged) bal += inChannel - charged;
             double perHour = (double)spent * 3600.0 / (double)span, left = (double)bal / perHour;
             if (left < hours) snprintf(w, sizeof w, "USDC.e for about %.0f h at the recent rate (%llu left, %.0f an hour)", left, (unsigned long long)bal, perHour);
         }

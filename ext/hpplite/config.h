@@ -61,7 +61,7 @@ extern "C" {
 #define HPPLITE_ENV_MAX_TX_GAS    "HPPLITE_MAX_TX_GAS"
 #define HPPLITE_ENV_STORE         "HPPLITE_STORE"          /* where batch bytes live instead of the chain (#11) */
 #define HPPLITE_ENV_STORE_CAP     "HPPLITE_STORE_CAP"
-#define HPPLITE_ENV_STORE_DEPOSIT "HPPLITE_STORE_DEPOSIT"
+#define HPPLITE_ENV_STORE_PERMIT "HPPLITE_STORE_PERMIT"
 #define HPPLITE_ENV_SPEND_CAP     "HPPLITE_SPEND_CAP"
 #define HPPLITE_ENV_RELAY_DEPOSIT "HPPLITE_RELAY_DEPOSIT"
 #define HPPLITE_ENV_SOFT          "HPPLITE_SOFT"
@@ -95,7 +95,7 @@ extern "C" {
 #define HPPLITE_URI_FACTORY       "factory"
 #define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
 #define HPPLITE_URI_STORE_CAP     "storecap"    /* the most to pay the store per call, atomic units of its asset */
-#define HPPLITE_URI_STORE_DEPOSIT "storedeposit" /* batch-settlement (#135): the most left unspent in a channel at once */
+#define HPPLITE_URI_STORE_PERMIT "storepermit"  /* hpplite-store/2 (#214): what the funding wallet's permit lets the store pull; 0: none */
 #define HPPLITE_URI_SOFT          "soft"        /* a verifier with a store follows the soft tier (#166); off: the anchored height only */
 #define HPPLITE_URI_RELAY_DEPOSIT "relaydeposit" /* batch-settlement for the relay (#179): the most unspent in its channel */
 #define HPPLITE_URI_SPEND_CAP     "spendcap"    /* the most paid to the store and the relay per hour or day (#173): N/hour, N/day */
@@ -168,7 +168,8 @@ typedef struct HppliteConfig {
     char *relayUrl;                  /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */
     uint64_t relayCap;               /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
     uint64_t storeCap;               /* storecap=: the most to pay the store per call (0 = pay nothing) */
-    uint64_t storeDeposit;           /* storedeposit=: x402 batch-settlement, the most unspent in the channel (0 = exact per call, #135) */
+    uint64_t storePermit;            /* storepermit=: what the permit lets the store pull, atomic units (#214) */
+    int storePermitSet;              /* ...given (0 is a value: no permit, the 402s paid) */
     int softOff;                     /* soft=off: a verifier stays at the anchored height (#166) */
     uint64_t relayDeposit;           /* relaydeposit=: the relay paid by voucher, the most unspent in its channel (0 = exact, #179) */
     uint64_t spendCap, spendWindow;  /* spendcap=: the most paid in the window (seconds), store and relay together (0 = none, #173) */

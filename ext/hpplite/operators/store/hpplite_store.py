@@ -19,8 +19,8 @@ tests only - a real store reads the chain).
 
 Layout (a directory standing for an object store):
   c/<cid>            content bytes;  c/<cid>.refs  {da: height} - the buckets holding it
-  b/<da>/bucket.json the bucket;     b/<da>/n/<height>  a name's body
-  i/<cid>            <da>/<height>: the name whose bytes have that CID (a name's bytes are read by CID too)
+  b/<da>/bucket.json the bucket;     b/<da>/n/<height>  a name: the instance (32), the signature (65), the bytes' CID
+  (a name's bytes are content: a name and a content put of the same bytes hold them once)
   a/<funder>.json    the account
 """
 import argparse
@@ -100,7 +100,7 @@ def same(a, b):
 class Disk:
     def __init__(self, directory):
         self.dir = directory
-        for d in ("c", "b", "a", "i"):
+        for d in ("c", "b", "a"):
             os.makedirs(os.path.join(directory, d), exist_ok=True)
 
     def path(self, key):
@@ -547,7 +547,8 @@ class Service:
             "service": "hpplite-store", "protocol": a.advertise_protocol or PROTOCOL,
             "signer": self.ledger.signer,
             "domain": {"name": "HPPLiteStore", "version": "2", "chainId": self.chain_id, "verifyingContract": a.pay_to},
-            "buckets": {"asset": a.asset, "payTo": a.pay_to, "spender": self.spender, "pricePerWrite": a.price_per_write,
+            "buckets": {"asset": a.asset, "assetDomain": {"name": a.asset_name, "version": a.asset_version},
+                        "payTo": a.pay_to, "spender": self.spender, "pricePerWrite": a.price_per_write,
                         "pricePerMiBMonth": a.price_per_mib_month, "pullThreshold": a.pull_threshold,
                         "pullIntervalSeconds": a.pull_interval, "parkSeconds": a.park_seconds},
             "payment": {"scheme": "exact", "network": a.network, "facilitator": a.facilitator, "minPay": a.min_pay,
@@ -687,25 +688,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(404, {"error": "no such name"})
             da, height = "0x" + m.group(1), int(m.group(2))
             b = self.L.bucket(da)
-            data = self.service.disk.read("b/%s/n/%d" % (da, height)) if b and b["state"] != "deleted" else None
+            rec = self.service.disk.read("b/%s/n/%d" % (da, height)) if b and b["state"] != "deleted" else None
+            data = self.service.disk.read("c/%s" % rec[97:].decode()) if rec else None
             if data is None:
                 return self.reply(404, {"error": "no such name", "name": path[6:]})
             if b["state"] == "parked":
                 return self.reply(410, {"error": "bucket_parked", "da": da, "funder": b.get("funder"),
                                         "detail": "the bucket's account cannot pay: paying restores it"})
-            signer = eth.recover(batch_digest(self.service.chain_id, da, "0x" + data[-97:-65].hex(), height, data[:-97]), data[-65:])
-            return self.reply_bytes(data, {"X-HPPLite-Signer": signer})
+            signer = eth.recover(batch_digest(self.service.chain_id, da, "0x" + rec[:32].hex(), height, data), rec[32:97])
+            return self.reply_bytes(data + rec[:97], {"X-HPPLite-Signer": signer})
         if path.startswith("/get/"):
             cid = path[5:]
             refs = self.service.disk.json("c/%s.refs" % cid) if CID_RE.match(cid) else None
             data = self.service.disk.read("c/%s" % cid) if refs else None
-            if data is None and CID_RE.match(cid):
-                # a name's bytes are content too: the CID of a batch's bytes, read from the name that holds them
-                where = (self.service.disk.read("i/%s" % cid) or b"").decode()
-                if "/" in where:
-                    named = self.service.disk.read("b/%s/n/%s" % tuple(where.split("/")))
-                    if named and cid_of(named[:-97]) == cid:
-                        data, refs = named[:-97], {where.split("/")[0]: 0}
             if data is None:
                 return self.reply(404, {"error": "not held here", "cid": cid})
             states = [(self.L.bucket(da) or {}).get("state") for da in refs]
@@ -719,11 +714,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             bal = L.token.balance(a["funder"]) if L.token else None
             allow = L.token.allowance(a["funder"]) if L.token else None
+            nonce = L.token.nonce(a["funder"]) if L.token else 0
         except ChainUnreadable:
-            bal = allow = None
+            bal = allow = nonce = None
         p = a.get("permit")
         return {"funder": a["funder"], "credit": a["credit"], "balance": bal, "allowance": allow,
                 "permit": {"value": p["value"], "deadline": p["deadline"], "sent": a.get("permitSent", False)} if p else None,
+                "permitNonce": nonce,
                 "dailyCost": int(L.rate(a["funder"]) * 86400 + 0.999999), "coveredUntil": L.covered_until(a),
                 "buckets": [b["da"] for b in L.buckets_of(a["funder"])],
                 "state": "uncovered" if a.get("uncovered") else "covered", "why": a.get("why", "")}
@@ -848,20 +845,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(409, {"error": "not the instance the rollup's lease names", "instance": instance,
                                     "lease": roles["leaseInstance"]})
         key = "b/%s/n/%d" % (da, height)
-        if self.service.disk.read(key) == body:
+        cid = cid_of(data)
+        rec = body[-97:] + cid.encode()
+        if self.service.disk.read(key) == rec:
             return self.reply(200, {"name": name, "bytes": len(data), "signer": signer, "held": True})
 
         def work():
+            self.hold(da, cid, data, height)
             b2 = self.L.bucket(da)
-            old = self.service.disk.read(key)
-            self.service.disk.write(key, body)
-            b2["bytes"] += len(body) - (len(old) if old else 0)
-            b2["objects"] += 0 if old else 1
+            if self.service.disk.read(key) is None:
+                b2["bytes"] += 97
+                b2["objects"] += 1
+            self.service.disk.write(key, rec)
             b2["height"] = max(b2.get("height", 0), height)
             self.L.save_bucket(b2)
-            self.service.disk.write("i/%s" % cid_of(data), ("%s/%d" % (da, height)).encode())
-            return 200, {"name": name, "bytes": len(data), "signer": signer}
+            return 200, {"name": name, "bytes": len(data), "signer": signer, "cid": cid}
         return self.write(b, len(body), work)
+
+    def hold(self, da, cid, data, height):
+        """the bytes in the bucket, once: written first, then the reference (without one, a sweep takes them)"""
+        b = self.L.bucket(da)
+        if cid in b.get("content", {}):
+            return
+        if self.service.disk.read("c/%s" % cid) is None:
+            self.service.disk.write("c/%s" % cid, data)
+        refs = self.service.disk.json("c/%s.refs" % cid) or {}
+        refs[da] = height
+        self.service.disk.set_json("c/%s.refs" % cid, refs)
+        b.setdefault("content", {})[cid] = {"height": height, "bytes": len(data)}
+        b["bytes"] += len(data)
+        b["objects"] += 1
+        self.L.save_bucket(b)
 
     def post_put(self, query, body):
         da = (query.get("bucket") or [""])[0].lower()
@@ -888,16 +902,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"cid": cid, "bytes": len(body), "held": True})
 
         def work():
-            if self.service.disk.read("c/%s" % cid) is None:
-                self.service.disk.write("c/%s" % cid, body)      # the bytes first: without refs a sweep takes them
-            refs = self.service.disk.json("c/%s.refs" % cid) or {}
-            refs[da] = height
-            self.service.disk.set_json("c/%s.refs" % cid, refs)
-            b2 = self.L.bucket(da)
-            b2.setdefault("content", {})[cid] = {"height": height, "bytes": len(body)}
-            b2["bytes"] += len(body)
-            b2["objects"] += 1
-            self.L.save_bucket(b2)
+            self.hold(da, cid, body, height)
             return 200, {"cid": cid, "bytes": len(body), "held": False}
         return self.write(b, len(body), work)
 
@@ -919,9 +924,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             h = req["height"]
             for f in self.service.disk.list("b/%s/n" % da):
                 if f.isdigit() and int(f) < h:
-                    data = self.service.disk.read("b/%s/n/%s" % (da, f)) or b""
                     self.service.disk.delete("b/%s/n/%s" % (da, f))
-                    b["bytes"] -= len(data)
+                    b["bytes"] -= 97
                     b["objects"] -= 1
             for cid, e in list(b.get("content", {}).items()):
                 if e["height"] < h:

@@ -178,9 +178,9 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). Other values are accepted and unused |
 | `soft` | No | `off`: a `role=verify` connection with `store=` stays at the anchored height instead of following the store's batches past it (#166). Also `HPPLITE_SOFT` |
-| `store` | No | `http://host:port` of a pin service (`operators/store`, or any provider speaking its four calls), `kubo://host:port` of a Kubo node's RPC, or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service): the batch bytes go there and the chain holds the commitment - hash, reference, the provider's receipt (none from Kubo or a bucket) (#11, #33). A replica needs the same `store=` to rebuild. The protocol a pin service speaks: [doc/store-protocol.md](doc/store-protocol.md) (#188). Also `HPPLITE_STORE` |
-| `storecap` | No | The most to pay the store per call, in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing. Also `HPPLITE_STORE_CAP` |
-| `storedeposit` | No | Pay the store by voucher in an x402 `batch-settlement` channel when it offers one (#135). The first put deposits once into x402's escrow, and each put after it is a signed voucher, with nothing on the chain per put. The value is the most this node leaves unspent in the channel at once, in atomic units. 0 (default) pays `exact`, a settlement per put. The deposit can be got back only by the store's cooperative refund, or by a timed withdrawal the wallet sends (that needs ETH). Also `HPPLITE_STORE_DEPOSIT` |
+| `store` | No | `http://host:port` of a store speaking `hpplite-store/2` (`operators/store/hpplite_store.py`, or the canonical one): the rollup's bucket, kept while its funding wallet covers it (#214); `kubo://host:port` of a Kubo node's RPC; or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service). The batch bytes go there and the chain holds the commitment - hash, reference, and with each anchor the store's signed bucket statement (#11, #33). A replica needs the same `store=` to rebuild. The protocol: [doc/store-buckets.md](doc/store-buckets.md). Also `HPPLITE_STORE` |
+| `storecap` | No | The most the funding wallet pays the store by x402 at once (a top-up), in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing by x402. Also `HPPLITE_STORE_CAP` |
+| `storepermit` | No | What the funding wallet's EIP-2612 permit lets the store pull for the rollup's bucket, in atomic units (default 20000000, 20 USDC.e; renewed as it runs low or within 30 days of its year). The funding wallet's key is derived from the node's (`store_funder` in `hpplite_status`: send USDC.e there, from any wallet or exchange; it needs no ETH). With a permit the store charges storage and writes as they accrue, so the bucket stays covered while the node is off; 0: no permit, each 402 is a top-up paid by x402 up to `storecap=` (#214). Also `HPPLITE_STORE_PERMIT` |
 | `spendcap` | No | The most paid to the store and the relay together over a rolling window, in atomic units: `N/hour` or `N/day` (a bare `N` means per day; #173). It counts what was charged; a channel deposit isn't counted, because it is still the node's money. A put past it is refused before anything is signed, and the batch waits with the reason (`store_state` = `over cap`). The ledger is kept per wallet in the data directory (`spend-<wallet>.json`), so a restart doesn't reset the window. A node opened without its key keeps it in memory. Also `HPPLITE_SPEND_CAP` |
 | `lowbalance` | No | Warn when the money left lasts fewer hours than this at the last day's rate (default 72; 0 turns it off; #173). USDC.e is the wallet's balance plus what is unspent in the store's channel, against the charges. ETH is the wallet's balance, against how fast it fell. The warning prints one line on stderr when it starts and when it clears, and shows in `spend_warning`. Also `HPPLITE_LOW_BALANCE` |
 | `relay` | No | `http://host:port` of a relay ([operators/relay](operators/relay/README.md), #170): every write to the chain goes there as its EIP-712 signed form, paid over x402 like the store: creating the rollup (VERSION 10 factories), the lease, anchors, commitments, checkpoints. A wallet with USDC.e and no ETH runs this way. When the relay fails, the wallet sends the plain transaction itself if it holds ETH; otherwise the write waits and `last_error` says why (#126). The protocol: [doc/relay-protocol.md](doc/relay-protocol.md) (#188). Also `HPPLITE_RELAY` |
@@ -557,12 +557,17 @@ changed by something that is not HPPLite, #37), `state` and `last_error`
 (#32), `chain_hash` (the DA contract's rolling hash over every batch as this
 node tracks it, #33; NULL in a file from before it was kept), and, with
 `store=` (#11): `store` (its URL), `store_state` (`ok`, `unreachable`, `over
-cap`, `receipt`, `error`: the last put's outcome, so a waiting batch says
-why), `store_spent` and `store_calls` (paid by this process in the asset's
-atomic units, and the puts and gets that succeeded), `store_price` (what the
-provider charges for a put of the last batch's size; NULL when it is free)
-and `store_balance` (the wallet's balance of the store's asset on the chain,
-read at most every 30 s; NULL without a paid store on this chain), `anchored`
+cap`, `error`: the last put's outcome, so a waiting batch says
+why), `store_spent` and `store_calls` (paid by x402 by this process in the asset's
+atomic units, and the puts and gets that succeeded), `store_price` (what a
+write of the last batch's size costs: the write fee and a month of its
+storage; NULL when the store is free), `store_balance` (the funding
+wallet's balance of the store's asset on the chain, read at most every
+30 s; NULL without a paid store on this chain), `store_funder`,
+`store_covered_until` and `store_bucket` (#214: the funding wallet's
+address, when its account runs out at the current cost, from the last
+bucket statement, and the bucket's state: `covered`, `parked`,
+`deleted`), `anchored`
 (the chain's last height, #164: above it the store alone holds the batches;
 NULL without a chain), `last_anchor_tx` (the transaction of this node's
 last anchor) and `last_checkpoint_root` (the root the last checkpoint or
@@ -570,9 +575,7 @@ anchor carried; a page-mode file keeps its bookkeeping in the sidecar, so
 the row is the way to read it), `relay` and `relay_spent` (`relay=`, #126:
 the URL and what this process paid it, in its asset's atomic units) 
 `last_tx_path` (`relay` or `direct`: how the last write reached the chain),
-and `store_channel` and `store_locked` (`storedeposit=`, #135: the
-batch-settlement channel the store is paid in, and what it holds that has
-not been charged yet), and `spent_window` and `spend_warning` (#173: what the
+and `spent_window` and `spend_warning` (#173: what the
 store and the relay were paid in `spendcap=`'s window, a day without one,
 and what runs out and when at the recent rate, NULL when nothing does), and
 `soft_height` and `soft_disagreements` (#166: a verifier with a store, the
@@ -657,9 +660,9 @@ Three words the rest of this document uses precisely (#35, #11):
   what the reference means.
 - **Data availability** is a property, not a place: anyone can fetch the
   bytes needed to rebuild, without the writer, for as long as the chain
-  lives. The on-chain store has it by construction. A pinned store has it
-  only as far as the pinner's receipt and the fallback to posting on chain
-  carry it. A directory has none: it is a store with no availability claim.
+  lives. The on-chain store has it by construction. A store's bucket has
+  it while the bucket is covered (#207), as its signed statement on chain
+  says, with the fallback to posting on chain for when the store is down. A directory has none: it is a store with no availability claim.
 
 ### Ranges: the store in seconds, the chain per anchor (#164)
 
@@ -674,7 +677,7 @@ hash, reference, receipt) and commits the range in one transaction: the
 chain hash after it (the same fold the per-batch path keeps), the state root
 after its last batch (the anchor is the checkpoint, and renews the lease: a
 node that anchors sends no checkpoint or lease transactions of its own), the
-manifest's sha-256 and the store's signed receipt for the manifest. A
+manifest's sha-256 and the store's signed bucket statement (#214). A
 replica reaching a height inside a range fetches the manifest by its
 digest's CID, refuses one whose batches do not fold to the anchored chain
 hash, and fetches each batch by the manifest's reference, checked against
@@ -687,8 +690,8 @@ with the sequencer's EIP-712 `Batch` signature appended (#165: the one
 `commitBatchFor` takes, in the DA contract's domain, over the instance, the
 height and the bytes' keccak), so a reader finds batches by height before the
 anchor and knows who claims them; `hpplite_store_batch_signer()` recovers the
-wallet. The pin service takes a name only from the first signer it saw for that
-rollup, and, given `--rpc`, only from the coordinator's `sequencerWallet()`;
+wallet. A `hpplite-store/2` store takes a name only into the rollup's bucket,
+from the sequencer the chain names and the instance its lease names;
 an S3 bucket takes it as a key; a Kubo node takes no names. The hard tier does
 not depend on the name: a store that refuses it is said once on stderr.
 
@@ -791,43 +794,36 @@ releases, and a replica rebuilds.
 
 ### A storage provider: `operators/store/`
 
-The reference pin service (#125) is what an IPFS store behind the chain's
-commitments looks like from the node's side: four HTTP calls (put bytes
-for a CID, pin a CID longer, get by CID, status), paid per call over
-[x402](https://x402.org) in USDC.e through HPP's facilitator, each put
-answered with a signed receipt the node verifies against the signer the
-service publishes and commits with the batch (`commitBatch`, #33). One
-Python file, standard library only, with the x402 seller side written out;
-`operators/conformance/buyer.py` is the node's side in Python. ctest runs it free
-(`test_pin_service`); anvil scenario 18 runs it paid against a mock USDC
-and a mock facilitator.
+The reference store (`hpplite_store.py`, #213) speaks `hpplite-store/2`
+([doc/store-buckets.md](doc/store-buckets.md)): a **bucket** per rollup,
+named by its DA address, kept while its **funding wallet** covers it - no
+per-item expiry, nothing to renew. The node binds the bucket with its own
+key (the rollup's sequencer) and its funding key (derived from it), gives
+the store an EIP-2612 permit (`storepermit=`), and writes: each batch's
+bytes and its name, the anchors' manifests, each signed for the bucket.
+Storage (bytes held x time) and a fee per write accrue to the funding
+wallet's account; the store pulls what is owed with the permit, so the
+bucket stays covered while the node is off for months. Without a permit
+(`storepermit=0`), a write the account cannot cover answers 402 and the
+node pays a top-up by x402 from the funding wallet, up to `storecap=`. A
+refused pull (the wallet empty, the permit spent or revoked) parks the
+bucket - not served, restorable by paying - for 30 days, then deletes it;
+the store's own failures never do. The funding wallet needs no ETH: top it
+up by sending USDC.e to `store_funder`. One Python file, standard library
+only; ctest runs it free and without a chain (`test_store`), and on anvil
+with real rollups, the permit and x402 (`test_store_buckets`, anvil
+scenarios 19, 20 and 30).
 
-The node's own side is `store=` (`store.c`): with it, a flush puts the
-sealed batch at the service, takes the CID and the receipt, and commits
-`(hash, CID, receipt)` to the rollup with `commitBatch` - no bytes on the
-chain (68k gas for a 1 KB batch on anvil, against 83k with the bytes, and
-the gap grows with size). A replica with the same `store=` reads the
-commitment, fetches by the CID, checks the hash, replays; one without says
-`batch N is in a store (...) and no store= names one` and rebuilds nothing.
-A 402 from the service is paid in x402's exact scheme with the node's key
-up to `storecap=` per call. With `storedeposit=`, a service that offers
-x402's `batch-settlement` is paid by voucher instead (#135). There is one
-deposit into a channel in x402's escrow, and after it a signed running
-total per put. The service checks the voucher itself and claims every
-channel in one transaction an hour, so a put no longer costs a settlement.
-The running total is kept in the data directory. Without it, the service's
-corrective 402 restores the total, carrying the node's own last voucher,
-which the node checks. Anvil scenario 29 runs it against x402's escrow as
-HPP Sepolia runs it. The receipt is checked before it is believed:
-its signature must recover to the signer the service publishes at
-`/status`, over the batch's hash, the CID and the expiry, or the batch is
-not committed under it; it goes on chain in a 114-byte form (signer, the
-domain's pay-to, expiry, signature) that anyone can verify from the chain
-alone, and `hpplite-verify` prints it for the last batch, saying whether
-the signature verifies. A store that does not answer never holds a batch
-back: the chain carries the bytes meanwhile (`storefallback=on`, the
-default). ctest `test_store` runs the client free; anvil scenarios 19, 20
-and 21 run it free, paid, and with the store down. `store=kubo://host:port`
+With each anchor the chain gets the store's signed **bucket statement**
+(138 bytes: version 2, the store's signer and domain, the heights held,
+covered until, signature), checked against the signer the store publishes
+before it is committed. A replica with the same `store=` reads the
+commitment, fetches by the CID (a name's bytes are content too), checks
+the hash, replays; one without says `batch N is in a store (...) and no
+store= names one` and rebuilds nothing. A store that does not answer never
+holds a batch back: the chain carries the bytes meanwhile
+(`storefallback=on`, the default); anvil scenario 21 runs it with the store
+down. `store=kubo://host:port`
 is a Kubo node's own RPC (`add` with CIDv1 and raw leaves, pinned; `cat`):
 the same commitments with no receipt, for a node you run yourself; ctest
 runs it against a stand-in (`operators/store/kubo_mock.py`), and

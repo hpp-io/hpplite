@@ -87,12 +87,13 @@ typedef struct StatusCursor {
 #define STATUS_COL_RELAY          37  /* relay= (#126): the URL; NULL without one */
 #define STATUS_COL_RELAY_SPENT    38  /* ...paid to it, atomic units of its asset */
 #define STATUS_COL_LAST_TX_PATH   39  /* "relay" or "direct": how the last write went to the chain; NULL before one */
-#define STATUS_COL_STORE_CHANNEL  40  /* batch-settlement (#135): the channel id the store is paid in; NULL with exact */
-#define STATUS_COL_STORE_LOCKED   41  /* ...what the channel holds not yet charged (atomic units) */
+#define STATUS_COL_STORE_FUNDER   40  /* hpplite-store/2 (#214): the funding wallet's address (send USDC.e there); NULL otherwise */
+#define STATUS_COL_STORE_COVERED  41  /* ...when the bucket's account runs out at the current cost (unix seconds); NULL before a statement */
 #define STATUS_COL_SPENT_WINDOW   42  /* paid to the store and the relay in spendcap='s window (a day without one), #173 */
 #define STATUS_COL_SOFT_DISAGREE  45  /* ...times the chain named another batch than the store served, each followed by a rebuild */
 #define STATUS_COL_SOFT_HEIGHT    44  /* a verifier with a store (#166): the height it applied to, soft batches included; NULL otherwise */
 #define STATUS_COL_SPEND_WARNING  43  /* what runs out and when at the recent rate (lowbalance=); NULL when nothing does */
+#define STATUS_COL_STORE_BUCKET   46  /* ...the bucket's state at the store: covered, parked, deleted; NULL before one is known */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -109,7 +110,8 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
-        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_channel TEXT, store_locked INTEGER, spent_window INTEGER, spend_warning TEXT, soft_height INTEGER, soft_disagreements INTEGER)");
+        " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_funder TEXT, store_covered_until INTEGER, spent_window INTEGER, spend_warning TEXT, soft_height INTEGER, soft_disagreements INTEGER,"
+        " store_bucket TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -386,19 +388,23 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             if (z) sqlite3_result_text(ctx, z, -1, SQLITE_STATIC);
             break;
         }
-        case STATUS_COL_STORE_CHANNEL: {
-            /* batch-settlement (#135): the channel the puts are paid in */
-            char id[67];
-            if (node->store && hpplite_store_channel(node->store, id, NULL, NULL, NULL) == 0) sqlite3_result_text(ctx, id, -1, SQLITE_TRANSIENT);
+        case STATUS_COL_STORE_FUNDER: {
+            unsigned char a[20];
+            char hex[43];
+            if (node->store && hpplite_store_funder(node->store, a) == 0) {
+                hex[0] = '0'; hex[1] = 'x';
+                hpplite_bytes_to_hex(a, 20, hex + 2);
+                for (int i = 2; i < 42; i++) if (hex[i] >= 'A' && hex[i] <= 'F') hex[i] += 32;
+                sqlite3_result_text(ctx, hex, 42, SQLITE_TRANSIENT);
+            }
             break;
         }
-        case STATUS_COL_STORE_LOCKED: {
-            /* ...and what sits in it not yet charged: the node's money in the escrow */
-            uint64_t charged, balance;
-            if (node->store && hpplite_store_channel(node->store, NULL, &charged, &balance, NULL) == 0)
-                sqlite3_result_int64(ctx, (sqlite3_int64)(balance > charged ? balance - charged : 0));
+        case STATUS_COL_STORE_COVERED:
+            if (node->store && hpplite_store_covered_until(node->store) >= 0) sqlite3_result_int64(ctx, hpplite_store_covered_until(node->store));
             break;
-        }
+        case STATUS_COL_STORE_BUCKET:
+            if (node->store && hpplite_store_bucket_state(node->store)) sqlite3_result_text(ctx, hpplite_store_bucket_state(node->store), -1, SQLITE_TRANSIENT);
+            break;
         case STATUS_COL_SOFT_HEIGHT:
             if (node->config.verifyOnly && node->store) sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_get_block_height(node->ctx));
             break;

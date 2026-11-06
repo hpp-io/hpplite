@@ -79,7 +79,7 @@ typedef struct HppliteNodeConfig {
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
-    uint64_t storeDeposit;          /* storedeposit=: batch-settlement, the most unspent in the channel (0 = exact, #135) */
+    uint64_t storePermit;           /* storepermit=: what the funding wallet's permit lets the store pull (0: none, #214) */
     int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
     uint64_t relayDeposit;          /* relaydeposit=: the relay paid by voucher (#179); 0 = exact */
     uint64_t spendCap, spendWindow; /* spendcap=: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
@@ -145,7 +145,7 @@ typedef struct HppliteNode {
     int softStopped;                /* the soft tier disagreed with the chain: not followed (#166) */
     int softDisagreements;          /* ...times it did, each followed by a rebuild (status soft_disagreements) */
     uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
-    int storeChannelBound;          /* the store's batch-settlement channel bound to this rollup (#135) */
+    int storeBucketSet;             /* the store told the rollup its bucket is for (#214) */
     struct HppliteSpend *spend;     /* what the store and the relay were paid, ETH samples (#173) */
     char spendWarning[200];         /* what runs out and when; "" when nothing does (status spend_warning) */
     long spendCheckedAt;
