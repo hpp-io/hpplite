@@ -1315,6 +1315,40 @@ int64_t hpplite_store_covered_until(HppliteStore *s) { return s && s->v2 ? s->co
 const char *hpplite_store_bucket_state(HppliteStore *s) { return s && s->v2 && s->bucketState[0] ? s->bucketState : NULL; }
 
 /* The bucket statement in its compact form (HPPLITE_STATEMENT_SIZE), checked against the store's signer */
+/* A bucket statement as an anchor carries it: its fields, and whether its signature recovers to the signer it names
+** over BucketStatement(da, height, pruneHeight, coveredUntil, issuedAt) in ("HPPLiteStore", "2", chainId, payTo).
+** 0 verified, -1 not (or not a version 2 statement) */
+int hpplite_store_statement_verify(const uint8_t *st, size_t n, uint64_t chainId, const unsigned char da[20],
+                                   HppliteStatement *out) {
+    static const char zType[] = "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)";
+    unsigned char domain[32], c[32], buf[32 * 6], h[32], digest[32], pub[33], who[20];
+    uint64_t f[4] = {0, 0, 0, 0};
+    HppliteSignature hs;
+    HppliteCrypto *crypto;
+    int i, k, rc;
+    if (out) memset(out, 0, sizeof *out);
+    if (!st || n != HPPLITE_STATEMENT_SIZE || st[0] != 2 || !da) return -1;
+    for (k = 0; k < 4; k++) for (i = 0; i < 8; i++) f[k] = (f[k] << 8) | st[41 + 8 * k + i];
+    if (out) {
+        memcpy(out->signer, st + 1, 20); memcpy(out->payTo, st + 21, 20);
+        out->height = f[0]; out->pruneHeight = f[1]; out->coveredUntil = f[2]; out->issuedAt = f[3];
+    }
+    memset(c, 0, 32); memcpy(c + 12, st + 21, 20);
+    domainOf("HPPLiteStore", "2", chainId, c, domain);
+    hpplite_keccak256((const unsigned char *)zType, sizeof zType - 1, buf);
+    memset(buf + 32, 0, 32); memcpy(buf + 44, da, 20);
+    for (k = 0; k < 4; k++) wordInt(f[k], buf + 64 + 32 * k);
+    hpplite_keccak256(buf, sizeof buf, h);
+    typedHash(domain, h, digest);
+    memcpy(hs.sig, st + 73, 64);
+    hs.recid = st[137] >= 27 ? st[137] - 27 : st[137];
+    if (hs.recid > 1 || !(crypto = hpplite_crypto_init())) return -1;
+    rc = hpplite_crypto_recover_pubkey(crypto, digest, &hs, pub);
+    hpplite_crypto_free(crypto);
+    if (rc != 0 || eth_address_from_compressed_pubkey(pub, who) != 0) return -1;
+    return memcmp(who, st + 1, 20) == 0 ? 0 : -1;
+}
+
 int hpplite_store_statement(HppliteStore *s, uint8_t out[HPPLITE_STATEMENT_SIZE]) {
     char da[43], path[80];
     cJSON *b = NULL, *st;

@@ -77,6 +77,13 @@ int hpplite_store_funder(HppliteStore *store, unsigned char out[20]);
 int64_t hpplite_store_covered_until(HppliteStore *store);
 const char *hpplite_store_bucket_state(HppliteStore *store);
 int hpplite_store_statement(HppliteStore *store, uint8_t out[HPPLITE_STATEMENT_SIZE]);
+/* A statement as an anchor carries it (hpplite-verify, #215): its fields, and 0 when its signature
+** recovers to the signer it names, for this DA on this chain; -1 otherwise */
+typedef struct HppliteStatement {
+    unsigned char signer[20], payTo[20];
+    uint64_t height, pruneHeight, coveredUntil, issuedAt;
+} HppliteStatement;
+int hpplite_store_statement_verify(const uint8_t *st, size_t n, uint64_t chainId, const unsigned char da[20], HppliteStatement *out);
 
 /* Get the bytes a reference names: malloc'd, terminated, *pLen set; NULL when not there */
 uint8_t *hpplite_store_get(HppliteStore *store, const char *zRef, size_t *pLen);

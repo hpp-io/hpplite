@@ -328,7 +328,33 @@ open_again:
             char z[65];
             hex(r.manifestDigest, z);
             printf("anchored to %llu: the last range %llu-%llu, manifest sha-256 %s%s\n", (unsigned long long)onChain,
-                   (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, z, r.nReceipt ? ", with the store's receipt" : ", no receipt");
+                   (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, z,
+                   !r.nReceipt ? ", no receipt" : r.receipt[0] == 2 ? ", with the store's bucket statement" : ", with the store's receipt");
+            if (r.nReceipt && r.receipt[0] == 2) {
+                /* hpplite-store/2 (#215): the store's signed word that it holds the rollup's batches, covered until a time */
+                char c[43], d[43], zs[41], when[40];
+                unsigned char da[20];
+                HppliteStatement stmt;
+                const char *zDa;
+                int verifies = -1;
+                if (hpplite_l1_get_addresses(node->l1, c, d) == 0) {
+                    zDa = d[0] ? d : c;
+                    if (strlen(zDa) == 42 && hpplite_hex_to_bytes(zDa + 2, da, 20) == 20)
+                        verifies = hpplite_store_statement_verify(r.receipt, r.nReceipt, node->config.chainId, da, &stmt);
+                }
+                if (verifies == 0) {
+                    time_t t = (time_t)(stmt.coveredUntil > (uint64_t)INT32_MAX * 2 ? (uint64_t)INT32_MAX * 2 : stmt.coveredUntil);
+                    hpplite_bytes_to_hex(stmt.signer, 20, zs);
+                    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S UTC", gmtime(&t));
+                    printf("bucket statement signed by 0x%s: holds the rollup's names %llu-%llu, covered until %s%s (signature verifies)\n",
+                           zs, (unsigned long long)stmt.pruneHeight, (unsigned long long)stmt.height,
+                           stmt.coveredUntil == UINT64_MAX ? "no end (a free store)" : when,
+                           stmt.coveredUntil != UINT64_MAX && stmt.coveredUntil < (uint64_t)time(NULL) ? " <- PAST" : "");
+                } else {
+                    printf("bucket statement: the signature DOES NOT VERIFY\n");
+                    rc = 1;
+                }
+            }
             hpplite_l1_range_clear(&r);
         }
     }

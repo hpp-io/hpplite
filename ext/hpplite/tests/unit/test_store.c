@@ -131,7 +131,7 @@ static void test_roundtrip(HppliteStore *s) {
 }
 
 static void test_statement(HppliteStore *s, const char *url) {
-    TEST("the bucket statement: version 2, the store's published signer, checked; another key cannot bind or write the bucket");
+    TEST("the bucket statement: version 2, the store's published signer, checked; it verifies from its bytes alone, not for another DA, chain or a changed byte (#215); another key cannot bind or write the bucket");
     static const unsigned char k2[32] = { [31] = 0x02 };
     unsigned char signer[20], payTo[20], da[20];
     uint64_t chainId = 0;
@@ -140,6 +140,21 @@ static void test_statement(HppliteStore *s, const char *url) {
     if (hpplite_store_statement(s, st) != HPPLITE_STATEMENT_SIZE) FAILF("statement: %s", hpplite_store_error(s));
     if (st[0] != 2 || memcmp(st + 1, signer, 20) != 0 || memcmp(st + 21, payTo, 20) != 0) FAIL("version 2, the signer, the domain's payTo");
     if (hpplite_store_covered_until(s) <= 0) FAIL("a free store covers the bucket");
+    {
+        /* as hpplite-verify checks it from the chain alone (#215): the right DA verifies; a changed byte, or another DA, does not */
+        HppliteStatement fields;
+        unsigned char daA[20], daB[20];
+        uint8_t bad[HPPLITE_STATEMENT_SIZE];
+        memset(daA, 0xa1, 20); memset(daB, 0xb2, 20);
+        if (hpplite_store_statement_verify(st, sizeof st, chainId, daA, &fields) != 0 || memcmp(fields.signer, signer, 20) != 0
+            || memcmp(fields.payTo, payTo, 20) != 0 || fields.coveredUntil == 0) FAIL("the statement verifies, its fields read back");
+        if (hpplite_store_statement_verify(st, sizeof st, chainId, daB, NULL) == 0) FAIL("verified for another rollup's DA");
+        memcpy(bad, st, sizeof bad); bad[48] ^= 1;               /* the height */
+        if (hpplite_store_statement_verify(bad, sizeof bad, chainId, daA, NULL) == 0) FAIL("verified with a changed height");
+        memcpy(bad, st, sizeof bad); bad[100] ^= 1;              /* a signature byte */
+        if (hpplite_store_statement_verify(bad, sizeof bad, chainId, daA, NULL) == 0) FAIL("verified with a changed signature");
+        if (hpplite_store_statement_verify(st, sizeof st, chainId + 1, daA, NULL) == 0) FAIL("verified on another chain");
+    }
     HppliteStore *other = hpplite_store_open(url, k2, 0);
     memset(da, 0xa1, 20);
     hpplite_store_set_bucket(other, da, 0);

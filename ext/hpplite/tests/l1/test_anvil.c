@@ -1691,10 +1691,11 @@ static void test_store_commit(void) {
         char params[300];
         snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=stored&store=http://127.0.0.1:%d", RPC, FACTORY, KEY2, port);
         int rc = run_verify_with(params, NULL, out, sizeof out);
-        if (rc != 0 || !strstr(out, "anchored to 3: the last range 3-3")) {
+        if (rc != 0 || !strstr(out, "anchored to 3: the last range 3-3") || !strstr(out, "bucket statement signed by 0x")
+            || !strstr(out, "(signature verifies)")) {
             printf("(hpplite-verify rc %d: %.300s) ", rc, out);
             sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0);
-            FAIL("hpplite-verify should report the range the chain anchored");
+            FAIL("hpplite-verify should report the range the chain anchored and its bucket statement, verified (#215)");
         }
     }
 
