@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""The conformance suite (#189): what doc/store-protocol.md and
-doc/relay-protocol.md say, checked call by call against any URL - the
+"""The conformance suite (#189, #213): what doc/store-protocol.md (hpplite-store/2)
+and doc/relay-protocol.md say, checked call by call against any URL - the
 reference in ctest, the canonical Workers under wrangler dev and on staging.
 
-    conformance.py --store http://host:port [--buyer-key 0x...]
+    conformance.py --store http://host:port [--da 0x... --sequencer-key 0x... --instance 0x...]
     conformance.py --relay http://host:port
 
-A free store is checked through every call. A paid one has its 402 checked
-against its /status (the price, the offers); with --buyer-key (a wallet
-holding the asset) the content calls are paid with `exact` and checked too.
+A free store is checked through every call: binding, content and names,
+the bucket and its statement, prune, release. A store that reads the chain
+needs a real rollup (--da, its sequencer's key, the instance its lease
+names). A paid one has its 402 checked as a top-up (its money paths are
+the reference's anvil selftest, operators/store/bucket_selftest.py).
 A relay is checked without spending: /status, the calls it refuses, and the
 402's offers and quote for a call that would succeed (a createRollupFor by a
 fresh wallet, signed). Exit 0 when everything conforms.
@@ -27,7 +29,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 sys.path.insert(0, here)
 from x402seller import eth  # noqa: E402
-from buyer import Buyer, receipt_ok  # noqa: E402
+
 
 VECTORS = json.load(open(os.path.join(here, "vectors.json")))
 fails = 0
@@ -68,113 +70,170 @@ def cid_of(data):
     return "b" + "".join(alphabet[int(bits[i:i + 5], 2)] for i in range(0, len(bits), 5))
 
 
-def put_price(n, pay):
-    months = pay["retentionSeconds"] / 2592000
-    storage = pay["pricePerMiBMonth"] * n / 1048576 * months
+BIND = "Bind(address da,address funder,uint256 issuedAt)"
+RELEASE = "Release(address da,address funder,uint256 issuedAt)"
+CONTENT = "Content(address da,uint256 height,bytes32 hash)"
+PRUNE = "Prune(address da,uint256 height,uint256 issuedAt)"
+STATEMENT = "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
+BATCH = "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)"
+
+
+def write_price(n, b):
+    """what a node quotes for a write of n bytes: the fee and a month of the bytes' storage (doc/store-protocol.md)"""
     import math
-    return pay["pricePerPin"] + pay.get("pricePerByte", 0) * n + math.ceil(storage - 1e-9)
+    return b["pricePerWrite"] + math.ceil(b["pricePerMiBMonth"] * n / 1048576 - 1e-9)
 
 
-# ---------------- the store ----------------
-
-def store(url, buyer_key=None):
+def store(url, da=None, sequencer_key=None, instance=None):
+    """hpplite-store/2. A store that reads the chain needs a real rollup: --da, --sequencer-key (its sequencer) and
+    --instance (the one its lease names, for the names); without them a fresh DA and key, which only a store without a
+    chain takes"""
     print("store %s" % url)
     st, _, data = request(url, "GET", "/status")
     status = as_json(data) or {}
-    check(st == 200 and status.get("protocol") == "hpplite-store/1", "/status: protocol hpplite-store/1 (%r)" % status.get("protocol"))
-    dom = (status.get("receipt") or {}).get("domain") or {}
-    check(isinstance(status.get("signer"), str) and len(status["signer"]) == 42, "/status: the receipt signer")
-    check(dom.get("name") == "HPPLitePinService" and dom.get("version") == "1" and dom.get("chainId") and len(dom.get("verifyingContract", "")) == 42,
-          "/status: the receipt's domain (HPPLitePinService, 1, chainId, payTo)")
+    check(st == 200 and status.get("protocol") == "hpplite-store/2", "/status: protocol hpplite-store/2 (%r)" % status.get("protocol"))
+    dom = status.get("domain") or {}
+    b = status.get("buckets") or {}
+    check(isinstance(status.get("signer"), str) and len(status["signer"]) == 42, "/status: the statement signer")
+    check(dom.get("name") == "HPPLiteStore" and dom.get("version") == "2" and dom.get("chainId") and len(dom.get("verifyingContract", "")) == 42,
+          "/status: the store's domain (HPPLiteStore, 2, chainId, payTo)")
+    check(all(k in b for k in ("asset", "assetDomain", "payTo", "spender", "pricePerWrite", "pricePerMiBMonth",
+                                "pullThreshold", "pullIntervalSeconds", "parkSeconds")), "/status: the bucket terms")
     pay = status.get("payment")
     if pay is not None:
-        check(all(k in pay for k in ("network", "asset", "payTo", "pricePerPin", "pricePerMiBMonth", "retentionSeconds")),
-              "/status: payment names the network, asset, payTo and prices")
+        check(pay.get("scheme") == "exact" and all(k in pay for k in ("network", "facilitator", "minPay")), "/status: x402 exact, minPay")
+    if not check(st == 200 and dom and b, "a /2 status to go on with"):
+        return
+    domain = eth.domain_separator("HPPLiteStore", "2", int(dom["chainId"]), dom["verifyingContract"])
+    free = b["pricePerWrite"] == 0 and b["pricePerMiBMonth"] == 0
+    seq = bytes.fromhex(sequencer_key[2:]) if sequencer_key else secrets.token_bytes(32)
+    da = (da or eth.address(secrets.token_bytes(32))).lower()
+    funder_key = secrets.token_bytes(32)
+    funder = eth.address(funder_key).lower()
+    other = secrets.token_bytes(32)
 
-    # the 402, priced as /status says
+    def bind(skey, fkey, issued, f=None):
+        f = f or eth.address(fkey).lower()
+        d = eth.typed_digest(domain, BIND, da, f, issued)
+        return request(url, "POST", "/bucket/" + da, json.dumps({"funder": f, "issuedAt": issued,
+                       "sequencerSignature": "0x" + eth.sign(skey, d).hex(), "funderSignature": "0x" + eth.sign(fkey, d).hex()}).encode(),
+                       {"Content-Type": "application/json"})
+
+    def content(key, height, payload, sign_over=None):
+        sig = eth.sign(key, eth.typed_digest(domain, CONTENT, da, height, eth.keccak256(sign_over or payload)))
+        return request(url, "POST", "/put?bucket=%s&height=%d" % (da, height), payload, {"X-HPPLite-Signature": "0x" + sig.hex()})
+
+    def named(key, height, payload, instance):
+        d = eth.typed_digest(eth.domain_separator("HPPLiteDA", "3", int(dom["chainId"]), da), BATCH, instance, height, eth.keccak256(payload))
+        body = payload + instance + eth.sign(key, d)
+        return body, request(url, "POST", "/name/%s-%d" % (da[2:], height), body)
+
+    now = int(time.time())
+    # --- binding ---
+    d = eth.typed_digest(domain, BIND, da, funder, now)
+    st, _, out = request(url, "POST", "/bucket/" + da, json.dumps({"funder": funder, "issuedAt": now,
+                         "sequencerSignature": "0x" + eth.sign(seq, d).hex(), "funderSignature": "0x" + eth.sign(other, d).hex()}).encode(),
+                         {"Content-Type": "application/json"})
+    check(st == 401, "a binding the funder did not sign: 401 (%d)" % st)
+    st, _, out = request(url, "POST", "/put?bucket=%s&height=1" % da, b"before any binding",
+                         {"X-HPPLite-Signature": "0x" + eth.sign(seq, eth.typed_digest(domain, CONTENT, da, 1, eth.keccak256(b"before any binding"))).hex()})
+    check(st == 402 and (as_json(out) or {}).get("error") == "bucket_unbound", "a write into a bucket never bound: 402 bucket_unbound (%d)" % st)
+    st, _, out = bind(seq, funder_key, now)
+    if not check(st == 200 and (as_json(out) or {}).get("funder") == funder,
+                 "bound by the sequencer and the funder: 200 (%d %s)" % (st, (as_json(out) or {}).get("error", ""))):
+        if st in (401, 404):
+            print("          a store that reads the chain takes a real rollup's bucket: --da and --sequencer-key")
+        return
+    st, _, _ = bind(seq, funder_key, now)
+    check(st == 409, "the same binding again (issuedAt not newer): 409 (%d)" % st)
+    st, _, _ = bind(other, funder_key, now + 1)
+    check(st in (401, 403), "a binding signed by another key than the sequencer: refused (%d)" % st)
+
+    # --- writes ---
     data = b"conformance " + secrets.token_bytes(64)
-    cid = cid_of(data)
-    paid = pay is not None
-    if paid:
-        st, h, body = request(url, "POST", "/put", data)
-        req = json.loads(base64.b64decode(h.get("PAYMENT-REQUIRED", ""))) if h.get("PAYMENT-REQUIRED") else {}
-        check(st == 402 and req.get("x402Version") == 2 and req == as_json(body), "a put unpaid: 402, the requirements in the body and PAYMENT-REQUIRED")
-        accepts = req.get("accepts") or []
-        exact = next((a for a in accepts if a.get("scheme") == "exact"), None)
-        check(exact is not None and int(exact["amount"]) == put_price(len(data), pay), "the exact offer asks the price /status implies (%s)" % (exact or {}).get("amount"))
-        check(exact is not None and exact["asset"].lower() == pay["asset"].lower() and exact["payTo"].lower() == pay["payTo"].lower()
-              and exact["network"] == pay["network"] and "name" in exact.get("extra", {}) and "version" in exact.get("extra", {}),
-              "the exact offer: asset, payTo, network as /status; the token's domain in extra")
-        if "batch-settlement" in (pay.get("schemes") or []):
-            bs = next((a for a in accepts if a.get("scheme") == "batch-settlement"), None)
-            check(bs is not None and all(k in bs.get("extra", {}) for k in ("receiverAuthorizer", "withdrawDelay", "minDeposit")),
-                  "the batch-settlement offer: receiverAuthorizer, withdrawDelay, minDeposit")
-        if not buyer_key:
-            print("  (paid, no --buyer-key: the content calls are not checked)")
-            return
-    b = Buyer(url, bytes.fromhex(buyer_key[2:]) if buyer_key else secrets.token_bytes(32), cap=10 ** 9, valid_for=600)
-
-    # content
-    st, out, _ = b.call("POST", "/put", data)
-    out = out if isinstance(out, dict) else {}
-    check(st == 200 and out.get("cid") == cid and out.get("bytes") == len(data) and out.get("held") is False,
-          "a put: 200, the CIDv1 raw sha-256 of the bytes, held false")
-    check(st == 200 and receipt_ok(out.get("receipt") or {}, status, data), "the receipt recovers to /status's signer over Receipt(keccak, cid, expires)")
-    retention = (pay or {}).get("retentionSeconds")
-    if retention:
-        check(abs(int(out.get("expires", 0)) - (time.time() + retention)) < 120, "expires: now + retentionSeconds")
-    st2, h2, body2 = request(url, "POST", "/put", data)
-    again = as_json(body2) or {}
-    check(st2 == 200 and again.get("held") is True and again.get("receipt") == out.get("receipt"), "the same bytes again: 200, held, the same receipt, nothing asked")
-    st, _, got = request(url, "GET", "/get/" + cid)
-    check(st == 200 and got == data, "get by CID: the bytes")
-    st, _, _ = request(url, "GET", "/get/" + cid_of(secrets.token_bytes(8)))
-    check(st == 404, "get of a CID never put: 404")
-    st, _, _ = request(url, "POST", "/put", b"")
-    check(st == 400, "an empty put: 400")
-    st, out, _ = b.call("POST", "/pin/" + cid)
-    out = out if isinstance(out, dict) else {}
-    check(st == 200 and int(out.get("expires", 0)) > int(again.get("expires", 0)) and receipt_ok(out.get("receipt") or {}, status, data),
-          "pin: retention extended, a new receipt")
-
-    # names
-    chain_id = int(dom.get("chainId", 0))
-    da = secrets.token_bytes(20).hex()
-    a, other = secrets.token_bytes(32), secrets.token_bytes(32)
-    instance = "0x" + eth.keccak256(b"conformance").hex()
-
-    def named(k, height, payload):
-        name = "%s-%d" % (da, height)
-        dom = eth.domain_separator("HPPLiteDA", "3", chain_id, "0x" + da)
-        digest = eth.typed_digest(dom, "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)",
-                                  bytes.fromhex(instance[2:]), height, eth.keccak256(payload))
-        return name, payload + bytes.fromhex(instance[2:]) + eth.sign(k, digest)
-
-    # a name is taken only for bytes the store holds as content (#199): names are free because the content put paid
-    unpaid = b"named, never put " + secrets.token_bytes(16)
-    nameX, bodyX = named(other, 1, unpaid)
-    st, _, out = request(url, "POST", "/name/" + nameX, bodyX)
-    check(st == 412, "a name for bytes the store does not hold: 412 (%d %s)" % (st, (as_json(out) or {}).get("error", "")))
-    st, _, _ = request(url, "GET", "/name/" + nameX)
-    check(st == 404, "nothing held under it")
-    name, body = named(a, 1, b"named batch")
-    st, _, _ = b.call("POST", "/put", b"named batch")          # the content first, as a node puts it
-    check(st == 200, "the batch's content put first: 200")
-    st, _, out = request(url, "POST", "/name/" + name, body)
+    if not free:
+        st, h, body = content(seq, 1, data)
+        req = json.loads(base64.b64decode(h["PAYMENT-REQUIRED"])) if h.get("PAYMENT-REQUIRED") else {}
+        check(st == 402 and (as_json(body) or {}).get("error") in ("account_uncovered", "bucket_parked") or req.get("x402Version") == 2,
+              "a write the account cannot cover: 402 (%d %s)" % (st, (as_json(body) or {}).get("error", "")))
+        if pay is not None:
+            exact = next((a for a in req.get("accepts") or [] if a.get("scheme") == "exact"), None)
+            check(exact is not None and int(exact["amount"]) >= int(pay["minPay"]) and exact["payTo"].lower() == b["payTo"].lower()
+                  and "name" in exact.get("extra", {}), "the 402 is a top-up: exact, at least minPay, to payTo, the token's domain")
+        print("          a paid store: the writes past the 402 need money (a permit or an x402 top-up); the reference's are in bucket_selftest.py")
+        return
+    st, _, out = content(seq, 1, data)
     out = as_json(out) or {}
-    check(st == 200 and (out.get("signer") or "").lower() == eth.address(a), "a name put by its sequencer: 200, the signer recovered (the rollup not taken by the refused name)")
-    st, h, got = request(url, "GET", "/name/" + name)
-    check(st == 200 and got == body and h.get("X-HPPLITE-SIGNER", "").lower() == eth.address(a), "the name reads back as put, X-HPPLite-Signer the signer")
-    st, _, _ = request(url, "POST", "/name/" + name, body)
+    check(st == 200 and out.get("cid") == cid_of(data) and out.get("held") is False, "a content put signed by the sequencer: 200, the CID, held false")
+    st, _, out = content(seq, 1, data)
+    check(st == 200 and (as_json(out) or {}).get("held") is True, "the same bytes again: 200, held")
+    st, _, got = request(url, "GET", "/get/" + cid_of(data))
+    check(st == 200 and got == data, "get by CID: the bytes")
+    st, _, _ = content(seq, 1, b"other bytes", sign_over=data)
+    check(st in (401, 403), "a Content signature over other bytes: refused (%d)" % st)
+    st, _, _ = request(url, "POST", "/put?bucket=%s&height=1" % da, b"unsigned")
+    check(st == 401, "a content put without X-HPPLite-Signature: 401 (%d)" % st)
+    st, _, _ = content(other, 1, b"from another key")
+    check(st in (401, 403), "a content put by another key: refused (%d)" % st)
+    st, _, _ = request(url, "GET", "/get/" + cid_of(b"never put " + secrets.token_bytes(8)))
+    check(st == 404, "get of a CID never put: 404")
+
+    # --- names ---
+ 
+    instance = bytes.fromhex(instance[2:]) if instance else secrets.token_bytes(32)
+    batch = b"a batch " + secrets.token_bytes(32)
+    body, (st, _, out) = named(seq, 2, batch, instance)
+    check(st == 200 and (as_json(out) or {}).get("signer", "").lower() == eth.address(seq).lower(),
+          "a name, no content put first: 200, the signer recovered (%d)" % st)
+    st, h, got = request(url, "GET", "/name/%s-2" % da[2:])
+    check(st == 200 and got == body and h.get("X-HPPLITE-SIGNER", "").lower() == eth.address(seq).lower(), "the name reads back, X-HPPLite-Signer the signer")
+    st, _, got = request(url, "GET", "/get/" + cid_of(batch))
+    check(st == 200 and got == batch, "a name's bytes read by their CID")
+    _, (st, _, _) = named(seq, 2, batch, instance)
     check(st == 200, "the same name and body again: 200")
-    name2, body2 = named(other, 2, b"another key")
-    b.call("POST", "/put", b"another key")
-    st, _, _ = request(url, "POST", "/name/" + name2, body2)
-    check(st == 403, "another signer for the same rollup: 403 (the refused unpaid name did not take it)")
-    st, _, _ = request(url, "GET", "/name/%s-999" % da)
+    _, (st, _, _) = named(other, 3, b"another signer", instance)
+    check(st == 403, "a name by another signer: 403 (%d)" % st)
+    st, _, _ = request(url, "GET", "/name/%s-99" % da[2:])
     check(st == 404, "a name never put: 404")
-    st, _, _ = request(url, "POST", "/name/not-a-name", body)
+    st, _, _ = request(url, "POST", "/name/not-a-name", b"x" * 100)
     check(st == 400, "a malformed name: 400")
+    named(seq, 3, b"batch three", instance)
+
+    # --- the bucket, its statement ---
+    st, _, out = request(url, "GET", "/bucket/" + da)
+    bk = as_json(out) or {}
+    s = bk.get("statement") or {}
+    dig = eth.typed_digest(domain, STATEMENT, da, s.get("height", 0), s.get("pruneHeight", 0), s.get("coveredUntil", 0), s.get("issuedAt", 0))
+    sig = bytes.fromhex(s.get("signature", "0x")[2:]) if s.get("signature") else b""
+    check(st == 200 and bk.get("state") == "covered" and bk.get("funder") == funder, "the bucket: covered, its funder")
+    check(len(sig) == 65 and eth.recover(dig, sig).lower() == status["signer"].lower() and s.get("height") == 3 and s.get("coveredUntil", 0) > now,
+          "the statement: height 3, covered ahead, signed by /status's signer over BucketStatement")
+    st, _, out = request(url, "GET", "/account/" + funder)
+    acct = as_json(out) or {}
+    check(st == 200 and acct.get("funder") == funder and da in (acct.get("buckets") or []) and "coveredUntil" in acct,
+          "the account: its funder, its buckets, covered until")
+
+    # --- prune ---
+    issued = int(time.time())
+    psig = eth.sign(seq, eth.typed_digest(domain, PRUNE, da, 3, issued))
+    st, _, out = request(url, "POST", "/bucket/%s/prune" % da, json.dumps({"height": 3, "issuedAt": issued, "signature": "0x" + psig.hex()}).encode())
+    check(st == 200 and (as_json(out) or {}).get("pruneHeight") == 3, "a prune at 3 by the sequencer: 200")
+    check(request(url, "GET", "/name/%s-2" % da[2:])[0] == 404 and request(url, "GET", "/name/%s-3" % da[2:])[0] == 200, "names below 3 gone, 3 kept")
+    st, _, _ = request(url, "POST", "/bucket/%s/prune" % da, json.dumps({"height": 3, "issuedAt": issued, "signature": "0x" + psig.hex()}).encode())
+    check(st == 409, "the same prune again: 409 (%d)" % st)
+    osig = eth.sign(other, eth.typed_digest(domain, PRUNE, da, 4, issued + 1))
+    st, _, _ = request(url, "POST", "/bucket/%s/prune" % da, json.dumps({"height": 4, "issuedAt": issued + 1, "signature": "0x" + osig.hex()}).encode())
+    check(st in (401, 403), "a prune by another key: refused (%d)" % st)
+
+    # --- release ---
+    issued = int(time.time()) + 2
+    rsig = eth.sign(funder_key, eth.typed_digest(domain, RELEASE, da, funder, issued))
+    st, _, out = request(url, "POST", "/bucket/%s/release" % da, json.dumps({"funder": funder, "issuedAt": issued, "signature": "0x" + rsig.hex()}).encode())
+    check(st == 200 and (as_json(out) or {}).get("state") == "parked", "released by its funder: parked (%d)" % st)
+    st, _, _ = request(url, "GET", "/name/%s-3" % da[2:])
+    check(st == 410, "a parked bucket's name: 410 (%d)" % st)
+    _, (st, _, out) = named(seq, 4, b"into a parked bucket", instance)
+    check(st == 402, "a write into a parked bucket: 402 (%d)" % st)
 
 
 # ---------------- the relay ----------------
@@ -231,12 +290,14 @@ def main():
     ap = argparse.ArgumentParser(description="HPPLite operators' conformance suite (#189)")
     ap.add_argument("--store", action="append", default=[])
     ap.add_argument("--relay", action="append", default=[])
-    ap.add_argument("--buyer-key", default=None, help="a wallet holding the store's asset: pay the content calls with exact")
+    ap.add_argument("--da", default=None, help="a rollup's DA address, for a store that reads the chain")
+    ap.add_argument("--sequencer-key", default=None, help="...its sequencer's key")
+    ap.add_argument("--instance", default=None, help="...the instance its lease names (for the names)")
     args = ap.parse_args()
     if not args.store and not args.relay:
         ap.error("--store and/or --relay")
     for u in args.store:
-        store(u.rstrip("/"), args.buyer_key)
+        store(u.rstrip("/"), args.da, args.sequencer_key, args.instance)
     for u in args.relay:
         relay(u.rstrip("/"))
     print("conformance: %s" % ("PASS" if not fails else "%d FAIL" % fails))

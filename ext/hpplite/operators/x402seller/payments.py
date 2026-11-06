@@ -52,17 +52,17 @@ class Payments:
         # a named User-Agent: HPP's facilitator sits behind a WAF that answers 403 to Python's default
         req = urllib.request.Request(self.facilitator + path, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json", "Accept": "application/json",
-                                              "User-Agent": "hpplite-pin-service/1 (+https://github.com/hpp-io/hpplite)"}, method="POST")
+                                              "User-Agent": "hpplite-operators/1 (+https://github.com/hpp-io/hpplite)"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             text = e.read().decode("utf-8", "replace")[:300]
-            sys.stderr.write("pin_service: facilitator %s answered %d: %s\n" % (path, e.code, text))
+            sys.stderr.write("x402seller: facilitator %s answered %d: %s\n" % (path, e.code, text))
             return {"isValid": False, "success": False, "invalidReason": "facilitator_error", "errorReason": "facilitator_error",
                     "invalidMessage": "%d %s" % (e.code, text), "errorMessage": "%d %s" % (e.code, text), "transaction": "", "network": self.network}
         except (OSError, ValueError) as e:
-            sys.stderr.write("pin_service: facilitator %s unreachable: %s\n" % (path, e))
+            sys.stderr.write("x402seller: facilitator %s unreachable: %s\n" % (path, e))
             return {"isValid": False, "success": False, "invalidReason": "facilitator_unreachable", "errorReason": "facilitator_unreachable",
                     "invalidMessage": str(e), "errorMessage": str(e), "transaction": "", "network": self.network}
 

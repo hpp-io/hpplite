@@ -1,5 +1,5 @@
 /*
-** HPPLite stores (#11): a hpplite-store/2 store over HTTP (#214, doc/store-buckets.md).
+** HPPLite stores (#11): a hpplite-store/2 store over HTTP (#214, doc/store-protocol.md).
 **
 ** The rollup's bucket: bound at the first write with the node's key (the rollup's sequencer) and a
 ** funding key derived from it, given an EIP-2612 permit (storepermit=) the store pulls what it is owed
@@ -71,7 +71,7 @@ struct HppliteStore {
     uint64_t deposited;             /* this process's deposits, for the status row */
     int nDeposits;
     HppliteSpend *spend;            /* the node's ledger (#173): spendcap= checked before signing, charges recorded; not owned */
-    /* hpplite-store/2 (#214, doc/store-buckets.md): the rollup's bucket, paid from a funding wallet */
+    /* hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket, paid from a funding wallet */
     int v2;                         /* /status says hpplite-store/2 */
     int hasBucket;                  /* bucketDa below is set (hpplite_store_set_bucket) */
     unsigned char bucketDa[20];
@@ -1111,7 +1111,7 @@ int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char
     return 0;
 }
 
-/* === hpplite-store/2 (#214, doc/store-buckets.md): the rollup's bucket and its funding wallet ===
+/* === hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket and its funding wallet ===
 ** The funding key is derived from the node's (keccak256("hpplite funding key" || key)): backing up
 ** the node's key backs up the wallet too. The node binds the bucket with both keys, gives the store
 ** a permit to pull from the funding wallet (storepermit=) and pays any 402 from it. */

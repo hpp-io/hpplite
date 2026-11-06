@@ -1,140 +1,257 @@
-# The store protocol, `hpplite-store/1`
+# The store protocol, `hpplite-store/2`
 
 What an HPPLite node expects of a store given as `store=http(s)://host:port`
-(#188). The reference implementation is
-[operators/store](../operators/store/README.md); the canonical store runs the
-same protocol on Cloudflare Workers (#190). Both are checked by the same
-conformance suite (#189).
+(#207, #213, #214). The reference implementation is
+[operators/store/hpplite_store.py](../operators/store/README.md); the
+canonical store (hpp-io/hpplite-operators) speaks the same, and both are
+checked by the same conformance suite (`operators/conformance`, #189). The
+account side - who holds which key, the console - is hpp-io/hpplite-operators
+docs/console.md.
 
-A service says which protocol it speaks in `GET /status` (`"protocol":
-"hpplite-store/1"`). A node puts nothing to a service that names a version it
-does not know, or another protocol (a relay given as `store=`): the batch
-waits and `hpplite_status.last_error` says why. A service that names none is
-taken as version 1 (it predates the field). A new version is made when a
-change would make an older node or an older service misread the other;
-fields added to an answer are not a new version.
+`hpplite-store/2` replaced `hpplite-store/1` (per-item retention, pins and
+receipts, 2026-11-06) before either was announced, so nothing was kept for
+compatibility (see [Removed](#removed)). A service says which protocol it
+speaks in `GET /status` (`"protocol": "hpplite-store/2"`); a node writes
+nothing to a service that names another, or none.
+
+## The idea
+
+- **A bucket** is a rollup's space at a store, named by its DA address, kept
+  while its account covers it. No per-item expiry, no renewal.
+- **An account** belongs to a **funding wallet** (an address holding the
+  asset, USDC.e) and may pay for several buckets. Its `credit` is what was
+  paid in minus what was charged; negative is owed. Money comes in two ways:
+  - **x402** (`exact`), started by a payer who is online: an agent, a
+    stranger, an "extend now" button. The facilitator pays the gas.
+  - **a permit pull**, started by the store: the funding wallet signs one
+    EIP-2612 permit, and the store takes what is owed with `transferFrom` -
+    so storage stays paid while the node is off for months.
+- **Charges** accrue to the account: storage (bytes held x time) and a fee
+  per write.
+- **Writes** are the rollup's sequencer's, signed: a name (as today) or a
+  content put signed for the bucket. A write into a bucket its account
+  cannot cover answers `402` - pay it and the write goes through.
+- **Covered until**: when the account's credit, plus what the permit can
+  still pull, runs out at the current daily cost.
+
+A store must read the chain (`--rpc`): who may bind, write and prune is the
+rollup's `sequencer()` - the key its owner names, so a rotation takes effect
+at once (#208); a name also needs the lease (`sequencerWallet()` and
+`sequencerInstance()`, #167). The reference store without `--rpc` keeps a
+bucket for its first binder's sequencer key: development and unit tests
+only.
+
+## Signatures
+
+EIP-712 in the domain `("HPPLiteStore", "2", chainId, payTo)` as `/status`
+gives it:
+
+| Type | Signed by | For |
+|------|-----------|-----|
+| `Bind(address da,address funder,uint256 issuedAt)` | the sequencer and the funder | bind (or rebind) a bucket to an account |
+| `Release(address da,address funder,uint256 issuedAt)` | the funder | stop paying for a bucket |
+| `Content(address da,uint256 height,bytes32 hash)` | the sequencer | put bytes into the bucket (`hash` the keccak-256 of the bytes; `height` the batch they belong to, for pruning) |
+| `Prune(address da,uint256 height,uint256 issuedAt)` | the sequencer | let go of the bucket's history before `height` |
+| `BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)` | the store's `signer` | what the store holds (below) |
+
+`issuedAt` (seconds) orders a bucket's bindings and prunes: the store takes
+one only if it is newer than the last it took and at most an hour ahead of
+its clock.
+
+The permit is the asset's own `Permit(address owner,address spender,uint256
+value,uint256 nonce,uint256 deadline)` (USDC.e,
+`0x401eCb1D350407f13ba348573E5630B83638E30D` on HPP Sepolia and mainnet,
+supports it: version 2).
 
 ## Calls
 
-| Call | Paid | Answer |
-|------|------|--------|
-| `POST /put`, the body the bytes | yes (x402) | `200 {cid, bytes, expires, receipt, held}` |
-| `POST /pin/<cid>` | yes, as a put of that size | `200 {cid, bytes, expires, receipt}`: retention extended |
-| `GET /get/<cid>` | no, unless the service says `paidGet` | `200` the bytes |
-| `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | no | `200 {name, bytes, signer}` |
-| `GET /name/<da>-<height>` | no | `200` the body as put; `X-HPPLite-Signer` |
-| `GET /status` | no | below |
+| Call | Signed / paid | Answer |
+|------|---------------|--------|
+| `POST /bucket/<da>`, body `{funder, issuedAt, sequencerSignature, funderSignature}` | the sequencer and the funder | `200` the bucket |
+| `POST /bucket/<da>/release`, body `{funder, issuedAt, signature}` | the funder | `200` the bucket |
+| `POST /bucket/<da>/prune`, body `{height, issuedAt, signature}` | the sequencer | `200` the bucket |
+| `GET /bucket/<da>` | - | `200 {da, funder, state, bytes, objects, height, pruneHeight, coveredUntil, statement}` |
+| `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | the sequencer; `402` if not covered | `200 {name, bytes, signer}`: the name is the write - its bytes are held in the bucket |
+| `POST /put?bucket=<da>&height=<n>`, the body the bytes, `X-HPPLite-Signature` the `Content` signature | the sequencer; `402` if not covered | `200 {cid, bytes}` |
+| `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names); a name's batch bytes are also read by their CID |
+| `POST /account/<funder>/permit`, body `{value, deadline, v, r, s}` | the funder (the permit) | `200` the account |
+| `POST /account/<funder>/pay?amount=<units>` | x402 `exact` | `200` the account: `credit` raised by the amount |
+| `GET /account/<funder>` | - | `200 {funder, credit, balance, allowance, deadline, dailyCost, coveredUntil, buckets, state}` |
+| `GET /status` | - | below |
 
-Errors: `400` a malformed request (an empty put, a name that is not
-`<40 hex>-<decimal>`, a body too short to carry a signature); `402` payment
-required or refused (below); `403` a name refused (another signer holds the
-rollup's names, or with a chain, the signer is not the rollup's sequencer);
-`404` not held (never put, or past its retention); `409` a name from an
-instance the rollup's lease does not name; `413` over the service's size
-limit (16 MiB in the reference); `412` a name for bytes the store does not
-hold (below); `503` a name the store cannot check now (its chain unreadable,
-below), or a put refused while the store is full (a store may set quotas;
-space frees as retention ends). Error
-bodies are JSON with `error`.
+Names keep /1's rules: `<da>-<height>`, the body the batch's bytes followed
+by the sequencer's instance id and its EIP-712 `Batch` signature in the DA's
+domain; a signer other than the DA's sequencer `403`, an instance other than
+the lease's `409`, the chain unreadable `503` (#198); the same body again
+`200`. The first-signer rule and "content before name" (#199) are gone: a
+name is taken only from the chain's sequencer, into a bucket it bound.
 
-### Content
+Errors: `400` malformed; `401` a signature that does not recover to the
+sequencer (or the funder); `402` a write its account cannot cover, or an
+unpaid `/pay` (x402 requirements, below); `403`/`409`/`503` as above; `404`
+not held, or no such bucket; `409` a binding or prune older than the last
+taken; `410` a read of a parked bucket (the body says what restores it);
+`413` over the size limit. JSON bodies with `error`; for `402` also
+`bucket_unbound`, `bucket_parked` or `account_uncovered`.
 
-- **The CID** is CIDv1, raw codec (0x55), sha2-256, multibase base32 lower
-  (`bafkrei…`): the same bytes give the same CID anywhere.
-- **Idempotent by CID.** A put of bytes already held answers `200` with the
-  existing receipt and `held: true`, and asks nothing.
-- **The receipt** is the store's promise to hold the bytes until `expires`:
-  `{hash, cid, expires, signer, signature}`, an EIP-712 signature over
-  `Receipt(bytes32 hash,string cid,uint256 expires)` where `hash` is the
-  keccak-256 of the bytes, in the domain `("HPPLitePinService", "1", chainId,
-  payTo)` as `/status` gives it. The node checks it recovers to `/status`'s
-  `signer` and commits it with the batch.
-- **Retention.** A put buys `retentionSeconds`; `/pin` extends from the later
-  of now and the current expiry. Past it the bytes may be deleted. A store may
-  cap how far ahead an expiry reaches (pins stack): a pin past its cap is
-  refused, naming the furthest expiry it allows.
+### Binding
 
-### Names (the soft tier, #165)
+- The first binding creates the bucket. A newer one changes the funder: the
+  new account pays from then on; what accrued before stays with the old one.
+  A rotated-in sequencer (#208) rebinds with its own signature.
+- `Release` leaves the bucket unbound, which parks it at once; a binding
+  restores it.
+- One funder signing both halves is the self-paying case (an agent, or a
+  self-provisioned node whose funding key signs as well).
 
-`<da>-<height>`: the rollup's DA contract (40 hex, lower case) and the batch
-height. The body is the batch's bytes followed by the sequencer's instance id
-(32 bytes) and its EIP-712 signature (65 bytes, r‖s‖v) over
-`Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)` in the DA
-contract's domain `("HPPLiteDA", "3", chainId, da)`, `batchHash` the
-keccak-256 of the bytes.
+### The permit
 
-- A name is taken only for bytes the store holds as content - the CID of the
-  batch's bytes put (and not expired) - else `412` and nothing held: names
-  are free because the content put paid, and an unpaid name must not claim a
-  rollup (#199). A node puts the content first.
-- The first signer to put a name for a DA holds that DA's names; another
-  signer is refused `403`. The decision must be atomic across everything that
-  serves the store (a conditional create), and reads must see a name as soon
-  as its put answered: a replica follows the names as they are written.
-- A store that reads the chain also refuses a signer that is not the
-  rollup's `sequencerWallet()` (`403`), and an instance other than the
-  lease's `sequencerInstance()` (`409`, #167). When it cannot read the chain
-  (unreachable, or answering an error) it refuses the name `503` and holds
-  nothing, rather than take it unchecked: the first signer would hold the
-  rollup's names for good (#198). A DA with no coordinator is not an HPPLite
-  rollup's and is taken on the first-signer rule alone.
-- The same body again answers `200`.
-- `X-HPPLite-Signer` on a read is the wallet the signature recovers to.
-- Names are kept for the store's `retentionSeconds` from their put.
+- One per account, not per bucket. The store keeps the latest and submits it
+  with its next pull (permit, then `transferFrom`) or when the chain's
+  allowance falls short, so a permit costs nothing until money moves. A
+  newer permit replaces an older one (the asset's nonce).
+- The permit's `spender` is `/status`'s `buckets.spender` (the store's
+  puller, which holds a little ETH for gas); `transferFrom` pays `payTo`.
+
+### Charges and pulls
+
+- **Storage** accrues per bucket for the time its bytes are held: bytes x
+  `pricePerMiBMonth` / 2^20 per 30 days, booked to the account at each of
+  the store's ticks (at least daily), the fraction carried. At 30
+  units per MiB-month, 1 GiB is 30,720 units a month ($0.03).
+- **Writes**: `pricePerWrite` per name or content put.
+- **Pulls**, when the account has a permit: the store pulls what is owed
+  (`-credit`) once it passes `pullThreshold`, or `pullIntervalSeconds` after
+  the last pull, or as soon as the owed exceeds what the wallet can still
+  pay (its balance, the allowance, before the deadline) - so a wallet
+  running dry is found within a day.
+- **Credit first**: x402 payments add credit; charges spend it; a pull
+  happens only when credit is below zero.
+
+### When it cannot pay
+
+The account is **uncovered** when it owes and cannot pay: no permit, or a
+pull **refused** - one the chain refuses for the funder's reasons (the
+balance or the allowance short, the permit past its deadline or replaced,
+the allowance revoked). The store finds out by simulating the pull first, so
+a refusal costs no gas. Anything else - the RPC unreachable, the store's own
+gas, a reorg - is the store's failure: it tries again, nothing changes for
+the account, and it warns (`/health/warnings`).
+
+An x402 account (no permit) is uncovered once its credit is spent.
+
+### Bucket states
+
+```
+          bind (covered account)                 account uncovered, release
+  (none) ───────────────────────▶ covered ────────────────────────────▶ parked
+                                     ▲                                    │
+                                     └──── covered again (paid, rebound) ─┤
+                                                                          │ parkSeconds (30 days)
+                                                                          ▼
+                                                                       deleted
+```
+
+- **covered**: served; writes accepted.
+- **parked**: not served (`410`), writes refused (`402 bucket_parked`);
+  storage still accrues. The store retries a pull daily; paying (`/pay`, or
+  a pull that succeeds) covers it again. Its bytes may move to cheaper
+  storage.
+- **deleted**: the bucket's bytes and names are gone; what it owed is
+  written off. A new binding starts an empty bucket.
+
+Only an uncovered account or a release parks a bucket, and only
+`parkSeconds` later is it deleted. A covered bucket is never deleted, and a
+store never deletes for its own failures.
+
+### Pruning and sweeping
+
+History is what makes a rollup verifiable, so a store never prunes at its
+own judgement. A `Prune` at `height` lets go of the bucket's names below it
+and its content put with a lower `height`. The node signs one after an
+anchored snapshot at or below `height` (#203), as its setting says (keep
+everything; or keep N days for point-in-time recovery, #205). The store
+deletes them (it may keep more) and reports `pruneHeight`.
+
+Bytes that are in no bucket (an interrupted put, #200) are the store's to
+sweep on a timer.
+
+### The bucket statement
+
+`statement` in `GET /bucket/<da>`: `{height, pruneHeight, coveredUntil,
+issuedAt, signer, signature}` - the store's signed word that it holds the
+DA's names from `pruneHeight` to `height`, covered until `coveredUntil`. An
+anchor commits the latest statement in its `receipt` field (the contract
+takes opaque bytes: a compact form, version byte 2, in place of /1's
+receipt, version 1), so a store that deletes a covered bucket's bytes, or
+bytes above a prune point, is caught by its own signature on chain.
 
 ## `GET /status`
 
 ```json
 {
-  "service": "hpplite-pin-service", "protocol": "hpplite-store/1",
+  "service": "hpplite-store", "protocol": "hpplite-store/2",
   "signer": "0x…",
-  "receipt": {"domain": {"name": "HPPLitePinService", "version": "1", "chainId": 181228, "verifyingContract": "0x…"},
-              "type": "Receipt(bytes32 hash,string cid,uint256 expires)"},
-  "payment": {"scheme": "exact", "schemes": ["exact", "batch-settlement"], "network": "eip155:181228",
-              "asset": "0x…", "payTo": "0x…", "pricePerPin": 10, "pricePerMiBMonth": 30.0, "pricePerByte": 0,
-              "retentionSeconds": 2592000, "paidGet": false, "facilitator": "https://…", "channels": {…}}
+  "domain": {"name": "HPPLiteStore", "version": "2", "chainId": 190415, "verifyingContract": "0x…"},
+  "buckets": {"asset": "0x…", "payTo": "0x…", "spender": "0x…",
+              "pricePerWrite": 10, "pricePerMiBMonth": 30.0,
+              "pullThreshold": 1000000, "pullIntervalSeconds": 2592000, "parkSeconds": 2592000},
+  "payment": {"scheme": "exact", "network": "eip155:190415", "facilitator": "https://…", "minPay": 1000000}
 }
 ```
 
-`payment` is `null` for a free service. The node reads `signer` and the
-receipt's domain to verify receipts, and the prices to quote a put before it
-is asked (`hpplite_status.store_price`).
+`payment` is `null` for a store without x402 (permit pulls only). A free
+store (development) has `buckets` with zero prices and charges nothing.
 
-## Payment (x402 v2)
+## Payment (x402 v2, `exact` only)
 
-A paid call without `PAYMENT-SIGNATURE` answers `402` with the requirements
-in the body and, base64, in `PAYMENT-REQUIRED`. The price of a put of `n`
-bytes is `pricePerPin + pricePerByte × n + ceil(pricePerMiBMonth × n / 2^20 ×
-retentionSeconds / 2592000 − 10^-9)`, in the asset's atomic units (USDC.e:
-10^-6), computed in IEEE doubles in that order (the node quotes it the same
-way; `operators/conformance/vectors.json` has cases).
+A `402` carries x402 v2 requirements, in the body and base64 in
+`PAYMENT-REQUIRED`: `exact` (EIP-3009 `TransferWithAuthorization`) to
+`payTo`, `extra` naming the token's EIP-712 domain. For a write the amount
+is a top-up - the larger of `minPay` and what covers the write and 30 days
+of the account's storage - so an agent pays now and then, not per write;
+for `/pay`, the amount asked. The payer repeats the request with
+`PAYMENT-SIGNATURE`; the store verifies, credits the account, does the work
+and settles. A settlement that fails takes the credit back (the write stays
+charged to the account as owed).
 
-`accepts` offers:
+## The node
 
-- **`exact`**: an EIP-3009 `TransferWithAuthorization` for the amount, to
-  `payTo`, settled by the facilitator after the work is done. `extra` names
-  the token's EIP-712 domain (`name`, `version`).
-- **`batch-settlement`** (when the service offers channels, #135): x402's
-  escrow at `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`; `extra` adds
-  `receiverAuthorizer`, `withdrawDelay` and `minDeposit`. The payer sends a
-  cumulative voucher per call, with a deposit when the channel cannot cover
-  it.
+- `store=https://…` as today; the node needs a funder (below) to write.
+- **Self-provisioned**: the node creates a funding key beside its own
+  (`<key>.funding`), reports its address (`hpplite_status.funder`) - send
+  USDC.e there to fund it - signs the binding with both keys and the permit
+  (a cap, e.g. 20 USDC.e, a deadline a year out; renewed when the allowance
+  falls under a quarter or the deadline is within 30 days). With no permit
+  (`store_permit=0`) it pays the `402`s from the funding key instead.
+- **Through the console**: given `funder=<address>`, the node signs only
+  its half of the binding; the console's signer signs the rest and the
+  permit.
+- It writes names (the bytes once) and other content (manifests, snapshots)
+  as signed bucket puts, commits the bucket statement with each anchor, and
+  reports `covered_until` and the bucket's state in `hpplite_status`.
+- `kubo://` and `s3://` stores are unchanged (no protocol, no payment).
 
-The payer repeats the call with `PAYMENT-SIGNATURE` (base64 JSON:
-`x402Version`, `accepted` - the offer it chose, unchanged - and `payload`).
-On success the answer carries `PAYMENT-RESPONSE`; for a voucher its `extra`
-has `chargedAmount` and `channelState`.
+## Removed
 
-A `402` to a paid request names the reason in `error`. The node acts on:
+From `hpplite-store/1`, in hpplite (the node, operators/store, the
+conformance suite; #213, #214) and in hpp-io/hpplite-operators (the store
+Worker, operators#16):
 
-| `error` | Meaning | The node |
-|---------|---------|----------|
-| `invalid_batch_settlement_evm_cumulative_amount_mismatch` | its running total differs from the service's; `extra.channelState` and `extra.voucherState` (the node's own last voucher) say where it stands | adopts the total if the voucher is its own, and pays again |
-| `…cumulative_exceeds_balance`, `…channel_not_found` | the channel cannot cover it | pays again with a deposit |
-| `invalid_batch_settlement_evm_deposit_pending` | the facilitator queued the deposit (#185); no other deposit is sent for the channel while it is pending | tries again later; the voucher is taken once the deposit lands |
+- per-item retention, `/pin`, stacked expiries, the pin cap (operators#13);
+  renewal by manifest (#202);
+- unsigned paid `/put`, the per-item receipt (`Receipt`, version 1) and its
+  checks in the node and verify;
+- the first-signer rule and content-before-name (#199) for names;
+- `batch-settlement` at the store: channels, deposits, vouchers, claims, the
+  Ledger and its warnings; the node's `storedeposit=`; undo on a failed
+  settle (#194) becomes "the credit taken back". The relay keeps x402 as it
+  is, channels included;
+- version negotiation with /1, and migrating per-item history (the Sepolia
+  store is reset, operators#12).
 
-Nothing done is charged: a call that fails after a payment verified is not
-settled, and a voucher counts only once its call answered `200`. Nothing
-unpaid is kept: a put or a pin whose `exact` settlement fails after the work
-is taken back (the bytes not held, the retention not extended) and answered
-`402` (#194).
+## Open
+
+- Pull cadence and threshold for mainnet; whether parked storage costs less.
+- Mirroring a bucket at two stores; moving one between stores.
+- The relay charging the account the same way (its own permit).

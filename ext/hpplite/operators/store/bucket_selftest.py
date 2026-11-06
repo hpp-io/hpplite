@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hpplite-store/2's selftest on anvil (#213, doc/store-buckets.md), run by
+"""hpplite-store/2's selftest on anvil (#213, doc/store-protocol.md), run by
 tests/l1/anvil_test.sh: real rollups from the factory, MockUSDC with
 EIP-2612 permit (#212), the mock facilitator for x402. A funding wallet with
 USDC.e and no ETH binds a rollup's bucket and gives a permit; the sequencer
@@ -227,7 +227,9 @@ def main():
         before = usdc_of(pay_to)
         pulled = wait_for(lambda: usdc_of(pay_to) > before, 30)
         check(pulled, "storage accrued past the threshold: the store pulled from the funding wallet (%d units)" % (usdc_of(pay_to) - before))
-        acct = http("GET", url + "/account/" + fa)[1]
+        # the transfer is on the chain before the store has seen its receipt: wait for the store's own record of the pull
+        acct = wait_for(lambda: (lambda a: a if (a.get("permit") or {}).get("sent") else None)(http("GET", url + "/account/" + fa)[1]), 10) \
+            or http("GET", url + "/account/" + fa)[1]
         check(acct.get("permit", {}).get("sent") is True and acct.get("state") == "covered", "the permit was sent with the pull; covered")
         check(int(cast("balance", fa)) == 0, "the funding wallet still holds no ETH")
 

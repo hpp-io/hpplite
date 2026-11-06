@@ -47,7 +47,7 @@ rm -f "$log.forge"
 echo "anvil on $rpc, factory $factory"
 # a stand-in USDC.e with EIP-3009 for the pin service's x402 payments (#125); key0 holds the supply
 usdc=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --broadcast --json src/test/MockUSDC.sol:MockUSDC --constructor-args 1000000000000000 2>/dev/null | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' | head -1)
-[ -n "$usdc" ] && echo "MockUSDC $usdc" || echo "MockUSDC not deployed: scenario 18 will be skipped"
+[ -n "$usdc" ] && echo "MockUSDC $usdc" || echo "MockUSDC not deployed: the paid store scenarios will be skipped"
 # x402's batch-settlement escrow and deposit collector, the bytecode HPP Sepolia runs (#135)
 escrow=""
 sh "$here/install_x402_escrow.sh" "$rpc" && escrow=0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003 || echo "x402 escrow not installed: batch-settlement scenarios will be skipped"

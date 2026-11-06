@@ -60,7 +60,7 @@ char *hpplite_store_put(HppliteStore *store, const uint8_t *data, size_t len, ch
 ** height (what a prune point counts); put is put_at height 0. No receipt at /2: the bucket statement is */
 char *hpplite_store_put_at(HppliteStore *store, uint64_t height, const uint8_t *data, size_t len, char **pzReceipt);
 /*
-** hpplite-store/2 (#214, doc/store-buckets.md): the rollup's bucket at the store, paid from a funding
+** hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket at the store, paid from a funding
 ** wallet whose key is derived from the node's. set_bucket names the rollup (its DA) and what the
 ** funding wallet's permit lets the store pull (storepermit=, atomic units; 0: no permit, the store's
 ** 402s are paid instead); the bucket is bound and the permit given at the first write. is_bucket: the

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Test vectors for the store and relay protocols (#189): fixed inputs and
 what the reference computes from them - keccak, addresses, signatures
-(RFC 6979, so deterministic), CIDs, the receipt's and the name's EIP-712
-digests, x402 batch-settlement's channel id, voucher, refund and claim
-digests, the store's and the relay's prices, the relay's quote MAC and the
-selectors it takes. vectors.json is what another implementation (the
+(RFC 6979, so deterministic), CIDs, the name's EIP-712 digest and
+hpplite-store/2's (Bind, Release, Content, Prune, BucketStatement, #213),
+x402 batch-settlement's channel id, voucher, refund and claim digests (the
+relay's), the store's write quote and the relay's prices, the relay's quote
+MAC and the selectors it takes. vectors.json is what another implementation (the
 canonical operators' TypeScript) tests itself against; this script checks
 the reference still computes it.
 
@@ -20,7 +21,7 @@ sys.path.insert(0, os.path.join(here, ".."))
 sys.path.insert(0, os.path.join(here, "..", "store"))
 sys.path.insert(0, os.path.join(here, "..", "relay"))
 from x402seller import channels, eth  # noqa: E402
-import pin_service  # noqa: E402
+import hpplite_store  # noqa: E402
 import relay  # noqa: E402
 
 PATH = os.path.join(here, "vectors.json")
@@ -32,7 +33,7 @@ def key(i):
 
 
 def generate():
-    v = {"version": 1, "about": "operators/conformance/vectors.py (#189); keys are test keys, never fund them"}
+    v = {"version": 2, "about": "operators/conformance/vectors.py (#189); keys are test keys, never fund them"}
     v["keccak256"] = [{"in": h, "out": "0x" + eth.keccak256(bytes.fromhex(h[2:])).hex()}
                       for h in ("0x", "0x616263", "0x" + "ff" * 200)]
     v["addresses"] = [{"key": k, "address": eth.address(bytes.fromhex(k[2:]))} for k in KEYS]
@@ -40,18 +41,22 @@ def generate():
     v["signatures"] = [{"key": KEYS[i % 3], "digest": d, "signature": "0x" + eth.sign(key(i % 3), bytes.fromhex(d[2:])).hex()}
                        for i, d in enumerate(digests)]
     datas = [b"", b"hpplite", bytes(range(256)) * 5]
-    v["cids"] = [{"data": "0x" + d.hex(), "cid": pin_service.cid_of(d)} for d in datas]
+    v["cids"] = [{"data": "0x" + d.hex(), "cid": hpplite_store.cid_of(d)} for d in datas]
 
-    # the store's receipt: Receipt(bytes32 hash,string cid,uint256 expires) in ("HPPLitePinService", "1", chainId, payTo)
+    # hpplite-store/2's messages (#213): in ("HPPLiteStore", "2", chainId, payTo), each signed by the key named
     pay_to = "0x" + "11" * 20
-    signer = pin_service.Signer(key(0), 181228, pay_to)
-    v["receipts"] = []
-    for d in datas[1:]:
-        cid = pin_service.cid_of(d)
-        r = signer.receipt(eth.keccak256(d), cid, 1800000000)
-        digest = eth.typed_digest(signer.domain, pin_service.RECEIPT_TYPE, eth.keccak256(d), eth.keccak256(cid.encode()), 1800000000)
-        v["receipts"].append({"key": KEYS[0], "chainId": 181228, "payTo": pay_to, "data": "0x" + d.hex(),
-                              "expires": 1800000000, "digest": "0x" + digest.hex(), "receipt": r})
+    sdom = eth.domain_separator("HPPLiteStore", "2", 181228, pay_to)
+    da2, funder = "0x" + "ab" * 20, eth.address(key(2)).lower()
+    msgs = [("Bind", hpplite_store.BIND_TYPE, [da2, funder, 1800000000], 1),
+            ("Release", hpplite_store.RELEASE_TYPE, [da2, funder, 1800000001], 2),
+            ("Content", hpplite_store.CONTENT_TYPE, [da2, 7, eth.keccak256(b"first batch")], 1),
+            ("Prune", hpplite_store.PRUNE_TYPE, [da2, 5, 1800000002], 1),
+            ("BucketStatement", hpplite_store.STATEMENT_TYPE, [da2, 9, 5, 2 ** 64 - 1, 1800000003], 0)]
+    v["bucketMessages"] = {"chainId": 181228, "payTo": pay_to, "messages": [
+        {"type": t, "typeString": ts, "fields": [("0x" + f.hex()) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
+         "digest": "0x" + eth.typed_digest(sdom, ts, *fields).hex(),
+         "signature": "0x" + eth.sign(key(k), eth.typed_digest(sdom, ts, *fields)).hex()}
+        for t, ts, fields, k in msgs]}
 
     # a name's signed batch: Batch(bytes32 instanceId,uint256 height,bytes32 batchHash) in ("HPPLiteDA", "3", chainId, da)
     da = "ab" * 20
@@ -59,7 +64,7 @@ def generate():
     v["names"] = []
     for h, d in ((1, b"first batch"), (42, b"")):
         name = "%s-%d" % (da, h)
-        digest = pin_service.batch_digest(181228, name, instance, d)
+        digest = hpplite_store.batch_digest(181228, "0x" + da, instance, h, d)
         v["names"].append({"chainId": 181228, "name": name, "instance": instance, "data": "0x" + d.hex(), "key": KEYS[1],
                            "digest": "0x" + digest.hex(), "signature": "0x" + eth.sign(key(1), digest).hex(),
                            "signer": eth.address(key(1))})
@@ -78,14 +83,12 @@ def generate():
                        "digest": "0x" + channels.claim_batch_digest([(cid, 1000, 990), ("0x" + "cd" * 32, 5, 5)], 181228).hex()},
     }
 
-    # prices: the store's per put (#172), the relay's per call (#170); IEEE doubles in this order
-    v["storePrices"] = [{"bytes": n, "pricePerPin": pp, "pricePerByte": pb, "pricePerMiBMonth": pm, "retentionSeconds": r,
-                         "amount": pin_service.put_price(n, pp, pb, pm, r)}
-                        for n, pp, pb, pm, r in ((183, 10, 0, 30.0, 2592000), (40000, 10, 0, 30.5, 5184000),
-                                                 (3 * 1048576 + 17, 10, 0, 30.5, 5184000), (1048576, 0, 0, 30.0, 2592000),
-                                                 (1000, 1000, 1, 30.0, 60),
-                                                 # the -1e-9 decides: storage is 55.00000000000001 and 165.00000000000003 in doubles (#193)
-                                                 (26214400, 10, 0, 1.1, 5184000), (52428800, 10, 0, 1.1, 7776000))]
+    # prices: the store's write quote (#172, #213), the relay's per call (#170); IEEE doubles in this order
+    v["writePrices"] = [{"bytes": n, "pricePerWrite": pw, "pricePerMiBMonth": pm, "amount": hpplite_store.write_quote(n, pw, pm)}
+                        for n, pw, pm in ((183, 10, 30.0), (40000, 10, 30.5), (3 * 1048576 + 17, 10, 30.5), (1048576, 0, 30.0),
+                                          (1000, 1000, 0.0),
+                                          # the -1e-9 decides: 55.00000000000001 in doubles (#193)
+                                          (52428800, 10, 1.1))]
     v["relayPrices"] = [{"gas": g, "feeWei": f, "margin": m, "ethUsd": e, "minFee": mf, "amount": relay.call_price(g, f, m, e, mf)}
                         for g, f, m, e, mf in ((73500, 10000000, 0.2, 3000.0, 100), (3430000, 10000000, 0.2, 3000.0, 100),
                                                (100000, 1000000000, 0.2, 30.0, 100), (21000, 1, 0.0, 3000.0, 0))]

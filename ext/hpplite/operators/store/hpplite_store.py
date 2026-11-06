@@ -1,6 +1,6 @@
 #!/usr/bin/env python3 -I
 """The reference store for HPPLite nodes, hpplite-store/2 (#213,
-doc/store-buckets.md): a bucket per rollup, kept while its account covers
+doc/store-protocol.md): a bucket per rollup, kept while its account covers
 it. An account belongs to a funding wallet and is paid two ways - x402
 `exact`, started by a payer who is online, and an EIP-2612 permit the store
 pulls with, so storage stays paid while the node is off. Standard library
@@ -983,6 +983,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         def work():
             return 200, self.account_view(self.L.account(funder, create=True))
         return self.x402(funder, amount, "top up %s's account" % funder, work)
+
+
+def write_quote(nbytes, per_write, per_mib_month) -> int:
+    """what a node quotes for a write (store_price): the fee and a month of the bytes' storage, rounded up to a whole
+    unit, in IEEE doubles in this order (the node's hpplite_store_quote; the vectors)"""
+    import math
+    return per_write + math.ceil(per_mib_month * nbytes / MIB * 1.0 - 1e-9)
 
 
 def batch_digest(chain_id, da, instance, height, data):

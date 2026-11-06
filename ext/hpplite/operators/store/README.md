@@ -1,199 +1,80 @@
-# A reference pin service for HPPLite (#125)
+# The reference store for HPPLite, `hpplite-store/2` (#213)
 
 What a storage provider for HPPLite nodes looks like, in one Python file
-with no dependencies beyond the standard library (`../x402seller/eth.py` does
-keccak-256, secp256k1 and EIP-712 in pure Python; slow, and far faster than
-a pin service needs). An HPP operator reads it before running the real
-service; HPPLite's IPFS store adapter (#11) is tested against it.
+with no dependencies beyond the standard library (`../x402seller/` does
+keccak-256, secp256k1, EIP-712, x402 and the chain in pure Python). The
+protocol is [doc/store-protocol.md](../../doc/store-protocol.md); the
+canonical store (hpp-io/hpplite-operators) speaks the same and is checked by
+the same conformance suite (`../conformance`).
 
 ```
-pin_service.py --port 8420 --dir /var/lib/pins --signer-key /etc/pins/key \
-    --pay-to 0xYourWallet --facilitator https://facilitator-sepolia.hpp.io \
-    --network eip155:181228 --asset 0x401eCb1D350407f13ba348573E5630B83638E30D
+hpplite_store.py --port 8420 --dir /var/lib/hpplite-store --signer-key /etc/hpplite-store/key \
+    --pay-to 0xYourWallet --rpc https://sepolia.hpp.io --network eip155:181228 \
+    --facilitator https://facilitator-sepolia.hpp.io     # x402 top-ups; without it, permit pulls only
+
+hpplite_store.py ... --price-per-write 0 --price-per-mib-month 0        # free (development)
 ```
 
-Without `--facilitator` every call is free: the storage and receipt logic
-alone, which is what `selftest.sh` and ctest's `test_pin_service` exercise.
+## The model
 
-## The contract with a node
+- **A bucket per rollup**, named by its DA address, kept while its
+  **account** covers it - no per-item expiry, nothing to renew.
+- **An account per funding wallet**, which may pay for several buckets. Its
+  credit is what was paid in less what was charged. Money comes in by x402
+  `exact` (a payer online: an agent, an "extend now", a write's 402) or by
+  an EIP-2612 permit the store pulls with (the store's own move, so storage
+  stays paid while the node is off). Pulls are simulated first: a refusal
+  for the funder's reasons parks the account's buckets; the store's own
+  failures only warn (`/status` `warnings`).
+- **Writes are the rollup's sequencer's**, signed: a name (`Batch`, as the
+  DA contract takes it), or a content put (`Content` over the bucket, the
+  height and the bytes). A name and a content put of the same bytes are
+  held once.
+- **Charges**: storage (bytes x time at `--price-per-mib-month`, booked at
+  each tick) and `--price-per-write` per write.
+- **States**: covered; parked (not served, 410; writes 402) when the account
+  cannot pay or the funder released it, restorable by paying; deleted
+  `--park-seconds` later.
+- **Pruning** only at a prune point the sequencer signs; bytes in no bucket
+  (an interrupted put) are swept after `--sweep-age`.
+- **The bucket statement**, signed by `--signer-key`: the heights held and
+  covered-until. A node commits it with each anchor.
 
-Four calls. The node (or `../conformance/buyer.py`, the same thing in Python) does them in
-this order and verifies every receipt before it believes it.
+With `--rpc` the store asks the chain who a rollup's sequencer is (bindings,
+writes, prunes: `sequencer()`, so a rotated key takes over at once, #208)
+and whether a name's instance holds the lease (#167); it refuses with 503
+what it cannot check (#198). Without `--rpc` the first binding's sequencer
+keeps the bucket: development and the node's unit tests only. The puller
+(`--spender-key`, the signer's by default) holds a little ETH for the
+pulls' gas.
 
-| Call | Paid | Answer |
-|---|---|---|
-| `POST /put` with the bytes | yes: `pricePerPin` + `pricePerMiBMonth` × size in MiB × retention in 30-day months, rounded up to a whole unit (+ `pricePerByte` × size, 0 by default), buys `retentionSeconds` (#172) | `{cid, bytes, expires, receipt, held}` |
-| `POST /pin/<cid>` | yes, the same price | retention extended, a new `receipt` |
-| `GET /get/<cid>` | no (`--paid-get` to charge) | the bytes |
-| `POST /name/<da>-<height>` with the bytes, then the sequencer instance (32 bytes) and its 65-byte EIP-712 `Batch` signature appended (#165) | no | `{name, bytes, signer}`; 403 when another signer holds the rollup's names, or (with `--rpc`) when the signer is not the coordinator's `sequencerWallet()`; 409 (with `--rpc`) when the instance is not the one the lease names (`sequencerInstance()`): a sequencer that lost the lease, partitioned with the same key, can't write over its successor's names (#167); the same bytes again: 200 |
-| `GET /name/<da>-<height>` | no | the bytes with the instance and the signature appended; `X-HPPLite-Signer` the wallet it recovers to |
-| `GET /status` | no | prices, retention, the **signer** and the receipt's typed-data layout |
+## Layout
 
-- **Idempotent by CID.** A `put` of bytes already held answers 200 with the
-  existing receipt and no 402. A node whose payment settled while the
-  upload failed retries and pays nothing twice.
-- **The CID is CIDv1, raw codec, sha-256, base32** (`bafkrei…`). The same
-  bytes give the same CID at every IPFS provider, so one commitment on
-  chain can be pinned at several (`--kubo http://127.0.0.1:5001` pins on a
-  Kubo node too and refuses to answer a CID Kubo would compute differently).
-- **The receipt is the provider's promise:** an EIP-712 signature by
-  `--signer-key` over `Receipt(bytes32 hash, string cid, uint256 expires)`
-  in the domain `("HPPLitePinService", "1", chainId, payTo)`. `/status`
-  publishes the signer, as HPP's facilitator publishes its signers. A node
-  verifies the receipt (`buyer.receipt_ok`), keeps it, and commits it with
-  the batch (`commitBatch`, #33), so anyone can later show what the provider
-  undertook to hold until when.
-- **Retention is enforced.** Every `--expire-interval` seconds (default an
-  hour) a tick deletes what is past its `expires`: content, and named
-  batches, which are kept for the same `--retention` from their put (#186).
-  A node extends what it still needs with `POST /pin/<cid>`.
-
-## How it keeps its state (#186)
-
-As an object store would, so that several processes on one directory agree
-(the canonical store runs as Worker isolates on one R2 bucket). There is no
-global index; each object's metadata sits beside it:
+A directory standing for an object store:
 
 | Key | Holds |
 |-----|-------|
-| `<cid>` and `<cid>.json` | the bytes; `{bytes, expires, receipt}` |
-| `name-<da>-<height>` and `.json` | the signed batch; `{signer, expires}` (the signer recorded at the put, served as `X-HPPLite-Signer`) |
-| `rollup-<da>` | the first signer of the rollup's names, written only if absent (on R2 a conditional put, or a Durable Object per rollup). Read-after-write consistent: never an eventually consistent store such as Cloudflare KV, or a replica could miss a name just written |
-| `expiry/<day>/<key>` | what expires that UTC day, for the tick |
+| `c/<cid>`, `c/<cid>.refs` | content bytes; `{da: height}`, the buckets holding them |
+| `b/<da>/bucket.json` | the bucket: funder, state, bytes, height, prune point |
+| `b/<da>/n/<height>` | a name: the instance (32 bytes), the signature (65), the bytes' CID |
+| `a/<funder>.json` | the account: credit, the permit, the last pull, why it is uncovered |
 
-A directory from before this, with one `index.json`, is migrated when the
-service starts. `/status` no longer counts what is held: an object store
-cannot count cheaply.
+The reference is one process (its ledger under one lock); the canonical
+store keeps the ledger in Durable Objects.
 
-## What it charges (#172)
+## Tests
 
-`--price-per-mib-month` (default 30 atomic units, so $0.03 per GiB-month:
-R2's $0.015 plus 100%) prices the storage, with fractions allowed; each put
-is rounded up to a whole unit. `--price-per-pin` (default 10 units,
-$0.00001) is per put, whatever its size. `--price-per-byte` (default 0) is
-the price before #172, kept for anyone who set it; the old default of 1
-unit per byte made a megabyte cost $1 and a gigabyte $1,000.
+- `bucket_selftest.sh` (ctest `test_store_buckets`): on anvil, real rollups,
+  MockUSDC's permit (#212) and the mock facilitator - binding, writes, a
+  pull from a wallet with no ETH, a refused pull parking the bucket and a
+  refill covering it again, an x402-only account parked then deleted, the
+  statement, prune, release, the sweep.
+- `edges_selftest.py` (ctest `test_store_edges`): a top-up whose settlement
+  fails is taken back; an unreadable chain answers 503 with nothing held.
+- `../conformance/selftest.sh` (ctest `test_conformance`): the suite, free
+  and paid.
+- The node's store client against it: ctest `test_store`, anvil scenarios
+  19, 20 and 30.
 
-At the defaults, a 2 KB batch kept 30 days costs 11 units: 10 for the put
-and 1 for the storage, rounded up. A database flushing every 5 seconds
-puts 17,280 batches a day, about $6 a month, nearly all of it the per-put
-part. That is the real cost of a payment per put: each `exact` payment is
-a settlement transaction for the facilitator. #135 (x402's
-`batch-settlement`, which HPP's facilitator supports) is what removes it,
-with one deposit and signed vouchers instead of a settlement per put. The
-node's `store_price` quotes a put exactly as the 402 will
-(`hpplite_store_quote`), so `storecap=` can be set from it.
-
-## The x402 seller side, written out
-
-`Handler.paid()` is the whole protocol from the seller's side, which is
-why it is not behind a library:
-
-1. no `PAYMENT-SIGNATURE` header: answer `402` with `PAYMENT-REQUIRED`, a
-   base64 `PaymentRequired` naming the price (`amount`, atomic units of
-   `asset`), `payTo`, the network and the token's EIP-712 domain (`extra`);
-2. with one: decode the `PaymentPayload`, `POST /verify` it to the
-   facilitator with the requirements;
-3. valid: do the work; if the work fails nothing is settled;
-4. `POST /settle`; on success answer 200 with `PAYMENT-RESPONSE`.
-
-No signing happens in the seller. The buyer signs an EIP-3009
-`TransferWithAuthorization` for exactly the quoted amount with a random
-nonce; the facilitator submits it and pays the gas. `hpp-x402 serve
---handler <url>` wraps a plain endpoint in the same dance with no code.
-
-On anvil the facilitator is `../conformance/facilitator_mock.py` (#183),
-which `tests/l1/anvil_test.sh` starts with a key of its own: verify is an
-`eth_call` of `transferWithAuthorization` (the token itself checks the
-signature), settle sends the same call; for batch-settlement it sends the
-escrow's deposit, claim, settle and refund, answers `/verify` with the
-channel's state, and can answer a deposit `settlement_queued` and repeat an
-earlier `/settle` answer, as HPP's does. The service never sends a
-transaction itself.
-`contracts/src/test/MockUSDC.sol` is the token, EIP-3009 with the real
-token's domain, `("Bridged USDC", "2")` (its `name()`; the symbol is USDC.e,
-and HPP's facilitator checks the quoted name against the token). That is anvil scenario 18 (`tests/l1/test_anvil.c`):
-the buyer pays a put and a pin, is refused over its cap before signing,
-and the pay-to wallet ends richer by what settled.
-
-## batch-settlement: a deposit once, a voucher per put (#135)
-
-Each 402 offers x402's `batch-settlement` next to `exact` (`--no-channels`
-turns it off). A node that takes it deposits once into a channel in x402's
-escrow, `x402BatchSettlement` at `0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003`
-on every chain. Its first payment authorizes an ERC-3009
-`receiveWithAuthorization` to the deposit collector, and the facilitator
-sends it. Every put after that carries a signed `Voucher(channelId,
-maxClaimableAmount)` for the node's running total. `channels.py` checks the
-voucher itself, with nothing on the chain:
-- the signature recovers to the channel's `payerAuthorizer`;
-- the total is exactly what it has charged plus this put's price;
-- the total is within the deposit.
-
-A total that doesn't match gets the corrective 402. It carries the channel's
-state and the node's own last voucher, which the node checks before adopting
-the total. A total past the balance is refused, and the node tops up with
-another deposit.
-
-Every `--claim-interval` (default 1 hour), one `claimWithSignature`
-transaction claims all channels charged since the last claim, then `settle`
-moves the money to `--pay-to`. The service signs as `receiverAuthorizer`
-with its receipt key. A channel idle for `--refund-idle` (default 7 days)
-gets back what it holds beyond its charges. All of it runs in
-`Channels.tick()`: the reference calls it from a timer thread, a Worker
-from a Cron Trigger (#185).
-
-The refund matters for a node with no ETH. The escrow's own exit, a timed
-withdrawal after `--withdraw-delay` (default 1 day), must be sent by the
-payer, so it costs gas. The claim interval has to stay well inside the
-withdraw delay, because vouchers not claimed when a withdrawal finishes are
-lost to the service.
-
-Two behaviours of HPP's facilitator are handled here:
-- **A deposit answered `settlement_queued`** (past the facilitator's
-  synchronous window) is being sent, not refused. The service records it as
-  pending and answers at once: a `402` with
-  `invalid_batch_settlement_evm_deposit_pending`, nothing waiting on the
-  chain (#185). The node's next attempt finds it landed, and the voucher is
-  taken with no second deposit; while it hasn't landed (up to 10 minutes) no
-  other deposit is sent for that channel. The service also reads the channel
-  before sending any deposit, and doesn't send one the channel no longer
-  needs.
-- **The facilitator answers a `/settle` body it has already seen** with its
-  earlier result. `settle(receiver, token)` would be the same body every time,
-  so each request carries `extra.requestedAt`.
-
-The per-put fee (`--price-per-pin`) is unchanged. With vouchers it no longer
-pays for a settlement transaction, so an operator can lower it.
-
-`channel_selftest.sh` (ctest `test_pin_service_channels`) runs this on anvil
-against the escrow's bytecode as HPP Sepolia runs it
-(`tests/l1/fixtures/`). A buyer holding MockUSDC and no ETH does the
-following:
-- one deposit for many puts, with no transaction for them;
-- the corrective 402;
-- a voucher from another key, refused;
-- one claim that pays the service exactly what it charged;
-- the service losing its book and taking the chain's claimed total as the
-  baseline;
-- a top-up;
-- an idle refund that gives the buyer back everything not charged.
-
-## Against HPP Sepolia
-
-The real facilitator is `https://facilitator-sepolia.hpp.io`, the asset
-USDC.e (six decimals) at the address above, the network `eip155:181228`.
-The buyer needs USDC.e; `hpp-x402 fund` shows where to send it. Then:
-
-```
-../conformance/buyer.py --service http://host:8420 --key <hex> --cap 50000 put batch.bin
-../conformance/buyer.py --service http://host:8420 --key <hex> status
-```
-
-## Not here, on purpose
-
-Per-byte settlement with the `upto` scheme and batch-settlement channels
-for per-flush volume (HPP's facilitator supports both); a `/commit` relay
-endpoint that submits a signed commitment to the rollup for a node that
-holds no ETH (#126); a bond and a challenge contract that turn the receipt
-into an enforceable promise. Each is a later layer on the four calls above.
+`kubo_mock.py` and `s3_mock.py` stand in for a Kubo node and an S3 bucket,
+the node's other two kinds of store.

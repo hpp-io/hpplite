@@ -2164,7 +2164,7 @@ static void test_relay_no_eth(void) {
     pid_t relay = start_relay(svc, usdc, rport);
 #define STOP_SERVICES() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); } while (0)
     if (relay < 0) { STOP_SERVICES(); FAIL("the relay did not come up (see relay.log)"); }
-    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead: see scenario 18 */
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
     snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&relaycap=200000000&anchor=0", sport, rport);
     sqlite3 *w = open_db("nz_writer.db", ZKEY, extra);
     if (!w) { STOP_SERVICES(); FAIL("open writer"); }
@@ -2297,7 +2297,7 @@ static void test_spend_cap(void) {
         if (!up) usleep(200 * 1000);
     }
     if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the pin service did not come up"); }
-    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead: see scenario 18 */
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
     setenv("HPPLITE_SPEND_CHECK_SECONDS", "1", 1);          /* the warning's rate from a second of history, not five minutes */
 #define SP_FAIL(why) do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); unsetenv("HPPLITE_SPEND_CHECK_SECONDS"); FAIL(why); } while (0)
     /* storepermit=0: every write's 402 is a top-up of 1000 paid by x402 from the funding wallet, two per batch (its bytes, its name) */
@@ -2364,7 +2364,7 @@ static void test_relay_channel(void) {
     pid_t relay = start_relay(svc, usdc, rport);
 #define STOP_SERVICES() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); } while (0)
     if (relay < 0) { STOP_SERVICES(); FAIL("the relay did not come up (see relay.log)"); }
-    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead: see scenario 18 */
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
     snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&relaycap=200000000&relaydeposit=500000000&anchor=0", sport, rport);
     sqlite3 *w = open_db("vr_writer.db", VKEY, extra);
     if (!w) { STOP_SERVICES(); FAIL("open writer"); }

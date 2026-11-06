@@ -14,6 +14,74 @@
    "key": "0x4242424242424242424242424242424242424242424242424242424242424242"
   }
  ],
+ "bucketMessages": {
+  "chainId": 181228,
+  "messages": [
+   {
+    "digest": "0x2bf24041889102cef9a4373e31b009c1758199004a9165613aad83a67f3c8ab8",
+    "fields": [
+     "0xabababababababababababababababababababab",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000000
+    ],
+    "key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+    "signature": "0x6fc7e6292534fd64daf15bde0e11b01532b24133c55f1cc14446f3fb64c50ee97d31161362fcf7e39efc5580870b8ac42d35131c4d8ec3eb1300ec3557e19ef41b",
+    "type": "Bind",
+    "typeString": "Bind(address da,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x48d7639ed94b3e87434fd1fb52bdc916e36e7b075dd69c9da56180d367bfd4c3",
+    "fields": [
+     "0xabababababababababababababababababababab",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000001
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0xbdb2a4d40a5d700c7594948d87ae53a587158380c600b1df21365b434c7883293d47c9a467502b620cff7636937a3a995e37a42ada5d6ba9edf5e9ae31f622ae1b",
+    "type": "Release",
+    "typeString": "Release(address da,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x8303198d42393fa594824f3fb56e928df86baea93862ecb3c614679b852e82f6",
+    "fields": [
+     "0xabababababababababababababababababababab",
+     7,
+     "0x88191be6dab8366fbc7c70a0038058f21932b62c9f7a90dd7b9d120e88358a66"
+    ],
+    "key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+    "signature": "0xe7d37d4c152eef39b847fbafc87e3b43f2b85295a9cc3174b3dda052de05f88867410e49a2a25d6282eb18477f555ad5fb3e116e9a9f8bb8d1d1bada0c5e89a51b",
+    "type": "Content",
+    "typeString": "Content(address da,uint256 height,bytes32 hash)"
+   },
+   {
+    "digest": "0x492de88f7f0141ab1ba07ecd12af4bafe3ded9fd5575c97a28c92b4e00fdfadd",
+    "fields": [
+     "0xabababababababababababababababababababab",
+     5,
+     1800000002
+    ],
+    "key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+    "signature": "0x165494398de0e18cf3e02e0466514567dd654c82efabe72ae9855097f1cf91572ab5b5bb5b32a5d5e66fbc75d663d956e355eebd813d4a1f35010294fda9e3b61c",
+    "type": "Prune",
+    "typeString": "Prune(address da,uint256 height,uint256 issuedAt)"
+   },
+   {
+    "digest": "0xb92c525d7393b1ff2718afee7a3b389e991a973e48d1ed6aebe59d0483efd7b1",
+    "fields": [
+     "0xabababababababababababababababababababab",
+     9,
+     5,
+     18446744073709551615,
+     1800000003
+    ],
+    "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+    "signature": "0x0b9a8ca41cc6057a814de5f8a3a9d2fef93b226159037308b302904f8f512fdc350ab2a0208f2051d06c3c6557d82bff7bd81e1cfc9b105c57f431b82a816a8e1b",
+    "type": "BucketStatement",
+    "typeString": "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
+   }
+  ],
+  "payTo": "0x1111111111111111111111111111111111111111"
+ },
  "channels": {
   "chainId": 181228,
   "channelId": "0x912b1dfd9d6efea0d0b92b6e9de5fa582d5c402047cd3ce42d51f2cd438a96e1",
@@ -110,38 +178,6 @@
    "signer": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c"
   }
  ],
- "receipts": [
-  {
-   "chainId": 181228,
-   "data": "0x6870706c697465",
-   "digest": "0x1f7632b9eb0b49aa454e1878cc4495639cff9b82f0d7205fa5f0833b59e6b269",
-   "expires": 1800000000,
-   "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
-   "payTo": "0x1111111111111111111111111111111111111111",
-   "receipt": {
-    "cid": "bafkreihjpgiqylokrw3ahe3eu4ewx6pz2tupdzlamuaylixswkkiuws7wq",
-    "expires": 1800000000,
-    "hash": "0x610dbfb45f53f8e27e7b8a50693b03a57e10f6d9e5f4398a01a9e90aa02d859a",
-    "signature": "0x4b931b159ea9962748a537aa51dcf8cc02e974f27fe56bdae33a7e53bb726c405ba1fffd41e3c8b208f8402a96c2895c77f95086858f83c78750e9d9ae300c2c1c",
-    "signer": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
-   }
-  },
-  {
-   "chainId": 181228,
-   "data": "0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
-   "digest": "0xf231b7123c02aa709cdefb410fd7821efd16282b3548d5a1a314f529a5242691",
-   "expires": 1800000000,
-   "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
-   "payTo": "0x1111111111111111111111111111111111111111",
-   "receipt": {
-    "cid": "bafkreigucsyilatowbtxqsb3unkwjxeetzsdgwpwt3mxi6dyxjxfjgc35u",
-    "expires": 1800000000,
-    "hash": "0x9d1ff092a1e205a727a9d8ff51db9d07399185e733560cf9107ae14b77d3a080",
-    "signature": "0x439cf4499bd3cdf5740d427f6d36e53ceb763ecd1d7dff7791420821b2b92a6d705ae60f879de7b68bdd90be6eda84419503ec430148fd55b074a3dfa8399fd21b",
-    "signer": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
-   }
-  }
- ],
  "relayCalls": {
   "factoryVersion": 10,
   "selectors": {
@@ -231,63 +267,43 @@
    "signature": "0xcac56d141df5ff2c0a753174826e957b0cf8a762fe3cf26c53a98fd75778dded2f7580be55812874621b40bfb525acde8ccdc71148ebc41eb177487e74e29a6b1c"
   }
  ],
- "storePrices": [
+ "version": 2,
+ "writePrices": [
   {
    "amount": 11,
    "bytes": 183,
-   "pricePerByte": 0,
    "pricePerMiBMonth": 30.0,
-   "pricePerPin": 10,
-   "retentionSeconds": 2592000
+   "pricePerWrite": 10
   },
   {
-   "amount": 13,
+   "amount": 12,
    "bytes": 40000,
-   "pricePerByte": 0,
    "pricePerMiBMonth": 30.5,
-   "pricePerPin": 10,
-   "retentionSeconds": 5184000
+   "pricePerWrite": 10
   },
   {
-   "amount": 194,
+   "amount": 102,
    "bytes": 3145745,
-   "pricePerByte": 0,
    "pricePerMiBMonth": 30.5,
-   "pricePerPin": 10,
-   "retentionSeconds": 5184000
+   "pricePerWrite": 10
   },
   {
    "amount": 30,
    "bytes": 1048576,
-   "pricePerByte": 0,
    "pricePerMiBMonth": 30.0,
-   "pricePerPin": 0,
-   "retentionSeconds": 2592000
+   "pricePerWrite": 0
   },
   {
-   "amount": 2001,
+   "amount": 1000,
    "bytes": 1000,
-   "pricePerByte": 1,
-   "pricePerMiBMonth": 30.0,
-   "pricePerPin": 1000,
-   "retentionSeconds": 60
+   "pricePerMiBMonth": 0.0,
+   "pricePerWrite": 1000
   },
   {
    "amount": 65,
-   "bytes": 26214400,
-   "pricePerByte": 0,
-   "pricePerMiBMonth": 1.1,
-   "pricePerPin": 10,
-   "retentionSeconds": 5184000
-  },
-  {
-   "amount": 175,
    "bytes": 52428800,
-   "pricePerByte": 0,
    "pricePerMiBMonth": 1.1,
-   "pricePerPin": 10,
-   "retentionSeconds": 7776000
+   "pricePerWrite": 10
   }
- ],
- "version": 1
+ ]
 }
