@@ -27,8 +27,12 @@ hpp-io/hpplite-operators docs/console.md.
 - **Covered until**: when the account's credit, plus what the permit can
   still pull, runs out at the current daily cost.
 
-A store must read the chain (`--rpc`): who may write, bind and prune is the
-DA's `sequencerWallet()` as the store follows it (#208).
+A store must read the chain (`--rpc`): who may bind, write and prune is the
+rollup's `sequencer()` - the key its owner names, so a rotation takes effect
+at once (#208); a name also needs the lease (`sequencerWallet()` and
+`sequencerInstance()`, #167). The reference store without `--rpc` keeps a
+bucket for its first binder's sequencer key: development and unit tests
+only.
 
 ## Signatures
 
@@ -62,7 +66,7 @@ supports it: version 2).
 | `GET /bucket/<da>` | - | `200 {da, funder, state, bytes, objects, height, pruneHeight, coveredUntil, statement}` |
 | `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | the sequencer; `402` if not covered | `200 {name, bytes, signer}`: the name is the write - its bytes are held in the bucket |
 | `POST /put?bucket=<da>&height=<n>`, the body the bytes, `X-HPPLite-Signature` the `Content` signature | the sequencer; `402` if not covered | `200 {cid, bytes}` |
-| `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names) |
+| `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names); a name's batch bytes are also read by their CID |
 | `POST /account/<funder>/permit`, body `{value, deadline, v, r, s}` | the funder (the permit) | `200` the account |
 | `POST /account/<funder>/pay?amount=<units>` | x402 `exact` | `200` the account: `credit` raised by the amount |
 | `GET /account/<funder>` | - | `200 {funder, credit, balance, allowance, deadline, dailyCost, coveredUntil, buckets, state}` |
@@ -104,8 +108,9 @@ taken; `410` a read of a parked bucket (the body says what restores it);
 
 ### Charges and pulls
 
-- **Storage** accrues daily per bucket: bytes held x `pricePerMiBMonth` /
-  2^20 / 30, in the asset's atomic units with the fraction carried. At 30
+- **Storage** accrues per bucket for the time its bytes are held: bytes x
+  `pricePerMiBMonth` / 2^20 per 30 days, booked to the account at each of
+  the store's ticks (at least daily), the fraction carried. At 30
   units per MiB-month, 1 GiB is 30,720 units a month ($0.03).
 - **Writes**: `pricePerWrite` per name or content put.
 - **Pulls**, when the account has a permit: the store pulls what is owed

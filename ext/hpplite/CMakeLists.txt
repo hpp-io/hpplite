@@ -343,6 +343,9 @@ if(HPPLITE_BUILD_TESTS)
         # the pin service's x402 batch-settlement (#135) against x402's escrow, HPP Sepolia's bytecode on anvil
         add_test(NAME test_pin_service_channels COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/channel_selftest.sh)
         set_tests_properties(test_pin_service_channels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+        # hpplite-store/2 (#213): buckets, accounts, permit pulls and x402 top-ups on anvil (doc/store-buckets.md)
+        add_test(NAME test_store_buckets COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/bucket_selftest.sh)
+        set_tests_properties(test_store_buckets PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
 
     # === CTest Registration ===
