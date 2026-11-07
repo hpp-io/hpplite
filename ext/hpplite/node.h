@@ -188,6 +188,7 @@ typedef struct HppliteNode {
     unsigned char snapChain[32], snapBlock[32];
     struct cJSON *manifest;         /* a replica: the manifest of the range it is reading */
     uint64_t manifestFrom, manifestTo;
+    char manifestOf[43];            /* ...and whose rollup: the lookup by name reads other rollups' ranges (#234) */
 
     /* Crypto */
     HppliteCrypto *crypto;

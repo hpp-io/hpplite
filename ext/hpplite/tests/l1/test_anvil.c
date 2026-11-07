@@ -2607,6 +2607,50 @@ static void test_snapshots_on_chain(void) {
     PASS();
 }
 
+/* 36. Two named rollups of one wallet whose first ranges have the same bounds (#234): the lookup by name reads
+** batch 1 of each through the range manifest; a cache keyed by the bounds alone served the first rollup's
+** manifest for the second, so the second was "not found" - a verifier had nothing to verify, a sequencer on a
+** fresh file would have created a duplicate. KEY4 (the wallet may hold other rollups from earlier scenarios). */
+static void test_two_rollups_same_range_bounds(void) {
+    TEST("two named rollups of one wallet, each anchored 1-3 (#234): the second is found by its name, and verifies");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    int port = test_free_port();
+    pid_t pid = start_pin_service_free(svc, port);
+    if (pid < 0) FAIL("the store did not come up");
+    static const char *names[] = { "alpha", "beta" };
+    long long rows[2] = { 0, 0 };
+    for (int r = 0; r < 2; r++) {
+        char extra[300], file[64];
+        snprintf(extra, sizeof extra, "&dbname=%s&capture=pages&store=http://127.0.0.1:%d&anchor=0", names[r], port);
+        snprintf(file, sizeof file, "tr_%s.db", names[r]);
+        sqlite3 *w = open_db(file, KEY4, extra);
+        if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("open the sequencer of %s", names[r]); }
+        sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+        for (int b = 0; b < 3; b++) {
+            sqlite3_exec(w, "INSERT INTO n(v) VALUES(hex(randomblob(200)))", NULL, NULL, NULL);
+            if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("a batch through the store"); }
+        }
+        if (scalar(w, "SELECT hpplite_anchor()") != 3) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("%s: the anchor 1-3", names[r]); }
+        rows[r] = scalar(w, "SELECT count(*) FROM n");
+        sqlite3_close(w);
+    }
+    /* the second, by name: found, and its own batches verified (not the first's, served from a cache) */
+    char params[500], out[8192];
+    snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=beta&store=http://127.0.0.1:%d", RPC, FACTORY, KEY4, port);
+    out[0] = 0;
+    int rc = run_verify_with(params, "--keep " DIR "/tr_keep", out, sizeof out);
+    sqlite3 *kept = NULL;
+    long long keptRows = -1;
+    if (sqlite3_open_v2(DIR "/tr_keep/rebuilt.db", &kept, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) keptRows = scalar(kept, "SELECT count(*) FROM n");
+    sqlite3_close(kept);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    printf("(beta: %lld rows, rebuilt %lld) ", rows[1], keptRows);
+    if (rc != 0 || !strstr(out, "\nverified") || keptRows != rows[1]) FAILF("hpplite-verify on the second named rollup: exit %d\n%s", rc, out);
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2654,6 +2698,7 @@ int main(void) {
     if (wanted(33)) test_sealed_to_owner();
     if (wanted(34)) test_verify_at();
     if (wanted(35)) test_snapshots_on_chain();
+    if (wanted(36)) test_two_rollups_same_range_bounds();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

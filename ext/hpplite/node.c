@@ -2540,8 +2540,12 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
         hpplite_l1_range_clear(&r);
         return NULL;
     }
-    if (!node->manifest || node->manifestFrom != r.fromHeight || node->manifestTo != r.toHeight) {
-        /* the manifest, by its digest's CID; it must be the bytes the chain named, and its batches must fold to the anchored chain hash */
+    char of[43] = "", da[43];
+    hpplite_l1_get_addresses(l1, of, da);
+    if (!node->manifest || node->manifestFrom != r.fromHeight || node->manifestTo != r.toHeight || strcmp(node->manifestOf, of) != 0) {
+        /* the manifest, by its digest's CID; it must be the bytes the chain named, and its batches must fold to the anchored chain hash.
+        ** Keyed by the rollup too (#234): the lookup by name reads batch 1 of each of the wallet's rollups through here, and two
+        ** rollups' first ranges have the same bounds more often than not */
         char cid[64], hx[67];
         size_t n = 0;
         uint8_t *text, digest[32];
@@ -2588,6 +2592,7 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
         node->manifest = m;
         node->manifestFrom = r.fromHeight;
         node->manifestTo = r.toHeight;
+        snprintf(node->manifestOf, sizeof node->manifestOf, "%s", of);
     }
     node->anchoredHeight = r.toHeight > node->anchoredHeight ? r.toHeight : node->anchoredHeight;
     b = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(node->manifest, "batches"), (int)(height - r.fromHeight));
