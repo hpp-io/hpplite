@@ -637,7 +637,10 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     char *zOthers = NULL;                 /* the wallet's databases, for the message below (#79) */
     int nUnread = 0;                      /* ...and how many could not be read (#228) */
     int nNoAnswer = 0;                    /* ...of those, because the store did not answer (#229): no new rollup then */
+    int nEmpty = 0;                       /* ...and how many have no batches yet (the wallet's unused primary): not databases (#241) */
+    char *zTail = NULL;                   /* the message's end: what could not be read, and why */
     if (node->store) hpplite_store_take_status(node->store);
+    node->ctx->zQuietError[0] = 0;
     for (i = 0; i < n; i++) {
         char hex[43];
         HppliteL1 *l1;
@@ -649,6 +652,13 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
             uint8_t *data;
             HppliteBatch *b;
             char *zSnap;
+            uint64_t last = 0, total = 0;
+            unsigned char latest[32];
+            if (hpplite_l1_get_da_state(l1, &last, &total, latest) == 0 && last == 0) {
+                nEmpty++;                            /* nothing to read: no batch names it (#241) */
+                hpplite_l1_disconnect(l1);
+                continue;
+            }
             node->ctx->quiet = 1;                    /* another rollup's bytes, or ours pruned: not this open's failure (#228) */
             data = node_fetch_bytes(node, l1, 1, &len);
             b = data ? node_decode_batch(node, 1, data, len) : NULL;
@@ -676,6 +686,9 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     }
     sqlite3_free(all);
     if (n < 0) { sqlite3_free(zOthers); return 0; }   /* could not list: do not create a second one */
+    zTail = sqlite3_mprintf("%s%s", nUnread ? "; some could not be read: " : "",
+                            nUnread ? (node->ctx->zQuietError[0] ? node->ctx->zQuietError : "(no reason recorded)") : "");
+    if (nEmpty) zTail = sqlite3_mprintf("%z; %d rollup%s with no batches", zTail, nEmpty, nEmpty == 1 ? "" : "s");
     /* The factory makes a wallet's first rollup its primary - the one an
     ** unnamed database uses. A named database's must never be it: the
     ** primary comes first (getOrCreateRollup is idempotent, also when two
@@ -695,12 +708,12 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
             }
             sqlite3_free(txHash);
         }
-        if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) != 1) return 0;
+        if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) != 1) { sqlite3_free(zOthers); sqlite3_free(zTail); return 0; }
     }
     if (node->config.verifyOnly) {
-        hpplite_error(node->ctx, "role=verify: no rollup of this wallet is database \"%s\" (its databases: %s%s%s); nothing to verify",
-                      zName, zOthers ? zOthers : "none named", nUnread ? "; some could not be read: " : "", nUnread ? node->ctx->zQuietError : "");
-        sqlite3_free(zOthers);
+        hpplite_error(node->ctx, "role=verify: no rollup of this wallet is database \"%s\" (its databases: %s%s); nothing to verify",
+                      zName, zOthers ? zOthers : "none named", zTail);
+        sqlite3_free(zOthers); sqlite3_free(zTail);
         return 0;
     }
     if (nNoAnswer) {
@@ -709,13 +722,13 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
         hpplite_error(node->ctx, "no rollup of this wallet is database \"%s\" among those readable (its databases: %s), and %d could not be read"
                       " because the store did not answer (%s): not creating one until it does",
                       zName, zOthers ? zOthers : "none named", nNoAnswer, node->ctx->zQuietError);
-        sqlite3_free(zOthers);
+        sqlite3_free(zOthers); sqlite3_free(zTail);
         return 0;
     }
     /* a misspelt name would be a new database: say which exist (#79) */
-    fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet (its databases: %s%s%s); creating one\n",
-            zName, zOthers ? zOthers : "none named", nUnread ? "; some could not be read: " : "", nUnread ? node->ctx->zQuietError : "");
-    sqlite3_free(zOthers);
+    fprintf(stderr, "hpplite: no rollup of this wallet is database \"%s\" yet (its databases: %s%s); creating one\n",
+            zName, zOthers ? zOthers : "none named", zTail);
+    sqlite3_free(zOthers); sqlite3_free(zTail);
     if (node->relay) {
         int rc = hpplite_l1_factory_create_rollup_for(config->rpcUrl, factoryHex, config->privkey, node->relay,
                                                       config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100, rollup);

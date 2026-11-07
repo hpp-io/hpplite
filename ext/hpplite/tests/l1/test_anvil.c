@@ -2636,7 +2636,13 @@ static void test_two_rollups_same_range_bounds(void) {
         char extra[300], file[64];
         snprintf(extra, sizeof extra, "&dbname=%s&capture=pages&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms", names[r], port);   /* a snapshot at 3, nothing pruned (#239) */
         snprintf(file, sizeof file, "tr_%s.db", names[r]);
+        char errPath[200];
+        int saved = dup(2), fd;
+        snprintf(errPath, sizeof errPath, DIR "/tr_open_%s.err", names[r]);
+        fd = open(errPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        fflush(stderr); dup2(fd, 2); close(fd);                /* what the open says (#241) */
         sqlite3 *w = open_db(file, KEY4, extra);
+        fflush(stderr); dup2(saved, 2); close(saved);
         if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("open the sequencer of %s", names[r]); }
         sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
         for (int b = 0; b < 3; b++) {
@@ -2647,6 +2653,14 @@ static void test_two_rollups_same_range_bounds(void) {
         rows[r] = scalar(w, "SELECT count(*) FROM n");
         if (r == 1) snprintf(betaContract, sizeof betaContract, "%s", status_text(w, "contract"));
         sqlite3_close(w);
+    }
+    {
+        /* #241: creating beta, the lookup read alpha and the wallet's empty primary rollup: the message names alpha
+        ** and says a rollup has no batches - nothing 'could not be read', no empty reason */
+        char said[2048] = "";
+        FILE *f = fopen(DIR "/tr_open_beta.err", "r");
+        if (f) { size_t got = fread(said, 1, sizeof said - 1, f); said[got] = 0; fclose(f); }
+        if (!strstr(said, "creating one") || strstr(said, "could not be read") || !strstr(said, "no batches")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("creating beta should say which databases exist and that one rollup has no batches, nothing unreadable:\n%s", said); }
     }
     /* the second, by name: found, and its own batches verified (not the first's, served from a cache) */
     char params[500], out[8192];
