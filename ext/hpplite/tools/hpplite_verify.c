@@ -219,7 +219,8 @@ open_again:
     { char to[40] = "";
       if (stopAt) snprintf(to, sizeof to, "&syncto=%llu", (unsigned long long)stopAt);    /* the stop, from the first sync at open */
       else if (atMs) snprintf(to, sizeof to, "&syncat=%llu", (unsigned long long)atMs);
-      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s&%s%s%s%s", dir, dir, params, zCapture, to, zFrom);
+      /* the retry's capture= and from= before the user's params: the first of a key wins (#239) */
+      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s%s%s%s&%s", dir, dir, zCapture, to, zFrom, params);
       db = uri ? hpplite_open(uri) : NULL;
       sqlite3_free(uri); }
     if (!db) {
@@ -292,8 +293,14 @@ open_again:
     }
     printf("rollup %s: %llu batches on chain, %llu replayed", contract, (unsigned long long)onChain, (unsigned long long)rebuilt);
     if (stopAt) printf(" (--to %llu)", (unsigned long long)stopAt);
-    if (fromSnap > 0) printf("\nverified from the snapshot at %lld: the batches below it are pruned at the store (keep=); its root is the one the chain anchored there, and %llu batches were replayed after it",
-                             (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
+    if (fromSnap > 0 && rebuilt >= target) {
+        /* a prune is claimed only when batch 1 could not be read and the retry from the oldest snapshot did it (#239);
+        ** from=snapshot given on a whole history started there by choice */
+        if (triedSnapshot) printf("\nverified from the snapshot at %lld: the batches below it are pruned at the store (keep=); its root is the one the chain anchored there, and %llu batches were replayed after it",
+                                  (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
+        else printf("\nstarted from the snapshot at %lld (from=): its root is the one the chain anchored there, and %llu batches were replayed after it; the batches below it were not replayed",
+                    (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
+    }
     else if (triedSnapshot && (stopAt || atMs)) printf("\nthe batches before the oldest snapshot the store keeps are pruned (keep=): the database as of an earlier height or time cannot be rebuilt");
     if (atMs) {
         char want[40], wrote[40];

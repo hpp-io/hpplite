@@ -663,8 +663,9 @@ check, every step since genesis - is only possible on a rollup without
 `keep=`, and `hpplite-verify` does it whenever batch 1 is there. The two
 defaults follow from this: a replica starts from the latest snapshot (it
 wants the state, fast); a verifier starts from batch 1 unless `from=` says
-otherwise, and falls back to the oldest snapshot kept only when batch 1 is
-pruned.
+otherwise (then the report says `started from the snapshot at <h>`, and
+claims nothing about a prune), and falls back to the oldest snapshot kept
+only when batch 1 is pruned.
 A verifier never posts, never claims the lease and never creates a rollup;
 `role=verify` is also usable from any connection that only wants to audit.
 It needs the wallet key (batches are encrypted); a viewing key is v0.3 (#15).

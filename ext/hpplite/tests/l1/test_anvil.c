@@ -2590,6 +2590,14 @@ static void test_snapshots_on_chain(void) {
     rc = run_verify_with(params, "--to 2", out, sizeof out);
     if (rc == 0 || !strstr(out, "cannot be rebuilt")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("--to 2, below the snapshot kept: exit %d\n%s", rc, out); }
     {
+        /* #239: from=genesis in the user's params does not win over the retry's from=earliest */
+        char fromGenesis[600];
+        snprintf(fromGenesis, sizeof fromGenesis, "%s&from=genesis", params);
+        out[0] = 0;
+        rc = run_verify_with(fromGenesis, "", out, sizeof out);
+        if (rc != 0 || !strstr(out, "verified from the snapshot at 5")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("with from=genesis given, the pruned history still verifies from the oldest snapshot: exit %d\n%s", rc, out); }
+    }
+    {
         /* a new replica of the named rollup: found by the name its snapshot carries (#226), from the snapshot -
         ** and the lookup's reads of batch 1, pruned, say nothing on stderr (#228) */
         char rx[300], err[4096] = "";
@@ -2626,7 +2634,7 @@ static void test_two_rollups_same_range_bounds(void) {
     char betaContract[64] = "";
     for (int r = 0; r < 2; r++) {
         char extra[300], file[64];
-        snprintf(extra, sizeof extra, "&dbname=%s&capture=pages&store=http://127.0.0.1:%d&anchor=0", names[r], port);
+        snprintf(extra, sizeof extra, "&dbname=%s&capture=pages&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms", names[r], port);   /* a snapshot at 3, nothing pruned (#239) */
         snprintf(file, sizeof file, "tr_%s.db", names[r]);
         sqlite3 *w = open_db(file, KEY4, extra);
         if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("open the sequencer of %s", names[r]); }
@@ -2649,9 +2657,18 @@ static void test_two_rollups_same_range_bounds(void) {
     long long keptRows = -1;
     if (sqlite3_open_v2(DIR "/tr_keep/rebuilt.db", &kept, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) keptRows = scalar(kept, "SELECT count(*) FROM n");
     sqlite3_close(kept);
-    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     printf("(beta: %lld rows, rebuilt %lld) ", rows[1], keptRows);
-    if (rc != 0 || !strstr(out, "\nverified") || keptRows != rows[1]) FAILF("hpplite-verify on the second named rollup: exit %d\n%s", rc, out);
+    if (rc != 0 || !strstr(out, "\nverified") || keptRows != rows[1]) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("hpplite-verify on the second named rollup: exit %d\n%s", rc, out); }
+    {
+        /* #239: told from=snapshot on a history nothing pruned, the report says it started from the snapshot
+        ** and claims no prune (only the retry after an unreadable batch 1 may say 'pruned at the store') */
+        char fromSnap[600];
+        snprintf(fromSnap, sizeof fromSnap, "%s&from=snapshot", params);
+        out[0] = 0;
+        rc = run_verify_with(fromSnap, "", out, sizeof out);
+        if (rc != 0 || !strstr(out, "started from the snapshot at 3") || strstr(out, "pruned")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("from=snapshot on an unpruned history: exit %d, must say it started from the snapshot at 3 and not claim a prune\n%s", rc, out); }
+    }
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     {
         /* #229: a sequencer on a fresh file while the store does not answer cannot tell its rollup from the others'
         ** - it must not create a second one under the name; it writes locally and finds its own when the store is
