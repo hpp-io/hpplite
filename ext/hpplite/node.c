@@ -2116,10 +2116,12 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
         nb.pageSize = (unsigned)hpplite_pagemode_page_size(node->pm);
         memcpy(nb.root, root, 32);
         nb.zName = ctx->zDbName; nb.nName = (unsigned)strlen(ctx->zDbName);
+        const char *zNameWhy = "the name could not be sealed";
         nbytes = hpplite_pagebatch_encode(&nb, &nlen);
         nsealed = nbytes ? node_seal_at(node, height, nbytes, nlen, 1, &slen) : NULL;
         sqlite3_free(nbytes);
         if (nsealed) {
+            zNameWhy = hpplite_store_error(node->store);
             char *zReceipt = NULL;
             zRef = hpplite_store_put_at(node->store, height, nsealed, slen, &zReceipt);
             sqlite3_free(zReceipt);
@@ -2132,6 +2134,13 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
                 sqlite3_free(zRef); zRef = NULL;
             }
             free(nsealed);
+        }
+        if (!cJSON_GetObjectItemCaseSensitive(ix, "name")) {
+            /* without the name a pruned rollup could not be found by dbname= (#226), silently (#235): no snapshot
+            ** this anchor; the next one tries again */
+            hpplite_error(ctx, "snapshot at %llu: the store did not take its name: %s", (unsigned long long)height,
+                          zNameWhy);
+            goto done;
         }
     }
     text = cJSON_PrintUnformatted(ix);

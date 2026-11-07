@@ -87,6 +87,7 @@ typedef struct TestNodeOpts {
     int determinismWarn;                     /* warn about non-deterministic SQL instead of refusing it */
     int captureText;                         /* statement capture, as v0.1 */
     int capturePages;                        /* page capture (#146); also from HPPLITE_CAPTURE=pages */
+    const char *dbName;                      /* dbname= (#61): its own rollup among the wallet's, named in its first batch and its snapshots */
     int noSync;                              /* attach the L1 without syncing from it first */
     int start;                               /* start the node even without an L1 */
     const char *nodeId;                      /* NULL: the suite's */

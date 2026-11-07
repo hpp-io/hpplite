@@ -163,6 +163,7 @@ HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpt
     config.determinismWarn = o->determinismWarn;
     config.captureText = o->captureText;
     config.capturePages = o->capturePages || (!o->captureText && test_pages_mode());   /* HPPLITE_CAPTURE=pages runs a suite in page mode (#146) */
+    config.dbName = (char *)o->dbName;
     config.storeUrl = (char *)o->storeUrl;
     config.snapshotIntervalMs = o->snapshotMs;
     config.fromSnapshot = o->fromSnapshot;

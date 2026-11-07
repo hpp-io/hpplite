@@ -824,10 +824,11 @@ static void test_keep(const char *url) {
 }
 
 /* a store of this test's own, on a port and directory it chooses, so it can be killed and started again */
-static pid_t start_store_at(const char *dir, int port, const char *storeDir) {
-    char portStr[16], keyPath[600], script[600];
+static pid_t start_store_at(const char *dir, int port, const char *storeDir, int failPut) {
+    char portStr[16], keyPath[600], script[600], failStr[16];
     pid_t pid;
     snprintf(portStr, sizeof portStr, "%d", port);
+    snprintf(failStr, sizeof failStr, "%d", failPut);
     snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
     snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
     pid = fork();
@@ -836,6 +837,7 @@ static pid_t start_store_at(const char *dir, int port, const char *storeDir) {
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", storeDir, "--signer-key", keyPath,
                "--pay-to", "0x1111111111111111111111111111111111111111", "--price-per-write", "0", "--price-per-mib-month", "0",
+               "--fail-put", failStr,                      /* a test hook: the k-th content put answers 503; 0 none */
                (char *)NULL);
         _exit(127);
     }
@@ -872,7 +874,7 @@ static void test_store_down_at_open(const char *dir) {
     hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
     hpplite_node_exec(w, "INSERT INTO t(v) VALUES('written while the store was down')", NULL);
     h1 = hpplite_node_flush_batch(w);                      /* waits: storefallback=off */
-    pid = start_store_at(dir, port, storeDir);
+    pid = start_store_at(dir, port, storeDir, 0);
     if (pid < 0) { hpplite_node_destroy(w); FAIL("the test's store did not start"); }
     h2 = hpplite_node_flush_batch(w);                      /* the first put after the store answers */
     snprintf(err, sizeof err, "%s", w->ctx->zLastError ? w->ctx->zLastError : "");
@@ -927,7 +929,7 @@ static void test_restart_store_down(const char *dir) {
     char zIndex[64];
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/sd_pins", test_dir());
-    pid = start_store_at(dir, port, storeDir);
+    pid = start_store_at(dir, port, storeDir, 0);
     if (pid < 0) FAIL("the test's store did not start");
     memset(&o, 0, sizeof o);
     o.storeUrl = url; o.nodeId = "sd_w"; o.privkey = kseq; o.capturePages = 1; o.snapshotMs = 1; o.keepSeconds = 3600; o.storeFallbackOff = 1;
@@ -953,7 +955,7 @@ static void test_restart_store_down(const char *dir) {
     w = test_open_node(tpath("sd_w.db"), l1, &o);
     if (!w) { hpplite_store_close(rs); FAIL("reopen"); }
     if (hpplite_node_anchor(w) == 6) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor with the store down should not land"); }
-    pid = start_store_at(dir, port, storeDir);                 /* the same bytes, back */
+    pid = start_store_at(dir, port, storeDir, 0);                 /* the same bytes, back */
     if (pid < 0) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the test's store did not come back"); }
     sleep(2);
     {
@@ -968,6 +970,58 @@ static void test_restart_store_down(const char *dir) {
     hpplite_l1_disconnect(l1);
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     if (n != 2 || earlier[0] != 3 || earlier[1] != 5) FAIL("the manifest at 6 names the snapshots at 3 and 5 as earlier: the restart learnt them once the store answered");
+    PASS();
+}
+
+
+/* the index at the store names a "name" object (#226) */
+static int index_has_name(HppliteStore *rs, const char *zIndex) {
+    size_t n = 0;
+    uint8_t *text = hpplite_store_get(rs, zIndex, &n);
+    cJSON *ix = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
+    int has = ix && cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(ix, "name"));
+    free(text); cJSON_Delete(ix);
+    return has;
+}
+
+/* 6h. A snapshot whose name object the store did not take is not made (#235): an index without the name would
+** leave the rollup unfindable by dbname= once a prune takes batch 1 (#226), with nothing said */
+static void test_snapshot_name_refused(const char *dir) {
+    TEST("a snapshot whose name object the store refuses is not made (#235): the anchor names none and says why; the next anchor makes one that carries the name");
+    int port = test_free_port();
+    char url[64], storeDir[600], zIndex[64];
+    uint64_t h = 0;
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x7f };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o;
+    HppliteNode *w;
+    HppliteStore *rs;
+    int got;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/nr_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 5);              /* content puts: batches 1-3, then the chunk (4), the name (5), the index */
+    if (pid < 0) FAIL("the test's store did not start");
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "nr_w"; o.privkey = kseq; o.capturePages = 1; o.snapshotMs = 1; o.keepSeconds = 3600; o.dbName = "named";
+    w = test_open_node(tpath("nr_w.db"), l1, &o);
+    rs = hpplite_store_open(url, NULL, 0);
+    if (!w || !rs) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (int i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('first three')", NULL); if (hpplite_node_flush_batch(w) == 0) { hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("a batch at the store"); } }
+    if (hpplite_node_anchor(w) != 3) { printf("(%s) ", w->ctx->zLastError); hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor 1-3"); }
+    got = range_snapshot(l1, rs, 3, &h, zIndex);
+    if (got == 0) { printf("(snapshot at %llu, name %s) ", (unsigned long long)h, index_has_name(rs, zIndex) ? "present" : "missing"); hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor must name no snapshot: the store refused the name object"); }
+    sleep(2);
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four')", NULL); hpplite_node_flush_batch(w);
+    if (hpplite_node_anchor(w) != 4 || range_snapshot(l1, rs, 4, &h, zIndex) != 0 || h != 4) { printf("(%s) ", w->ctx->zLastError); hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the next anchor makes a snapshot at 4"); }
+    got = index_has_name(rs, zIndex);
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_store_close(rs);
+    hpplite_l1_disconnect(l1);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (!got) FAIL("the snapshot at 4 carries the name");
     PASS();
 }
 
@@ -1341,6 +1395,7 @@ int main(int argc, char **argv) {
     test_keep(url);
     test_store_down_at_open(dir);
     test_restart_store_down(dir);
+    test_snapshot_name_refused(dir);
     test_anchor_timer(url);
     test_recovery(url);
     test_soft_replica(url);

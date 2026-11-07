@@ -522,6 +522,7 @@ class Ledger:
 class Service:
     def __init__(self, args):
         self.args = args
+        self.puts = 0                     # content puts seen (the --fail-put test hook)
         self.disk = Disk(args.dir)
         with open(args.signer_key) as f:
             key = bytes.fromhex(f.read().strip().replace("0x", ""))
@@ -887,6 +888,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def post_put(self, query, body):
         da = (query.get("bucket") or [""])[0].lower()
+        self.service.puts += 1
+        if self.service.args.fail_put and self.service.puts == self.service.args.fail_put:
+            return self.reply(503, {"error": "test hook: this put is refused (--fail-put)"})
         try:
             height = int((query.get("height") or [""])[0])
         except ValueError:
@@ -1035,6 +1039,7 @@ def main():
     ap.add_argument("--sweep-age", type=int, default=3600, help="bytes in no bucket older than this are swept")
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--fail-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th content put answers 503
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     args.pay_to = args.pay_to.lower()
