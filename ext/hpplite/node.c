@@ -1964,6 +1964,12 @@ static cJSON *node_range_manifest_on(HppliteNode *node, HppliteL1 *l1, uint64_t 
 
 static cJSON *node_range_manifest(HppliteNode *node, uint64_t height) { return node_range_manifest_on(node, node->l1, height); }
 
+/* a 32-byte hex field of a manifest or index (#240): a string, 0x and 64 hex digits (or the 64 alone); never read
+** past a short one */
+static int json_hex32(const cJSON *j, unsigned char out[32]) {
+    return cJSON_IsString(j) && j->valuestring && hpplite_hex_to_bytes(j->valuestring, out, 32) == 32;
+}
+
 /* the snapshot a manifest names: 0 and its height, -1 none */
 static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex[64], int64_t *pAt, unsigned char sha[32]) {
     const cJSON *sn = m ? cJSON_GetObjectItemCaseSensitive(m, "snapshot") : NULL;
@@ -1972,7 +1978,7 @@ static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex
     const cJSON *at = sn ? cJSON_GetObjectItemCaseSensitive(sn, "at") : NULL;
     const cJSON *sh = sn ? cJSON_GetObjectItemCaseSensitive(sn, "sha256") : NULL;
     if (!cJSON_IsNumber(h) || h->valuedouble < 1 || !cJSON_IsString(ix) || strlen(ix->valuestring) >= 64
-        || !cJSON_IsString(sh) || strlen(sh->valuestring) != 66 || hpplite_hex_to_bytes(sh->valuestring + 2, sha, 32) != 32) return -1;
+        || !json_hex32(sh, sha)) return -1;
     *pHeight = (uint64_t)h->valuedouble;
     snprintf(zIndex, 64, "%s", ix->valuestring);
     if (pAt) *pAt = cJSON_IsNumber(at) ? (int64_t)at->valuedouble : 0;
@@ -2033,7 +2039,7 @@ static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1) {
     nm = ix ? cJSON_GetObjectItemCaseSensitive(ix, "name") : NULL;
     ref = nm ? cJSON_GetObjectItemCaseSensitive(nm, "ref") : NULL;
     sha = nm ? cJSON_GetObjectItemCaseSensitive(nm, "sha256") : NULL;
-    if (!cJSON_IsString(ref) || !cJSON_IsString(sha) || strlen(sha->valuestring) != 66 || hpplite_hex_to_bytes(sha->valuestring + 2, latest, 32) != 32) goto done;
+    if (!cJSON_IsString(ref) || !json_hex32(sha, latest)) goto done;
     bytes = hpplite_store_get(node->store, ref->valuestring, &n);
     if (!bytes) goto done;
     hpplite_store_sha256(bytes, n, d);
@@ -2350,7 +2356,7 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
                     *jn = cJSON_GetObjectItemCaseSensitive(ix, "bytes");
         chunks = cJSON_GetObjectItemCaseSensitive(ix, "chunks");
         if (!cJSON_IsNumber(jh) || (uint64_t)jh->valuedouble != h || !cJSON_IsString(jr) || !cJSON_IsString(jc) || !cJSON_IsString(jb) || !cJSON_IsNumber(jn) || !cJSON_IsArray(chunks)
-            || hpplite_hex_to_bytes(jr->valuestring + 2, root, 32) != 32 || hpplite_hex_to_bytes(jc->valuestring + 2, chain, 32) != 32 || hpplite_hex_to_bytes(jb->valuestring + 2, block, 32) != 32)
+            || !json_hex32(jr, root) || !json_hex32(jc, chain) || !json_hex32(jb, block))
             why = "its index is malformed";
         else if (hpplite_l1_get_range(node->l1, h, &r) != 0 || r.toHeight != h) why = "no range commitment ends at its height";
         else if (memcmp(r.stateRoot, root, 32) != 0) why = "its root is not the one the chain anchored there";
@@ -2363,7 +2369,7 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
             const cJSON *ref = cJSON_GetObjectItemCaseSensitive(c, "ref"), *sha = cJSON_GetObjectItemCaseSensitive(c, "sha256");
             unsigned char d[32];
             uint8_t *part = NULL, *grown;
-            if (cJSON_IsString(ref) && cJSON_IsString(sha) && strlen(sha->valuestring) == 66 && hpplite_hex_to_bytes(sha->valuestring + 2, d, 32) == 32)
+            if (cJSON_IsString(ref) && json_hex32(sha, d))
                 part = node_store_get_checked(node, ref->valuestring, d, &n);
             if (!part) { why = "a chunk is not at the store, or not the one the index names"; break; }
             grown = realloc(all, total + n);
@@ -2620,7 +2626,7 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
         free(text);
         arr = m ? cJSON_GetObjectItemCaseSensitive(m, "batches") : NULL;
         cb = m ? cJSON_GetObjectItemCaseSensitive(m, "chain_before") : NULL;
-        if (!arr || !cJSON_IsArray(arr) || !cJSON_IsString(cb) || hpplite_hex_to_bytes(cb->valuestring + 2, chain, 32) != 32) {
+        if (!arr || !cJSON_IsArray(arr) || !json_hex32(cb, chain)) {
             hpplite_error(node->ctx, "range %llu-%llu: the manifest is malformed", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight);
             cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
         }
@@ -2633,7 +2639,7 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
         }
         cJSON_ArrayForEach(e, arr) {
             const cJSON *hh = cJSON_GetObjectItemCaseSensitive(e, "h"), *hs = cJSON_GetObjectItemCaseSensitive(e, "hash");
-            if (!cJSON_IsNumber(hh) || (uint64_t)hh->valuedouble != h || !cJSON_IsString(hs) || hpplite_hex_to_bytes(hs->valuestring + 2, hash, 32) != 32) {
+            if (!cJSON_IsNumber(hh) || (uint64_t)hh->valuedouble != h || !json_hex32(hs, hash)) {
                 hpplite_error(node->ctx, "range %llu-%llu: the manifest does not name batch %llu in order", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, (unsigned long long)h);
                 cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
             }
@@ -2657,7 +2663,7 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
     e = b ? cJSON_GetObjectItemCaseSensitive(b, "ref") : NULL;
     zRef = cJSON_IsString(e) ? e->valuestring : NULL;
     e = b ? cJSON_GetObjectItemCaseSensitive(b, "hash") : NULL;
-    if (!zRef || !cJSON_IsString(e) || hpplite_hex_to_bytes(e->valuestring + 2, want, 32) != 32) { hpplite_l1_range_clear(&r); return NULL; }
+    if (!zRef || !json_hex32(e, want)) { hpplite_l1_range_clear(&r); return NULL; }
     data = hpplite_store_get(node->store, zRef, pLen);
     if (!data) {
         hpplite_error(node->ctx, "batch %llu: the store has no %s: %s", (unsigned long long)height, zRef, hpplite_store_error(node->store));

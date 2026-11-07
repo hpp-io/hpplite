@@ -877,7 +877,7 @@ static void test_store_down_at_open(const char *dir) {
     pid = start_store_at(dir, port, storeDir, 0);
     if (pid < 0) { hpplite_node_destroy(w); FAIL("the test's store did not start"); }
     h2 = hpplite_node_flush_batch(w);                      /* the first put after the store answers */
-    snprintf(err, sizeof err, "%s", w->ctx->zLastError ? w->ctx->zLastError : "");
+    snprintf(err, sizeof err, "%s", w->ctx->zLastError);
     printf("(down: %llu; up: %llu) ", (unsigned long long)h1, (unsigned long long)h2);
     hpplite_node_destroy(w);
     hpplite_l1_disconnect(l1);
@@ -1024,6 +1024,51 @@ static void test_snapshot_name_refused(const char *dir) {
     if (!got) FAIL("the snapshot at 4 carries the name");
     PASS();
 }
+
+/* 9b. A manifest whose hex field is too short (#240): refused as malformed, never read past its end */
+static void test_manifest_short_hex(const char *url) {
+    TEST("ranges: a manifest with a hex field shorter than its prefix (chain_before: \"\") is refused as malformed, not read past its end (#240)");
+    static const unsigned char kseq[32] = { [31] = 0x6a };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "short_w", .privkey = kseq };
+    HppliteNode *w = test_open_node(tpath("short_w.db"), l1, &o);
+    HppliteRange bad;
+    char *tx, *zRef, *text;
+    unsigned char digest[32];
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(v); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) < 1 || hpplite_node_anchor(w) != 1) { hpplite_node_destroy(w); FAIL("batch 1 anchored"); }
+    hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { hpplite_node_destroy(w); FAIL("batch 2 at the store"); }
+    /* the manifest of 2-2 as a sequencer bug might write it: chain_before an empty string; the chain names its digest */
+    text = sqlite3_mprintf("{\"v\":1,\"batches\":[{\"h\":2,\"hash\":\"0x%064d\",\"ref\":\"nothing\"}],\"from\":2,\"to\":2,\"chain_before\":\"\",\"chain_after\":\"0x%064d\",\"root\":\"0x%064d\"}", 0, 0, 0);
+    hpplite_store_sha256((const uint8_t *)text, strlen(text), digest);
+    zRef = hpplite_store_put_at(w->store, 2, (const uint8_t *)text, strlen(text), NULL);
+    if (!zRef) { printf("(%s) ", hpplite_store_error(w->store)); sqlite3_free(text); hpplite_node_destroy(w); FAIL("the crafted manifest at the store"); }
+    sqlite3_free(zRef); sqlite3_free(text);
+    memset(&bad, 0, sizeof bad);
+    bad.fromHeight = 2; bad.toHeight = 2;
+    memcpy(bad.manifestDigest, digest, 32);
+    tx = hpplite_l1_commit_range(l1, w->instanceId, &bad);
+    if (!tx) { hpplite_node_destroy(w); FAIL("the mock should take the range"); }
+    sqlite3_free(tx);
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .noSync = 1, .nodeId = "short_r", .privkey = kseq };
+        HppliteNode *rp = test_open_node(tpath("short_r.db"), l1, &ro);
+        int synced = rp ? hpplite_node_sync_from_l1(rp, 1) : -2;
+        char err[300];
+        snprintf(err, sizeof err, "%s", rp ? status_text(rp->db, "last_error") : "");
+        if (rp) { rp->l1 = NULL; hpplite_node_destroy(rp); }
+        printf("(synced %d, '%.80s') ", synced, err);
+        if (!strstr(err, "malformed")) { hpplite_node_destroy(w); FAIL("the manifest is refused as malformed"); }
+    }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+
 
 static void test_ranges_restart(const char *url) {
     TEST("ranges: a run that dies with batches at the store leaves rows for the chain; the next run anchors them before its own; a manifest with a swapped hash is refused");
@@ -1396,6 +1441,7 @@ int main(int argc, char **argv) {
     test_store_down_at_open(dir);
     test_restart_store_down(dir);
     test_snapshot_name_refused(dir);
+    test_manifest_short_hex(url);
     test_anchor_timer(url);
     test_recovery(url);
     test_soft_replica(url);
