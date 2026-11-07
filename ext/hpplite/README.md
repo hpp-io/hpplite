@@ -752,7 +752,10 @@ names a `dbname=` database (#160), goes too: the index's `name` - the name
 sealed like a batch, as a page batch with no pages - is where a named
 lookup finds it then (#226). The bucket then holds the database about once per
 snapshot kept plus the window's batches. With `keep=all` (the default)
-nothing is pruned and snapshots only speed replicas up.
+nothing is pruned and snapshots only speed replicas up - and each one
+stays in the bucket, paid for, the replaced ones named by nothing (#242):
+`snapshot=` without `keep=` multiplies the bucket by the number of
+snapshots made, so give it a `keep=` unless the history must stay whole.
 
 Each batch is also stored **under its rollup's name**, `<da contract hex>-<height>`,
 with the sequencer's EIP-712 `Batch` signature appended (#165: the one
