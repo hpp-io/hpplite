@@ -1025,6 +1025,7 @@ static void test_snapshot_name_refused(const char *dir) {
     PASS();
 }
 
+
 /* 9b. A manifest whose hex field is too short (#240): refused as malformed, never read past its end */
 static void test_manifest_short_hex(const char *url) {
     TEST("ranges: a manifest with a hex field shorter than its prefix (chain_before: \"\") is refused as malformed, not read past its end (#240)");
@@ -1069,6 +1070,52 @@ static void test_manifest_short_hex(const char *url) {
 }
 
 
+/* the objects the store holds in the rollup's bucket (GET /bucket/<da>), -1 unknown */
+static long long bucket_objects(const char *url, HppliteL1 *l1) {
+    char c[43], d[43], cmd[300], out[2000] = "";
+    const char *p;
+    FILE *f;
+    if (hpplite_l1_get_addresses(l1, c, d) != 0) return -1;
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/bucket/%s", url, d[0] ? d : c);
+    f = popen(cmd, "r");
+    if (!f) return -1;
+    (void)!fread(out, 1, sizeof out - 1, f);
+    pclose(f);
+    p = strstr(out, "\"objects\":");
+    return p ? atoll(p + 10) : -1;
+}
+
+/* 6i. A snapshot the chain refused is reused at the retry (#237): the same height and root, so the same bytes; a
+** refused attempt uploaded the whole image once, not again at every retry */
+static void test_snapshot_reused_after_refusal(const char *url) {
+    TEST("a snapshot made for an anchor the chain refused is reused when the retry anchors the same height and root (#237): no second upload");
+    static const unsigned char kseq[32] = { [31] = 0x6b };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "reuse_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 1 };
+    HppliteNode *w = test_open_node(tpath("reuse_w.db"), l1, &o);
+    HppliteStore *rs = hpplite_store_open(url, NULL, 0);
+    long long before, refused, after;
+    uint64_t h = 0;
+    char zIndex[64];
+    if (!w || !rs) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (int i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('three')", NULL); hpplite_node_flush_batch(w); }
+    before = bucket_objects(url, l1);
+    hpplite_l1_mock_set_fail_submit(l1, 1);
+    if (hpplite_node_anchor(w) != 0) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the mock should refuse the anchor"); }
+    refused = bucket_objects(url, l1);                    /* the image's chunk, its index and the manifest went up */
+    hpplite_l1_mock_set_fail_submit(l1, 0);
+    if (hpplite_node_anchor(w) != 3 || range_snapshot(l1, rs, 3, &h, zIndex) != 0 || h != 3) { printf("(%s) ", w->ctx->zLastError); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the retry anchors 1-3 with a snapshot at 3"); }
+    after = bucket_objects(url, l1);
+    printf("(objects: %lld, after the refused anchor %lld, after the retry %lld) ", before, refused, after);
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_store_close(rs);
+    hpplite_l1_disconnect(l1);
+    if (before < 0 || refused <= before) FAIL("the refused anchor uploaded the snapshot and the manifest");
+    if (after - refused > 1) FAIL("the retry should put at most its manifest: the snapshot at 3 is the one already there");   /* the same manifest bytes: the store holds them once */
+    PASS();
+}
 
 static void test_ranges_restart(const char *url) {
     TEST("ranges: a run that dies with batches at the store leaves rows for the chain; the next run anchors them before its own; a manifest with a swapped hash is refused");
@@ -1442,6 +1489,7 @@ int main(int argc, char **argv) {
     test_restart_store_down(dir);
     test_snapshot_name_refused(dir);
     test_manifest_short_hex(url);
+    test_snapshot_reused_after_refusal(url);
     test_anchor_timer(url);
     test_recovery(url);
     test_soft_replica(url);

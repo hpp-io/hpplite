@@ -2160,6 +2160,7 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
     node->snapHeight = height;
     snprintf(node->snapIndex, sizeof node->snapIndex, "%s", zRef);
     hpplite_store_sha256((const uint8_t *)text, strlen(text), node->snapIndexSha);
+    memcpy(node->snapRoot, root, 32);
     node->snapAt = (int64_t)time(NULL);
     node->snapLooked = 1;
     node->warnedSnapshot = 0;
@@ -2224,9 +2225,20 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
         char pIndex[64];
         unsigned char pSha[32];
         int64_t pAt = node->snapAt;
+        int made;
         snprintf(pIndex, sizeof pIndex, "%s", node->snapIndex);
         memcpy(pSha, node->snapIndexSha, 32);
-        if (node_make_snapshot(node, to, root) == 0 && ph && node->config.keepSeconds > 0) {
+        if (node->spare.height == to && memcmp(node->spareRoot, root, 32) == 0) {
+            /* the one made for the anchor the chain refused (#237): the same height and root, its bytes at the store */
+            node->snapHeight = node->spare.height;
+            snprintf(node->snapIndex, sizeof node->snapIndex, "%s", node->spare.index);
+            memcpy(node->snapIndexSha, node->spare.sha, 32);
+            memcpy(node->snapRoot, root, 32);
+            node->snapAt = node->spare.at;
+            made = 0;
+        } else made = node_make_snapshot(node, to, root);
+        node->spare.height = 0;
+        if (made == 0 && ph && node->config.keepSeconds > 0) {
             /* keep= (#223): the one it replaces stays named until a prune passes it (the list has room: above) */
             node->aEarlier[node->nEarlier].height = ph;
             snprintf(node->aEarlier[node->nEarlier].index, sizeof node->aEarlier[0].index, "%s", pIndex);
@@ -2568,7 +2580,13 @@ static int node_anchor(HppliteNode *node) {
         memcpy(node->aEarlier, wasEarlier, sizeof wasEarlier); node->nEarlier = wasN;
         if (node->snapHeight != was) {
             /* a snapshot made for a range the chain did not take: no commitment ends at its height for a
-            ** replica to check it against; the one before stands, and the next anchor makes a new one */
+            ** replica to check it against; the one before stands. Kept aside (#237): the retry, anchoring the
+            ** same height and root, names it instead of uploading the image again */
+            node->spare.height = node->snapHeight;
+            snprintf(node->spare.index, sizeof node->spare.index, "%s", node->snapIndex);
+            memcpy(node->spare.sha, node->snapIndexSha, 32);
+            node->spare.at = node->snapAt;
+            memcpy(node->spareRoot, node->snapRoot, 32);
             node->snapHeight = was; snprintf(node->snapIndex, sizeof node->snapIndex, "%s", wasIndex); node->snapAt = wasAt; memcpy(node->snapIndexSha, wasSha, 32);
         }
     }

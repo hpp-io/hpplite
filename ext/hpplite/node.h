@@ -181,6 +181,9 @@ typedef struct HppliteNode {
     int64_t snapAt;                 /* when it was made (seconds) */
     int snapLooked;                 /* the latest anchor's manifest was read for it (a process that did not make it) */
     int warnedSnapshot;             /* said once why no snapshot is made */
+    unsigned char snapRoot[32];     /* the latest snapshot's root */
+    HppliteSnapRef spare;           /* a snapshot made for an anchor the chain refused (#237): reused when the retry anchors the same height and root */
+    unsigned char spareRoot[32];
     HppliteSnapRef aEarlier[HPPLITE_SNAPSHOTS_NAMED];   /* keep= (#223): the older snapshots still kept, oldest first; the open refuses settings past it (#231) */
     int nEarlier;
     uint64_t prunedHeight;          /* the last Prune the store took (#223); 0: none */
