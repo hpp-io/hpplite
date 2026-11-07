@@ -823,6 +823,68 @@ static void test_keep(const char *url) {
     PASS();
 }
 
+/* a store of this test's own, on a port and directory it chooses, so it can be killed and started again */
+static pid_t start_store_at(const char *dir, int port, const char *storeDir) {
+    char portStr[16], keyPath[600], script[600];
+    pid_t pid;
+    snprintf(portStr, sizeof portStr, "%d", port);
+    snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
+    snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
+    pid = fork();
+    if (pid == 0) {
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", storeDir, "--signer-key", keyPath,
+               "--pay-to", "0x1111111111111111111111111111111111111111", "--price-per-write", "0", "--price-per-mib-month", "0",
+               (char *)NULL);
+        _exit(127);
+    }
+    for (int i = 0; i < 50; i++) {
+        char cmd[200];
+        if (!test_child_alive(pid)) return -1;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status 2>/dev/null | grep -q signer", port);
+        if (system(cmd) == 0) return pid;
+        usleep(200 * 1000);
+    }
+    kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+    return -1;
+}
+
+/* 6f. A store that was down at open (#244): the first put after it answers must go through - the client's
+** "keeps buckets" flag comes from /status, and the node told it the rollup's address only once it knew that */
+static void test_store_down_at_open(const char *dir) {
+    TEST("a store down at open, up later (#244): the first flush after it answers goes to the store");
+    int port = test_free_port();
+    char url[64], storeDir[600];
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x7e };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o;
+    HppliteNode *w;
+    uint64_t h1, h2;
+    char err[300] = "";
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/do_pins", test_dir());
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "do_w"; o.privkey = kseq; o.capturePages = 1; o.storeFallbackOff = 1;
+    w = test_open_node(tpath("do_w.db"), l1, &o);         /* nothing listens on the port yet */
+    if (!w) FAIL("open with the store down");
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('written while the store was down')", NULL);
+    h1 = hpplite_node_flush_batch(w);                      /* waits: storefallback=off */
+    pid = start_store_at(dir, port, storeDir);
+    if (pid < 0) { hpplite_node_destroy(w); FAIL("the test's store did not start"); }
+    h2 = hpplite_node_flush_batch(w);                      /* the first put after the store answers */
+    snprintf(err, sizeof err, "%s", w->ctx->zLastError ? w->ctx->zLastError : "");
+    printf("(down: %llu; up: %llu) ", (unsigned long long)h1, (unsigned long long)h2);
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (h1 != 0) FAIL("with the store down and storefallback=off the batch waits");
+    if (h2 != 1) FAILF("the first flush after the store answers should put batch 1: '%s'", err);
+    PASS();
+}
+
 static void test_ranges_restart(const char *url) {
     TEST("ranges: a run that dies with batches at the store leaves rows for the chain; the next run anchors them before its own; a manifest with a swapped hash is refused");
     HppliteL1 *l1 = hpplite_l1_create_mock();
@@ -1191,6 +1253,7 @@ int main(int argc, char **argv) {
     test_snapshot_replica(url);
     test_snapshot_chunks(url);
     test_keep(url);
+    test_store_down_at_open(dir);
     test_anchor_timer(url);
     test_recovery(url);
     test_soft_replica(url);

@@ -1890,7 +1890,9 @@ static void node_store_bucket(HppliteNode *node) {
     char c[43], d[43];
     const char *zDa;
     unsigned char da[20];
-    if (node->storeBucketSet || !node->store || !hpplite_store_is_bucket(node->store)) return;
+    /* whatever the store speaks (#244): whether it keeps buckets is learnt from its /status, which a store down
+    ** at open has not answered yet; the address is only recorded, a store that keeps no buckets ignores it */
+    if (node->storeBucketSet || !node->store) return;
     if (!node->l1 || hpplite_l1_get_addresses(node->l1, c, d) != 0) return;
     zDa = d[0] ? d : c;
     if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return;
