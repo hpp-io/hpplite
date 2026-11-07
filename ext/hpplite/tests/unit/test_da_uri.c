@@ -305,6 +305,26 @@ static void test_operators_on(void) {
     PASS();
 }
 
+
+/* keep= and snapshot= together must fit the snapshots a manifest can name (#231) */
+static void test_keep_snapshot_cap(void) {
+    TEST("keep= with snapshot=: refused at open when they would keep more snapshots than a manifest names (64)");
+    HppliteConfig *cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&snapshot=1h&keep=30d");
+    int ok = cfg && hpplite_config_resolve_operators(cfg) != 0 && hpplite_config_error() && strstr(hpplite_config_error(), "720 snapshots");
+    printf("  snapshot=1h keep=30d: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)");
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("720 snapshots would be kept: the open must be refused and say so"); }
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&snapshot=1h&keep=48h");
+    ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { printf("  snapshot=1h keep=48h: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)"); FAIL("48 snapshots fit"); }
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&snapshot=1h");
+    ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("snapshot= without keep= (keep=all) is not capped"); }
+    PASS();
+}
+
 int main(void) {
     printf("test_da_uri: DA URI Scheme Tests\n");
     printf("================================\n\n");
@@ -319,6 +339,7 @@ int main(void) {
     test_uri_parse_file();
     test_alias_interval();
     test_operators_on();
+    test_keep_snapshot_cap();
 
     printf("\n================================\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);

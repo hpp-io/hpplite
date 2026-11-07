@@ -2204,7 +2204,15 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
         cJSON_Delete(prev);
         node->snapLooked = 1;
     }
-    if (node->config.snapshotIntervalMs > 0
+    if (node->config.snapshotIntervalMs > 0 && node->config.keepSeconds > 0 && node->snapHeight
+        && node->nEarlier == (int)(sizeof node->aEarlier / sizeof node->aEarlier[0])) {
+        /* the list is full and none of it is keep= old yet (settings changed between runs: the open refuses such a pair,
+        ** #231): a new snapshot would push the oldest out, kept at the store and named by nothing - none until a prune */
+        if (!node->warnedSnapshot) {
+            fprintf(stderr, "hpplite: snapshot: %d older snapshots are named and none is keep= old yet; no new snapshot until one is pruned\n", node->nEarlier);
+            node->warnedSnapshot = 1;
+        }
+    } else if (node->config.snapshotIntervalMs > 0
         && (node->snapHeight == 0 || ((int64_t)time(NULL) - node->snapAt) * 1000 >= (int64_t)node->config.snapshotIntervalMs)) {
         uint64_t ph = node->snapHeight;
         char pIndex[64];
@@ -2213,9 +2221,7 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
         snprintf(pIndex, sizeof pIndex, "%s", node->snapIndex);
         memcpy(pSha, node->snapIndexSha, 32);
         if (node_make_snapshot(node, to, root) == 0 && ph && node->config.keepSeconds > 0) {
-            /* keep= (#223): the one it replaces stays named until a prune passes it */
-            int cap = (int)(sizeof node->aEarlier / sizeof node->aEarlier[0]);
-            if (node->nEarlier == cap) { memmove(node->aEarlier, node->aEarlier + 1, sizeof node->aEarlier[0] * (size_t)(cap - 1)); node->nEarlier--; }
+            /* keep= (#223): the one it replaces stays named until a prune passes it (the list has room: above) */
             node->aEarlier[node->nEarlier].height = ph;
             snprintf(node->aEarlier[node->nEarlier].index, sizeof node->aEarlier[0].index, "%s", pIndex);
             memcpy(node->aEarlier[node->nEarlier].sha, pSha, 32);
@@ -2544,7 +2550,7 @@ static int node_anchor(HppliteNode *node) {
     unsigned char wasSha[32];
     int64_t wasAt = node->snapAt;
     int rc, wasN = node->nEarlier;
-    HppliteSnapRef wasEarlier[64];
+    HppliteSnapRef wasEarlier[HPPLITE_SNAPSHOTS_NAMED];
     snprintf(wasIndex, sizeof wasIndex, "%s", node->snapIndex);
     memcpy(wasSha, node->snapIndexSha, 32);
     memcpy(wasEarlier, node->aEarlier, sizeof wasEarlier);

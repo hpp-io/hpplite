@@ -181,7 +181,7 @@ typedef struct HppliteNode {
     int64_t snapAt;                 /* when it was made (seconds) */
     int snapLooked;                 /* the latest anchor's manifest was read for it (a process that did not make it) */
     int warnedSnapshot;             /* said once why no snapshot is made */
-    HppliteSnapRef aEarlier[64];    /* keep= (#223): the older snapshots still kept, oldest first */
+    HppliteSnapRef aEarlier[HPPLITE_SNAPSHOTS_NAMED];   /* keep= (#223): the older snapshots still kept, oldest first; the open refuses settings past it (#231) */
     int nEarlier;
     uint64_t prunedHeight;          /* the last Prune the store took (#223); 0: none */
     uint64_t prunePlanned;          /* the Prune this anchor sends once the chain accepts it (#238); 0: none */
