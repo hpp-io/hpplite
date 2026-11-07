@@ -2165,7 +2165,19 @@ static void node_prune_plan(HppliteNode *node);
 static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch, uint64_t to, const unsigned char root[32]) {
     cJSON *sn;
     if (!node->snapLooked) {
-        cJSON *prev = lastBatch ? node_range_manifest(node, lastBatch) : NULL;
+        cJSON *prev = NULL;
+        if (lastBatch) {
+            long st;
+            if (node->store) hpplite_store_take_status(node->store);
+            prev = node_range_manifest(node, lastBatch);
+            st = node->store ? hpplite_store_take_status(node->store) : -1;
+            if (!prev && (st == 0 || st >= 500)) {
+                /* the store did not answer (#236): nothing is decided - taking "no snapshot known" would make a
+                ** fresh one at the next anchor and drop the list; the next anchor reads again, this one names none */
+                fprintf(stderr, "hpplite: snapshot: the previous anchor's manifest could not be read (%s); nothing decided until it can\n", hpplite_store_error(node->store));
+                return;
+            }
+        }
         if (prev && node_manifest_snapshot(prev, &node->snapHeight, node->snapIndex, &node->snapAt, node->snapIndexSha) != 0) node->snapHeight = 0;
         if (prev && node->snapHeight) {
             /* keep= (#223): the older snapshots still kept */

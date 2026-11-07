@@ -885,6 +885,92 @@ static void test_store_down_at_open(const char *dir) {
     PASS();
 }
 
+/* the heights the manifest ending at `to` names in "earlier", oldest first; -1 none */
+static int range_earlier(HppliteL1 *l1, HppliteStore *rs, uint64_t to, uint64_t *out, int max) {
+    HppliteRange r;
+    char cid[64];
+    size_t n = 0;
+    uint8_t *text;
+    cJSON *m, *e;
+    int k = 0;
+    memset(&r, 0, sizeof r);
+    if (hpplite_l1_get_range(l1, to, &r) != 0) return -1;
+    hpplite_store_cid_from_sha256(r.manifestDigest, cid);
+    hpplite_l1_range_clear(&r);
+    text = hpplite_store_get(rs, cid, &n);
+    m = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
+    free(text);
+    if (!m) return -1;
+    cJSON_ArrayForEach(e, cJSON_GetObjectItemCaseSensitive(m, "earlier")) {
+        const cJSON *h = cJSON_GetObjectItemCaseSensitive(e, "height");
+        if (k < max && cJSON_IsNumber(h)) out[k++] = (uint64_t)h->valuedouble;
+    }
+    cJSON_Delete(m);
+    return k;
+}
+
+/* 6e. A restart whose first anchor cannot read the previous manifest decides nothing (#236): with the store not
+** answering it would have taken "no snapshot known", made a fresh one at the next anchor that landed and dropped
+** the earlier list - the snapshots earlier anchors named referenced by nothing, never pruned, never found */
+static void test_restart_store_down(const char *dir) {
+    TEST("a restart with the store not answering at its first anchor (#236): no snapshot made, nothing decided; the next anchor reads the previous manifest and names the latest snapshot and the earlier ones");
+    int port = test_free_port();
+    char url[64], storeDir[600];
+    uint64_t h = 0, earlier[8];
+    int n;
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x7c };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o;
+    HppliteNode *w;
+    HppliteStore *rs;
+    char zIndex[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/sd_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir);
+    if (pid < 0) FAIL("the test's store did not start");
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "sd_w"; o.privkey = kseq; o.capturePages = 1; o.snapshotMs = 1; o.keepSeconds = 3600; o.storeFallbackOff = 1;
+    w = test_open_node(tpath("sd_w.db"), l1, &o);
+    rs = hpplite_store_open(url, NULL, 0);
+    if (!w || !rs) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (int i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('first three')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 3 || range_snapshot(l1, rs, 3, &h, zIndex) != 0 || h != 3) { hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor 1-3 with a snapshot at 3"); }
+    sleep(2);                                   /* snapshot=1ms, by whole seconds: the next anchor makes a new one */
+    for (int i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four and five')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 5 || range_snapshot(l1, rs, 5, &h, zIndex) != 0 || h != 5) { hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor 4-5 with a snapshot at 5"); }
+    n = range_earlier(l1, rs, 5, earlier, 8);
+    if (n != 1 || earlier[0] != 3) { printf("(earlier: %d) ", n); hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the manifest at 5 names the snapshot at 3 as earlier"); }
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('six, at the store, unanchored')", NULL);
+    if (hpplite_node_flush_batch(w) != 6) { hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 6 at the store"); }
+    /* the process dies (no anchor at close); the store goes down; the next run's first anchor cannot read the manifest at 5 */
+    hpplite_node_stop_timer(w);
+    w->ownsL1 = 0;
+    w->l1 = NULL;
+    hpplite_node_destroy(w);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    w = test_open_node(tpath("sd_w.db"), l1, &o);
+    if (!w) { hpplite_store_close(rs); FAIL("reopen"); }
+    if (hpplite_node_anchor(w) == 6) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor with the store down should not land"); }
+    pid = start_store_at(dir, port, storeDir);                 /* the same bytes, back */
+    if (pid < 0) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the test's store did not come back"); }
+    sleep(2);
+    {
+        uint64_t a = hpplite_node_anchor(w);
+        int got = range_snapshot(l1, rs, 6, &h, zIndex);
+        if (a != 6 || got != 0 || h != 6) { printf("(anchor %llu, snapshot %d at %llu, error '%s') ", (unsigned long long)a, got, (unsigned long long)h, w->ctx->zLastError); hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor 6 with a snapshot at 6"); }
+    }
+    n = range_earlier(l1, rs, 6, earlier, 8);
+    printf("(earlier at 6: %d%s%llu%s%llu) ", n, n > 0 ? ": " : "", n > 0 ? (unsigned long long)earlier[0] : 0ULL, n > 1 ? ", " : "", n > 1 ? (unsigned long long)earlier[1] : 0ULL);
+    hpplite_node_destroy(w);
+    hpplite_store_close(rs);
+    hpplite_l1_disconnect(l1);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (n != 2 || earlier[0] != 3 || earlier[1] != 5) FAIL("the manifest at 6 names the snapshots at 3 and 5 as earlier: the restart learnt them once the store answered");
+    PASS();
+}
+
 static void test_ranges_restart(const char *url) {
     TEST("ranges: a run that dies with batches at the store leaves rows for the chain; the next run anchors them before its own; a manifest with a swapped hash is refused");
     HppliteL1 *l1 = hpplite_l1_create_mock();
@@ -1254,6 +1340,7 @@ int main(int argc, char **argv) {
     test_snapshot_chunks(url);
     test_keep(url);
     test_store_down_at_open(dir);
+    test_restart_store_down(dir);
     test_anchor_timer(url);
     test_recovery(url);
     test_soft_replica(url);
