@@ -654,6 +654,17 @@ rebuild then starts from the oldest snapshot the last anchor still names
 (`from=earliest`, #224) - its root checked against the one the chain anchored
 at its height - replays the batches after it, and says `verified from the
 snapshot at <h>`; `--to`/`--at` before it cannot be met, and it says so.
+What that line claims, exactly (#232): the state at `h` is the one the chain
+anchored at `h` (the snapshot's root and chain hash match the range
+commitment ending there), and every batch after `h` was replayed and its
+root checked. What it does not claim: how the rollup got to `h`. That
+history is gone from the store, so a replay from batch 1 - the stronger
+check, every step since genesis - is only possible on a rollup without
+`keep=`, and `hpplite-verify` does it whenever batch 1 is there. The two
+defaults follow from this: a replica starts from the latest snapshot (it
+wants the state, fast); a verifier starts from batch 1 unless `from=` says
+otherwise, and falls back to the oldest snapshot kept only when batch 1 is
+pruned.
 A verifier never posts, never claims the lease and never creates a rollup;
 `role=verify` is also usable from any connection that only wants to audit.
 It needs the wallet key (batches are encrypted); a viewing key is v0.3 (#15).
