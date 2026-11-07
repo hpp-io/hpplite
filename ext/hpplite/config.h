@@ -98,6 +98,8 @@ extern "C" {
 #define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
 #define HPPLITE_URI_STORE_CAP     "storecap"    /* the most to pay the store per call, atomic units of its asset */
 #define HPPLITE_URI_STORE_PERMIT "storepermit"  /* hpplite-store/2 (#214): what the funding wallet's permit lets the store pull; 0: none */
+#define HPPLITE_URI_KEEP         "keep"        /* how long the store keeps the history behind a snapshot (#223) */
+#define HPPLITE_URI_SNAPSHOT     "snapshot"    /* how often a sequencer at a store snapshots the database at an anchor (#221) */
 #define HPPLITE_URI_FROM         "from"        /* where a new replica starts: snapshot (the latest the anchors name), earliest (the oldest still kept, #224) or genesis (batch 1) (#222) */
 #define HPPLITE_URI_SYNC_TO      "syncto"      /* a verifier's stop: no batch past this height is applied (hpplite-verify --to, #206) */
 #define HPPLITE_URI_SYNC_AT      "syncat"      /* ...no batch written after this time, ms since the epoch (hpplite-verify --at, #205) */

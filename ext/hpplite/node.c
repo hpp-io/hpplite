@@ -35,6 +35,8 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
 static int node_switch_to_rows(HppliteNode *node);
 static int node_check_rollup(HppliteNode *node);
 static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1);
+static uint8_t *node_store_get_checked(HppliteNode *node, const char *zRef, const unsigned char want[32], size_t *pLen);
+static struct cJSON *node_snapshot_index(HppliteNode *node, const char *zIndex, const unsigned char sha[32]);
 static void node_checkpoint_wal(HppliteNode *node, int64_t now);
 #include "da_uri.h"
 #include "capture_rows.h"
@@ -1957,7 +1959,6 @@ static void hex32(const unsigned char *b, char out[67]) { out[0] = '0'; out[1] =
 /* The manifest the range commitment ending at `height` names, fetched by its digest's CID and checked against it; NULL: none */
 static cJSON *node_range_manifest_on(HppliteNode *node, HppliteL1 *l1, uint64_t height) {
     HppliteRange r;
-    unsigned char digest[32];
     char cid[64];
     uint8_t *text;
     size_t n = 0;
@@ -1965,14 +1966,20 @@ static cJSON *node_range_manifest_on(HppliteNode *node, HppliteL1 *l1, uint64_t 
     memset(&r, 0, sizeof r);
     if (!node->store || !l1 || height == 0 || hpplite_l1_get_range(l1, height, &r) != 0) return NULL;
     hpplite_store_cid_from_sha256(r.manifestDigest, cid);
-    text = hpplite_store_get(node->store, cid, &n);
-    if (text) {
-        hpplite_store_sha256(text, n, digest);
-        if (memcmp(digest, r.manifestDigest, 32) == 0) m = cJSON_ParseWithLength((const char *)text, n);
-        free(text);
-    }
+    text = node_store_get_checked(node, cid, r.manifestDigest, &n);
+    if (text) m = cJSON_ParseWithLength((const char *)text, n);
+    free(text);
     hpplite_l1_range_clear(&r);
     return m;
+}
+
+/* a snapshot's index (#221) by its CID, checked against the sha-256 the manifest names; parsed, or NULL */
+static cJSON *node_snapshot_index(HppliteNode *node, const char *zIndex, const unsigned char sha[32]) {
+    size_t n = 0;
+    uint8_t *text = node_store_get_checked(node, zIndex, sha, &n);
+    cJSON *ix = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
+    free(text);
+    return ix;
 }
 
 static cJSON *node_range_manifest(HppliteNode *node, uint64_t height) { return node_range_manifest_on(node, node->l1, height); }
@@ -2034,35 +2041,29 @@ static uint8_t *node_seal_at(HppliteNode *node, uint64_t height, const uint8_t *
 ** The manifest the last anchor names, its snapshot's index, the sealed name object - each checked by its hash. */
 static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1) {
     uint64_t last = 0, total = 0, h = 0;
-    unsigned char latest[32], ixSha[32], d[32];
+    unsigned char latest[32], ixSha[32];
     char zIndex[64], *zName = NULL;
     int64_t at = 0;
     cJSON *m = NULL, *ix = NULL;
-    uint8_t *text = NULL, *bytes = NULL;
+    uint8_t *bytes = NULL;
     size_t n = 0;
     const cJSON *nm, *ref, *sha;
     if (!node->store || !l1 || hpplite_l1_get_da_state(l1, &last, &total, latest) != 0 || last == 0) return NULL;
     m = node_range_manifest_on(node, l1, last);
     if (!m || node_manifest_snapshot(m, &h, zIndex, &at, ixSha) != 0) goto done;
-    text = hpplite_store_get(node->store, zIndex, &n);
-    if (!text) goto done;
-    hpplite_store_sha256(text, n, d);
-    if (memcmp(d, ixSha, 32) != 0) goto done;
-    ix = cJSON_ParseWithLength((const char *)text, n);
+    ix = node_snapshot_index(node, zIndex, ixSha);
     nm = ix ? cJSON_GetObjectItemCaseSensitive(ix, "name") : NULL;
     ref = nm ? cJSON_GetObjectItemCaseSensitive(nm, "ref") : NULL;
     sha = nm ? cJSON_GetObjectItemCaseSensitive(nm, "sha256") : NULL;
     if (!cJSON_IsString(ref) || !json_hex32(sha, latest)) goto done;
-    bytes = hpplite_store_get(node->store, ref->valuestring, &n);
-    if (!bytes) goto done;
-    hpplite_store_sha256(bytes, n, d);
-    if (memcmp(d, latest, 32) == 0) {
+    bytes = node_store_get_checked(node, ref->valuestring, latest, &n);
+    if (bytes) {
         HppliteBatch *b = node_decode_batch(node, h, bytes, n);
         if (b && b->zDbName) zName = sqlite3_mprintf("%s", b->zDbName);
         hpplite_batch_free(b);
     }
 done:
-    free(bytes); free(text);
+    free(bytes);
     cJSON_Delete(ix); cJSON_Delete(m);
     return zName;
 }
@@ -2371,9 +2372,7 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
     if (node->syncTo && h > node->syncTo) return 0;                         /* a stop before it (#206): from batch 1 */
     if (node->syncAtMs && (uint64_t)at * 1000 > node->syncAtMs) return 0;  /* ...or a time before it was made (#205) */
     memset(&r, 0, sizeof r);
-    text = node_store_get_checked(node, zIndex, ixSha, &n);
-    ix = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
-    free(text);
+    ix = node_snapshot_index(node, zIndex, ixSha);
     if (!ix) why = "its index is not at the store, or not the one the anchor named";
     else {
         const cJSON *jh = cJSON_GetObjectItemCaseSensitive(ix, "height"), *jr = cJSON_GetObjectItemCaseSensitive(ix, "root"),
