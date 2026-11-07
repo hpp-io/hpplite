@@ -309,15 +309,25 @@ static void test_operators_on(void) {
 /* keep= and snapshot= together must fit the snapshots a manifest can name (#231) */
 static void test_keep_snapshot_cap(void) {
     TEST("keep= with snapshot=: refused at open when they would keep more snapshots than a manifest names (64)");
-    HppliteConfig *cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&snapshot=1h&keep=30d");
+    HppliteConfig *cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&anchor=30m&snapshot=1h&keep=30d");
     int ok = cfg && hpplite_config_resolve_operators(cfg) != 0 && hpplite_config_error() && strstr(hpplite_config_error(), "720 snapshots");
-    printf("  snapshot=1h keep=30d: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)");
+    printf("  anchor=30m snapshot=1h keep=30d: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)");
     if (cfg) hpplite_config_free(cfg);
     if (!ok) { FAIL("720 snapshots would be kept: the open must be refused and say so"); }
-    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&snapshot=1h&keep=48h");
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&anchor=30m&snapshot=1h&keep=48h");
     ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
     if (cfg) hpplite_config_free(cfg);
     if (!ok) { printf("  snapshot=1h keep=48h: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)"); FAIL("48 snapshots fit"); }
+    /* a snapshot is made at an anchor: snapshot=1ms with anchor=1h is one an hour; 48 h of them fit */
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&anchor=1h&snapshot=1ms&keep=48h");
+    ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { printf("  anchor=1h snapshot=1ms keep=48h: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)"); FAIL("the cadence is the anchor's: 48 fit"); }
+    /* anchors by hand (anchor=0): the cadence is not known here; the anchor refuses a snapshot when the list is full */
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&anchor=0&snapshot=1ms&keep=3s");
+    ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { printf("  anchor=0 snapshot=1ms keep=3s: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)"); FAIL("anchors by hand: not refused at open"); }
     cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&capture=pages&snapshot=1h");
     ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
     if (cfg) hpplite_config_free(cfg);
