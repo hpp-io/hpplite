@@ -316,7 +316,7 @@ static void store_check(int round) {
     CHECK(rows >= flushed, "store round %d: %lld rows recovered, %d were flushed before the kill (%s)", round, (long long)rows, flushed, n->ctx->zLastError);
     CHECK(rows == maxId, "store round %d: the recovered ids are not contiguous (%lld rows, max id %lld)", round, (long long)rows, (long long)maxId);
     sqlite3_exec(n->db, "INSERT INTO t VALUES(1000000, 'after the recovery')", NULL, NULL, NULL);
-    CHECK(hpplite_node_flush_batch(n) > 0, "store round %d: the successor's own flush", round);
+    CHECK(hpplite_node_flush_batch(n) > 0, "store round %d: the successor's own flush (%s)", round, n->ctx->zLastError);   /* #225: the reason, for the next time it fails */
     CHECK(hpplite_node_anchor(n) > 0, "store round %d: the anchor of what was recovered (%s)", round, n->ctx->zLastError);
     unsigned char rootW[32], rootR[32];
     hpplite_node_get_state_root(n, rootW);
