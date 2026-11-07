@@ -2156,7 +2156,7 @@ done:
     return rc;
 }
 
-static void node_prune(HppliteNode *node);
+static void node_prune_plan(HppliteNode *node);
 
 /* The snapshot this anchor's manifest names (#221): a new one when snapshot= says the last is old
 ** enough, else the latest an earlier anchor named (read once from that anchor's manifest) */
@@ -2201,7 +2201,7 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
         }
     }
     if (node->snapHeight == 0) return;
-    node_prune(node);                               /* keep= (#223): before the manifest, so it names only what is kept */
+    node_prune_plan(node);                          /* keep= (#223): decided before the manifest, so it names only what is kept; sent once the chain accepts (#238) */
     sn = cJSON_AddObjectToObject(m, "snapshot");
     cJSON_AddNumberToObject(sn, "height", (double)node->snapHeight);
     cJSON_AddStringToObject(sn, "index", node->snapIndex);
@@ -2225,27 +2225,39 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
 /*
 ** keep= (#223): at an anchor, the history behind the newest snapshot made at
 ** least `keep` ago is let go - the sequencer signs a Prune at its height, the
-** store deletes the bucket's batches and older snapshots below it - before
-** the manifest is written, so it names only the snapshots kept. Only a
-** snapshot an earlier anchor named qualifies (one made now is not that old).
-** The state stays provable from that snapshot on; the commitments stay on chain.
+** store deletes the bucket's batches and older snapshots below it. Decided
+** before the manifest is written, so it names only the snapshots kept; sent
+** once the chain has accepted the anchor (#238: a refused anchor leaves the
+** store as the manifest on chain describes it, and node_anchor restores the
+** list). Only a snapshot an earlier anchor named qualifies (one made now is
+** not that old). The state stays provable from that snapshot on; the
+** commitments stay on chain. A Prune the store did not take is planned again
+** at the next anchor (the list is already without what it lets go).
 */
-static void node_prune(HppliteNode *node) {
+static void node_prune_plan(HppliteNode *node) {
     int64_t cutoff;
     uint64_t p = 0;
     int i, k;
+    node->prunePlanned = 0;
     if (node->config.keepSeconds <= 0 || !node->store || !node->snapHeight) return;
     cutoff = (int64_t)time(NULL) - node->config.keepSeconds;
     for (i = 0; i < node->nEarlier; i++) if (node->aEarlier[i].at <= cutoff && node->aEarlier[i].height > p) p = node->aEarlier[i].height;
     if (node->snapAt <= cutoff && node->snapHeight > p) p = node->snapHeight;
     if (p <= node->prunedHeight) return;
+    node->prunePlanned = p;
+    for (i = 0, k = 0; i < node->nEarlier; i++) if (node->aEarlier[i].height >= p) node->aEarlier[k++] = node->aEarlier[i];
+    node->nEarlier = k;
+}
+
+static void node_prune_send(HppliteNode *node) {
+    uint64_t p = node->prunePlanned;
+    node->prunePlanned = 0;
+    if (!p || !node->store) return;
     if (hpplite_store_prune(node->store, p) != 0) {
         fprintf(stderr, "hpplite: keep=: the store did not prune below the snapshot at %llu: %s\n", (unsigned long long)p, hpplite_store_error(node->store));
         return;
     }
     node->prunedHeight = p;
-    for (i = 0, k = 0; i < node->nEarlier; i++) if (node->aEarlier[i].height >= p) node->aEarlier[k++] = node->aEarlier[i];
-    node->nEarlier = k;
 }
 
 /* bytes the store holds under zRef, checked against a sha-256 from an authenticated source (#222) */
@@ -2514,14 +2526,16 @@ static int node_anchor(HppliteNode *node) {
     memcpy(wasSha, node->snapIndexSha, 32);
     memcpy(wasEarlier, node->aEarlier, sizeof wasEarlier);
     rc = node_anchor_once(node);
-    if (rc != 1 && node->snapHeight != was) {
-        int i, k;
+    if (rc == 1) node_prune_send(node);             /* keep= (#223, #238): the chain has the anchor; now the store lets go */
+    else {
+        /* the list as it was (a planned prune filtered it, #238; a snapshot made now was pushed to it) */
+        node->prunePlanned = 0;
         memcpy(node->aEarlier, wasEarlier, sizeof wasEarlier); node->nEarlier = wasN;
-        for (i = 0, k = 0; i < node->nEarlier; i++) if (node->aEarlier[i].height >= node->prunedHeight) node->aEarlier[k++] = node->aEarlier[i];   /* not what a prune let go */
-        node->nEarlier = k;
-        /* a snapshot made for a range the chain did not take: no commitment ends at its height for a
-        ** replica to check it against; the one before stands, and the next anchor makes a new one */
-        node->snapHeight = was; snprintf(node->snapIndex, sizeof node->snapIndex, "%s", wasIndex); node->snapAt = wasAt; memcpy(node->snapIndexSha, wasSha, 32);
+        if (node->snapHeight != was) {
+            /* a snapshot made for a range the chain did not take: no commitment ends at its height for a
+            ** replica to check it against; the one before stands, and the next anchor makes a new one */
+            node->snapHeight = was; snprintf(node->snapIndex, sizeof node->snapIndex, "%s", wasIndex); node->snapAt = wasAt; memcpy(node->snapIndexSha, wasSha, 32);
+        }
     }
     return rc;
 }

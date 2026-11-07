@@ -184,6 +184,7 @@ typedef struct HppliteNode {
     HppliteSnapRef aEarlier[64];    /* keep= (#223): the older snapshots still kept, oldest first */
     int nEarlier;
     uint64_t prunedHeight;          /* the last Prune the store took (#223); 0: none */
+    uint64_t prunePlanned;          /* the Prune this anchor sends once the chain accepts it (#238); 0: none */
     int snapApply;                  /* a replica writing a snapshot (#222): the bookkeeping set to its height, not advanced by a batch */
     unsigned char snapChain[32], snapBlock[32];
     struct cJSON *manifest;         /* a replica: the manifest of the range it is reading */

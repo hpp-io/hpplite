@@ -769,7 +769,7 @@ static int store_has(HppliteStore *rs, const char *zRef) {
 /* 6d. keep= (#223): the history behind the newest snapshot made at least `keep` ago is pruned at the store;
 ** a replica still starts from the snapshot, and the earlier snapshots still kept are named */
 static void test_keep(const char *url) {
-    TEST("keep=: after an anchor, the batches and snapshots below the newest snapshot older than keep are pruned at the store; the snapshot and what follows stay; a replica still starts there");
+    TEST("keep=: after an anchor, the batches and snapshots below the newest snapshot older than keep are pruned at the store; the snapshot and what follows stay; a replica still starts there; an anchor the chain refuses prunes nothing (#238)");
     static const unsigned char kseq[32] = { [31] = 0x7b };
     HppliteL1 *l1 = hpplite_l1_create_mock();
     TestNodeOpts o = { .storeUrl = url, .nodeId = "keep_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 1, .keepSeconds = 3 };
@@ -786,6 +786,12 @@ static void test_keep(const char *url) {
     if (range_batch_ref(l1, rs, 3, 1, b1) != 0 || range_batch_ref(l1, rs, 3, 3, b3) != 0 || !store_has(rs, b1)) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("batch 1 at the store: nothing older than keep yet"); }
     sleep(4);                                   /* keep=3s, by whole seconds: a margin over the boundary */
     for (i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four and five')", NULL); hpplite_node_flush_batch(w); }
+    /* the anchor at which the prune is due, refused by the chain (#238): the store must still hold what the
+    ** manifest on chain (the anchor at 3) names - batch 1 and the snapshot at 3; the prune waits for an anchor that lands */
+    hpplite_l1_mock_set_fail_submit(l1, 1);
+    if (hpplite_node_anchor(w) == 5) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the mock should refuse this anchor"); }
+    if (!store_has(rs, b1) || !store_has(rs, zIndex3)) { printf("(batch 1 %d, snapshot 3 %d) ", store_has(rs, b1), store_has(rs, zIndex3)); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("a refused anchor must not prune: batch 1 and the snapshot at 3 still named by the chain's manifest"); }
+    hpplite_l1_mock_set_fail_submit(l1, 0);
     if (hpplite_node_anchor(w) != 5 || range_snapshot(l1, rs, 5, &h, zIndex) != 0 || h != 5) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 4-5 with a new snapshot at 5"); }
     /* the snapshot at 3 is older than keep: below it is pruned; it and what follows stay */
     range_batch_ref(l1, rs, 5, 4, b4);

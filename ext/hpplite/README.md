@@ -742,8 +742,10 @@ With `keep=<duration>` (#223) the history is bounded: the manifests also
 name the older snapshots still kept (`"earlier": [...]`, oldest first),
 and at each anchor the sequencer signs a `Prune` (hpplite-store/2) at the
 height of the newest snapshot an earlier anchor named that is at least
-`keep` old - before that anchor's manifest is written, so it names only
-what is kept (#227) - and the store deletes the bucket's batches, names
+`keep` old - decided before that anchor's manifest is written, so it names
+only what is kept (#227), sent once the chain has accepted the anchor, so
+an anchor the chain refuses leaves the store as the manifest on chain
+describes it (#238) - and the store deletes the bucket's batches, names
 and older snapshots below it, never on its own judgement. Batch 1, which
 names a `dbname=` database (#160), goes too: the index's `name` - the name
 sealed like a batch, as a page batch with no pages - is where a named
