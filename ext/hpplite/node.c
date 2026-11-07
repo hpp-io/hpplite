@@ -636,6 +636,8 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     n = hpplite_l1_factory_list_my_rollups(config->rpcUrl, factoryHex, config->privkey, all, 256);
     char *zOthers = NULL;                 /* the wallet's databases, for the message below (#79) */
     int nUnread = 0;                      /* ...and how many could not be read (#228) */
+    int nNoAnswer = 0;                    /* ...of those, because the store did not answer (#229): no new rollup then */
+    if (node->store) hpplite_store_take_status(node->store);
     for (i = 0; i < n; i++) {
         char hex[43];
         HppliteL1 *l1;
@@ -652,7 +654,11 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
             b = data ? node_decode_batch(node, 1, data, len) : NULL;
             zSnap = (!b && hpplite_l1_has_ranges(l1)) ? node_snapshot_name(node, l1) : NULL;   /* batch 1 pruned: the snapshot names it (#226) */
             node->ctx->quiet = 0;
-            if (!b && !zSnap) nUnread++;
+            if (!b && !zSnap) {
+                long st = node->store ? hpplite_store_take_status(node->store) : -1;
+                nUnread++;
+                if (st == 0 || st >= 500) nNoAnswer++;   /* no answer, or the store failing: its bytes may well be there */
+            }
             const char *zHas = b && b->zDbName ? b->zDbName : zSnap;
             int match = zHas && strcmp(zHas, zName) == 0;
             if (zHas && !match) zOthers = sqlite3_mprintf("%z%s\"%s\"", zOthers, zOthers ? ", " : "", zHas);
@@ -694,6 +700,15 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     if (node->config.verifyOnly) {
         hpplite_error(node->ctx, "role=verify: no rollup of this wallet is database \"%s\" (its databases: %s%s%s); nothing to verify",
                       zName, zOthers ? zOthers : "none named", nUnread ? "; some could not be read: " : "", nUnread ? node->ctx->zQuietError : "");
+        sqlite3_free(zOthers);
+        return 0;
+    }
+    if (nNoAnswer) {
+        /* the store did not answer for some: one of them may be this database, and a second rollup under the
+        ** name would be a second history (#229). Writes stay local; the next flush looks again */
+        hpplite_error(node->ctx, "no rollup of this wallet is database \"%s\" among those readable (its databases: %s), and %d could not be read"
+                      " because the store did not answer (%s): not creating one until it does",
+                      zName, zOthers ? zOthers : "none named", nNoAnswer, node->ctx->zQuietError);
         sqlite3_free(zOthers);
         return 0;
     }
@@ -2614,6 +2629,18 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
     return data;
 }
 
+/* A connection that did not come at open - the lookup by name could not tell this database's rollup from
+** the others' while the store did not answer (#229), or the RPC was down - is tried again at a flush, at most
+** every ten seconds, as a key given after open tries it (hpplite_node_set_key). Nothing is finalized meanwhile */
+static void node_retry_l1(HppliteNode *node) {
+    int64_t now = node_current_time_ms();
+    if (node->l1 || !node->wantsL1 || node->follower || !(node->config.hasPrivkey || node->hasSigner)) return;
+    if (node->l1RetryAt && now < node->l1RetryAt) return;
+    node->l1RetryAt = now + 10000;
+    node_auto_connect_l1(node, &node->config);
+    if (node->l1) node->warnedNoL1 = 0;
+}
+
 static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes) {
     HppliteCtx *ctx = node->ctx;
     unsigned char *bytes = NULL, root[32];
@@ -2630,6 +2657,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     zStoreWhy[0] = 0;
     node_wal_maintenance(node);                         /* frames another connection or process committed since (#153); the pins moved */
     node_pages_decide_snapshot(node);                   /* if nothing decided it yet */
+    node_retry_l1(node);
     if (!node->l1 && node->wantsL1) {
         /* l1=/contract=/factory= was given but no connection came of it (no key,
         ** bad RPC): finalizing locally would move the height past batches the
@@ -2804,6 +2832,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         overhead = node_envelope_overhead(node);
         maxBytes = maxBytes > overhead ? maxBytes - overhead : 1;
     }
+    node_retry_l1(node);
     if (!node->l1 && node->wantsL1) {
         /* l1=/contract=/factory= was given but no connection came of it
         ** (no key, bad RPC, ...): finalizing locally would advance the

@@ -1513,7 +1513,9 @@ static int run_cmd(const char *cmd, char *out, size_t n) {
 ** the store the bytes; a replica with the same store=
 ** rebuilds equal, one without cannot and says so; the commit transaction
 ** costs a fraction of posting the bytes. KEY2, its own named database. */
-static pid_t start_pin_service_free(const char *svc, int port) {
+static pid_t start_pin_service_dir(const char *svc, int port, const char *dir);
+static pid_t start_pin_service_free(const char *svc, int port) { return start_pin_service_dir(svc, port, DIR "/store_pins"); }
+static pid_t start_pin_service_dir(const char *svc, int port, const char *dir) {
     pid_t pid;
     FILE *f = fopen(DIR "/store_signer.key", "w");
     if (!f) return -1;
@@ -1526,7 +1528,7 @@ static pid_t start_pin_service_free(const char *svc, int port) {
         snprintf(script, sizeof script, "%s/hpplite_store.py", svc);
         int fd = open(DIR "/store_service.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
-        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/store_pins", "--signer-key", DIR "/store_signer.key",
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", dir, "--signer-key", DIR "/store_signer.key",
                "--pay-to", "0x1111111111111111111111111111111111111111", "--network", "eip155:31337",   /* the store's domain: anvil's chain */
                "--rpc", RPC, "--price-per-write", "0", "--price-per-mib-month", "0", (char *)NULL);       /* free; the rollup's sequencer and lease from the chain (#165, #214) */
         _exit(127);
@@ -2612,7 +2614,7 @@ static void test_snapshots_on_chain(void) {
 ** manifest for the second, so the second was "not found" - a verifier had nothing to verify, a sequencer on a
 ** fresh file would have created a duplicate. KEY4 (the wallet may hold other rollups from earlier scenarios). */
 static void test_two_rollups_same_range_bounds(void) {
-    TEST("two named rollups of one wallet, each anchored 1-3 (#234): the second is found by its name, and verifies");
+    TEST("two named rollups of one wallet, each anchored 1-3 (#234): the second is found by its name, and verifies; a fresh file while the store does not answer creates no second rollup (#229)");
     const char *svc = getenv("HPPLITE_PIN_SERVICE");
     if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
     if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
@@ -2621,6 +2623,7 @@ static void test_two_rollups_same_range_bounds(void) {
     if (pid < 0) FAIL("the store did not come up");
     static const char *names[] = { "alpha", "beta" };
     long long rows[2] = { 0, 0 };
+    char betaContract[64] = "";
     for (int r = 0; r < 2; r++) {
         char extra[300], file[64];
         snprintf(extra, sizeof extra, "&dbname=%s&capture=pages&store=http://127.0.0.1:%d&anchor=0", names[r], port);
@@ -2634,6 +2637,7 @@ static void test_two_rollups_same_range_bounds(void) {
         }
         if (scalar(w, "SELECT hpplite_anchor()") != 3) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("%s: the anchor 1-3", names[r]); }
         rows[r] = scalar(w, "SELECT count(*) FROM n");
+        if (r == 1) snprintf(betaContract, sizeof betaContract, "%s", status_text(w, "contract"));
         sqlite3_close(w);
     }
     /* the second, by name: found, and its own batches verified (not the first's, served from a cache) */
@@ -2648,6 +2652,42 @@ static void test_two_rollups_same_range_bounds(void) {
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     printf("(beta: %lld rows, rebuilt %lld) ", rows[1], keptRows);
     if (rc != 0 || !strstr(out, "\nverified") || keptRows != rows[1]) FAILF("hpplite-verify on the second named rollup: exit %d\n%s", rc, out);
+    {
+        /* #229: a sequencer on a fresh file while the store does not answer cannot tell its rollup from the others'
+        ** - it must not create a second one under the name; it writes locally and finds its own when the store is
+        ** back. A store that answers but has none of the bytes (a fresh one: every read a 404) is no reason to wait */
+        char extra[300], contract[64] = "", err[256] = "", later[64] = "", gamma[64] = "";
+        snprintf(extra, sizeof extra, "&dbname=beta&capture=pages&store=http://127.0.0.1:%d&anchor=0", port);
+        sqlite3 *w = open_db("tr_beta2.db", KEY4, extra);          /* the store is down: killed above */
+        if (!w) FAIL("open a fresh file for beta with the store down");
+        snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+        sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO n(v) VALUES('while the store was down')", NULL, NULL, NULL);
+        scalar(w, "SELECT hpplite_flush()");                        /* local; the chain is not told without a rollup */
+        pid = start_pin_service_free(svc, port);                    /* the same bytes, back */
+        if (pid < 0) { sqlite3_close(w); FAIL("the store did not come back"); }
+        for (int i = 0; i < 15 && !later[0]; i++) {                /* a flush tries the chain again, at most every 10 s */
+            sleep(1);
+            scalar(w, "SELECT hpplite_flush()");
+            snprintf(later, sizeof later, "%s", status_text(w, "contract"));
+        }
+        sqlite3_close(w);
+        printf("(store down: contract '%s'; back: '%s') ", contract, later);
+        if (contract[0]) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("a fresh file with the store down took a rollup (%s): a second one under the name, or another's; last_error '%s'", contract, err); }
+        if (!strstr(err, "did not answer")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("the open with the store down should say why it waits: '%s'", err); }
+        if (strcmp(later, betaContract) != 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("with the store back, the fresh file should find beta (%s), has '%s'", betaContract, later); }
+        kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        pid = start_pin_service_dir(svc, port, DIR "/store_pins_empty");   /* answers, holds nothing: every read a 404 */
+        if (pid < 0) FAIL("the empty store did not come up");
+        snprintf(extra, sizeof extra, "&dbname=gamma&capture=pages&store=http://127.0.0.1:%d&anchor=0", port);
+        w = open_db("tr_gamma.db", KEY4, extra);
+        if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open gamma at the empty store"); }
+        snprintf(gamma, sizeof gamma, "%s", status_text(w, "contract"));
+        sqlite3_close(w);
+        kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        printf("(empty store: gamma %s) ", gamma[0] ? "created" : "not created");
+        if (!gamma[0] || strcmp(gamma, betaContract) == 0) FAILF("a store that answers 404 to every read is no reason not to create: gamma '%s'", gamma);
+    }
     PASS();
 }
 

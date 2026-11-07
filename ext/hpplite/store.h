@@ -162,6 +162,7 @@ int hpplite_store_domain(HppliteStore *store, unsigned char payTo[20], uint64_t 
 #define HPPLITE_STORE_FAIL_RECEIPT     3   /* the receipt does not verify: the provider is not to be trusted with this batch */
 #define HPPLITE_STORE_FAIL_OTHER       4
 int hpplite_store_last_failure(HppliteStore *store);
+long hpplite_store_take_status(HppliteStore *store);   /* the last request's HTTP status since last asked: -1 none, 0 no answer (#229) */
 
 #ifdef __cplusplus
 }

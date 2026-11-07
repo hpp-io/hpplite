@@ -54,6 +54,7 @@ struct HppliteStore {
     double pricePerMiBMonth;        /* per MiB per 30 days, fractions allowed (#172) */
     uint64_t retentionSeconds;      /* what a put buys */
     int lastFailure;                /* HPPLITE_STORE_FAIL_* */
+    long lastStatus;                /* the HTTP status of the last request, -1 none since taken (#229) */
     int hasSigner;                  /* the provider's /status named its receipt signer and domain */
     unsigned char signer[20];
     unsigned char payTo[20];        /* the receipt domain's verifyingContract */
@@ -158,6 +159,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
     } else {
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
     }
+    s->lastStatus = status;
     /* the x402 headers, case-insensitively */
     if (headers.p) {
         char *line = headers.p, *next;
@@ -999,6 +1001,7 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
     else if (strncmp(url, "s3://", 5) == 0 && url[5]) kind = STORE_S3;
     else return NULL;
     s = calloc(1, sizeof *s);
+    if (s) s->lastStatus = -1;
     if (!s) return NULL;
     s->url = strdup(url);
     n = strlen(s->url);
@@ -1064,6 +1067,15 @@ int hpplite_store_domain(HppliteStore *s, unsigned char payTo[20], uint64_t *pCh
 }
 
 int hpplite_store_last_failure(HppliteStore *s) { return s ? s->lastFailure : HPPLITE_STORE_FAIL_OTHER; }
+
+/* The HTTP status of the last request since the last call: -1 none, 0 no answer, else the status. The lookup by
+** name (#229) tells a store that did not answer (a reason not to create a rollup) from one that has no such
+** bytes (404: gone, no reason to wait). Only a pin store (hpplite-store/2) speaks HTTP this way; others say -1. */
+long hpplite_store_take_status(HppliteStore *s) {
+    long st = s ? s->lastStatus : -1;
+    if (s) s->lastStatus = -1;
+    return st;
+}
 
 void hpplite_store_close(HppliteStore *s) {
     if (!s) return;
