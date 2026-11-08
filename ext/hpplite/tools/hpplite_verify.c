@@ -227,17 +227,14 @@ int main(int argc, char **argv) {
             }
         }
     }
-    /* the verifier's own datadir, first so it wins over one in the parameters */
-    const char *zFrom = "";
-    int triedSnapshot = 0;
+    /* the verifier's own datadir, first so it wins over one in the parameters. The node reads batch 1 and, when the
+    ** store has pruned it, starts from the oldest snapshot kept (#224, #255); with --to/--at it stays at the hard
+    ** tier, else the store's batches past the anchor follow as the soft tier, reported below (#166) */
     sqlite3 *db;
-open_again:
-    /* the hard tier first: soft=off keeps the rebuild at the anchored height, the soft tier is reported after (#166) */
     { char to[40] = "";
       if (stopAt) snprintf(to, sizeof to, "&syncto=%llu", (unsigned long long)stopAt);    /* the stop, from the first sync at open */
       else if (atMs) snprintf(to, sizeof to, "&syncat=%llu", (unsigned long long)atMs);
-      /* the retry's from= before the user's params: the first of a key wins (#239) */
-      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s%s%s&%s%s", dir, dir, to, zFrom, params, zStore);
+      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&datadir=%s%s&%s%s", dir, dir, to, params, zStore);
       db = uri ? hpplite_open(uri) : NULL;
       sqlite3_free(uri); }
     if (!db) {
@@ -270,20 +267,6 @@ open_again:
     }
     const char *zState = status_text(db, "state");
     const char *zErr = status_text(db, "last_error");
-    if (!triedSnapshot && rebuilt == 0 && onChain > 0 && node->state == HPPLITE_STATE_ERROR) {
-        /* not even batch 1: a history pruned at the store (keep=, #223)? From the oldest snapshot it
-        ** still keeps (#224): its root checked against the one the chain anchored there, then the batches after */
-        char path[1100];
-        triedSnapshot = 1;
-        fprintf(stderr, "hpplite-verify: batch 1 cannot be read (%s); trying the oldest snapshot the anchors name\n", zErr);
-        sqlite3_close(db);
-        snprintf(path, sizeof path, "%s/rebuilt.db", dir); unlink(path);
-        snprintf(path, sizeof path, "%s/rebuilt.db-wal", dir); unlink(path);
-        snprintf(path, sizeof path, "%s/rebuilt.db-shm", dir); unlink(path);
-        snprintf(path, sizeof path, "%s/rebuilt.db-hpplite.db", dir); unlink(path);
-        zFrom = "&from=earliest";
-        goto open_again;
-    }
     sqlite3_int64 fromSnap = scalar(db, "SELECT snapshot_height FROM hpplite_status");
     sqlite3_int64 compared = scalar(db, "SELECT roots_compared FROM hpplite_status");
     sqlite3_int64 mismatches = scalar(db, "SELECT root_mismatches FROM hpplite_status");
@@ -298,14 +281,10 @@ open_again:
     printf("rollup %s: %llu batches on chain, %llu replayed", contract, (unsigned long long)onChain, (unsigned long long)rebuilt);
     if (stopAt) printf(" (--to %llu)", (unsigned long long)stopAt);
     if (fromSnap > 0 && rebuilt >= target) {
-        /* a prune is claimed only when batch 1 could not be read and the retry from the oldest snapshot did it (#239);
-        ** from=snapshot given on a whole history started there by choice */
-        if (triedSnapshot) printf("\nverified from the snapshot at %lld: the batches below it are pruned at the store (keep=); its root is the one the chain anchored there, and %llu batches were replayed after it",
-                                  (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
-        else printf("\nstarted from the snapshot at %lld (from=): its root is the one the chain anchored there, and %llu batches were replayed after it; the batches below it were not replayed",
-                    (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
+        /* a verifier starts from a snapshot only when batch 1 could not be read (#239, #255): the prune is the node's finding */
+        printf("\nverified from the snapshot at %lld: the batches below it are pruned at the store (keep=); its root is the one the chain anchored there, and %llu batches were replayed after it",
+               (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
     }
-    else if (triedSnapshot && (stopAt || atMs)) printf("\nthe batches before the oldest snapshot the store keeps are pruned (keep=): the database as of an earlier height or time cannot be rebuilt");
     if (atMs) {
         char want[40], wrote[40];
         fmt_time(atMs, want, sizeof want);
@@ -448,14 +427,12 @@ open_again:
     }
 
     /* the soft tier (#166): what the store holds under the rollup's names past the anchor, signed by the
-    ** sequencer and applying on the rebuilt history - stored to here, anchored to there */
+    ** sequencer and applied on the rebuilt history by the node itself (soft_height; height stays the anchored) */
     if (rc == 0 && !stopAt && !atMs && node->store && hpplite_l1_has_ranges(node->l1)) {
-        uint64_t before = hpplite_get_block_height(node->ctx);
-        node->config.softOff = 0;
-        hpplite_node_sync_from_l1(node, 1);
-        uint64_t after = hpplite_get_block_height(node->ctx);
-        if (after > before) printf("stored to %llu, anchored to %llu: %llu batches at the store past the anchor, signed by the sequencer, applied on this history\n",
-                                   (unsigned long long)(after - 1), (unsigned long long)onChain, (unsigned long long)(after - before));
+        sqlite3_int64 soft = scalar(db, "SELECT soft_height FROM hpplite_status");   /* the next batch number past the soft tier */
+        uint64_t stored = soft > 0 ? (uint64_t)soft - 1 : onChain;
+        if (stored > onChain) printf("stored to %llu, anchored to %llu: %llu batches at the store past the anchor, signed by the sequencer, applied on this history\n",
+                                     (unsigned long long)stored, (unsigned long long)onChain, (unsigned long long)(stored - onChain));
         else printf("stored to %llu, anchored to %llu: nothing at the store past the anchor\n", (unsigned long long)onChain, (unsigned long long)onChain);
     }
 

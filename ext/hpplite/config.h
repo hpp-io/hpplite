@@ -61,7 +61,8 @@ extern "C" {
 #define HPPLITE_ENV_STORE_CAP     "HPPLITE_STORE_CAP"
 #define HPPLITE_ENV_STORE_PERMIT "HPPLITE_STORE_PERMIT"
 #define HPPLITE_ENV_SPEND_CAP     "HPPLITE_SPEND_CAP"
-#define HPPLITE_ENV_SOFT          "HPPLITE_SOFT"
+#define HPPLITE_ENV_SOFT          "HPPLITE_SOFT"          /* gone (#255): refused */
+#define HPPLITE_ENV_FROM          "HPPLITE_FROM"          /* gone (#255): refused */
 #define HPPLITE_ENV_LOW_BALANCE   "HPPLITE_LOW_BALANCE"
 #define HPPLITE_ENV_RELAY         "HPPLITE_RELAY"          /* a relay submits the signed forms of the writes, paid over x402 (#126) */
 #define HPPLITE_ENV_RELAY_CAP     "HPPLITE_RELAY_CAP"
@@ -96,10 +97,10 @@ extern "C" {
 #define HPPLITE_URI_STORE_PERMIT "storepermit"   /* refused in a URI (#254): the setting is HPPLITE_STORE_PERMIT */
 #define HPPLITE_URI_KEEP         "keep"        /* how long the store keeps the history behind a snapshot (#223) */
 #define HPPLITE_URI_SNAPSHOT     "snapshot"    /* how often a sequencer at a store snapshots the database at an anchor (#221) */
-#define HPPLITE_URI_FROM         "from"        /* where a new replica starts: snapshot (the latest the anchors name), earliest (the oldest still kept, #224) or genesis (batch 1) (#222) */
+#define HPPLITE_URI_FROM         "from"        /* gone (#255): refused at open; where a rebuild starts is not a setting */
 #define HPPLITE_URI_SYNC_TO      "syncto"      /* a verifier's stop: no batch past this height is applied (hpplite-verify --to, #206) */
 #define HPPLITE_URI_SYNC_AT      "syncat"      /* ...no batch written after this time, ms since the epoch (hpplite-verify --at, #205) */
-#define HPPLITE_URI_SOFT          "soft"        /* a verifier with a store follows the soft tier (#166); off: the anchored height only */
+#define HPPLITE_URI_SOFT          "soft"        /* gone (#255): refused at open; the soft tier follows unless a stop is given */
 #define HPPLITE_URI_RELAY_DEPOSIT "relaydeposit" /* gone (#251): refused at open, so a URI from before v0.8 fails loudly */
 #define HPPLITE_URI_SPEND_CAP     "spendcap"   /* refused in a URI (#254): the setting is HPPLITE_SPEND_CAP */
 #define HPPLITE_URI_LOW_BALANCE   "lowbalance"   /* refused in a URI (#254): the setting is HPPLITE_LOW_BALANCE */
@@ -166,9 +167,7 @@ typedef struct HppliteConfig {
     uint64_t storeCap;               /* HPPLITE_STORE_CAP: the most to pay the store per call (0 = pay nothing) */
     uint64_t storePermit;            /* HPPLITE_STORE_PERMIT: what the permit lets the store pull, atomic units (#214) */
     int storePermitSet;              /* ...given (0 is a value: no permit, the 402s paid) */
-    int softOff;                     /* soft=off: a verifier stays at the anchored height (#166) */
     int64_t keepSeconds;             /* keep= (#223): how long the store keeps the history behind the latest snapshot; 0: all of it */
-    int fromMode;                    /* from= (#222): 0 the default (a snapshot for a replica, batch 1 for a verifier), 1 snapshot, 2 genesis, 3 earliest (#224) */
     uint64_t syncTo;                 /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;               /* syncat=: ...none written after this time, ms since the epoch (#205); 0: none */
     uint64_t spendCap, spendWindow;  /* HPPLITE_SPEND_CAP: the most paid in the window (seconds), store and relay together (0 = none, #173) */

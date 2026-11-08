@@ -182,7 +182,6 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). The only value: any other refuses the open (#248); a sequencer needs no `role=` |
 | `snapshot` | No | With `store=` on a chain with ranges: how often the sequencer snapshots the database at an anchor - `24h`, `1h`; `0` (default) never (#221). The snapshot is the file at the anchored height, sealed like a batch, at the store in chunks under an index the anchor's manifest names, so a replica can start there instead of at batch 1. Also `HPPLITE_SNAPSHOT`. See Stores and commitments |
-| `soft` | No | `off`: a `role=verify` connection with `store=` stays at the anchored height instead of following the store's batches past it (#166). Also `HPPLITE_SOFT` |
 | `store` | No | `on` for the network's canonical store (`l1=hpp-sepolia`: `https://store.sepolia.hpplite.hpp.io`; a network without one refuses to open, #192), or `http://host:port` of a store speaking `hpplite-store/2` (`operators/store/hpplite_store.py`, or the canonical one): the rollup's bucket, kept while its funding wallet covers it (#214). The batch bytes go there and the chain holds the commitment - hash, reference, and with each anchor the store's signed bucket statement (#11, #33). A replica needs the same `store=` to rebuild. The protocol: [doc/store-protocol.md](doc/store-protocol.md). Also `HPPLITE_STORE` |
 | `relay` | No | `on` for the network's canonical relay (`l1=hpp-sepolia`: `https://relay.sepolia.hpplite.hpp.io`, #192), or `http://host:port` of a relay ([operators/relay](operators/relay/README.md), #170): every write to the chain goes there as its EIP-712 signed form, paid over x402 like the store: creating the rollup (VERSION 10 factories), the lease, anchors, commitments, checkpoints. A wallet with USDC.e and no ETH runs this way. When the relay fails, the wallet sends the plain transaction itself if it holds ETH; otherwise the write waits and `last_error` says why (#126). The protocol: [doc/relay-protocol.md](doc/relay-protocol.md) (#188). Also `HPPLITE_RELAY` |
 | `anchor` | No | With `store=` on a chain that takes ranges (VERSION 9 and later, #164, the `hpp-sepolia` factory): how often the batches the store holds are anchored on the chain in one commitment: `5m`, `30m` (default: HPP's cadence), `1h`; `0` = at close and on `hpplite_anchor()` only. Also `HPPLITE_ANCHOR`. See Stores and commitments |
@@ -190,7 +189,6 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `keep` | No | With `snapshot=`: how long the store keeps the history behind a snapshot - `all` (default: every batch, an audit log) or `7d`, `24h`, `30m` (#223). After each anchor the sequencer signs a `Prune` at the newest snapshot made at least that long ago; the store lets go of the batches and older snapshots below it. The snapshots kept are named in each manifest, at most 64 besides the latest, so `keep` divided by the snapshot cadence (the longer of `snapshot=` and `anchor=`: a snapshot is made at an anchor) must not exceed 64 (`snapshot=1h` with `keep=30d` would keep 720: the open refuses it and says so, #231; with anchors by hand, `anchor=0`, the anchor itself makes no snapshot while the list is full). The current state stays provable (that snapshot's root is anchored, then the batches after it); what is lost is replaying how the state got there, and `hpplite-verify --to`/`--at` before it. Also `HPPLITE_KEEP` |
 | `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min for a node without a store, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). With `store=` the chain's cadence goes to `anchor` instead and the interval stays 5 s: the batches reach the store in seconds, the chain gets one commitment per anchor (#164). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
-| `from` | No | Where a new replica (an empty file, `store=`) starts: `snapshot` (the default, except for `role=verify`) - the latest snapshot the anchors name (#222), checked against the root and chain hash the chain anchored at its height, then the batches after it; `earliest` - the oldest one still kept (`keep=`, #224: the most history verified; the latest when it is gone); or `genesis` - every batch from 1. A verifier replays from batch 1 unless given `from=snapshot`; `syncto=`/`syncat=` before the snapshot start from batch 1. Also `HPPLITE_FROM` |
 | `compress` | No | `on` (default): the page batch is deflated before it is sealed or posted when that shrinks it (#12); `off`: posted as is. Every reader takes both forms. Also `HPPLITE_COMPRESS` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
 | `dbname` | No | Give the database its own rollup among the wallet's, found by this name (#61): several databases on one key. Names are compared exactly and must be unique per wallet: two files with the same name on one key are one database on chain (the second, if empty, rebuilds the first's data into itself). `{file}` = the file's base name without its directory (`a/x.db` and `b/x.db` are both `x.db`; `:memory:` is `memory`), so one `HPPLITE_PARAMS` serves every file `HPPLITE_FILES` names. A name no rollup has yet creates one (~2.5M gas): a misspelt name on a replica is a new, empty database, and the message says which names the wallet has. The name is read from each rollup's first batch (or its snapshot) at the store; while the store does not answer for any of them, a sequencer on a fresh file creates nothing (#229: one of them may be this database) - writes stay local and each flush looks again; a store that answers 404 (the bytes gone) is no reason to wait. Also `HPPLITE_DBNAME` |
@@ -670,7 +668,7 @@ flight at that moment is completed, never left halfway; with `--keep`, the datab
 that time stays.
 A history pruned at the store (`keep=`, #223) has no batch 1 to read: the
 rebuild then starts from the oldest snapshot the last anchor still names
-(`from=earliest`, #224) - its root checked against the one the chain anchored
+(#224) - its root checked against the one the chain anchored
 at its height - replays the batches after it, and says `verified from the
 snapshot at <h>`; `--to`/`--at` before it cannot be met, and it says so.
 What that line claims, exactly (#232): the state at `h` is the one the chain
@@ -680,11 +678,10 @@ root checked. What it does not claim: how the rollup got to `h`. That
 history is gone from the store, so a replay from batch 1 - the stronger
 check, every step since genesis - is only possible on a rollup without
 `keep=`, and `hpplite-verify` does it whenever batch 1 is there. The two
-defaults follow from this: a replica starts from the latest snapshot (it
-wants the state, fast); a verifier starts from batch 1 unless `from=` says
-otherwise (then the report says `started from the snapshot at <h>`, and
-claims nothing about a prune), and falls back to the oldest snapshot kept
-only when batch 1 is pruned.
+defaults follow from this, and neither is a setting (#255): a replica
+starts from the latest snapshot (it wants the state, fast); a verifier
+starts from batch 1 and falls back to the oldest snapshot kept only when
+batch 1 is pruned, saying so on stderr.
 A verifier never posts, never claims the lease and never creates a rollup;
 `role=verify` is also usable from any connection that only wants to audit.
 It needs the wallet key or a viewing key the writer granted (batches are encrypted; see Keys).
@@ -747,7 +744,7 @@ manifest names the latest one, so the last anchor always does; a restart
 finds it in the last anchor's manifest. An anchor the chain refuses drops
 the snapshot it made. Each chunk is a write at a paid store.
 
-A new replica (`from=snapshot`, the default but for a verifier, #222)
+A new replica (a node without `role=verify` on an empty file, #222)
 starts there: it reads the snapshot the last anchor's manifest names,
 checks the index against the manifest's hash and each chunk against the
 index's, the root and chain hash against the range commitment ending at
@@ -813,8 +810,10 @@ a second verifier rebuilds it from the chain and the store in
 pages as they are (not through `sqlite3_backup`, which would move the
 schema cookie the next diff of page 1 lands on), with page 1's change
 counter moved so the replica's readers notice, and the sidecar by
-`sqlite3_backup`. `soft_disagreements` counts these events. `soft=off` keeps
-a replica at the anchored height.
+`sqlite3_backup`. `soft_disagreements` counts these events. With `syncto=`
+or `syncat=` (`hpplite-verify --to`, `--at`) a verifier stays at the hard
+tier: the soft tier is past the anchor, and a stop asks for the history as
+of a point (#255).
 
 `hpplite-verify` verifies the hard tier as before. It then reports the soft
 tier ("stored to S, anchored to H"), or nothing past the anchor.
@@ -973,6 +972,10 @@ paid per call (#251), the factories before VERSION 8, refused at connect
 parameters do not name (#247). The budgets - `storecap`, `storepermit`,
 `spendcap`, `lowbalance`, `relaycap`, `storefallback` - are environment
 variables alone, refused in a URI (#254; `HPPLITE_STORE_FALLBACK` is new).
+`from=` and `soft=` are gone (#255): a replica starts from the latest
+snapshot, a verifier from batch 1 and, when the store has pruned it, from
+the oldest snapshot kept - the fallback `hpplite-verify` used to retry with
+is the node's now - and the soft tier follows unless a stop is given.
 
 Paying in the HPP token itself is open (#175).
 
@@ -985,7 +988,7 @@ Paying in the HPP token itself is open (#175).
 | v0.5 | HPP economics: store-based persistence and soft commitment, one chain anchor every 30 minutes (#162, #164-#167); replicas on the soft tier (#166); a node with USDC.e and no ETH through a relay (#126, #170); store and relay paid by voucher (#135, #179), spending caps (#173) | same | a store (soft) + one L1 commitment per 30 min (hard) |
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
-| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254) | same | same |
+| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254, #255) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database
@@ -1036,7 +1039,10 @@ with `batch N is not a page batch`. A URI or environment that still names
 `capture=` or `determinism=` refuses the open as well, saying both are gone,
 and so does a URI carrying a budget (`storecap=`, `storepermit=`,
 `spendcap=`, `lowbalance=`, `relaycap=`, `storefallback=`): the refusal
-names the environment variable that sets it (#254).
+names the environment variable that sets it (#254). `from=` and `soft=`
+(and `HPPLITE_FROM`, `HPPLITE_SOFT`) are gone too (#255): where a rebuild
+starts and whether the soft tier is followed are what the node is, not
+settings, and the refusal says what it does.
 
 ## Keys
 

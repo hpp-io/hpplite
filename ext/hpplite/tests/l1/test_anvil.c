@@ -2409,20 +2409,21 @@ static void test_snapshots_on_chain(void) {
     rc = run_verify_with(params, "--to 2", out, sizeof out);
     if (rc == 0 || !strstr(out, "cannot be rebuilt")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("--to 2, below the snapshot kept: exit %d\n%s", rc, out); }
     {
-        /* #239: from=genesis in the user's params does not win over the retry's from=earliest */
+        /* from= is gone (#255; was #239's override): given, the tool cannot open and says so */
         char fromGenesis[600];
         snprintf(fromGenesis, sizeof fromGenesis, "%s&from=genesis", params);
         out[0] = 0;
         rc = run_verify_with(fromGenesis, "", out, sizeof out);
-        if (rc != 0 || !strstr(out, "verified from the snapshot at 5")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("with from=genesis given, the pruned history still verifies from the oldest snapshot: exit %d\n%s", rc, out); }
+        if (rc != 2 || !strstr(out, "from= is gone")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("from=genesis given: the tool must refuse to open (exit 2) and say from= is gone; exit %d\n%s", rc, out); }
     }
     {
-        /* a new replica of the named rollup: found by the name its snapshot carries (#226), from the snapshot -
-        ** and the lookup's reads of batch 1, pruned, say nothing on stderr (#228) */
+        /* a new verifier of the named rollup: found by the name its snapshot carries (#226); batch 1 is pruned, so it
+        ** starts from the oldest snapshot kept, the one the tool verified from (#255) - and the lookup's reads of
+        ** batch 1 say nothing on stderr (#228) */
         char rx[300], err[4096] = "";
         int saved = dup(2), fd = open(DIR "/sn_lookup.err", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         FILE *f;
-        snprintf(rx, sizeof rx, "&dbname=snapshots&store=http://127.0.0.1:%d&role=verify&from=snapshot&soft=off", port);
+        snprintf(rx, sizeof rx, "&dbname=snapshots&store=http://127.0.0.1:%d&role=verify", port);
         fflush(stderr); dup2(fd, 2); close(fd);
         sqlite3 *r = open_db("sn_replica.db", KEY4, rx);
         long long rRows = r ? scalar(r, "SELECT count(*) FROM n") : -1, rSnap = r ? scalar(r, "SELECT snapshot_height FROM hpplite_status") : -1;
@@ -2430,7 +2431,7 @@ static void test_snapshots_on_chain(void) {
         fflush(stderr); dup2(saved, 2); close(saved);
         if ((f = fopen(DIR "/sn_lookup.err", "r"))) { size_t got = fread(err, 1, sizeof err - 1, f); err[got] = 0; fclose(f); }
         printf("(replica: rows %lld from the snapshot at %lld) ", rRows, rSnap);
-        if (rRows != rows || rSnap != 6 || strstr(err, "no manifest") || strstr(err, "has no")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("a replica of the pruned, named rollup, quietly found:\n%s", err); }
+        if (rRows != rows || rSnap != 5 || strstr(err, "no manifest") || strstr(err, "has no")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("a verifier of the pruned, named rollup, quietly found, from the oldest snapshot kept (5):\n%s", err); }
     }
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     PASS();
@@ -2493,15 +2494,7 @@ static void test_two_rollups_same_range_bounds(void) {
     sqlite3_close(kept);
     printf("(beta: %lld rows, rebuilt %lld) ", rows[1], keptRows);
     if (rc != 0 || !strstr(out, "\nverified") || keptRows != rows[1]) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("hpplite-verify on the second named rollup: exit %d\n%s", rc, out); }
-    {
-        /* #239: told from=snapshot on a history nothing pruned, the report says it started from the snapshot
-        ** and claims no prune (only the retry after an unreadable batch 1 may say 'pruned at the store') */
-        char fromSnap[600];
-        snprintf(fromSnap, sizeof fromSnap, "%s&from=snapshot", params);
-        out[0] = 0;
-        rc = run_verify_with(fromSnap, "", out, sizeof out);
-        if (rc != 0 || !strstr(out, "started from the snapshot at 3") || strstr(out, "pruned")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("from=snapshot on an unpruned history: exit %d, must say it started from the snapshot at 3 and not claim a prune\n%s", rc, out); }
-    }
+    if (strstr(out, "snapshot at")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("an unpruned history verifies from batch 1 and claims no snapshot start (#239):\n%s", out); }
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     {
         /* #229: a sequencer on a fresh file while the store does not answer cannot tell its rollup from the others'

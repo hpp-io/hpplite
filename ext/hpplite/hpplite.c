@@ -660,10 +660,9 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->storeUrl = cfg->storeUrl;
     nc->storeCap = cfg->storeCap;
     nc->storePermit = cfg->storePermitSet ? cfg->storePermit : 20000000;   /* 20 USDC.e by default (#214) */
-    nc->softOff = cfg->softOff;
     nc->syncTo = nc->verifyOnly ? cfg->syncTo : 0;      /* a stop for a verifier only: a sequencer must replay all (#206) */
     nc->keepSeconds = cfg->keepSeconds;                /* pruning behind a snapshot (#223) */
-    nc->fromSnapshot = cfg->fromMode == 3 ? 2 : (cfg->fromMode == 1 || (cfg->fromMode == 0 && !nc->verifyOnly));   /* a verifier replays from batch 1 unless told (#222); 2: the oldest kept (#224) */
+    nc->fromSnapshot = !nc->verifyOnly;                /* a new replica starts from the latest snapshot (#222); a verifier from batch 1, else the oldest kept (#224, #255) */
     nc->syncAtMs = nc->verifyOnly ? cfg->syncAtMs : 0;
     nc->spendCap = cfg->spendCap;
     nc->spendWindow = cfg->spendWindow;

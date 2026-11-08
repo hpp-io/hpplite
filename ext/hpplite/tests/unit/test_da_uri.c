@@ -393,6 +393,38 @@ static void test_money_knobs_env_only(void) {
     PASS();
 }
 
+/* #255: from= and soft= are gone. hpplite-verify decided both for the user: a replica starts from the latest snapshot,
+** a verifier from batch 1 (else the oldest kept), and the soft tier follows unless a stop is given. A URI or an
+** environment that still names one refuses the open, naming the two defaults */
+static void test_from_soft_gone(void) {
+    TEST("from= and soft= refuse the open naming what the node does instead (gone in v0.8, #255); HPPLITE_FROM and HPPLITE_SOFT too");
+    static const char *uris[] = { "from=genesis", "from=snapshot", "from=earliest", "soft=off", "soft=on" };
+    for (int i = 0; i < 5; i++) {
+        char uri[200];
+        snprintf(uri, sizeof uri, "hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&role=verify&%s", uris[i]);
+        HppliteConfig *cfg = hpplite_config_load(uri);
+        const char *why = hpplite_config_error();
+        int refused = why && strstr(why, uris[i][0] == 'f' ? "from= is gone" : "soft= is gone") && strstr(why, uris[i][0] == 'f' ? "batch 1" : "soft tier");
+        printf("\n  %s: %s", uris[i], why ? why : "(no error)");
+        if (cfg) hpplite_config_free(cfg);
+        if (!refused) { printf("\n"); FAIL("from= / soft= in a URI should refuse the open and say what the node does instead"); }
+    }
+    setenv("HPPLITE_FROM", "genesis", 1);
+    HppliteConfig *cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on");
+    int refused = hpplite_config_error() && strstr(hpplite_config_error(), "from= is gone");
+    unsetenv("HPPLITE_FROM");
+    if (cfg) hpplite_config_free(cfg);
+    if (!refused) { printf("\n"); FAIL("HPPLITE_FROM should refuse the open"); }
+    setenv("HPPLITE_SOFT", "off", 1);
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on");
+    refused = hpplite_config_error() && strstr(hpplite_config_error(), "soft= is gone");
+    unsetenv("HPPLITE_SOFT");
+    if (cfg) hpplite_config_free(cfg);
+    if (!refused) { printf("\n"); FAIL("HPPLITE_SOFT should refuse the open"); }
+    printf("\n  ");
+    PASS();
+}
+
 int main(void) {
     printf("test_da_uri: DA URI Scheme Tests\n");
     printf("================================\n\n");
@@ -410,6 +442,7 @@ int main(void) {
     test_keep_snapshot_cap();
     test_relay_exact_only();
     test_money_knobs_env_only();
+    test_from_soft_gone();
 
     printf("\n================================\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);

@@ -80,9 +80,9 @@ typedef struct HppliteNodeConfig {
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* HPPLITE_STORE_CAP: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storePermit;           /* HPPLITE_STORE_PERMIT: what the funding wallet's permit lets the store pull (0: none, #214) */
-    int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
-    int fromSnapshot;               /* from= (#222): a new replica starts from the latest snapshot (1) or the oldest still kept (2, #224) */
+    int fromSnapshot;               /* a new replica (no role=verify, an empty file) starts from the latest snapshot (#222); a verifier
+                                    ** reads batch 1 and, when the store has pruned it, starts from the oldest snapshot kept (#224, #255) */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;              /* syncat=: ...none written after this time (ms since the epoch, #205); 0: none */
     uint64_t spendCap, spendWindow; /* HPPLITE_SPEND_CAP: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
@@ -170,6 +170,8 @@ typedef struct HppliteNode {
     unsigned char anchorReceipt[114];   /* HPPLITE_RECEIPT_SIZE */
     /* Snapshots (#221): the latest one the anchors name, carried forward to each new manifest */
     uint64_t snapHeight;            /* 0: none */
+    int triedOldestSnapshot;        /* a verifier whose batch 1 could not be read tried the oldest snapshot kept (#255): once */
+    uint64_t snapshotPastStop;      /* the snapshot a start was refused for because syncto=/syncat= is before it (#206); 0: none */
     char snapIndex[64];             /* the index's CID at the store */
     unsigned char snapIndexSha[32]; /* ...and its sha-256, in the manifest: a reader checks the index it is served */
     int64_t snapAt;                 /* when it was made (seconds) */

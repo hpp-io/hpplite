@@ -456,7 +456,7 @@ static void test_snapshot_made(const char *url) {
 /* 6c. A replica from a snapshot (#222): it writes the snapshot the last anchor names, checked against the
 ** chain, and replays only the batches after it; the state is the one a replay from batch 1 reaches */
 static void test_snapshot_replica(const char *url) {
-    TEST("snapshots: a replica with from=snapshot starts at the snapshot the last anchor names and replays only what follows; the same rows and root as one from batch 1");
+    TEST("snapshots: a replica starting from the snapshot the last anchor names and replays only what follows; the same rows and root as one from batch 1");
     static const unsigned char kseq[32] = { [31] = 0x7a };
     HppliteL1 *l1 = hpplite_l1_create_mock();
     TestNodeOpts o = { .storeUrl = url, .nodeId = "snaprep_w", .privkey = kseq, .snapshotMs = 3600 * 1000 };

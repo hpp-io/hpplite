@@ -86,12 +86,6 @@ static int parse_duration_ms(const char *str) {
 }
 
 /* keep= (#223): "all" (0: every batch kept), or N with s, m, h or d (no unit: days) - in seconds; -1 malformed */
-/* from= (#222, #224): snapshot 1, genesis 2, earliest 3; anything else leaves the mode as it was */
-static int parse_from_mode(const char *str, int was) {
-    if (!str) return was;
-    return strcmp(str, "snapshot") == 0 ? 1 : strcmp(str, "genesis") == 0 ? 2 : strcmp(str, "earliest") == 0 ? 3 : was;
-}
-
 static int64_t parse_keep_seconds(const char *str) {
     char *end = NULL;
     long long v;
@@ -132,6 +126,15 @@ static const struct { const char *uri, *env; } gMoneyKnobs[] = {
 static void refuse_money_knob(int i) {
     snprintf(gConfigError, sizeof(gConfigError), "%s= is not a URI setting (v0.8, #254): a budget is the deployment's; set %s in the environment",
              gMoneyKnobs[i].uri, gMoneyKnobs[i].env);
+}
+
+/* from= and soft= are gone (v0.8, #255): where a rebuild starts and whether the soft tier is followed are what the
+** node is, not settings - hpplite-verify decided both for the user and overrode what was passed */
+static void refuse_from(void) {
+    snprintf(gConfigError, sizeof(gConfigError), "from= is gone (v0.8, #255): a replica starts from the latest snapshot the anchors name; a verifier (role=verify) from batch 1, and from the oldest snapshot kept when the store has pruned it");
+}
+static void refuse_soft(void) {
+    snprintf(gConfigError, sizeof(gConfigError), "soft= is gone (v0.8, #255): a verifier follows the store's batches past the anchor (hpplite-verify reports them as the soft tier); with syncto= or syncat= it stays at the hard tier");
 }
 
 /* role=verify, nothing else (#248): sequencer and observer were parsed and read nowhere - a sequencer needs no role= */
@@ -259,7 +262,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     }
     val = getenv("HPPLITE_KEEP");
     if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) cfg->keepSeconds = k; }
-    cfg->fromMode = parse_from_mode(getenv("HPPLITE_FROM"), cfg->fromMode);
+    val = getenv(HPPLITE_ENV_FROM);
+    if (val) refuse_from();
     val = getenv("HPPLITE_SNAPSHOT");
     if (val) {
         int ms = parse_duration_ms(val);
@@ -285,7 +289,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_STORE_PERMIT);
     if (val && val[0] >= '0' && val[0] <= '9') { cfg->storePermit = (uint64_t)atoll(val); cfg->storePermitSet = 1; }
     val = getenv(HPPLITE_ENV_SOFT);
-    if (val && val[0]) cfg->softOff = strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0;
+    if (val) refuse_soft();
     val = getenv(HPPLITE_ENV_SPEND_CAP);
     if (val && val[0] && hpplite_spend_parse_cap(val, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: %s=%s: not N, N/hour or N/day; ignored\n", HPPLITE_ENV_SPEND_CAP, val);
     val = getenv(HPPLITE_ENV_LOW_BALANCE);
@@ -541,10 +545,10 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         if (get_uri_param(uri, gMoneyKnobs[i].uri, buf, sizeof(buf))) refuse_money_knob(i);
     if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)))
         snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (HPPLITE_RELAY_CAP bounds a call)");
-    if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf)) && buf[0]) cfg->softOff = strcasecmp(buf, "off") == 0 || strcmp(buf, "0") == 0;
+    if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf))) refuse_soft();
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) { int64_t k = parse_keep_seconds(buf); if (k >= 0) cfg->keepSeconds = k; }
-    if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) cfg->fromMode = parse_from_mode(buf, cfg->fromMode);
+    if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) refuse_from();
     if (get_uri_param(uri, HPPLITE_URI_SYNC_AT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncAtMs = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_RELAY, buf, sizeof(buf)) && buf[0]) {
         free(cfg->relayUrl);
@@ -717,12 +721,13 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     for (int i = 0; i < N_MONEY_KNOBS; i++)
         if (sqlite3_uri_parameter(filename, gMoneyKnobs[i].uri)) refuse_money_knob(i);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SOFT);
-    if (val && val[0]) cfg->softOff = strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0;
+    if (val) refuse_soft();
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_TO);
     if (val && atoll(val) > 0) cfg->syncTo = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_KEEP);
     if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) cfg->keepSeconds = k; }
-    cfg->fromMode = parse_from_mode(sqlite3_uri_parameter(filename, HPPLITE_URI_FROM), cfg->fromMode);
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_FROM);
+    if (val) refuse_from();
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_AT);
     if (val && atoll(val) > 0) cfg->syncAtMs = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_DEPOSIT);

@@ -147,7 +147,6 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeUrl = node_strdup(config->storeUrl);
     node->config.storeCap = config->storeCap;
     node->config.storePermit = config->storePermit;
-    node->config.softOff = config->softOff;
     node->syncTo = config->syncTo;
     node->syncAtMs = config->syncAtMs;
     node->config.spendCap = config->spendCap;
@@ -2202,7 +2201,7 @@ static uint8_t *node_store_get_checked(HppliteNode *node, const char *zRef, cons
 ** 1 started there; 0 not (from batch 1; why said when a snapshot was
 ** refused); -1 the file could not be written.
 */
-static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, int latestOnly) {
+static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, int earliest) {
     HppliteCtx *ctx = node->ctx;
     cJSON *m, *ix = NULL, *chunks = NULL, *c;
     uint64_t h = 0;
@@ -2214,10 +2213,11 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
     HppliteRange r;
     HppliteBatch *batch = NULL;
     const char *why = NULL;
+    node->snapshotPastStop = 0;
     m = node_range_manifest(node, lastBatch);
     if (!m || node_manifest_snapshot(m, &h, zIndex, &at, ixSha) != 0 || h < 2) { cJSON_Delete(m); return 0; }
-    if (node->config.fromSnapshot == 2 && !latestOnly) {
-        /* from=earliest (#224): the oldest snapshot still kept (keep=, #223) - the most history verified */
+    if (earliest) {
+        /* the oldest snapshot still kept (keep=, #223; #224) - the most history verified */
         const cJSON *first = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(m, "earlier"), 0);
         if (first) {
             cJSON *one = cJSON_CreateObject();
@@ -2230,8 +2230,8 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
         }
     }
     cJSON_Delete(m);
-    if (node->syncTo && h > node->syncTo) return 0;                         /* a stop before it (#206): from batch 1 */
-    if (node->syncAtMs && (uint64_t)at * 1000 > node->syncAtMs) return 0;  /* ...or a time before it was made (#205) */
+    if (node->syncTo && h > node->syncTo) { node->snapshotPastStop = h; return 0; }                         /* a stop before it (#206): from batch 1 */
+    if (node->syncAtMs && (uint64_t)at * 1000 > node->syncAtMs) { node->snapshotPastStop = h; return 0; }  /* ...or a time before it was made (#205) */
     memset(&r, 0, sizeof r);
     ix = node_snapshot_index(node, zIndex, ixSha);
     if (!ix) why = "its index is not at the store, or not the one the anchor named";
@@ -2293,9 +2293,9 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
     return 1;
 }
 
-static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch) {
-    int rc = node_start_from_snapshot_at(node, lastBatch, 0);
-    if (rc == 0 && node->config.fromSnapshot == 2) rc = node_start_from_snapshot_at(node, lastBatch, 1);   /* the oldest was not usable: the latest (#224) */
+static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch, int earliest) {
+    int rc = node_start_from_snapshot_at(node, lastBatch, earliest);
+    if (rc == 0 && earliest) rc = node_start_from_snapshot_at(node, lastBatch, 0);   /* the oldest was not usable: the latest (#224) */
     return rc;
 }
 
@@ -3002,7 +3002,8 @@ static int node_soft_walk(HppliteNode *node) {
 ** this replica's soft state is not the rollup's.
 */
 static int node_soft_follows(HppliteNode *node) {
-    return node && node->config.verifyOnly && !node->config.softOff && node->store && node->l1 && !node->softStopped && hpplite_l1_has_ranges(node->l1);
+    /* not with a stop (#206, #205): --to and --at ask for the hard history as of a point; the soft tier is past the anchor */
+    return node && node->config.verifyOnly && !node->syncTo && !node->syncAtMs && node->store && node->l1 && !node->softStopped && hpplite_l1_has_ranges(node->l1);
 }
 
 static int node_soft_push(HppliteNode *node, uint64_t h, const unsigned char after[32]) {
@@ -3132,7 +3133,6 @@ static int node_soft_rebuild(HppliteNode *node) {
     cfg = node->config;
     cfg.dbPath = zTmp;
     cfg.verifyOnly = 1;
-    cfg.softOff = 0;
     n2 = hpplite_node_create(&cfg);
     if (n2) {
         if (node->hasViewKey) hpplite_node_set_view_key(n2, node->viewKey);
@@ -3270,13 +3270,22 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     if (node->config.fromSnapshot && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2
         && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0) {
         /* a new replica: from the latest snapshot rather than batch 1 (#222) */
-        int started = node_start_from_snapshot(node, lastBatch);
+        int started = node_start_from_snapshot(node, lastBatch, 0);
         if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
         if (started > 0) synced++;
     }
     while (node->ctx->blockHeight <= lastBatch && !(node->syncTo && node->ctx->blockHeight > node->syncTo) && !node->syncAtReached) {
-        HppliteBatch *batch = node_fetch_batch(node, node->ctx->blockHeight);
+        /* a verifier reads batch 1 first - every step since genesis is the stronger check - and a history pruned at
+        ** the store (keep=, #223) has none to read: then the oldest snapshot the anchors still name (#224), its root
+        ** checked against the one the chain anchored there, and the batches after it. Was hpplite-verify's retry with
+        ** from=earliest (#255); now any verifier's. The read of batch 1 is quiet (#228): a prune is not this open's failure */
+        int mayFallBack = node->ctx->blockHeight == 1 && node->config.verifyOnly && !node->triedOldestSnapshot && node->pm && node->store && lastBatch >= 2
+                          && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0;
+        HppliteBatch *batch;
         int rc;
+        if (mayFallBack) { node->ctx->quiet = 1; node->ctx->zQuietError[0] = 0; }
+        batch = node_fetch_batch(node, node->ctx->blockHeight);
+        node->ctx->quiet = 0;
         if (batch && node->syncAtMs) {
             /* a stop by time (#205): no batch written after it begins; one that continues a transaction in flight
             ** at that time is applied, so the database is never left halfway through one */
@@ -3291,6 +3300,20 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
             if (node->lastFetchForeign && node_skip_foreign_height(node, node->ctx->blockHeight) == 0) {
                 synced++;
                 continue;
+            }
+            if (mayFallBack) {
+                char why[256];
+                int started;
+                snprintf(why, sizeof why, "%s", node->ctx->zQuietError[0] ? node->ctx->zQuietError : "not readable");
+                node->triedOldestSnapshot = 1;
+                fprintf(stderr, "hpplite: batch 1 cannot be read: trying the oldest snapshot the anchors name (a history pruned at the store, keep=)\n");
+                started = node_start_from_snapshot(node, lastBatch, 1);
+                if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
+                if (started > 0) { synced++; continue; }
+                if (node->snapshotPastStop)
+                    hpplite_error(node->ctx, "batch 1 cannot be read (%s) and the oldest snapshot the store keeps is at %llu, past the stop: the batches before "
+                                  "it are pruned (keep=), so the database as of an earlier height or time cannot be rebuilt", why, (unsigned long long)node->snapshotPastStop);
+                else hpplite_error(node->ctx, "%s", why);        /* the quiet read's reason, said now */
             }
             if (node->ctx->zLastError[0]) {   /* the fetch said what is wrong with the batch; keep that */
                 fprintf(stderr, "hpplite: sync stopped at height %llu of %llu on L1\n",
