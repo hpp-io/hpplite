@@ -244,7 +244,7 @@ once per process before opening. Checked by `tests/orm/run_orm.sh`:
 | Python `sqlite3`: SQLAlchemy, Alembic, Django | `sqlite3.connect(uri, uri=True)`; Django `NAME` = the URI | works |
 | Node `node:sqlite`: Drizzle (`sqlite-proxy`) | URI, or a plain path with `HPPLITE_FILES` | works |
 | npm `sqlite3`: Knex | `connection: { filename: uri, flags: ['OPEN_URI', 'OPEN_READWRITE', 'OPEN_CREATE'] }` | works |
-| better-sqlite3 (Drizzle's and Knex's default) | a plain path with `HPPLITE_FILES` (`tests/orm/test_better_sqlite3.js`) | works with row capture (the default). Its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in `sqlite3_expanded_sql()`: `capture=text` is refused at open, and a statement still logged as text (a schema change, a write reaching a virtual table) is refused when it binds values |
+| better-sqlite3 (Drizzle's and Knex's default) | a plain path with `HPPLITE_FILES` (`tests/orm/test_better_sqlite3.js`) | works with page capture (the default since v0.4) and with row capture. Its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in `sqlite3_expanded_sql()`: `capture=text` is refused at open, and a statement still logged as text (a schema change, a write reaching a virtual table) is refused when it binds values |
 | Prisma | - | not supported: its engine has its own SQLite and loads no extensions |
 | Ruby `sqlite3` gem: Rails 8 (Solid Queue, Solid Cache) | `extensions: [<module>]` in `database.yml`, `HPPLITE_FILES` for the files and `dbname={file}` in `HPPLITE_PARAMS` (`tests/real_apps/rails`) | works (macOS, forking Puma: `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`) |
 
@@ -402,8 +402,8 @@ on the VERSION 10 factory since 2026-11-04, page capture), a panel shows the cip
 store holds while it waits for its anchor, with explorer links to the rollup
 and the last anchor, and **Verify** rebuilds the database from the chain and
 the store in a separate process and compares roots. `examples/demo/run_demo.sh`
-serves it, starts the pin service (free mode, `data/pins`) and opens a
-Cloudflare quick tunnel (needs `cloudflared`, a real-L1 build and
+serves it with `store=on` (HPP Sepolia's store, one anchor per 30 minutes,
+paid from the node's funding wallet) and opens a Cloudflare quick tunnel (needs `cloudflared`, a real-L1 build and
 `HPPLITE_PRIVATE_KEY`).
 
 ## Gas Costs (HPP Sepolia)
@@ -598,7 +598,7 @@ finalized or a sync completes. A program polling `height` can tell why it
 stopped from these two columns alone.
 
 
-What exists in v0.1 is **rebuild and compare**: open an empty file with the
+The check is **rebuild and compare**: open an empty file with the
 same key and `l1=`/`contract=`; every batch is fetched, opened and replayed,
 and after each batch that carries a state root the content hash of the
 rebuilt database is compared with the posted one (`hpplite: state root
@@ -631,12 +631,13 @@ sqlite3> SELECT height, state_root, roots_compared, root_mismatches, replay_skip
 **`hpplite-verify`** (#5) packages this as a command:
 
 ```sh
-HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" hpplite-verify --db /path/to/app.db
+HPPLITE_PARAMS="l1=hpp-sepolia&store=on&keyfile=/path/to/key" hpplite-verify --db /path/to/app.db
 ```
 
 It opens an empty file with `role=verify` and the application's own
-parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`),
-rebuilds from the chain alone, compares every posted root with the rebuilt
+parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`, and
+`store=` where the bytes are at a store: every rollup on the `hpp-sepolia`
+factory), rebuilds from the chain and the store, compares every posted root with the rebuilt
 content, and compares the root the contract anchors at its last checkpoint
 with the rebuilt content at that height. With `--db` it also compares the
 live database (the same content hash as the state root) and, when they
@@ -668,7 +669,7 @@ claims nothing about a prune), and falls back to the oldest snapshot kept
 only when batch 1 is pruned.
 A verifier never posts, never claims the lease and never creates a rollup;
 `role=verify` is also usable from any connection that only wants to audit.
-It needs the wallet key (batches are encrypted); a viewing key is v0.3 (#15).
+It needs the wallet key or a viewing key the writer granted (batches are encrypted; see Keys).
 There is no fraud proof or challenge period: the chain holds the log and
 the roots, the key holder is the one who checks them.
 
@@ -980,7 +981,9 @@ Issues are grouped by [milestone](https://github.com/hpp-io/hpplite/milestones).
 
 ## What is refused
 
-By default (row capture, below) a replica applies what each write changed,
+With page capture (the default since v0.4) nothing below applies: the pages
+each commit wrote replicate whatever SQL produced them, and the only
+refusals are `ATTACH` and the `_hpplite_` names. With row capture (below) a replica applies what each write changed,
 so what a statement computed - random values, the clock, application
 functions - does not matter. What is still logged as SQL *text* must produce
 the same rows wherever it runs: schema changes, writes that reach a virtual
@@ -1224,7 +1227,7 @@ See [doc/architecture.md](doc/architecture.md#local-durability).
 The sequencer is your process; it is trusted to execute SQL. What the chain
 adds is a history it cannot quietly rewrite: batches are posted in order
 under a lease, roots are anchored, and anyone holding the key can rebuild
-from the chain alone and compare. Nothing in v0.1 punishes a divergent
+from the chain and the store and compare. Nothing here punishes a divergent
 sequencer - there are no funds, bonds or fraud proofs here - it makes the
 divergence detectable, and a lost disk recoverable. The lease keeps two
 copies of your process from posting at once, and only the rollup's

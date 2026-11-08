@@ -19,7 +19,7 @@
 **   HPPLITE_ENCRYPT           - on|off: seal batches before posting (default on)
 **   HPPLITE_CHECKPOINT_INTERVAL - batches per checkpoint / state root (default 100)
 **   HPPLITE_DETERMINISM       - strict (default: refuse SQL replay cannot reproduce) | warn
-**   HPPLITE_CAPTURE           - rows (default: what each write changed, #19) | text (each write statement, v0.1)
+**   HPPLITE_CAPTURE           - auto (default: pages for a new rollup, #146) | pages | rows (#19) | text (v0.1's)
 **   HPPLITE_DBNAME            - a name: the database gets its own rollup among the wallet's (#61); {file} = its file name
 **   HPPLITE_ROLE              - sequencer|observer
 **   HPPLITE_NODE_ID           - Node identifier (status output only)

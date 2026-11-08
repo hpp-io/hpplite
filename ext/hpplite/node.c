@@ -2900,8 +2900,9 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
 
     *pMore = 0;
     zStoreWhy[0] = 0;
-    /* The root is O(database size): compute it only on the batch that
-    ** closes a checkpoint interval (the checkpoint is submitted from it) */
+    /* A root is embedded only on the batch that closes a checkpoint interval
+    ** (the checkpoint is submitted from it); the trees keep it incrementally
+    ** (#9), and page mode carries one per batch regardless */
     int withRoot = node->batchesSinceCheckpoint + 1 >= node->config.checkpointInterval;
     /* The DA limit applies to the posted bytes: leave room for the envelope */
     size_t maxBytes = node->config.maxBatchBytes;
