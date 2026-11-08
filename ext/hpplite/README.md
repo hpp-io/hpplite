@@ -7,8 +7,8 @@ database pages, by default for a new rollup (`capture=pages`), or row
 records or statements. It cuts that into batches and seals them with a key
 derived from your wallet key.
 
-- **Soft tier:** each batch goes to a store within seconds (a pin service,
-  Kubo or S3), under its height and signed by the sequencer.
+- **Soft tier:** each batch goes to a store within seconds, under its
+  height and signed by the sequencer.
 - **Hard tier:** every 30 minutes, at HPP's own cadence, one transaction
   anchors everything since the last anchor on an Ethereum-compatible chain:
   the chain hash, the state root (a Merkle root over the database), and the
@@ -53,7 +53,7 @@ sqlite3_exec(db, "INSERT INTO users VALUES(1, 'alice')", NULL, NULL, NULL);
 sqlite3_close(db);
 ```
 
-`l1=hpp-sepolia` selects the RPC endpoint, factory contract and batch interval (30 minutes, the chain's own cadence; `interval=5s` for development) for HPP Sepolia (see Contracts). On first open, the factory auto-deploys your rollup contracts (~3s). Without a store, the batches go on the chain itself. With `store=` (a pin service, `kubo://` or `s3://`), they go to the store within seconds, and the chain gets one anchor per `anchor=` interval (see [Stores and commitments](#stores-and-commitments)).
+`l1=hpp-sepolia` selects the RPC endpoint, factory contract and batch interval (30 minutes, the chain's own cadence; `interval=5s` for development) for HPP Sepolia (see Contracts). On first open, the factory auto-deploys your rollup contracts (~3s). Without a store, the batches go on the chain itself. With `store=` (`on`, or an `hpplite-store/2` store's URL), they go to the store within seconds, and the chain gets one anchor per `anchor=` interval (see [Stores and commitments](#stores-and-commitments)).
 
 The same works from the stock `sqlite3` shell after `.load ./hpplite`, and
 from any language whose SQLite binding can load extensions.
@@ -179,7 +179,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). The only value: any other refuses the open (#248); a sequencer needs no `role=` |
 | `snapshot` | No | With `store=` on a chain with ranges, page capture: how often the sequencer snapshots the database at an anchor - `24h`, `1h`; `0` (default) never (#221). The snapshot is the file at the anchored height, sealed like a batch, at the store in chunks under an index the anchor's manifest names, so a replica can start there instead of at batch 1. Also `HPPLITE_SNAPSHOT`. See Stores and commitments |
 | `soft` | No | `off`: a `role=verify` connection with `store=` stays at the anchored height instead of following the store's batches past it (#166). Also `HPPLITE_SOFT` |
-| `store` | No | `on` for the network's canonical store (`l1=hpp-sepolia`: `https://store.sepolia.hpplite.hpp.io`; a network without one refuses to open, #192), or `http://host:port` of a store speaking `hpplite-store/2` (`operators/store/hpplite_store.py`, or the canonical one): the rollup's bucket, kept while its funding wallet covers it (#214); `kubo://host:port` of a Kubo node's RPC; or `s3://bucket[/prefix]` (credentials and region from `AWS_*`, `HPPLITE_S3_ENDPOINT` for a compatible service). The batch bytes go there and the chain holds the commitment - hash, reference, and with each anchor the store's signed bucket statement (#11, #33). A replica needs the same `store=` to rebuild. The protocol: [doc/store-protocol.md](doc/store-protocol.md). Also `HPPLITE_STORE` |
+| `store` | No | `on` for the network's canonical store (`l1=hpp-sepolia`: `https://store.sepolia.hpplite.hpp.io`; a network without one refuses to open, #192), or `http://host:port` of a store speaking `hpplite-store/2` (`operators/store/hpplite_store.py`, or the canonical one): the rollup's bucket, kept while its funding wallet covers it (#214). The batch bytes go there and the chain holds the commitment - hash, reference, and with each anchor the store's signed bucket statement (#11, #33). A replica needs the same `store=` to rebuild. The protocol: [doc/store-protocol.md](doc/store-protocol.md). Also `HPPLITE_STORE` |
 | `storecap` | No | The most the funding wallet pays the store by x402 at once (a top-up), in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing by x402. Also `HPPLITE_STORE_CAP` |
 | `storepermit` | No | What the funding wallet's EIP-2612 permit lets the store pull for the rollup's bucket, in atomic units (default 20000000, 20 USDC.e; renewed as it runs low or within 30 days of its year). The funding wallet's key is derived from the node's (`store_funder` in `hpplite_status`: send USDC.e there, from any wallet or exchange; it needs no ETH). With a permit the store charges storage and writes as they accrue, so the bucket stays covered while the node is off; 0: no permit, each 402 is a top-up paid by x402 up to `storecap=` (#214). Also `HPPLITE_STORE_PERMIT` |
 | `spendcap` | No | The most paid to the store and the relay together over a rolling window, in atomic units: `N/hour` or `N/day` (a bare `N` means per day; #173). It counts what was charged; a channel deposit isn't counted, because it is still the node's money. A put past it is refused before anything is signed, and the batch waits with the reason (`store_state` = `over cap`). The ledger is kept per wallet in the data directory (`spend-<wallet>.json`), so a restart doesn't reset the window. A node opened without its key keeps it in memory. Also `HPPLITE_SPEND_CAP` |
@@ -682,8 +682,8 @@ the roots, the key holder is the one who checks them.
 Three words the rest of this document uses precisely (#35, #11):
 
 - A **store** is where the bytes of a batch live. Today that is the rollup's
-  DA contract on the chain, a directory, a pin service, a Kubo node or an
-  S3 bucket (#11).
+  DA contract on the chain, a directory, or an `hpplite-store/2` store (#11,
+  #214).
 - A **commitment** is what the chain holds per height: HPPLite's own hash
   of the batch and a reference into the store (on chain, the height itself;
   later a CID or an object key), and, with each anchor, the store's signed
@@ -768,9 +768,8 @@ with the sequencer's EIP-712 `Batch` signature appended (#165: the one
 height and the bytes' keccak), so a reader finds batches by height before the
 anchor and knows who claims them; `hpplite_store_batch_signer()` recovers the
 wallet. A `hpplite-store/2` store takes a name only into the rollup's bucket,
-from the sequencer the chain names and the instance its lease names;
-an S3 bucket takes it as a key; a Kubo node takes no names. The hard tier does
-not depend on the name: a store that refuses it is said once on stderr.
+from the sequencer the chain names and the instance its lease names. The hard
+tier does not depend on the name: a store that refuses it is said once on stderr.
 
 **Recovery (#167).** A sequencer that dies with batches at the store and not
 yet anchored loses none of them: the next sequencer with the same key, on
@@ -900,21 +899,11 @@ the hash, replays; one without says `batch N is in a store (...) and no
 store= names one` and rebuilds nothing. A store that does not answer never
 holds a batch back: the chain carries the bytes meanwhile
 (`storefallback=on`, the default); anvil scenario 21 runs it with the store
-down. `store=kubo://host:port`
-is a Kubo node's own RPC (`add` with CIDv1 and raw leaves, pinned; `cat`):
-the same commitments with no receipt, for a node you run yourself; ctest
-runs it against a stand-in (`operators/store/kubo_mock.py`), and
-`HPPLITE_KUBO=kubo://127.0.0.1:5001` runs the same case against a daemon.
-`store=s3://bucket[/prefix]` is a bucket: Signature Version 4 with the
-standard `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_REGION`,
-`HPPLITE_S3_ENDPOINT` for MinIO, R2 or another compatible service
-(path-style, `endpoint/bucket/key`), the object keyed by the bytes' CID
-under the prefix, so the reference committed is the same CID a pin service
-or Kubo would commit and the bytes can be re-pinned anywhere; ctest runs it
-against a stand-in that checks the signature (`s3_mock.py`), and
-`HPPLITE_S3=s3://bucket/prefix` runs the same case against a real bucket;
-CI runs both against Kubo and RustFS (MinIO's drop-in; MinIO publishes no
-public image any more) in containers, which is how #136 was found.
+down. A store you run yourself is `operators/store/hpplite_store.py` in
+front of your own disk, at a price of zero: the same protocol, names,
+bucket statement and snapshots as the canonical one (`store=kubo://` and
+`store=s3://`, which took no payment, no names and gave no statement, were
+removed in v0.8, #250).
 `tools/topup.sh AMOUNT` tops the wallet up: it bridges that many USDC from
 Ethereum Sepolia to USDC.e on HPP Sepolia through HPP's gateway with `cast`
 (approve, then `outboundTransfer` with a retryable ticket it prices from the

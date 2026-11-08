@@ -58,53 +58,6 @@ jobs:
             -DHPPLITE_USE_REAL_L1=ON -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
           cmake --build ext/hpplite/build_real -j"$(nproc)"
 
-  stores:
-    name: real stores (Kubo, RustFS)
-    runs-on: ubuntu-24.04
-    services:
-      kubo:
-        image: ipfs/kubo:latest
-        ports: ['5001:5001']
-      rustfs:
-        image: rustfs/rustfs:latest
-        ports: ['9000:9000']
-        env:
-          RUSTFS_ACCESS_KEY: hpplite
-          RUSTFS_SECRET_KEY: hpplite-ci-secret
-    steps:
-      - uses: actions/checkout@v4
-      - name: dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config tcl zlib1g-dev \
-            libsecp256k1-dev libcurl4-openssl-dev python3
-      - name: SQLite amalgamation
-        run: mkdir -p build && cd build && ../configure >/dev/null && make -s sqlite3.c sqlite3ext.h >/dev/null
-      - name: build
-        run: |
-          cmake -S ext/hpplite -B ext/hpplite/build -DHPPLITE_SQLITE_SRC=$PWD/build \
-            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
-          cmake --build ext/hpplite/build -j"$(nproc)" --target test_store
-      - name: the services answer, the bucket exists
-        env:
-          AWS_ACCESS_KEY_ID: hpplite
-          AWS_SECRET_ACCESS_KEY: hpplite-ci-secret
-          AWS_REGION: us-east-1
-        run: |
-          for i in $(seq 1 60); do curl -s -m 2 -X POST http://127.0.0.1:5001/api/v0/version | grep -q Version && break; sleep 2; done
-          curl -s -X POST http://127.0.0.1:5001/api/v0/version
-          for i in $(seq 1 60); do curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ | grep -qE '403|200' && break; sleep 2; done
-          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://batches
-      - name: test_store against the stand-ins and the real services (#11, #136)
-        env:
-          HPPLITE_KUBO: kubo://127.0.0.1:5001
-          HPPLITE_S3: s3://batches/hpplite/ci
-          HPPLITE_S3_ENDPOINT: http://127.0.0.1:9000
-          AWS_ACCESS_KEY_ID: hpplite
-          AWS_SECRET_ACCESS_KEY: hpplite-ci-secret
-          AWS_REGION: us-east-1
-        run: cd ext/hpplite/build && ./test_store ../operators/store
-
   anvil:
     name: real contracts on anvil
     runs-on: ubuntu-24.04

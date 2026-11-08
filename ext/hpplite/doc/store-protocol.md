@@ -235,7 +235,7 @@ charged to the account as owed).
 - It writes names (the bytes once) and other content (manifests, snapshots)
   as signed bucket puts, commits the bucket statement with each anchor, and
   reports `covered_until` and the bucket's state in `hpplite_status`.
-- `kubo://` and `s3://` stores are unchanged (no protocol, no payment).
+- `kubo://` and `s3://` stores: removed in v0.8 (#250); a store speaks this protocol.
 
 ## Removed
 

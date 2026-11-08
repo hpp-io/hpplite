@@ -4,15 +4,10 @@
 ** the store keeps the bytes: put bytes, get by reference. The reference is
 ** opaque to the node (a CID at a pin service).
 **
-** store=http://host:port is the pin service of operators/store (or any
-** provider speaking its four calls): POST /put, GET /get/<ref>. A 402 is
-** paid in x402's exact scheme with the node's key, up to storecap= per call.
-** store=kubo://host:port is a Kubo node's own RPC (add, cat): the node pins
-** what it is given and signs nothing, so the chain commits (hash, CID) with
-** no receipt. store=s3://bucket[/prefix] is a bucket over Signature Version
-** 4 (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION; HPPLITE_S3_ENDPOINT
-** for a compatible service), keyed by the bytes' CID under the prefix; the
-** same (hash, CID) commitment, no receipt.
+** store=http(s)://host[:port] is an hpplite-store/2 store (operators/store/hpplite_store.py, or the network's
+** canonical one, store=on): the rollup's bucket, paid by its funding wallet. A 402 is paid in x402's exact
+** scheme with the node's key, up to storecap= per call. Nothing else is a store: kubo:// and s3:// were
+** removed in v0.8 (#250) - they took no payment, no names (Kubo) and gave no bucket statement.
 */
 #ifndef HPPLITE_STORE_H
 #define HPPLITE_STORE_H
@@ -122,8 +117,7 @@ void hpplite_store_sha256(const uint8_t *data, size_t len, uint8_t out[32]);
 ** domain) appended, so a reader finds batches by height and recovers who claims them (#167).
 ** sign fills sig from the store's key (-1 without one); put_named stores bytes||instance||sig
 ** under the name (0, or -1 with the reason in error); get_named reads them back, the instance
-** and the signature apart (malloc'd bytes, or NULL). A pin service and an S3 bucket take
-** names; a Kubo node does not (-1 / NULL). */
+** and the signature apart (malloc'd bytes, or NULL). */
 int hpplite_store_sign_batch(HppliteStore *store, const unsigned char da[20], uint64_t chainId, const unsigned char instance[32],
                              uint64_t height, const uint8_t *data, size_t len, uint8_t sig[65]);
 int hpplite_store_put_named(HppliteStore *store, const char *zName, const unsigned char instance[32], const uint8_t *data, size_t len, const uint8_t sig[65]);
