@@ -348,12 +348,22 @@ cmake --build ext/hpplite/build_real
 ## Testing
 
 ```bash
+# The acceptance run (#258): the four runs a change passes before it is committed - ctest on
+# the mock build, the same on a build against SQLite trunk, test_anvil on the real-L1 build,
+# and the rest of that build's ctest (the reference store and relay, x402, the encodings) -
+# one line each with what it proves; exit 1 naming any run that did not happen (a build not
+# configured, foundry missing, a suite that skipped) or did not pass. Build directories and
+# the trunk amalgamation are taken from the environment (see the script's header)
+ext/hpplite/tools/acceptance.sh             # all four, then the report (~20 min)
+ext/hpplite/tools/acceptance.sh mock anvil  # some of them
+ext/hpplite/tools/acceptance.sh --report    # the last results alone
+
 # Unit tests (mock L1, fast, no network)
-ctest                    # 43 tests, ~1 min: node, durability, page capture (the WAL reader,
+ctest                    # 44 tests, ~3 min: node, durability, page capture (the WAL reader,
                          # the pin, the page batch, the page mode), concurrency, reorg, blob
                          # I/O, cipher, envelope, keys, keystore, the store and the
                          # conformance vectors, the loadable extension, the crash harness
-                         # (mock, store, directory), Python/CLI smoke, docs check.
+                         # (mock, store, directory), Python/CLI smoke, docs check, the acceptance report.
                          # One capture, so each suite runs once (the _text/_pages twins
                          # went with row and statement capture, #253)
 
@@ -986,7 +996,9 @@ the anchored root instead of saying there is no checkpoint yet. A manifest
 names the latest snapshot and the oldest kept (`"earliest"`), not a list of
 up to 64 (#257): the sequencer keeps its list in the sidecar, and the #231
 cap on `keep=` with `snapshot=` is gone. Manifests from v0.7 that carry
-`"earlier"` are read for their latest snapshot only.
+`"earlier"` are read for their latest snapshot only. The acceptance run is
+a script, `tools/acceptance.sh` (#258): four runs, each saying what it
+proves, and no pass reported while one is missing.
 
 Paying in the HPP token itself is open (#175).
 
@@ -999,7 +1011,7 @@ Paying in the HPP token itself is open (#175).
 | v0.5 | HPP economics: store-based persistence and soft commitment, one chain anchor every 30 minutes (#162, #164-#167); replicas on the soft tier (#166); a node with USDC.e and no ETH through a relay (#126, #170); store and relay paid by voucher (#135, #179), spending caps (#173) | same | a store (soft) + one L1 commitment per 30 min (hard) |
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
-| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#257) | same | same |
+| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#258) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database

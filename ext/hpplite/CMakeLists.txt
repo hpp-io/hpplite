@@ -375,6 +375,9 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_conformance_ports_taken COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ports_taken.sh
                  sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/conformance/selftest.sh)
         set_tests_properties(test_conformance_ports_taken PROPERTIES RESOURCE_LOCK test_store)
+        # the acceptance run's report refuses a pass while a run is missing, skipped or failed (#258)
+        add_test(NAME test_acceptance_report COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/acceptance_report.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/acceptance.sh)
     endif()
     if(HPPLITE_BUILD_EXTENSION)
         add_test(NAME test_loadable COMMAND test_loadable)
