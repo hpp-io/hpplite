@@ -44,6 +44,7 @@
 #include "crypto.h"
 #include "config.h"
 #include "store.h"
+#include "da_uri.h"
 #include <time.h>
 #include <ftw.h>
 #include <sys/stat.h>
@@ -210,6 +211,22 @@ int main(int argc, char **argv) {
         if (!mkdtemp(dir)) { perror("hpplite-verify: mkdtemp"); return 2; }
     }
 
+    /* store=on when the parameters name a network with a canonical store and no store (#247): on such a network the
+    ** bytes - and the databases' names - are at the store, so a verifier without one can do nothing; another store
+    ** is named with store= as before */
+    const char *zStore = "";
+    if (!strstr(params, "store=")) {
+        const char *l1 = strncmp(params, "l1=", 3) == 0 ? params + 3 : strstr(params, "&l1=") ? strstr(params, "&l1=") + 4 : NULL;
+        if (l1) {
+            char alias[64];
+            size_t n = strcspn(l1, "&");
+            if (n < sizeof alias) {
+                memcpy(alias, l1, n); alias[n] = 0;
+                const char *url = hpplite_network_store_url(hpplite_da_resolve_alias(alias));
+                if (url) { zStore = "&store=on"; fprintf(stderr, "hpplite-verify: store=on (%s, the network's canonical store; give store= to name another)\n", url); }
+            }
+        }
+    }
     /* the verifier's own datadir, first so it wins over one in the parameters */
     const char *zCapture = "", *zFrom = "";
     int triedPages = 0, triedSnapshot = 0;
@@ -220,7 +237,7 @@ open_again:
       if (stopAt) snprintf(to, sizeof to, "&syncto=%llu", (unsigned long long)stopAt);    /* the stop, from the first sync at open */
       else if (atMs) snprintf(to, sizeof to, "&syncat=%llu", (unsigned long long)atMs);
       /* the retry's capture= and from= before the user's params: the first of a key wins (#239) */
-      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s%s%s%s&%s", dir, dir, zCapture, to, zFrom, params);
+      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s%s%s%s&%s%s", dir, dir, zCapture, to, zFrom, params, zStore);
       db = uri ? hpplite_open(uri) : NULL;
       sqlite3_free(uri); }
     if (!db) {
@@ -230,7 +247,10 @@ open_again:
     }
     HppliteNode *node = hpplite_get_node(db);
     if (!node || !node->l1) {
-        fprintf(stderr, "hpplite-verify: no chain connection (%s)\n", status_text(db, "last_error"));
+        const char *why = status_text(db, "last_error");
+        if (strstr(why, "no store= names one"))
+            fprintf(stderr, "hpplite-verify: could not verify: the wallet's databases are named at a store and no store= names one; give store= (store=on for the network's canonical store)\n");
+        else fprintf(stderr, "hpplite-verify: no chain connection (%s)\n", why);
         rc = 2;
         goto close;
     }
@@ -312,7 +332,12 @@ open_again:
                    node->lastAppliedMs > atMs ? " (it completes a transaction in flight at that time)" : "");
         }
     }
-    if (rebuilt < target) {
+    if (rebuilt < target && strstr(zErr, "no store= names one")) {
+        /* not a verdict on the data: the bytes are at a store the parameters did not name (#247); what the chain
+        ** says is reported below all the same */
+        printf("\nhpplite-verify: could not verify: %s; give store= (store=on for the network's canonical store)\n", zErr);
+        rc = 2;
+    } else if (rebuilt < target) {
         printf("\nhpplite-verify: sync stopped at batch %llu: %s\n", (unsigned long long)rebuilt + 1, zErr[0] ? zErr : zState);
         rc = 1;
     } else {

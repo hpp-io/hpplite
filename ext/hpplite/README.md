@@ -631,19 +631,23 @@ sqlite3> SELECT height, state_root, roots_compared, root_mismatches, replay_skip
 **`hpplite-verify`** (#5) packages this as a command:
 
 ```sh
-HPPLITE_PARAMS="l1=hpp-sepolia&store=on&keyfile=/path/to/key" hpplite-verify --db /path/to/app.db
+HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" hpplite-verify --db /path/to/app.db
 ```
 
 It opens an empty file with `role=verify` and the application's own
-parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`, and
-`store=` where the bytes are at a store: every rollup on the `hpp-sepolia`
-factory), rebuilds from the chain and the store, compares every posted root with the rebuilt
+parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`), rebuilds
+from the chain and the store, compares every posted root with the rebuilt
 content, and compares the root the contract anchors at its last checkpoint
 with the rebuilt content at that height. With `--db` it also compares the
 live database (the same content hash as the state root) and, when they
 differ and nothing is pending, names the tables that differ. Exit 0 verified,
 1 not (a root mismatch, a sync that stopped short, a live file that
-differs), 2 could not run. The rebuilt file is deleted unless `--keep <dir>`.
+differs), 2 could not run. On a network with a canonical store (`l1=hpp-sepolia`)
+the tool takes `store=on` itself when the parameters name no store: the bytes,
+and the databases' names, are there; another store is named with `store=` as
+usual. Without a store on a rollup whose bytes are at one, the tool says so and
+exits 2 (a gap in the parameters, not a verdict), after reporting what the chain
+anchors (#247). The rebuilt file is deleted unless `--keep <dir>`.
 `--to <height>` stops after that batch (#206): with `--keep`, the database as of that
 height stays, its own posted root matched; checkpoints past it are not compared.
 `--at <time>` (unix seconds or `YYYY-MM-DDTHH:MM:SSZ`) is point-in-time recovery (#205):

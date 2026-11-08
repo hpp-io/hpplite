@@ -1699,6 +1699,24 @@ static void test_store_commit(void) {
             sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0);
             FAIL("hpplite-verify should report the range the chain anchored and its bucket statement, verified (#215)");
         }
+        /* without store=: the bytes are at a store the command line did not name - a gap in the parameters, not a
+        ** verdict: exit 2 'could not verify ... give store=' (#247). By name, the names themselves are at the store,
+        ** so the rollup is not even found; by address, the rollup is known and the chain-only facts are still reported */
+        snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=stored", RPC, FACTORY, KEY2);
+        rc = run_verify_with(params, NULL, out, sizeof out);
+        if (rc != 2 || !strstr(out, "give store=") || !strstr(out, "could not verify") || strstr(out, "NOT verified")) {
+            printf("(hpplite-verify by name without store= rc %d: %.400s) ", rc, out);
+            sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+            FAIL("hpplite-verify by name without store= should exit 2 'could not verify ... give store=' (#247)");
+        }
+        snprintf(params, sizeof params, "rpc=%s&chainid=31337&privkey=%s&contract=%s", RPC, KEY2, contract);
+        rc = run_verify_with(params, NULL, out, sizeof out);
+        if (rc != 2 || !strstr(out, "give store=") || !strstr(out, "could not verify") || strstr(out, "NOT verified")
+            || !strstr(out, "anchored to 3: the last range 3-3")) {
+            printf("(hpplite-verify by address without store= rc %d: %.400s) ", rc, out);
+            sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+            FAIL("hpplite-verify by address without store= should exit 2 'could not verify ... give store=' and still report the anchor (#247)");
+        }
     }
 
     /* without the store the bytes are out of reach: nothing rebuilt, and the reason says so */
