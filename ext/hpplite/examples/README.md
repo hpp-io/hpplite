@@ -104,7 +104,7 @@ file:myapp.db?hpplite=on&l1=hpp-sepolia&privkey=0x...
 | `factory` | No* | Factory contract (auto-set from l1 alias) |
 | `contract` | No | Direct rollup address (if known) |
 | `privkey` | Yes | Private key for signing |
-| `datadir` | No | Local data directory |
+| `datadir` | No | The per-wallet spending ledger and relay channel files (default `/tmp/hpplite`) |
 | `interval` | No | Batch interval (e.g., `5s`, `1m`) |
 
 *Use `l1=hpp-sepolia` for simplest config - RPC and factory are built-in.
