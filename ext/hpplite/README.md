@@ -190,7 +190,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min for a node without a store, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). With `store=` the chain's cadence goes to `anchor` instead and the interval stays 5 s: the batches reach the store in seconds, the chain gets one commitment per anchor (#164). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `compress` | No | `on` (default): the page batch is deflated before it is sealed or posted when that shrinks it (#12); `off`: posted as is. Every reader takes both forms. Also `HPPLITE_COMPRESS` |
-| `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
+| `checkpoint` | No | On a rollup without a store: batches per checkpoint, the batch whose root the contract also holds. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44); a history shorter than that has no root on chain to verify against yet (see Verification). With `store=` on a chain with ranges it is ignored, said once on stderr: the anchor carries the root every `anchor=` and no checkpoint transaction is sent (#256) |
 | `dbname` | No | Give the database its own rollup among the wallet's, found by this name (#61): several databases on one key. Names are compared exactly and must be unique per wallet: two files with the same name on one key are one database on chain (the second, if empty, rebuilds the first's data into itself). `{file}` = the file's base name without its directory (`a/x.db` and `b/x.db` are both `x.db`; `:memory:` is `memory`), so one `HPPLITE_PARAMS` serves every file `HPPLITE_FILES` names. A name no rollup has yet creates one (~2.5M gas): a misspelt name on a replica is a new, empty database, and the message says which names the wallet has. The name is read from each rollup's first batch (or its snapshot) at the store; while the store does not answer for any of them, a sequencer on a fresh file creates nothing (#229: one of them may be this database) - writes stay local and each flush looks again; a store that answers 404 (the bytes gone) is no reason to wait. Also `HPPLITE_DBNAME` |
 
 *Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`. `capture=` and `determinism=` (and `HPPLITE_CAPTURE`, `HPPLITE_DETERMINISM`) are gone since v0.8 (#253): a URI or environment that still names one refuses the open and says so. The budgets below are environment variables alone (#254).
@@ -549,12 +549,13 @@ contract's storage, and v0.7 is the last release that reads it.
 
 ## Verification
 
-A replica rebuilt from L1 compares the root of its file with the root
-posted at each checkpoint (`roots_compared`, `root_mismatches`). Until the
-first checkpoint (`checkpoint=`, default every 100 batches) there is no
-posted root yet: compare `SELECT state_root FROM hpplite_status` of the
-writer and the rebuilt file yourself, or use a smaller `checkpoint` in
-development.
+A replica rebuilt from L1 compares the root of its file with the root each
+page batch carries (`roots_compared`, `root_mismatches`), and
+`hpplite-verify` compares the root the chain holds with the rebuilt content
+at its height: with `store=` the root each anchor carries (every `anchor=`;
+`anchored root at H: ... matches the rebuilt content`, #256), without one
+the root of each checkpoint (`checkpoint=`, default every 100 batches; until
+the first there is none on chain yet, and the tool says so).
 
 `hpplite_status` columns (43): `height` (next batch number), `pending`
 (commits captured and not yet posted), `state_root` (the page root of the
@@ -648,8 +649,9 @@ HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" hpplite-verify --db /path/t
 It opens an empty file with `role=verify` and the application's own
 parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`), rebuilds
 from the chain and the store, compares every posted root with the rebuilt
-file's page root, and compares the root the contract anchors at its last
-checkpoint with the rebuilt file's root at that height. It prints the
+file's page root, and compares the root the chain holds - the last
+anchor's with `store=`, the last checkpoint's without (#256) - with the
+rebuilt file's root at that height. It prints the
 rebuilt file's content hash too (`rebuilt state root`, version 1): that is
 the hash `--db` compares the live database with, and when they differ and
 nothing is pending, it names the tables that differ. Exit 0 verified,
@@ -976,6 +978,9 @@ variables alone, refused in a URI (#254; `HPPLITE_STORE_FALLBACK` is new).
 snapshot, a verifier from batch 1 and, when the store has pruned it, from
 the oldest snapshot kept - the fallback `hpplite-verify` used to retry with
 is the node's now - and the soft tier follows unless a stop is given.
+Under `store=` on a chain with ranges `checkpoint=` writes no contract
+(#256): the anchor is the one root cadence, and `hpplite-verify` checks
+the anchored root instead of saying there is no checkpoint yet.
 
 Paying in the HPP token itself is open (#175).
 
@@ -988,7 +993,7 @@ Paying in the HPP token itself is open (#175).
 | v0.5 | HPP economics: store-based persistence and soft commitment, one chain anchor every 30 minutes (#162, #164-#167); replicas on the soft tier (#166); a node with USDC.e and no ETH through a relay (#126, #170); store and relay paid by voucher (#135, #179), spending caps (#173) | same | a store (soft) + one L1 commitment per 30 min (hard) |
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
-| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254, #255) | same | same |
+| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#256) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database

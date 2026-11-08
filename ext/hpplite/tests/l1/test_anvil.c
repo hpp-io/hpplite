@@ -1576,6 +1576,26 @@ static void test_store_commit(void) {
         hpplite_l1_disconnect(peek);
         if (!closed) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the close should anchor batch 4 as a range of one"); }
     }
+    {
+        /* checkpoint= under a store (#256): the anchor carries the root, so the knob writes no contract - the rollup's
+        ** interval stays and one stderr line says so (before: a paid setCheckpointInterval at every such open) */
+        char cp[260];
+        HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
+        HppliteSystemConfig *sc = peek ? hpplite_l1_get_system_config(peek) : NULL;
+        unsigned long long before = sc ? (unsigned long long)sc->checkpointInterval : 0, after = 0;
+        if (sc) hpplite_l1_system_config_free(sc);
+        hpplite_l1_disconnect(peek);
+        snprintf(cp, sizeof cp, "&dbname=stored&store=http://127.0.0.1:%d&checkpoint=7", port);   /* extra carries role=verify by now */
+        sqlite3 *w3 = open_db("st_writer.db", KEY2, cp);
+        if (w3) { sqlite3_exec(w3, "INSERT INTO s(v) VALUES('five')", NULL, NULL, NULL); scalar(w3, "SELECT hpplite_flush()"); sqlite3_close(w3); }
+        peek = hpplite_l1_connect(RPC, contract);                 /* a fresh connection: the system config is cached per connection */
+        sc = peek ? hpplite_l1_get_system_config(peek) : NULL;
+        after = sc ? (unsigned long long)sc->checkpointInterval : 0;
+        if (sc) hpplite_l1_system_config_free(sc);
+        hpplite_l1_disconnect(peek);
+        printf("(checkpoint=7 under the store: the contract's interval %llu before, %llu after) ", before, after);
+        if (!w3 || before == 0 || after != before) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("checkpoint= under a store must write no contract: the interval stays"); }
+    }
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     if (!refused) FAIL("a replica without a store should rebuild nothing and say why");
     PASS();

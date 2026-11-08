@@ -310,7 +310,10 @@ int main(int argc, char **argv) {
     if (mismatches > 0) { printf(" <- the content does not match what was posted"); rc = 1; }
     printf("\n");
 
-    /* the root the contract anchors, against the rebuilt content at that height */
+    /* the root the contract holds, against the rebuilt content at that height: with ranges (#164) the anchor carries
+    ** it, checked in the range block below; without, the checkpoint (#256) */
+    HppliteRange lastRange;
+    int anchored = onChain > 0 && hpplite_l1_get_range(node->l1, onChain, &lastRange) == 0;
     {
         HppliteL1State *st = hpplite_l1_get_state(node->l1);
         if (stopAt && rebuilt == stopAt) {
@@ -346,7 +349,7 @@ int main(int argc, char **argv) {
                        (unsigned long long)st->lastCheckpointHeight, want, (unsigned long long)node->ctx->rootCmpHeight);
                 if (rebuilt >= st->lastCheckpointHeight) rc = 1;
             }
-        } else if (st) {
+        } else if (st && !anchored) {
             printf("no checkpoint on chain yet (checkpoint interval %llu): posted roots only\n", (unsigned long long)st->checkpointInterval);
         }
         hpplite_l1_state_free(st);
@@ -389,14 +392,22 @@ int main(int argc, char **argv) {
         if (hpplite_db_hash(db, root) == SQLITE_OK) { hex(root, z); printf("rebuilt state root: 0x%s\n", z); }
     }
     /* ranges (#164): what the chain anchored against what the rebuild holds */
-    if (onChain > 0) {
-        HppliteRange r;
-        if (hpplite_l1_get_range(node->l1, onChain, &r) == 0) {
-            char z[65];
+    if (anchored) {
+        HppliteRange r = lastRange;
+        {
+            char z[65], want[65], got[65];
+            unsigned char at[32];
             hex(r.manifestDigest, z);
             printf("anchored to %llu: the last range %llu-%llu, manifest sha-256 %s%s\n", (unsigned long long)onChain,
                    (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, z,
                    !r.nReceipt ? ", no receipt" : r.receipt[0] == 2 ? ", with the store's bucket statement" : ", with the store's receipt");
+            /* the anchor is the checkpoint (#164): the state root it carries against the rebuilt content at its end (#256) */
+            hex(r.stateRoot, want);
+            if (hpplite_root_at(node->ctx, r.toHeight, at) == 0) {
+                hex(at, got);
+                if (memcmp(r.stateRoot, at, 32) == 0) printf("anchored root at %llu: %s matches the rebuilt content\n", (unsigned long long)r.toHeight, want);
+                else { printf("anchored root at %llu: %s, rebuilt content %s <- MISMATCH\n", (unsigned long long)r.toHeight, want, got); rc = 1; }
+            } else printf("anchored root at %llu (%s): not reached by the rebuild\n", (unsigned long long)r.toHeight, want);
             if (r.nReceipt && r.receipt[0] == 2) {
                 /* hpplite-store/2 (#215): the store's signed word that it holds the rollup's batches, covered until a time */
                 char c[43], d[43], zs[41], when[40];

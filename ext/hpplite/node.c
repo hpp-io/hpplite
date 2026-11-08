@@ -1051,7 +1051,15 @@ static void node_learn_batch_limit(HppliteNode *node) {
         ** chain says and what the node does agree. */
         if (cfg->checkpointInterval > 0 && !node->checkpointSynced) {
             node->checkpointSynced = 1;
-            if (!node->checkpointGiven) {
+            if (node_ranges(node)) {
+                /* with a store on a chain with ranges the anchor carries the root (#164) and no checkpoint transaction
+                ** is sent: checkpoint= would buy one contract write and nothing else, so it is ignored, said once (#256) */
+                if (node->checkpointGiven && (uint64_t)node->config.checkpointInterval != cfg->checkpointInterval)
+                    fprintf(stderr, "hpplite: checkpoint=%d ignored: with a store the anchor carries the root (every anchor=) and no checkpoint "
+                                    "transaction is sent; the contract's interval (%llu) is left as it is\n",
+                            node->config.checkpointInterval, (unsigned long long)cfg->checkpointInterval);
+                node->config.checkpointInterval = (int)cfg->checkpointInterval;
+            } else if (!node->checkpointGiven) {
                 node->config.checkpointInterval = (int)cfg->checkpointInterval;
             } else if ((uint64_t)node->config.checkpointInterval != cfg->checkpointInterval && !node->config.verifyOnly) {
                 char *tx = hpplite_l1_set_checkpoint_interval(node->l1, (uint64_t)node->config.checkpointInterval);
