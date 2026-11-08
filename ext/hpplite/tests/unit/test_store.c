@@ -577,6 +577,31 @@ static int store_has(HppliteStore *rs, const char *zRef) {
     return d != NULL;
 }
 
+/* 1 when the manifest ending at `to` names a snapshot at `height` anywhere (the latest, or an older one kept); 0 not; -1 unreadable */
+static int manifest_names_snapshot(HppliteL1 *l1, HppliteStore *rs, uint64_t to, uint64_t height) {
+    HppliteRange r;
+    char cid[64];
+    size_t n = 0;
+    uint8_t *text;
+    cJSON *m;
+    const cJSON *e, *h;
+    int found = 0;
+    memset(&r, 0, sizeof r);
+    if (hpplite_l1_get_range(l1, to, &r) != 0) return -1;
+    hpplite_store_cid_from_sha256(r.manifestDigest, cid);
+    hpplite_l1_range_clear(&r);
+    text = hpplite_store_get(rs, cid, &n);
+    m = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
+    free(text);
+    if (!m) return -1;
+    cJSON_ArrayForEach(e, m) {
+        if (cJSON_IsObject(e) && (h = cJSON_GetObjectItemCaseSensitive(e, "height")) && cJSON_IsNumber(h) && (uint64_t)h->valuedouble == height) found = 1;
+        if (cJSON_IsArray(e)) { const cJSON *x; cJSON_ArrayForEach(x, e) { h = cJSON_GetObjectItemCaseSensitive(x, "height"); if (cJSON_IsObject(x) && cJSON_IsNumber(h) && (uint64_t)h->valuedouble == height && cJSON_GetObjectItemCaseSensitive(x, "index")) found = 1; } }
+    }
+    cJSON_Delete(m);
+    return found;
+}
+
 /* 6d. keep= (#223): the history behind the newest snapshot made at least `keep` ago is pruned at the store;
 ** a replica still starts from the snapshot, and the earlier snapshots still kept are named */
 static void test_keep(const char *url) {
@@ -594,6 +619,11 @@ static void test_keep(const char *url) {
     hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
     for (i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('one of the first three')", NULL); hpplite_node_flush_batch(w); }
     if (hpplite_node_anchor(w) != 3 || range_snapshot(l1, rs, 3, &h, zIndex3) != 0 || h != 3) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 1-3 with a snapshot at 3"); }
+    /* a restart between the snapshots at 3 and 5: the process that did not make the snapshot at 3 learns it from the
+    ** manifest at its first anchor - which the chain refuses below (#238) - and must still name it at the retry (#259) */
+    hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    w = test_open_node(tpath("kp_w.db"), l1, &o);
+    if (!w) { hpplite_store_close(rs); FAIL("reopen between the snapshots"); }
     if (range_batch_ref(l1, rs, 3, 1, b1) != 0 || range_batch_ref(l1, rs, 3, 3, b3) != 0 || !store_has(rs, b1)) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("batch 1 at the store: nothing older than keep yet"); }
     sleep(4);                                   /* keep=3s, by whole seconds: a margin over the boundary */
     for (i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four and five')", NULL); hpplite_node_flush_batch(w); }
@@ -604,6 +634,7 @@ static void test_keep(const char *url) {
     if (!store_has(rs, b1) || !store_has(rs, zIndex3)) { printf("(batch 1 %d, snapshot 3 %d) ", store_has(rs, b1), store_has(rs, zIndex3)); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("a refused anchor must not prune: batch 1 and the snapshot at 3 still named by the chain's manifest"); }
     hpplite_l1_mock_set_fail_submit(l1, 0);
     if (hpplite_node_anchor(w) != 5 || range_snapshot(l1, rs, 5, &h, zIndex) != 0 || h != 5) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 4-5 with a new snapshot at 5"); }
+    if (manifest_names_snapshot(l1, rs, 5, 3) != 1) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the manifest at 5 must still name the snapshot at 3 after a restart and a refused anchor (#259)"); }
     /* the snapshot at 3 is older than keep: below it is pruned; it and what follows stay */
     range_batch_ref(l1, rs, 5, 4, b4);
     if (store_has(rs, b1) || !store_has(rs, b3) || !store_has(rs, b4) || !store_has(rs, zIndex3)) {

@@ -2447,7 +2447,7 @@ static int node_anchor(HppliteNode *node) {
     char wasIndex[64];
     unsigned char wasSha[32];
     int64_t wasAt = node->snapAt;
-    int rc, wasN = node->nEarlier;
+    int rc, wasN = node->nEarlier, wasLooked = node->snapLooked;
     HppliteSnapRef wasEarlier[HPPLITE_SNAPSHOTS_NAMED];
     snprintf(wasIndex, sizeof wasIndex, "%s", node->snapIndex);
     memcpy(wasSha, node->snapIndexSha, 32);
@@ -2469,6 +2469,10 @@ static int node_anchor(HppliteNode *node) {
             memcpy(node->spareRoot, node->snapRoot, 32);
             node->snapHeight = was; snprintf(node->snapIndex, sizeof node->snapIndex, "%s", wasIndex); node->snapAt = wasAt; memcpy(node->snapIndexSha, wasSha, 32);
         }
+        /* the first anchor of a process reads the previous manifest inside node_anchor_once: what was saved above is
+        ** "nothing known", and a restart whose first anchor the chain refused forgot the snapshot kept (#259) - the
+        ** retry reads the manifest again */
+        if (!wasLooked) node->snapLooked = 0;
     }
     return rc;
 }
