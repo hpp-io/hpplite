@@ -83,8 +83,8 @@ typedef struct TestNodeOpts {
     const char *nodeId;                      /* NULL: the suite's */
     const unsigned char *privkey;            /* NULL: the suite's */
     const char *storeUrl;                    /* store= (#11): the batch bytes go there, the chain holds commitments */
-    uint64_t storeCap;                       /* storecap= */
-    int storeFallbackOff;                    /* storefallback=off: a store that does not answer keeps the batch waiting */
+    uint64_t storeCap;                       /* HPPLITE_STORE_CAP */
+    int storeFallbackOff;                    /* HPPLITE_STORE_FALLBACK=off: a store that does not answer keeps the batch waiting */
     int snapshotMs;                          /* snapshot= (#221): a snapshot at an anchor when the last is older */
     int fromSnapshot;                        /* from=snapshot (#222): a new replica starts from the latest snapshot */
     int64_t keepSeconds;                     /* keep= (#223): the history behind a snapshot this old is pruned */

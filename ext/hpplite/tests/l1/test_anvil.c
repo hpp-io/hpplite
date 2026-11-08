@@ -1229,9 +1229,17 @@ static void test_soak(void) {
     PASS();
 }
 
+/* the money knobs are environment, not URI (#254): a scenario sets what it needs; wanted() clears them before the next */
+static void money_env(const char *cap, const char *permit, const char *spend, const char *low, const char *relayCap, const char *fallback) {
+    const char *k[] = { "HPPLITE_STORE_CAP", "HPPLITE_STORE_PERMIT", "HPPLITE_SPEND_CAP", "HPPLITE_LOW_BALANCE", "HPPLITE_RELAY_CAP", "HPPLITE_STORE_FALLBACK" };
+    const char *v[] = { cap, permit, spend, low, relayCap, fallback };
+    for (int i = 0; i < 6; i++) { if (v[i]) setenv(k[i], v[i], 1); else unsetenv(k[i]); }
+}
+
 static int wanted(int number) {
     const char *z = getenv("HPPLITE_ANVIL_TESTS");
     char tag[16];
+    money_env(NULL, NULL, NULL, NULL, NULL, NULL);
     if (!z || !z[0]) return 1;
     snprintf(tag, sizeof tag, ",%d,", number);
     char all[256];
@@ -1575,9 +1583,9 @@ static void test_store_commit(void) {
 
 /* 20. The node pays its bucket (#214, hpplite-store/2): the reference store on the mock facilitator
 ** (MockUSDC, KEY1 the pay-to, KEY3 the store's signer and puller). The node's funding wallet - its
-** key derived from the node's - holds MockUSDC and no ETH. With the default storepermit= the node
+** key derived from the node's - holds MockUSDC and no ETH. With the default HPPLITE_STORE_PERMIT the node
 ** binds the bucket and gives a permit; its writes accrue and the store pulls them from the funding
-** wallet. With storepermit=0 a write's 402 is paid by x402 from the funding wallet, up to storecap=:
+** wallet. With HPPLITE_STORE_PERMIT=0 a write's 402 is paid by x402 from the funding wallet, up to HPPLITE_STORE_CAP:
 ** below the top-up nothing is signed and the batch waits. */
 static long long anvil_usdc_of(const char *usdc, const char *addr) {
     char cmd[400], out[200];
@@ -1585,7 +1593,7 @@ static long long anvil_usdc_of(const char *usdc, const char *addr) {
     return run_cmd(cmd, out, sizeof out) == 0 ? (long long)first_number(out) : -1;
 }
 static void test_store_paid(void) {
-    TEST("the node pays its bucket (#214): the funding wallet (no ETH) gives a permit and the store pulls what the writes cost; with storepermit=0 a 402 is a top-up paid by x402 up to storecap=, below it nothing is signed and the batch waits");
+    TEST("the node pays its bucket (#214): the funding wallet (no ETH) gives a permit and the store pulls what the writes cost; with HPPLITE_STORE_PERMIT=0 a 402 is a top-up paid by x402 up to HPPLITE_STORE_CAP, below it nothing is signed and the batch waits");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
     if (!svc || !usdc || !usdc[0]) { printf("SKIP (no store or MockUSDC in the environment) "); PASS(); return; }
     int port = test_free_port();
@@ -1624,7 +1632,8 @@ static void test_store_paid(void) {
 #define PD_FAIL(why) do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); FAIL(why); } while (0)
 
     /* the permit: the node binds, gives the permit, writes; the store pulls */
-    snprintf(extra, sizeof extra, "&dbname=paidstore&store=http://127.0.0.1:%d&storecap=100000", port);
+    money_env("100000", NULL, NULL, NULL, NULL, NULL);
+    snprintf(extra, sizeof extra, "&dbname=paidstore&store=http://127.0.0.1:%d", port);
     sqlite3 *w = open_db("pd_writer.db", KEY0, extra);
     if (!w) PD_FAIL("open writer");
     snprintf(funder, sizeof funder, "%s", status_text(w, "store_funder"));
@@ -1650,8 +1659,9 @@ static void test_store_paid(void) {
     sqlite3_close(w);
     if (!okPermit) PD_FAIL("the store should pull the writes' cost from the funding wallet, which holds no ETH; nothing paid by x402");
 
-    /* storepermit=0: a fresh funding wallet (KEY9's) pays the 402s; storecap= below the top-up: nothing signed */
-    snprintf(extra, sizeof extra, "&dbname=paidx402&store=http://127.0.0.1:%d&storecap=10&storepermit=0", port);
+    /* HPPLITE_STORE_PERMIT=0: a fresh funding wallet (KEY9's) pays the 402s; HPPLITE_STORE_CAP below the top-up: nothing signed */
+    money_env("10", "0", NULL, NULL, NULL, NULL);
+    snprintf(extra, sizeof extra, "&dbname=paidx402&store=http://127.0.0.1:%d", port);
     sqlite3 *w2 = open_db("pd_x402.db", KEY9, extra);
     if (!w2) PD_FAIL("open the second writer");
     snprintf(funder, sizeof funder, "%s", status_text(w2, "store_funder"));
@@ -1662,12 +1672,13 @@ static void test_store_paid(void) {
     long long h = scalar(w2, "SELECT hpplite_flush()");
     char err[300];
     snprintf(err, sizeof err, "%s", status_text(w2, "last_error"));
-    int refused = h == 0 && strstr(err, "storecap") != NULL && scalar(w2, "SELECT pending FROM hpplite_status") > 0
+    int refused = h == 0 && strstr(err, "STORE_CAP") != NULL && scalar(w2, "SELECT pending FROM hpplite_status") > 0
                   && strcmp(status_text(w2, "store_state"), "over cap") == 0 && anvil_usdc_of(usdc, funder) == fundBefore;
-    printf("(storepermit=0, cap 10: flush %lld, '%.60s', store_state %s) ", h, err, status_text(w2, "store_state"));
+    printf("(HPPLITE_STORE_PERMIT=0, cap 10: flush %lld, '%.60s', store_state %s) ", h, err, status_text(w2, "store_state"));
     sqlite3_close(w2);
     if (!refused) PD_FAIL("a top-up over storecap should be refused before signing, the batch kept pending, nothing paid");
-    snprintf(extra, sizeof extra, "&dbname=paidx402&store=http://127.0.0.1:%d&storecap=100000&storepermit=0", port);
+    money_env("100000", "0", NULL, NULL, NULL, NULL);
+    snprintf(extra, sizeof extra, "&dbname=paidx402&store=http://127.0.0.1:%d", port);
     w2 = open_db("pd_x402.db", KEY9, extra);
     if (!w2) PD_FAIL("reopen the second writer");
     h = scalar(w2, "SELECT hpplite_flush()");
@@ -1685,10 +1696,10 @@ static void test_store_paid(void) {
 
 /* 21. The store does not answer (#11): with storefallback on (the default)
 ** the chain carries the bytes meanwhile, as before the store, and a replica
-** with no store rebuilds; with storefallback=off the batch waits and says
+** with no store rebuilds; with HPPLITE_STORE_FALLBACK=off the batch waits and says
 ** why. KEY4, its own named database; the store is a port nobody listens on. */
 static void test_store_fallback(void) {
-    TEST("the store does not answer (#11): the chain carries the bytes meanwhile; storefallback=off keeps the batch waiting instead");
+    TEST("the store does not answer (#11): the chain carries the bytes meanwhile; HPPLITE_STORE_FALLBACK=off keeps the batch waiting instead");
     char extra[200];
     snprintf(extra, sizeof extra, "&dbname=fallback&store=http://127.0.0.1:9");
     sqlite3 *w = open_db("fb_writer.db", KEY4, extra);
@@ -1717,7 +1728,8 @@ static void test_store_fallback(void) {
     sqlite3_close(r);
     sqlite3_close(w);
 
-    snprintf(extra, sizeof extra, "&dbname=fallback&store=http://127.0.0.1:9&storefallback=off");
+    money_env(NULL, NULL, NULL, NULL, NULL, "off");
+    snprintf(extra, sizeof extra, "&dbname=fallback&store=http://127.0.0.1:9");
     sqlite3 *w2 = open_db("fb_writer.db", KEY4, extra);
     if (!w2) FAIL("reopen writer");
     sqlite3_exec(w2, "INSERT INTO fb(v) VALUES('waits')", NULL, NULL, NULL);
@@ -1726,7 +1738,7 @@ static void test_store_fallback(void) {
     int waited = h2 == 0 && strstr(err, "store") != NULL && scalar(w2, "SELECT pending FROM hpplite_status") > 0;
     printf("(fallback off: flush %lld, '%.50s') ", h2, err);
     sqlite3_close(w2);
-    if (!waited) FAIL("with storefallback=off the batch should wait with the store's reason");
+    if (!waited) FAIL("with HPPLITE_STORE_FALLBACK=off the batch should wait with the store's reason");
     PASS();
 }
 
@@ -2018,7 +2030,8 @@ static void test_relay_no_eth(void) {
 #define STOP_SERVICES() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); } while (0)
     if (relay < 0) { STOP_SERVICES(); FAIL("the relay did not come up (see relay.log)"); }
     setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
-    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&relaycap=200000000&anchor=0", sport, rport);
+    money_env(NULL, NULL, NULL, NULL, "200000000", NULL);
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", sport, rport);
     sqlite3 *w = open_db("nz_writer.db", ZKEY, extra);
     if (!w) { STOP_SERVICES(); FAIL("open writer"); }
     char contract[80];
@@ -2076,7 +2089,8 @@ static void test_relay_fallback(void) {
     TEST("relay= that does not answer, a wallet with ETH (#126): the writes go from the wallet itself; last_tx_path says direct; a replica rebuilds");
     char extra[200];
     int dead = test_free_port();                                  /* nobody listens there */
-    snprintf(extra, sizeof extra, "&dbname=relayfallback&relay=http://127.0.0.1:%d&relaycap=1000", dead);
+    money_env(NULL, NULL, NULL, NULL, "1000", NULL);
+    snprintf(extra, sizeof extra, "&dbname=relayfallback&relay=http://127.0.0.1:%d", dead);
     sqlite3 *w = open_db("rf_writer.db", KEY8, extra);
     if (!w) FAIL("open writer");
     sqlite3_exec(w, "CREATE TABLE f(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO f(v) VALUES('direct')", NULL, NULL, NULL);
@@ -2107,14 +2121,14 @@ static long long usdc_balance(const char *usdc, const char *addr) {
     snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", usdc, addr, RPC);
     return cast_number(cmd);
 }
-/* 30. Spending over time (#173): spendcap= over a rolling window, the store
+/* 30. Spending over time (#173): HPPLITE_SPEND_CAP over a rolling window, the store
 ** and the relay together. Two puts at about 1,001 units fit 2500/hour; the
 ** third is refused before anything is signed and waits, saying spendcap;
 ** spent_window says what the window holds; the ledger is in the data
 ** directory, so a reopen does not reset it. A wallet with 5,000 units at
-** that rate gets spend_warning (lowbalance=). */
+** that rate gets spend_warning (HPPLITE_LOW_BALANCE). */
 static void test_spend_cap(void) {
-    TEST("spending over time (#173): spendcap= refuses the put past the window's cap before signing, the batch waits; a reopen keeps the window; spend_warning names the balance that runs out");
+    TEST("spending over time (#173): HPPLITE_SPEND_CAP refuses the put past the window's cap before signing, the batch waits; a reopen keeps the window; spend_warning names the balance that runs out");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
     static const char SKEY[] = "0x3030303030303030303030303030303030303030303030303030303030303030";
     if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
@@ -2153,8 +2167,9 @@ static void test_spend_cap(void) {
     setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
     setenv("HPPLITE_SPEND_CHECK_SECONDS", "1", 1);          /* the warning's rate from a second of history, not five minutes */
 #define SP_FAIL(why) do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); unsetenv("HPPLITE_SPEND_CHECK_SECONDS"); FAIL(why); } while (0)
-    /* storepermit=0: every write's 402 is a top-up of 1000 paid by x402 from the funding wallet, two per batch (its bytes, its name) */
-    snprintf(extra, sizeof extra, "&dbname=spendcap&store=http://127.0.0.1:%d&storecap=5000&storepermit=0&spendcap=4500/hour&lowbalance=1000", port);
+    /* HPPLITE_STORE_PERMIT=0: every write's 402 is a top-up of 1000 paid by x402 from the funding wallet, two per batch (its bytes, its name) */
+    money_env("5000", "0", "4500/hour", "1000", NULL, NULL);
+    snprintf(extra, sizeof extra, "&dbname=spendcap&store=http://127.0.0.1:%d", port);
     sqlite3 *w = open_db("spend_writer.db", SKEY, extra);
     if (!w) SP_FAIL("open writer");
     snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 5000 >/dev/null", RPC, KEY0, usdc, status_text(w, "store_funder"));
@@ -2168,7 +2183,7 @@ static void test_spend_cap(void) {
     sqlite3_exec(w, "INSERT INTO s(v) VALUES('past the cap')", NULL, NULL, NULL);
     long long h = scalar(w, "SELECT hpplite_flush()");
     snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
-    int refused = h == 0 && strstr(err, "spendcap") && scalar(w, "SELECT pending FROM hpplite_status") > 0 && strcmp(status_text(w, "store_state"), "over cap") == 0;
+    int refused = h == 0 && strstr(err, "SPEND_CAP") && scalar(w, "SELECT pending FROM hpplite_status") > 0 && strcmp(status_text(w, "store_state"), "over cap") == 0;
     printf("(spent %lld, window %lld; third put: flush %lld, '%.80s') ", spent, window, h, err);
     if (spent != 4000 || window != spent || !refused) { sqlite3_close(w); SP_FAIL("the third batch should wait over spendcap, the window holding the two"); }
     usleep(1500 * 1000);
@@ -2185,7 +2200,7 @@ static void test_spend_cap(void) {
     long long window2 = status_int(w, "spent_window");
     sqlite3_close(w);
     printf("(after a reopen: flush %lld, window %lld) ", h, window2);
-    if (h != 0 || !strstr(err, "spendcap") || window2 < spent) SP_FAIL("a reopen must not reset the window");
+    if (h != 0 || !strstr(err, "SPEND_CAP") || window2 < spent) SP_FAIL("a reopen must not reset the window");
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     unsetenv("HPPLITE_STORE_VALID_FOR"); unsetenv("HPPLITE_SPEND_CHECK_SECONDS");
 #undef SP_FAIL

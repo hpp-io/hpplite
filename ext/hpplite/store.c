@@ -2,11 +2,11 @@
 ** HPPLite stores (#11): a hpplite-store/2 store over HTTP (#214, doc/store-protocol.md).
 **
 ** The rollup's bucket: bound at the first write with the node's key (the rollup's sequencer) and a
-** funding key derived from it, given an EIP-2612 permit (storepermit=) the store pulls what it is owed
+** funding key derived from it, given an EIP-2612 permit (HPPLITE_STORE_PERMIT) the store pulls what it is owed
 ** with. put: POST <url>/put?bucket=<da>&height=<n> with the bytes and the sequencer's Content
 ** signature; names: POST /name/<da>-<height>. A 402 (a write the account cannot cover) is paid once
 ** from the funding wallet in x402's exact scheme, an EIP-3009 TransferWithAuthorization for the quoted
-** top-up, sent back in PAYMENT-SIGNATURE; above storecap= the call is refused before anything is
+** top-up, sent back in PAYMENT-SIGNATURE; above HPPLITE_STORE_CAP the call is refused before anything is
 ** signed. The relay is paid the same way from the node's own key, per call (x402's batch-settlement
 ** channels were removed in v0.8, #251).
 ** get: GET <url>/get/<ref>: the bytes.
@@ -52,7 +52,7 @@ struct HppliteStore {
     uint64_t chainId;
     int isRelay;                    /* opened for relay= (#126): its messages name the relay and relaycap */
     char protocol[48];              /* what /status says it speaks ("hpplite-store/1"; empty: a service from before #188) */
-    HppliteSpend *spend;            /* the node's ledger (#173): spendcap= checked before signing, charges recorded; not owned */
+    HppliteSpend *spend;            /* the node's ledger (#173): HPPLITE_SPEND_CAP checked before signing, charges recorded; not owned */
     /* hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket, paid from a funding wallet */
     int v2;                         /* /status says hpplite-store/2 */
     int hasBucket;                  /* bucketDa below is set (hpplite_store_set_bucket) */
@@ -62,7 +62,7 @@ struct HppliteStore {
     int hasFund;                    /* the funding key: derived from the node's key */
     HppliteKeypair fundKp;
     unsigned char fundAddr[20];
-    uint64_t permitCap;             /* storepermit=: what the permit lets the store pull (0: none, the 402s are paid) */
+    uint64_t permitCap;             /* HPPLITE_STORE_PERMIT: what the permit lets the store pull (0: none, the 402s are paid) */
     time_t permitChecked;
     unsigned char spender[20];      /* who the permit names (/status buckets.spender) */
     char assetName[64], assetVersion[16];   /* the asset's EIP-712 domain, for the permit */
@@ -273,7 +273,7 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "exact") == 0 && !acc) acc = it;
     }
     if (acc && s->spend) {
-        /* spendcap= (#173): over the window's cap, nothing is signed; the batch waits as over storecap= */
+        /* HPPLITE_SPEND_CAP (#173): over the window's cap, nothing is signed; the batch waits as over HPPLITE_STORE_CAP */
         uint64_t asked = strtoull(jstr(acc, "amount") ? jstr(acc, "amount") : "0", NULL, 10);
         char why[200];
         if (hpplite_spend_allow(s->spend, asked, why, sizeof why) != 0) {
@@ -300,7 +300,7 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         HppliteKeypair *payKp = s->v2 && s->hasFund ? &s->fundKp : &s->kp;          /* /2: the funding wallet pays (#214) */
         const unsigned char *payAddr = s->v2 && s->hasFund ? s->fundAddr : s->address;
         if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the %s asks %llu, %s is %llu: refused", s->isRelay ? "relay" : "store",
-                                     (unsigned long long)amt, s->isRelay ? "relaycap" : "storecap", (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
+                                     (unsigned long long)amt, s->isRelay ? "HPPLITE_RELAY_CAP" : "HPPLITE_STORE_CAP", (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
         if (strncmp(network->valuestring, "eip155:", 7) == 0) chainId = strtoull(network->valuestring + 7, NULL, 10);
         /* domain = keccak(typehash, keccak(name), keccak(version), chainId, asset) */
         unsigned char domain[32], w[32 * 7], h[32], digest[32], nonce[32], sig[65], t[32];
@@ -559,7 +559,7 @@ void hpplite_store_set_valid_for(HppliteStore *s, uint64_t seconds) { if (s && s
 /* === hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket and its funding wallet ===
 ** The funding key is derived from the node's (keccak256("hpplite funding key" || key)): backing up
 ** the node's key backs up the wallet too. The node binds the bucket with both keys, gives the store
-** a permit to pull from the funding wallet (storepermit=) and pays any 402 from it. */
+** a permit to pull from the funding wallet (HPPLITE_STORE_PERMIT) and pays any 402 from it. */
 
 static void lowerHex(const unsigned char *b, size_t n, char *out) {
     size_t i;
@@ -1022,7 +1022,7 @@ char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data
     }
     status = paidPost(s, path, data, len, zHeader, &out);
     sqlite3_free(zHeader);
-    if (status == 402 && (strstr(s->error, "storecap") || strstr(s->error, "spendcap"))) {
+    if (status == 402 && (strstr(s->error, "HPPLITE_STORE_CAP") || strstr(s->error, "HPPLITE_SPEND_CAP"))) {
         s->lastFailure = HPPLITE_STORE_FAIL_CAP;            /* nothing signed past the caps: the batch waits */
         free(out.p);
         return NULL;

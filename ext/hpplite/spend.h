@@ -2,7 +2,7 @@
 ** What the node pays, over time (#173): a ledger of the charges the store
 ** and the relay made (atomic units of their asset, USDC.e), kept a day in
 ** the data directory so a restart does not reset it; a cap over a rolling
-** window (spendcap=); samples of the wallet's ETH balance, whose fall is
+** window (HPPLITE_SPEND_CAP); samples of the wallet's ETH balance, whose fall is
 ** what its own transactions cost. One ledger per node, shared by the store
 ** and the relay handles; safe from the flush thread and the status reader.
 */
@@ -18,7 +18,7 @@ typedef struct HppliteSpend HppliteSpend;
 HppliteSpend *hpplite_spend_open(const char *zPath, uint64_t cap, uint64_t window);
 void hpplite_spend_close(HppliteSpend *sp);
 
-/* 0 when paying amount now stays within the cap; -1 with the reason in zWhy (it names spendcap=) */
+/* 0 when paying amount now stays within the cap; -1 with the reason in zWhy (it names HPPLITE_SPEND_CAP) */
 int hpplite_spend_allow(HppliteSpend *sp, uint64_t amount, char *zWhy, size_t nWhy);
 /* A charge made now */
 void hpplite_spend_add(HppliteSpend *sp, uint64_t amount);
@@ -31,7 +31,7 @@ uint64_t hpplite_spend_cap(HppliteSpend *sp, uint64_t *pWindow);
 void hpplite_spend_eth_sample(HppliteSpend *sp, double wei);
 double hpplite_spend_eth_spent(HppliteSpend *sp, uint64_t *pSpan);
 
-/* "spendcap=5000/hour" etc.: the cap and its window; -1 when it does not parse */
+/* "HPPLITE_SPEND_CAP=5000/hour" etc.: the cap and its window; -1 when it does not parse */
 int hpplite_spend_parse_cap(const char *z, uint64_t *pCap, uint64_t *pWindow);
 
 #endif

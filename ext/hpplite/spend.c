@@ -122,7 +122,7 @@ int hpplite_spend_allow(HppliteSpend *sp, uint64_t amount, char *zWhy, size_t nW
     used = sum_since(sp, now_s() - (int64_t)sp->window);
     ok = used + amount <= sp->cap;
     pthread_mutex_unlock(&sp->mu);
-    if (!ok && zWhy) snprintf(zWhy, nWhy, "this call (%llu) would pass spendcap=%llu/%s (%llu spent in it)", (unsigned long long)amount,
+    if (!ok && zWhy) snprintf(zWhy, nWhy, "this call (%llu) would pass HPPLITE_SPEND_CAP=%llu/%s (%llu spent in it)", (unsigned long long)amount,
                               (unsigned long long)sp->cap, sp->window == 3600 ? "hour" : "day", (unsigned long long)used);
     return ok ? 0 : -1;
 }

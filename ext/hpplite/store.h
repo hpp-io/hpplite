@@ -6,7 +6,7 @@
 **
 ** store=http(s)://host[:port] is an hpplite-store/2 store (operators/store/hpplite_store.py, or the network's
 ** canonical one, store=on): the rollup's bucket, paid by its funding wallet. A 402 is paid in x402's exact
-** scheme with the node's key, up to storecap= per call. Nothing else is a store: kubo:// and s3:// were
+** scheme with the node's key, up to HPPLITE_STORE_CAP per call. Nothing else is a store: kubo:// and s3:// were
 ** removed in v0.8 (#250) - they took no payment, no names (Kubo) and gave no bucket statement.
 */
 #ifndef HPPLITE_STORE_H
@@ -32,9 +32,9 @@ void hpplite_store_close(HppliteStore *store);
 ** The HTTP status (0: unreachable; 402: not paid, the reason in
 ** hpplite_store_error) and the answer's body (sqlite3_free) */
 long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *body, size_t len, char **pzOut);
-/* The handle is a relay's (#126): what it says names the relay and relaycap= */
+/* The handle is a relay's (#126): what it says names the relay and HPPLITE_RELAY_CAP */
 void hpplite_store_set_relay(HppliteStore *s);
-/* The node's spend ledger (#173, spend.h): checked before signing (spendcap=), charges recorded. Not owned. */
+/* The node's spend ledger (#173, spend.h): checked before signing (HPPLITE_SPEND_CAP), charges recorded. Not owned. */
 struct HppliteSpend;
 void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp);
 
@@ -47,7 +47,7 @@ char *hpplite_store_put_at(HppliteStore *store, uint64_t height, const uint8_t *
 /*
 ** hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket at the store, paid from a funding
 ** wallet whose key is derived from the node's. set_bucket names the rollup (its DA) and what the
-** funding wallet's permit lets the store pull (storepermit=, atomic units; 0: no permit, the store's
+** funding wallet's permit lets the store pull (HPPLITE_STORE_PERMIT, atomic units; 0: no permit, the store's
 ** 402s are paid instead); the bucket is bound and the permit given at the first write. is_bucket: the
 ** store speaks /2. funder: the funding wallet's address (send USDC.e there). covered_until and
 ** bucket_state: from the last statement (-1 / NULL when not known). statement: the store's signed
@@ -123,7 +123,7 @@ int hpplite_store_domain(HppliteStore *store, unsigned char payTo[20], uint64_t 
 /* Why the last put or get failed, for the node's choice between waiting and posting on chain */
 #define HPPLITE_STORE_FAIL_NONE        0
 #define HPPLITE_STORE_FAIL_UNREACHABLE 1   /* no answer: the chain can carry the bytes meanwhile */
-#define HPPLITE_STORE_FAIL_CAP         2   /* the price is over storecap=: nothing signed, the batch waits */
+#define HPPLITE_STORE_FAIL_CAP         2   /* the price is over HPPLITE_STORE_CAP: nothing signed, the batch waits */
 #define HPPLITE_STORE_FAIL_OTHER       4
 int hpplite_store_last_failure(HppliteStore *store);
 long hpplite_store_take_status(HppliteStore *store);   /* the last request's HTTP status since last asked: -1 none, 0 no answer (#229) */

@@ -1769,7 +1769,7 @@ static void node_anchor_row(HppliteNode *node, const unsigned char hash[32], con
 }
 
 /* The store's bucket is the rollup's (hpplite-store/2, #214): named by the DA address, bound and
-** given the funding wallet's permit (storepermit=) at the first write, once the addresses are known. */
+** given the funding wallet's permit (HPPLITE_STORE_PERMIT) at the first write, once the addresses are known. */
 static void node_store_bucket(HppliteNode *node) {
     char c[43], d[43];
     const char *zDa;
@@ -2896,7 +2896,7 @@ void hpplite_node_spend_check(HppliteNode *node) {
             if (left < hours) snprintf(w + n, sizeof w - n, "%sETH for about %.0f h at the recent rate (%.6f ETH left)", n ? "; " : "", left, wei / 1e18);
         }
     }
-    if (w[0] && strcmp(w, node->spendWarning) != 0 && !node->spendWarning[0]) fprintf(stderr, "hpplite: warning: %s (lowbalance=%d)\n", w, hours);
+    if (w[0] && strcmp(w, node->spendWarning) != 0 && !node->spendWarning[0]) fprintf(stderr, "hpplite: warning: %s (HPPLITE_LOW_BALANCE=%d)\n", w, hours);
     else if (!w[0] && node->spendWarning[0]) fprintf(stderr, "hpplite: the balance warning cleared\n");
     snprintf(node->spendWarning, sizeof node->spendWarning, "%s", w);
 }

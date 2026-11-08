@@ -78,18 +78,18 @@ typedef struct HppliteNodeConfig {
     int verifyOnly;                 /* role=verify: rebuild and compare, never post, claim or create (#5) */
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
-    uint64_t storeCap;              /* storecap=: the most to pay a store per call, atomic units (0 = pay nothing) */
-    uint64_t storePermit;           /* storepermit=: what the funding wallet's permit lets the store pull (0: none, #214) */
+    uint64_t storeCap;              /* HPPLITE_STORE_CAP: the most to pay a store per call, atomic units (0 = pay nothing) */
+    uint64_t storePermit;           /* HPPLITE_STORE_PERMIT: what the funding wallet's permit lets the store pull (0: none, #214) */
     int softOff;                    /* soft=off: a verifier stays at the anchored height (#166) */
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
     int fromSnapshot;               /* from= (#222): a new replica starts from the latest snapshot (1) or the oldest still kept (2, #224) */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;              /* syncat=: ...none written after this time (ms since the epoch, #205); 0: none */
-    uint64_t spendCap, spendWindow; /* spendcap=: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
-    int lowBalanceHours;            /* lowbalance=: warn below this many hours of money at the recent rate; 0 = 72, -1 = off */
+    uint64_t spendCap, spendWindow; /* HPPLITE_SPEND_CAP: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
+    int lowBalanceHours;            /* HPPLITE_LOW_BALANCE: warn below this many hours of money at the recent rate; 0 = 72, -1 = off */
     char *relayUrl;                 /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */
-    uint64_t relayCap;              /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
-    int storeFallback;              /* storefallback=: a store that does not answer lets the chain carry the bytes (default on) */
+    uint64_t relayCap;              /* HPPLITE_RELAY_CAP: the most to pay the relay per call (0 = pay nothing) */
+    int storeFallback;              /* HPPLITE_STORE_FALLBACK: a store that does not answer lets the chain carry the bytes (default on) */
     int snapshotIntervalMs;         /* snapshot=: a snapshot at an anchor when the last is older than this (#221); 0: never */
     int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */

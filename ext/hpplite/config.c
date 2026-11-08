@@ -121,6 +121,19 @@ static void refuse_determinism(const char *val) {
     snprintf(gConfigError, sizeof(gConfigError), "determinism= is gone (v0.8, #253): page capture replicates any SQL, nothing is refused for replay's sake");
 }
 
+/* The money knobs are the deployment's, not the connection string's (v0.8, #254): a budget belongs with the wallet's
+** key in the environment, not in every URI that opens the file. Each in a URI refuses the open and names its variable */
+static const struct { const char *uri, *env; } gMoneyKnobs[] = {
+    { HPPLITE_URI_STORE_CAP, HPPLITE_ENV_STORE_CAP },     { HPPLITE_URI_STORE_PERMIT, HPPLITE_ENV_STORE_PERMIT },
+    { HPPLITE_URI_SPEND_CAP, HPPLITE_ENV_SPEND_CAP },     { HPPLITE_URI_LOW_BALANCE, HPPLITE_ENV_LOW_BALANCE },
+    { HPPLITE_URI_RELAY_CAP, HPPLITE_ENV_RELAY_CAP },     { HPPLITE_URI_STORE_FALLBACK, HPPLITE_ENV_STORE_FALLBACK },
+};
+#define N_MONEY_KNOBS (int)(sizeof(gMoneyKnobs) / sizeof(gMoneyKnobs[0]))
+static void refuse_money_knob(int i) {
+    snprintf(gConfigError, sizeof(gConfigError), "%s= is not a URI setting (v0.8, #254): a budget is the deployment's; set %s in the environment",
+             gMoneyKnobs[i].uri, gMoneyKnobs[i].env);
+}
+
 /* role=verify, nothing else (#248): sequencer and observer were parsed and read nowhere - a sequencer needs no role= */
 static void parse_role(HppliteConfig *cfg, const char *val, int source) {
     if (strcasecmp(val, "verify") == 0) { cfg->roleVerify = 1; cfg->roleSource = source; return; }
@@ -281,6 +294,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val && val[0]) { free(cfg->relayUrl); cfg->relayUrl = strdup(val); }
     val = getenv(HPPLITE_ENV_RELAY_CAP);
     if (val && atoll(val) > 0) cfg->relayCap = (uint64_t)atoll(val);
+    val = getenv(HPPLITE_ENV_STORE_FALLBACK);
+    if (val) cfg->storeFallback = strcasecmp(val, "off") != 0 && strcmp(val, "0") != 0;
     val = getenv(HPPLITE_ENV_MAX_TX);
     if (val && atol(val) > 0) cfg->maxTxBytes = (size_t)atol(val);
     val = getenv(HPPLITE_ENV_MAX_TX_GAS);
@@ -522,32 +537,18 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         free(cfg->storeUrl);
         cfg->storeUrl = strdup(buf);
     }
-    if (get_uri_param(uri, HPPLITE_URI_STORE_CAP, buf, sizeof(buf)) && atoll(buf) > 0) {
-        cfg->storeCap = (uint64_t)atoll(buf);
-    }
-    if (get_uri_param(uri, HPPLITE_URI_STORE_PERMIT, buf, sizeof(buf)) && buf[0] >= '0' && buf[0] <= '9') {
-        cfg->storePermit = (uint64_t)atoll(buf);
-        cfg->storePermitSet = 1;
-    }
+    for (int i = 0; i < N_MONEY_KNOBS; i++)
+        if (get_uri_param(uri, gMoneyKnobs[i].uri, buf, sizeof(buf))) refuse_money_knob(i);
     if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)))
-        snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (relaycap= bounds a call)");
+        snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (HPPLITE_RELAY_CAP bounds a call)");
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf)) && buf[0]) cfg->softOff = strcasecmp(buf, "off") == 0 || strcmp(buf, "0") == 0;
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) { int64_t k = parse_keep_seconds(buf); if (k >= 0) cfg->keepSeconds = k; }
     if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) cfg->fromMode = parse_from_mode(buf, cfg->fromMode);
     if (get_uri_param(uri, HPPLITE_URI_SYNC_AT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncAtMs = (uint64_t)atoll(buf);
-    if (get_uri_param(uri, HPPLITE_URI_SPEND_CAP, buf, sizeof(buf)) && buf[0]
-        && hpplite_spend_parse_cap(buf, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: spendcap=%s: not N, N/hour or N/day; ignored\n", buf);
-    if (get_uri_param(uri, HPPLITE_URI_LOW_BALANCE, buf, sizeof(buf)) && buf[0]) cfg->lowBalanceHours = atoi(buf) > 0 ? atoi(buf) : -1;
     if (get_uri_param(uri, HPPLITE_URI_RELAY, buf, sizeof(buf)) && buf[0]) {
         free(cfg->relayUrl);
         cfg->relayUrl = strdup(buf);
-    }
-    if (get_uri_param(uri, HPPLITE_URI_RELAY_CAP, buf, sizeof(buf)) && atoll(buf) > 0) {
-        cfg->relayCap = (uint64_t)atoll(buf);
-    }
-    if (get_uri_param(uri, HPPLITE_URI_STORE_FALLBACK, buf, sizeof(buf))) {
-        cfg->storeFallback = strcasecmp(buf, "off") != 0 && strcmp(buf, "0") != 0;
     }
     if (get_uri_param(uri, HPPLITE_URI_MAX_TX_GAS, buf, sizeof(buf)) && atoll(buf) > 0) {
         cfg->maxTxGas = (uint64_t)atoll(buf);
@@ -713,10 +714,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && atol(val) > 0) cfg->maxTxBytes = (size_t)atol(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE);
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_CAP);
-    if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_PERMIT);
-    if (val && val[0] >= '0' && val[0] <= '9') { cfg->storePermit = (uint64_t)atoll(val); cfg->storePermitSet = 1; }
+    for (int i = 0; i < N_MONEY_KNOBS; i++)
+        if (sqlite3_uri_parameter(filename, gMoneyKnobs[i].uri)) refuse_money_knob(i);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SOFT);
     if (val && val[0]) cfg->softOff = strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_TO);
@@ -727,17 +726,9 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_AT);
     if (val && atoll(val) > 0) cfg->syncAtMs = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_DEPOSIT);
-    if (val) snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (relaycap= bounds a call)");
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_SPEND_CAP);
-    if (val && val[0] && hpplite_spend_parse_cap(val, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: spendcap=%s: not N, N/hour or N/day; ignored\n", val);
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_LOW_BALANCE);
-    if (val && val[0]) cfg->lowBalanceHours = atoi(val) > 0 ? atoi(val) : -1;
+    if (val) snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (HPPLITE_RELAY_CAP bounds a call)");
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY);
     if (val && val[0]) { free(cfg->relayUrl); cfg->relayUrl = strdup(val); }
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_CAP);
-    if (val && atoll(val) > 0) cfg->relayCap = (uint64_t)atoll(val);
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE_FALLBACK);
-    if (val) cfg->storeFallback = strcasecmp(val, "off") != 0 && strcmp(val, "0") != 0;
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX_GAS);
     if (val && atoll(val) > 0) cfg->maxTxGas = (uint64_t)atoll(val);
 

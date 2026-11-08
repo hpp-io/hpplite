@@ -332,7 +332,7 @@ static uint64_t sig_deadline(EthClient *eth) {
     return ts + 600;
 }
 
-/* POST {to, data} to the relay's /commit, paid within relaycap=: the
+/* POST {to, data} to the relay's /commit, paid within HPPLITE_RELAY_CAP: the
 ** transaction's hash once it landed (sqlite3_mprintf), or NULL with the
 ** reason in relayError */
 static char *relay_post(HppliteStore *relay, EthClient *eth, const uint8_t to[20], const uint8_t *data, size_t n,

@@ -684,7 +684,7 @@ static void test_store_down_at_open(const char *dir) {
     if (!w) FAIL("open with the store down");
     hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
     hpplite_node_exec(w, "INSERT INTO t(v) VALUES('written while the store was down')", NULL);
-    h1 = hpplite_node_flush_batch(w);                      /* waits: storefallback=off */
+    h1 = hpplite_node_flush_batch(w);                      /* waits: HPPLITE_STORE_FALLBACK=off */
     pid = start_store_at(dir, port, storeDir, 0);
     if (pid < 0) { hpplite_node_destroy(w); FAIL("the test's store did not start"); }
     h2 = hpplite_node_flush_batch(w);                      /* the first put after the store answers */
@@ -693,7 +693,7 @@ static void test_store_down_at_open(const char *dir) {
     hpplite_node_destroy(w);
     hpplite_l1_disconnect(l1);
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
-    if (h1 != 0) FAIL("with the store down and storefallback=off the batch waits");
+    if (h1 != 0) FAIL("with the store down and HPPLITE_STORE_FALLBACK=off the batch waits");
     if (h2 != 1) FAILF("the first flush after the store answers should put batch 1: '%s'", err);
     PASS();
 }

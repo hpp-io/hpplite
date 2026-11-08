@@ -84,10 +84,10 @@ typedef struct StatusCursor {
 #define STATUS_COL_LAST_TX_PATH   34  /* "relay" or "direct": how the last write went to the chain; NULL before one */
 #define STATUS_COL_STORE_FUNDER   35  /* hpplite-store/2 (#214): the funding wallet's address (send USDC.e there); NULL otherwise */
 #define STATUS_COL_STORE_COVERED  36  /* ...when the bucket's account runs out at the current cost (unix seconds); NULL before a statement */
-#define STATUS_COL_SPENT_WINDOW   37  /* paid to the store and the relay in spendcap='s window (a day without one), #173 */
+#define STATUS_COL_SPENT_WINDOW   37  /* paid to the store and the relay in HPPLITE_SPEND_CAP's window (a day without one), #173 */
 #define STATUS_COL_SOFT_DISAGREE  40  /* ...times the chain named another batch than the store served, each followed by a rebuild */
 #define STATUS_COL_SOFT_HEIGHT    39  /* a verifier with a store (#166): the height it applied to, soft batches included; NULL otherwise */
-#define STATUS_COL_SPEND_WARNING  38  /* what runs out and when at the recent rate (lowbalance=); NULL when nothing does */
+#define STATUS_COL_SPEND_WARNING  38  /* what runs out and when at the recent rate (HPPLITE_LOW_BALANCE); NULL when nothing does */
 #define STATUS_COL_STORE_BUCKET   41  /* ...the bucket's state at the store: covered, parked, deleted; NULL before one is known */
 #define STATUS_COL_SNAPSHOT       42  /* the latest snapshot's height: the one this sequencer's anchors name, or a replica started from (#221, #222); NULL: none */
 

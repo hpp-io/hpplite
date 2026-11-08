@@ -352,10 +352,44 @@ static void test_relay_exact_only(void) {
     if (cfg) printf("  relay=on: relaycap %llu\n", (unsigned long long)cfg->relayCap);
     if (cfg) hpplite_config_free(cfg);
     if (!ok) { FAIL("relay=on without relaycap= should take the default cap"); }
-    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&relay=on&relaycap=7");
+    setenv("HPPLITE_RELAY_CAP", "7", 1);
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&relay=on");
+    unsetenv("HPPLITE_RELAY_CAP");
     ok = cfg && hpplite_config_resolve_operators(cfg) == 0 && cfg->relayCap == 7;
     if (cfg) hpplite_config_free(cfg);
-    if (!ok) { FAIL("relaycap= given keeps its value"); }
+    if (!ok) { FAIL("HPPLITE_RELAY_CAP given keeps its value"); }
+    PASS();
+}
+
+/* #254: the money knobs are the deployment's, not the connection string's. Each in a URI refuses the open naming
+** its environment variable; the variable is honoured; storefallback gets the twin it never had */
+static void test_money_knobs_env_only(void) {
+    TEST("storecap=, storepermit=, spendcap=, lowbalance=, relaycap=, storefallback= refuse the open naming their variable; the environment is read (#254)");
+    static const char *knobs[][2] = {
+        { "storecap=5", "HPPLITE_STORE_CAP" }, { "storepermit=5", "HPPLITE_STORE_PERMIT" }, { "spendcap=5/hour", "HPPLITE_SPEND_CAP" },
+        { "lowbalance=5", "HPPLITE_LOW_BALANCE" }, { "relaycap=5", "HPPLITE_RELAY_CAP" }, { "storefallback=off", "HPPLITE_STORE_FALLBACK" },
+    };
+    for (int i = 0; i < 6; i++) {
+        char uri[200];
+        snprintf(uri, sizeof uri, "hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&%s", knobs[i][0]);
+        HppliteConfig *cfg = hpplite_config_load(uri);
+        const char *why = hpplite_config_error();
+        int refused = why && strstr(why, knobs[i][1]);
+        printf("\n  %s: %s", knobs[i][0], why ? why : "(no error)");
+        if (cfg) hpplite_config_free(cfg);
+        if (!refused) { printf("\n"); FAIL("a money knob in a URI should refuse the open naming its environment variable"); }
+    }
+    setenv("HPPLITE_STORE_PERMIT", "5", 1);
+    setenv("HPPLITE_SPEND_CAP", "4500/hour", 1);
+    setenv("HPPLITE_STORE_FALLBACK", "off", 1);
+    HppliteConfig *cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on");
+    unsetenv("HPPLITE_STORE_PERMIT"); unsetenv("HPPLITE_SPEND_CAP"); unsetenv("HPPLITE_STORE_FALLBACK");
+    int ok = cfg && hpplite_config_error() == NULL && cfg->storePermit == 5 && cfg->storePermitSet
+             && cfg->spendCap == 4500 && cfg->spendWindow == 3600 && cfg->storeFallback == 0;
+    if (cfg) printf("\n  environment: permit %llu (set %d), spendcap %llu/%llu, fallback %d\n  ", (unsigned long long)cfg->storePermit, cfg->storePermitSet,
+                    (unsigned long long)cfg->spendCap, (unsigned long long)cfg->spendWindow, cfg->storeFallback);
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("HPPLITE_STORE_PERMIT, HPPLITE_SPEND_CAP and HPPLITE_STORE_FALLBACK should be read from the environment"); }
     PASS();
 }
 
@@ -375,6 +409,7 @@ int main(void) {
     test_operators_on();
     test_keep_snapshot_cap();
     test_relay_exact_only();
+    test_money_knobs_env_only();
 
     printf("\n================================\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);
