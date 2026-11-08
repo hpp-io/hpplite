@@ -13,16 +13,8 @@
 int tests_run = 0, tests_passed = 0;
 int test_verbose = 0;
 
-int test_rows_mode(void) {
-    const char *v = getenv("HPPLITE_CAPTURE");
-    return !(v && strcasecmp(v, "text") == 0);
-}
-int test_pages_mode(void) {
-    const char *v = getenv("HPPLITE_CAPTURE");
-    return v && strcasecmp(v, "pages") == 0;
-}
 int test_pending_is(long long pending, int n) {
-    return pending == n || (test_pages_mode() && pending == n + 1);
+    return pending == n || pending == n + 1;
 }
 
 int test_report(void) {
@@ -160,9 +152,6 @@ HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpt
     config.noEncrypt = o->noEncrypt;
     config.noCompress = o->noCompress;
     config.verifyOnly = o->verifyOnly;
-    config.determinismWarn = o->determinismWarn;
-    config.captureText = o->captureText;
-    config.capturePages = o->capturePages || (!o->captureText && test_pages_mode());   /* HPPLITE_CAPTURE=pages runs a suite in page mode (#146) */
     config.dbName = (char *)o->dbName;
     config.storeUrl = (char *)o->storeUrl;
     config.snapshotIntervalMs = o->snapshotMs;

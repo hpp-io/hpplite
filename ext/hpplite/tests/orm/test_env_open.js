@@ -4,10 +4,6 @@
 // URIs do.
 //  - node:sqlite, plain path, Drizzle on top: must work; the replica check
 //    afterwards compares it with the chain.
-//  - better-sqlite3: its bundled SQLite is built with SQLITE_TRACE_SIZE_LIMIT=32,
-//    which cuts bound strings in sqlite3_expanded_sql: with statement capture
-//    (capture=text) HPPLite must refuse to open it, saying so, rather than post
-//    truncated values. Row capture serves it (test_better_sqlite3.js, #62).
 const { DatabaseSync } = require("node:sqlite");
 const { drizzle } = require("drizzle-orm/sqlite-proxy");
 const { sqliteTable, integer, text } = require("drizzle-orm/sqlite-core");
@@ -17,18 +13,6 @@ const DIR = process.env.HPPLITE_ORM_DIR;
 
 (async () => {
     console.log("== plain-path opens, enabled from the environment");
-    await step("better-sqlite3 with capture=text is refused at open, with the reason (in a child: one SQLite library per process)", async () => {
-        const { spawnSync } = require("node:child_process");
-        const env = { ...process.env, HPPLITE_CAPTURE: "text" };
-        const r = spawnSync(process.execPath, ["-e", `
-            const Database = require("better-sqlite3");
-            new Database(":memory:").loadExtension(${JSON.stringify(EXT)});
-            try { new Database(${JSON.stringify(DIR + "/env_open_bs3.db")}); console.log("OPENED"); }
-            catch (e) { console.log("REFUSED " + e.message); }`], { env, encoding: "utf8" });
-        const out = (r.stdout || "").trim();
-        assert(out.startsWith("REFUSED"), "better-sqlite3 opened: its writes would replay truncated (" + out + (r.stderr || "").slice(0, 200) + ")");
-        assert(/SQLITE_TRACE_SIZE_LIMIT/.test(out), "error does not name the cause: " + out);
-    });
     const boot = new DatabaseSync(":memory:", { allowExtension: true });
     boot.loadExtension(EXT); boot.close();
     const raw = new DatabaseSync(`${DIR}/env_open.db`);           // a plain path

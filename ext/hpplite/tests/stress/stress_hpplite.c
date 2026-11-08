@@ -172,9 +172,9 @@ int main(int argc, char **argv) {
     unsigned char rootR[32];
     hpplite_node_get_state_root(r, rootR);
     sqlite3_int64 rowsR = count_rows(r->db);
-    printf("reader: replayed %llu batches in %.1fs (%.0f rows/s), %lld rows, replay_skipped %llu\n",
+    printf("reader: applied %llu batches in %.1fs (%.0f rows/s), %lld rows\n",
            (unsigned long long)(hpplite_node_get_height(r) - 1), tReplay / 1000, rowsR / (tReplay / 1000),
-           (long long)rowsR, (unsigned long long)r->ctx->nReplaySkipped);
+           (long long)rowsR);
     if (rowsR != rows) { printf("FAIL: row count %lld != %lld\n", (long long)rowsR, (long long)rows); ok = 0; }
     if (memcmp(rootW, rootR, 32) != 0) {
         printf("FAIL: content root differs after reconstruction\n"); ok = 0;

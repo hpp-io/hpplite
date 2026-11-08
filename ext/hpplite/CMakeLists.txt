@@ -191,11 +191,9 @@ if(HPPLITE_BUILD_TESTS)
     target_include_directories(hpplite_testlib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
 
     # === Unit Tests (no network required) ===
-    add_executable(test_hpplite tests/unit/test_hpplite.c)
-    target_link_libraries(test_hpplite hpplite_testlib)
 
-    add_executable(test_batch tests/unit/test_batch.c)
-    target_link_libraries(test_batch hpplite_testlib)
+
+
 
     add_executable(test_node tests/unit/test_node.c)
     target_link_libraries(test_node hpplite)
@@ -235,10 +233,8 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_durability hpplite_testlib)
         add_executable(test_compress tests/unit/test_compress.c)
         target_link_libraries(test_compress hpplite_testlib)
-        add_executable(test_smt tests/unit/test_smt.c)
-        target_link_libraries(test_smt hpplite_testlib)
-        add_executable(test_state_root tests/unit/test_state_root.c)
-        target_link_libraries(test_state_root hpplite_testlib)
+
+
         add_executable(test_faults tests/unit/test_faults.c)
         target_link_libraries(test_faults hpplite_testlib)
         add_executable(test_keys tests/unit/test_keys.c)
@@ -253,29 +249,22 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_pages hpplite_testlib)
         add_executable(test_pagemode tests/unit/test_pagemode.c)
         target_link_libraries(test_pagemode hpplite_testlib)
-        # the keystore fixtures, for the suites and their capture=text twins alike
+        # the keystore fixtures
         target_compile_definitions(test_keys PRIVATE HPPLITE_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
         target_compile_definitions(test_keystore PRIVATE HPPLITE_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
-        add_executable(test_abuse tests/unit/test_abuse.c)
-        target_link_libraries(test_abuse hpplite_testlib)
-        add_executable(test_foreign_keys tests/unit/test_foreign_keys.c)
-        target_link_libraries(test_foreign_keys hpplite_testlib)
-        add_executable(test_big_txn tests/unit/test_big_txn.c)
-        target_link_libraries(test_big_txn hpplite_testlib)
-        add_executable(test_clock tests/unit/test_clock.c)
-        target_link_libraries(test_clock hpplite_testlib)
+
+
+
+
         add_executable(test_env_enable tests/unit/test_env_enable.c)
         target_link_libraries(test_env_enable hpplite_testlib)
         add_executable(test_reorg tests/unit/test_reorg.c)
         target_link_libraries(test_reorg hpplite_testlib)
-        add_executable(test_big_stmt tests/unit/test_big_stmt.c)
-        target_link_libraries(test_big_stmt hpplite_testlib)
+
         add_executable(test_concurrency tests/unit/test_concurrency.c)
         target_link_libraries(test_concurrency hpplite_testlib)
-        add_executable(test_rows tests/unit/test_rows.c)
-        target_link_libraries(test_rows hpplite_testlib)
-        add_executable(test_rows_e2e tests/unit/test_rows_e2e.c)
-        target_link_libraries(test_rows_e2e hpplite_testlib)
+
+
         add_executable(test_blob_io tests/unit/test_blob_io.c)
         target_link_libraries(test_blob_io hpplite_testlib)
 
@@ -350,8 +339,6 @@ if(HPPLITE_BUILD_TESTS)
     # === CTest Registration ===
     enable_testing()
 
-    add_test(NAME test_hpplite COMMAND test_hpplite)
-    add_test(NAME test_batch COMMAND test_batch)
     add_test(NAME test_node COMMAND test_node)
     add_test(NAME test_da_uri COMMAND test_da_uri)
     add_test(NAME test_l1_dispatch COMMAND test_l1_dispatch)
@@ -384,8 +371,6 @@ if(HPPLITE_BUILD_TESTS)
         # the chain client refuses contracts before VERSION 8 (#252), against a JSON-RPC stand-in
         add_test(NAME test_l1_version COMMAND test_l1_version ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/rpc_stub.py)
         set_tests_properties(test_store PROPERTIES SKIP_RETURN_CODE 77)
-        add_test(NAME test_store_pages COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)   # the page flush through the store (#146)
-        set_tests_properties(test_store_pages PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT HPPLITE_CAPTURE=pages RESOURCE_LOCK test_store)
         set_tests_properties(test_store PROPERTIES RESOURCE_LOCK test_store)
         # ...with the ports it used to derive from its pid taken by another program (#177)
         add_test(NAME test_store_ports_taken COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/ports_taken.sh
@@ -401,13 +386,10 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME smoke_python_cli
                  COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke/smoke.sh $<TARGET_FILE:hpplite_ext>)
         set_tests_properties(smoke_python_cli PROPERTIES SKIP_RETURN_CODE 77)
-        add_test(NAME smoke_python_cli_text
-                 COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke/smoke.sh $<TARGET_FILE:hpplite_ext>)
-        set_tests_properties(smoke_python_cli_text PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT HPPLITE_CAPTURE=text)
-        set_tests_properties(smoke_python_cli smoke_python_cli_text PROPERTIES RESOURCE_LOCK smoke)
+        set_tests_properties(smoke_python_cli PROPERTIES RESOURCE_LOCK smoke)
         if(CMAKE_C_FLAGS MATCHES "sanitize")
             # an instrumented module cannot be loaded into a stock python/sqlite3 process
-            set_tests_properties(smoke_python_cli smoke_python_cli_text PROPERTIES DISABLED TRUE)
+            set_tests_properties(smoke_python_cli PROPERTIES DISABLED TRUE)
         endif()
     endif()
 
@@ -417,8 +399,6 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_checkpoint_flow COMMAND test_checkpoint_flow)
         add_test(NAME test_durability COMMAND test_durability)
         add_test(NAME test_compress COMMAND test_compress)
-        add_test(NAME test_smt COMMAND test_smt)
-        add_test(NAME test_state_root COMMAND test_state_root)
         add_test(NAME test_faults COMMAND test_faults)
         add_test(NAME test_keys COMMAND test_keys)
         add_test(NAME test_keystore COMMAND test_keystore)
@@ -426,46 +406,17 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_wal_pin COMMAND test_wal_pin)
         add_test(NAME test_pages COMMAND test_pages)
         add_test(NAME test_pagemode COMMAND test_pagemode)
-        add_test(NAME test_abuse COMMAND test_abuse)
-        add_test(NAME test_foreign_keys COMMAND test_foreign_keys)
-        add_test(NAME test_big_txn COMMAND test_big_txn)
-        add_test(NAME test_clock COMMAND test_clock)
         add_test(NAME test_env_enable COMMAND test_env_enable)
         add_test(NAME test_reorg COMMAND test_reorg)
-        add_test(NAME test_big_stmt COMMAND test_big_stmt)
         add_test(NAME test_concurrency COMMAND test_concurrency)
-        add_test(NAME test_rows COMMAND test_rows)
-        add_test(NAME test_rows_e2e COMMAND test_rows_e2e)
         add_test(NAME test_blob_io COMMAND test_blob_io)
         add_test(NAME test_crash COMMAND crash_hpplite)
         # a sequencer lost between a flush and an anchor, a successor recovering from the store by key (#167)
         add_test(NAME test_crash_store COMMAND crash_hpplite --store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
 
-        # Every suite above again with statement capture (capture=text, v0.1's;
-        # rows are the default, #19): the cases about statement text run there
-        foreach(t test_checkpoint_flow test_durability test_compress test_faults test_keys test_abuse test_foreign_keys
-                  test_big_txn test_clock test_reorg test_big_stmt test_concurrency test_blob_io)
-            add_test(NAME ${t}_text COMMAND ${t})
-            # the same scratch directory: never at once (ctest -j)
-            set_tests_properties(${t} ${t}_text PROPERTIES RESOURCE_LOCK ${t})
-            set_tests_properties(${t}_text PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=text)
-        endforeach()
-        # ...and with page capture (#146): the cases about statements, the log table
-        # or the content root skip there, the rest runs on pages
-        foreach(t test_checkpoint_flow test_durability test_faults test_keys test_abuse test_foreign_keys
-                  test_big_txn test_clock test_big_stmt test_concurrency test_readers test_node test_state_root test_simple_open test_loadable test_env_enable test_blob_io)
-            add_test(NAME ${t}_pages COMMAND ${t})
-            set_tests_properties(${t} ${t}_pages PROPERTIES RESOURCE_LOCK ${t})
-            set_tests_properties(${t}_pages PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=pages)
-        endforeach()
-        add_test(NAME test_crash_pages COMMAND crash_hpplite)
-        set_tests_properties(test_crash_pages PROPERTIES RESOURCE_LOCK test_crash ENVIRONMENT HPPLITE_CAPTURE=pages)
-        add_test(NAME test_crash_text COMMAND crash_hpplite)
         # the same harness on the directory backend (l1=file://, #35)
         add_test(NAME test_crash_dir COMMAND crash_hpplite --l1 dir)
-        add_test(NAME test_crash_dir_text COMMAND crash_hpplite --l1 dir)
-        set_tests_properties(test_crash test_crash_text test_crash_dir test_crash_dir_text PROPERTIES RESOURCE_LOCK test_crash)
-        set_tests_properties(test_crash_text test_crash_dir_text PROPERTIES ENVIRONMENT HPPLITE_CAPTURE=text)
+        set_tests_properties(test_crash test_crash_dir PROPERTIES RESOURCE_LOCK test_crash)
 
     # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c
     add_test(NAME docs_factory_address

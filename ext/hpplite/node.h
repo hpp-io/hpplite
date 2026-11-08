@@ -74,11 +74,6 @@ typedef struct HppliteNodeConfig {
     size_t maxBatchBytes;           /* DA size limit (0 = from L1 / default 128 KB) */
     int noEncrypt;                  /* Post plaintext batches (default: sealed when a key exists) */
     int noCompress;                 /* compress=off: post the batch JSON as is (#12); default: deflate when it shrinks */
-    int determinismWarn;            /* Warn about non-deterministic SQL instead of refusing it */
-    int captureText;                /* Capture statements, as v0.1 (default 0: rows, #19) */
-    int capturePages;               /* Capture pages through the VFS (#146) */
-    int captureSource;              /* ...2 when a URI said so: HPPLITE_CAPTURE does not override it (#80) */
-    int captureAuto;                /* no capture given: pages for a new rollup, the history's mode for an existing one (#146) */
     int localOnly;                  /* l1=local: finalize batches locally, keep no history (#38) */
     int verifyOnly;                 /* role=verify: rebuild and compare, never post, claim or create (#5) */
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */

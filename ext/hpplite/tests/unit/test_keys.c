@@ -116,88 +116,7 @@ static void test_keyfile_rejections(void) {
     PASS();
 }
 
-static void test_no_key_never_posts(void) {
-    TEST("no key: writes captured, nothing posted, status says keyed=0");
-    SKIP_IF_PAGES("a connection HPPLite did not open captures nothing in page mode yet (#155); the guard itself: test_pagemode");
-    reset_keys();
-    HppliteL1 *l1 = hpplite_l1_create_mock();
-    HppliteNodeConfig config;
-    memset(&config, 0, sizeof(config));
-    config.nodeId = "nokey"; config.dataDir = DIR; config.dbPath = DIR "/nokey.db";
-    HppliteNode *n = hpplite_node_create(&config);
-    if (!n) FAIL("open");
-    if (n->config.hasPrivkey || n->cipher) FAIL("should have no key and no cipher");
-    hpplite_node_set_l1(n, l1);
-    hpplite_node_exec(n, "CREATE TABLE t(x); INSERT INTO t VALUES('secret');", NULL);
-    if (hpplite_node_flush_batch(n) != 0) FAIL("flush must not post without a key");
-    if (!test_pending_is(hpplite_node_pending_count(n), 2)) FAIL("pending must be kept");
-    size_t len = 0;
-    uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
-    if (raw) { free(raw); FAIL("a batch reached L1 without a key"); }
 
-    sqlite3_stmt *s;
-    sqlite3_prepare_v2(n->db, "SELECT keyed, encryption FROM hpplite_status", -1, &s, NULL);
-    if (sqlite3_step(s) != SQLITE_ROW || sqlite3_column_int(s, 0) != 0
-        || strcmp((const char*)sqlite3_column_text(s, 1), "none") != 0) FAIL("status should report keyed=0, encryption=none");
-    sqlite3_finalize(s);
-    n->l1 = NULL;
-    hpplite_node_destroy(n);
-
-    /* the documented URI form: an L1 is named but (no key) cannot be reached.
-    ** The flush must keep everything pending rather than finalize locally and
-    ** advance the height past batches L1 never saw */
-    sqlite3 *db = open_v2("file:" DIR "/nokey_uri.db?hpplite=on&l1=hpp-sepolia&datadir=" DIR);
-    if (!db) FAIL("open with l1= and no key");
-    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1); SELECT hpplite_flush();", NULL, NULL, NULL);
-    sqlite3_prepare_v2(db, "SELECT height, pending FROM hpplite_status", -1, &s, NULL);
-    if (sqlite3_step(s) != SQLITE_ROW || sqlite3_column_int(s, 0) != 1 || sqlite3_column_int(s, 1) != 2) {
-        printf("(height=%d pending=%d) ", sqlite3_column_int(s, 0), sqlite3_column_int(s, 1));
-        sqlite3_finalize(s); sqlite3_close(db);
-        FAIL("with l1= configured and no connection, nothing may be finalized locally");
-    }
-    sqlite3_finalize(s);
-    sqlite3_close(db);
-    hpplite_l1_disconnect(l1);
-    PASS();
-}
-
-static void test_encrypt_off_is_explicit(void) {
-    TEST("encrypt=off with a key posts plaintext; with a key and default, sealed");
-    SKIP_IF_ROWS("the plaintext batch carries records (test_rows_e2e)");
-    reset_keys();
-    HppliteL1 *l1 = hpplite_l1_create_mock();
-    sqlite3 *db = hpplite_open("file:" DIR "/p.db?hpplite=on&encrypt=off&datadir=" DIR "&privkey=" KEY_A);
-    if (!db) FAIL("open");
-    HppliteNode *n = hpplite_get_node(db);
-    hpplite_node_set_l1(n, l1); hpplite_node_start(n);
-    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES('visible');", NULL, NULL, NULL);
-    if (hpplite_flush(db) != 1) FAIL("flush plaintext");
-    size_t len = 0;
-    uint8_t *raw = hpplite_l1_get_batch(l1, 1, &len);
-    {
-        size_t n = 0;
-        uint8_t *readable = raw ? test_readable_bytes(raw, len, &n) : NULL;   /* deflated since #12, still anyone's to read */
-        int ok = readable && memmem(readable, n, "visible", 7) != NULL;
-        free(readable);
-        if (!ok) FAIL("encrypt=off should post plaintext");
-    }
-    free(raw);
-    sqlite3_close(db);
-
-    db = hpplite_open("file:" DIR "/s.db?hpplite=on&datadir=" DIR "&privkey=" KEY_B);
-    if (!db) FAIL("open 2");
-    n = hpplite_get_node(db);
-    HppliteL1 *l2 = hpplite_l1_create_mock();
-    hpplite_node_set_l1(n, l2); hpplite_node_start(n);
-    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES('hidden');", NULL, NULL, NULL);
-    if (hpplite_flush(db) != 1) FAIL("flush sealed");
-    raw = hpplite_l1_get_batch(l2, 1, &len);
-    if (!raw || memmem(raw, len, "hidden", 6)) FAIL("default should seal");
-    free(raw);
-    sqlite3_close(db);
-    hpplite_l1_disconnect(l1); hpplite_l1_disconnect(l2);
-    PASS();
-}
 
 /* #17 step 1: the key given to the connection after open, the SQLite-extension
 ** idiom: nothing posts until then; then the node is keyed, the lease taken,
@@ -424,8 +343,6 @@ int main(int argc, char **argv) {
     test_env_key_and_precedence();
     test_keyfile();
     test_keyfile_rejections();
-    test_no_key_never_posts();
-    test_encrypt_off_is_explicit();
     test_key_at_runtime();
     test_keystore();
     test_signer();

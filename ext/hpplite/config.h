@@ -18,8 +18,7 @@
 **   HPPLITE_BATCH_INTERVAL    - Batch flush interval (500ms, 5s, 1m, 1h; 0 = no timer)
 **   HPPLITE_ENCRYPT           - on|off: seal batches before posting (default on)
 **   HPPLITE_CHECKPOINT_INTERVAL - batches per checkpoint / state root (default 100)
-**   HPPLITE_DETERMINISM       - strict (default: refuse SQL replay cannot reproduce) | warn
-**   HPPLITE_CAPTURE           - auto (default: pages for a new rollup, #146) | pages | rows (#19) | text (v0.1's)
+**   (HPPLITE_CAPTURE and HPPLITE_DETERMINISM are gone, #253: HPPLite captures pages)
 **   HPPLITE_DBNAME            - a name: the database gets its own rollup among the wallet's (#61); {file} = its file name
 **   HPPLITE_ROLE              - verify: an audit connection (rebuild and compare, never post, claim or create, #5)
 */
@@ -150,11 +149,6 @@ typedef struct HppliteConfig {
     int encrypt;                     /* Seal batches before posting (default 1) */
     int compress;                    /* Deflate batches before sealing or posting when it shrinks them (default 1, #12) */
     int checkpointInterval;          /* Batches per checkpoint (0 = node default, 100) */
-    int determinismWarn;             /* 1: only warn about non-deterministic SQL (default 0: refuse it) */
-    int captureText;                 /* 1: capture statements, as v0.1 (default 0: rows, #19) */
-    int capturePages;                /* 1: capture pages through the VFS (#146); captureText is then 0 */
-    int captureSource;               /* ...where from: 0 default, 1 environment, 2 URI (the URI wins, #80) */
-    int captureAuto;                 /* no capture given (the default, #146): pages for a new rollup, the history's mode for an existing one */
     int intervalGiven;               /* interval= was said: a chain alias's own cadence does not apply */
     int snapshotIntervalMs;          /* snapshot=: how often a sequencer at a store snapshots the database at an anchor (#221); 0: never */
     int anchorIntervalMs;            /* anchor=: how often a store node anchors its batches on the chain (#164); default 30 min, the chain's cadence */

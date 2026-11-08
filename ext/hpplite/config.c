@@ -110,14 +110,15 @@ static int64_t parse_keep_seconds(const char *str) {
 static char gConfigError[160];
 const char *hpplite_config_error(void) { return gConfigError[0] ? gConfigError : NULL; }
 
-/* capture=auto|rows|text|pages, nothing else: a misspelling must not quietly choose (#80) */
-static void parse_capture(HppliteConfig *cfg, const char *val, int source) {
-    if (strcasecmp(val, "rows") == 0) { cfg->captureText = 0; cfg->capturePages = 0; cfg->captureAuto = 0; }
-    else if (strcasecmp(val, "text") == 0) { cfg->captureText = 1; cfg->capturePages = 0; cfg->captureAuto = 0; }
-    else if (strcasecmp(val, "pages") == 0) { cfg->captureText = 0; cfg->capturePages = 1; cfg->captureAuto = 0; }
-    else if (strcasecmp(val, "auto") == 0) { cfg->captureText = 0; cfg->capturePages = 0; cfg->captureAuto = 1; }
-    else { snprintf(gConfigError, sizeof(gConfigError), "capture=%.40s is none of auto, rows, text, pages", val); return; }
-    cfg->captureSource = source;
+/* capture= and determinism= are gone (v0.8, #253): HPPLite captures pages, which replicate any SQL. A setting from
+** before refuses the open rather than being read as a default in its place (#80) */
+static void refuse_capture(const char *val) {
+    (void)val;
+    snprintf(gConfigError, sizeof(gConfigError), "capture= is gone (v0.8, #253): HPPLite captures pages; row and statement capture were removed (v0.7 is the last release with them)");
+}
+static void refuse_determinism(const char *val) {
+    (void)val;
+    snprintf(gConfigError, sizeof(gConfigError), "determinism= is gone (v0.8, #253): page capture replicates any SQL, nothing is refused for replay's sake");
 }
 
 /* role=verify, nothing else (#248): sequencer and observer were parsed and read nowhere - a sequencer needs no role= */
@@ -141,7 +142,6 @@ HppliteConfig *hpplite_config_create(void) {
     cfg->encrypt = 1;             /* everything posted is public otherwise */
     cfg->compress = 1;            /* smaller batches everywhere they go (#12) */
     cfg->storeFallback = 1;       /* a store that does not answer never holds a batch back (#11) */
-    cfg->captureAuto = 1;         /* pages for a new rollup, the history's mode for an existing one (#146) */
 
     return cfg;
 }
@@ -259,11 +259,10 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_COMPRESS);
     if (val) cfg->compress = parse_bool(val);
 
-    /* Determinism: strict (default) or warn */
     val = getenv(HPPLITE_ENV_DETERMINISM);
-    if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
+    if (val) refuse_determinism(val);
     val = getenv(HPPLITE_ENV_CAPTURE);
-    if (val) parse_capture(cfg, val, 1);
+    if (val) refuse_capture(val);
     val = getenv(HPPLITE_ENV_DBNAME);
     if (val && val[0]) { free(cfg->dbName); cfg->dbName = strdup(val); }
     val = getenv(HPPLITE_ENV_STORE);
@@ -510,10 +509,8 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, HPPLITE_URI_ENCRYPT, buf, sizeof(buf))) {
         cfg->encrypt = parse_bool(buf);
     }
-    if (get_uri_param(uri, HPPLITE_URI_DETERMINISM, buf, sizeof(buf))) {
-        cfg->determinismWarn = (strcasecmp(buf, "warn") == 0);
-    }
-    if (get_uri_param(uri, HPPLITE_URI_CAPTURE, buf, sizeof(buf))) parse_capture(cfg, buf, 2);
+    if (get_uri_param(uri, HPPLITE_URI_DETERMINISM, buf, sizeof(buf))) refuse_determinism(buf);
+    if (get_uri_param(uri, HPPLITE_URI_CAPTURE, buf, sizeof(buf))) refuse_capture(buf);
     if (get_uri_param(uri, HPPLITE_URI_DBNAME, buf, sizeof(buf)) && buf[0]) {
         free(cfg->dbName);
         cfg->dbName = strdup(buf);
@@ -707,9 +704,9 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_COMPRESS);
     if (val) cfg->compress = parse_bool(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DETERMINISM);
-    if (val) cfg->determinismWarn = (strcasecmp(val, "warn") == 0);
+    if (val) refuse_determinism(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_CAPTURE);
-    if (val) parse_capture(cfg, val, 2);
+    if (val) refuse_capture(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_DBNAME);
     if (val && val[0]) { free(cfg->dbName); cfg->dbName = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_MAX_TX);

@@ -377,7 +377,7 @@ static void test_snapshot_made(const char *url) {
     TEST("snapshots: snapshot= makes one at the anchor (the file at the anchored height, its root the range's), named by that manifest and every later one, a restart too");
     static const unsigned char kseq[32] = { [31] = 0x79 };
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .storeUrl = url, .nodeId = "snap_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 3600 * 1000 };
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "snap_w", .privkey = kseq, .snapshotMs = 3600 * 1000 };
     HppliteNode *w = test_open_node(tpath("sn_w.db"), l1, &o);
     HppliteStore *rs;
     HppliteRange r;
@@ -459,7 +459,7 @@ static void test_snapshot_replica(const char *url) {
     TEST("snapshots: a replica with from=snapshot starts at the snapshot the last anchor names and replays only what follows; the same rows and root as one from batch 1");
     static const unsigned char kseq[32] = { [31] = 0x7a };
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .storeUrl = url, .nodeId = "snaprep_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 3600 * 1000 };
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "snaprep_w", .privkey = kseq, .snapshotMs = 3600 * 1000 };
     HppliteNode *w = test_open_node(tpath("snr_w.db"), l1, &o);
     int i;
     if (!w) FAIL("open");
@@ -472,8 +472,8 @@ static void test_snapshot_replica(const char *url) {
     hpplite_node_exec(w, "UPDATE t SET v = 'changed after the snapshot' WHERE id = 2", NULL);
     if (hpplite_node_flush_batch(w) < 1 || hpplite_node_anchor(w) != 6 || status_int(w->db, "snapshot_height") != 3) { hpplite_node_destroy(w); FAIL("the anchor 4-6 names the snapshot at 3"); }
     {
-        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .capturePages = 1, .fromSnapshot = 1, .nodeId = "snaprep_s", .privkey = kseq };
-        TestNodeOpts go = { .storeUrl = url, .verifyOnly = 1, .capturePages = 1, .nodeId = "snaprep_g", .privkey = kseq };
+        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .fromSnapshot = 1, .nodeId = "snaprep_s", .privkey = kseq };
+        TestNodeOpts go = { .storeUrl = url, .verifyOnly = 1, .nodeId = "snaprep_g", .privkey = kseq };
         HppliteNode *sp = test_open_node(tpath("snr_s.db"), l1, &so);
         HppliteNode *gp = test_open_node(tpath("snr_g.db"), l1, &go);
         int sRows = sp ? count_rows(sp->db, "t") : -1, gRows = gp ? count_rows(gp->db, "t") : -1;
@@ -503,7 +503,7 @@ static void test_snapshot_chunks(const char *url) {
     TEST("snapshots: a database over 8 MiB is a snapshot in two chunks; a replica joins them and reaches the sequencer's state");
     static const unsigned char kseq[32] = { [31] = 0x7c };
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .storeUrl = url, .nodeId = "snapch_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 3600 * 1000 };
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "snapch_w", .privkey = kseq, .snapshotMs = 3600 * 1000 };
     HppliteNode *w = test_open_node(tpath("snc_w.db"), l1, &o);
     HppliteStore *rs;
     uint64_t h = 0, a = 0;
@@ -534,7 +534,7 @@ static void test_snapshot_chunks(const char *url) {
     hpplite_node_flush_batch(w);
     if (hpplite_node_anchor(w) != a + 1) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the next anchor"); }
     {
-        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .capturePages = 1, .fromSnapshot = 1, .nodeId = "snapch_s", .privkey = kseq };
+        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .fromSnapshot = 1, .nodeId = "snapch_s", .privkey = kseq };
         HppliteNode *sp = test_open_node(tpath("snc_s.db"), l1, &so);
         int rows = sp ? count_rows(sp->db, "t") : -1, same = sp ? same_root(w, sp) : 0;
         sqlite3_int64 snap = sp ? status_int(sp->db, "snapshot_height") : -1;
@@ -583,7 +583,7 @@ static void test_keep(const char *url) {
     TEST("keep=: after an anchor, the batches and snapshots below the newest snapshot older than keep are pruned at the store; the snapshot and what follows stay; a replica still starts there; an anchor the chain refuses prunes nothing (#238)");
     static const unsigned char kseq[32] = { [31] = 0x7b };
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .storeUrl = url, .nodeId = "keep_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 1, .keepSeconds = 3 };
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "keep_w", .privkey = kseq, .snapshotMs = 1, .keepSeconds = 3 };
     HppliteNode *w = test_open_node(tpath("kp_w.db"), l1, &o);
     HppliteStore *rs;
     char b1[128], b3[128], b4[128], zIndex3[64], zIndex[64];
@@ -620,7 +620,7 @@ static void test_keep(const char *url) {
     }
     {
         /* a replica starts from the latest snapshot and reaches the sequencer's state; one from batch 1 cannot */
-        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .capturePages = 1, .fromSnapshot = 1, .nodeId = "keep_s", .privkey = kseq };
+        TestNodeOpts so = { .storeUrl = url, .verifyOnly = 1, .fromSnapshot = 1, .nodeId = "keep_s", .privkey = kseq };
         HppliteNode *sp = test_open_node(tpath("kp_s.db"), l1, &so);
         int rows = sp ? count_rows(sp->db, "t") : -1, same = sp ? same_root(w, sp) : 0;
         sqlite3_int64 snap = sp ? status_int(sp->db, "snapshot_height") : -1;
@@ -679,7 +679,7 @@ static void test_store_down_at_open(const char *dir) {
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/do_pins", test_dir());
     memset(&o, 0, sizeof o);
-    o.storeUrl = url; o.nodeId = "do_w"; o.privkey = kseq; o.capturePages = 1; o.storeFallbackOff = 1;
+    o.storeUrl = url; o.nodeId = "do_w"; o.privkey = kseq; o.storeFallbackOff = 1;
     w = test_open_node(tpath("do_w.db"), l1, &o);         /* nothing listens on the port yet */
     if (!w) FAIL("open with the store down");
     hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
@@ -743,7 +743,7 @@ static void test_restart_store_down(const char *dir) {
     pid = start_store_at(dir, port, storeDir, 0);
     if (pid < 0) FAIL("the test's store did not start");
     memset(&o, 0, sizeof o);
-    o.storeUrl = url; o.nodeId = "sd_w"; o.privkey = kseq; o.capturePages = 1; o.snapshotMs = 1; o.keepSeconds = 3600; o.storeFallbackOff = 1;
+    o.storeUrl = url; o.nodeId = "sd_w"; o.privkey = kseq; o.snapshotMs = 1; o.keepSeconds = 3600; o.storeFallbackOff = 1;
     w = test_open_node(tpath("sd_w.db"), l1, &o);
     rs = hpplite_store_open(url, NULL, 0);
     if (!w || !rs) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open"); }
@@ -814,7 +814,7 @@ static void test_snapshot_name_refused(const char *dir) {
     pid = start_store_at(dir, port, storeDir, 5);              /* content puts: batches 1-3, then the chunk (4), the name (5), the index */
     if (pid < 0) FAIL("the test's store did not start");
     memset(&o, 0, sizeof o);
-    o.storeUrl = url; o.nodeId = "nr_w"; o.privkey = kseq; o.capturePages = 1; o.snapshotMs = 1; o.keepSeconds = 3600; o.dbName = "named";
+    o.storeUrl = url; o.nodeId = "nr_w"; o.privkey = kseq; o.snapshotMs = 1; o.keepSeconds = 3600; o.dbName = "named";
     w = test_open_node(tpath("nr_w.db"), l1, &o);
     rs = hpplite_store_open(url, NULL, 0);
     if (!w || !rs) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open"); }
@@ -902,7 +902,7 @@ static void test_snapshot_reused_after_refusal(const char *url) {
     TEST("a snapshot made for an anchor the chain refused is reused when the retry anchors the same height and root (#237): no second upload");
     static const unsigned char kseq[32] = { [31] = 0x6b };
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .storeUrl = url, .nodeId = "reuse_w", .privkey = kseq, .capturePages = 1, .snapshotMs = 1 };
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "reuse_w", .privkey = kseq, .snapshotMs = 1 };
     HppliteNode *w = test_open_node(tpath("reuse_w.db"), l1, &o);
     HppliteStore *rs = hpplite_store_open(url, NULL, 0);
     long long before, refused, after;

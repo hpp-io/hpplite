@@ -19,7 +19,7 @@ def rebuild():
     c = sqlite3.connect(":memory:")
     c.enable_load_extension(True); c.load_extension(os.path.splitext(ext)[0]); c.close()
     c = sqlite3.connect(uri, uri=True)
-    st = c.execute("SELECT height, pending, state_root, last_checkpoint_height, replay_skipped, contract, "
+    st = c.execute("SELECT height, pending, state_root, last_checkpoint_height, 0 AS replay_skipped, contract, "
                    "roots_compared, root_mismatches, foreign_batches FROM hpplite_status").fetchone()
     tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_hpplite\\_%' ESCAPE '\\'")]
     rows = c.execute("SELECT count(*) FROM entries").fetchone()[0] if "entries" in tables else 0

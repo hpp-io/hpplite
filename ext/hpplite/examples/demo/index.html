@@ -78,7 +78,7 @@ $('#verify').addEventListener('click',async()=>{$('#verify').disabled=true;$('#v
   try{const j=await (await fetch('/api/verify',{method:'POST'})).json();
     if(j.error&&!j.height){$('#vres').innerHTML=`<span class="bad">${esc(j.error)}</span>`;}
     else{const same=j.state_root===j.live.state_root&&j.rows===j.live.entries;
-      $('#vres').innerHTML=`<div>rebuilt <b>${j.batches}</b> batches → <b>${j.rows}</b> entries in ${j.seconds}s; replay skipped ${j.replay_skipped}</div>
+      $('#vres').innerHTML=`<div>rebuilt <b>${j.batches}</b> batches → <b>${j.rows}</b> entries in ${j.seconds}s</div>
       <div>posted roots compared: <b>${j.roots_compared}</b>, mismatches: <b class="${j.root_mismatches?'bad':'ok'}">${j.root_mismatches}</b></div>
       <div>rebuilt root <span class="mono">${esc(j.state_root||'')}</span></div>
       <div>live root &nbsp;&nbsp;&nbsp;<span class="mono">${esc(j.live.state_root||'')}</span> → ${same?'<b class="ok">identical to the live database</b>':`<b class="warn">live db is ahead</b> (${j.live.pending} pending, ${j.live.entries-j.rows} entries not on chain yet)`}</div>

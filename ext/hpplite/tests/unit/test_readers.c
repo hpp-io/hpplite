@@ -127,50 +127,12 @@ static void test_reader_from_the_start_and_revoke(void) {
     PASS();
 }
 
-static void test_series_key(void) {
-    TEST("one data key per batch series: the chunks of one flush share it, the next flush draws another; a reader opens every chunk");
-    SKIP_IF_PAGES("a commit of four random rows is one page diff of 600 bytes, over this 900-byte limit: a commit larger than the limit is #152");
-    reset_dir();
-    char pubR[70], sql[200];
-    unsigned char privR[32], dek[4][32];
-    pubhex(KEY_R, pubR);
-    hpplite_hex_to_bytes(KEY_R, privR, 32);
-    HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .maxBatchBytes = 900, .privkey = NULL };
-    unsigned char kw[32];
-    hpplite_hex_to_bytes(KEY_W, kw, 32);
-    o.privkey = kw;
-    HppliteNode *w = test_open_node(DIR "/w3.db", l1, &o);
-    if (!w) FAIL("open writer");
-    snprintf(sql, sizeof sql, "SELECT hpplite_grant('%s')", pubR);
-    if (scalar(w->db, sql) != 1) FAIL("grant");
-    hpplite_node_exec(w, "CREATE TABLE t(x); BEGIN; INSERT INTO t VALUES(randomblob(150)); INSERT INTO t VALUES(randomblob(150));"
-                         " INSERT INTO t VALUES(randomblob(150)); INSERT INTO t VALUES(randomblob(150)); COMMIT", NULL);
-    int h = (int)hpplite_node_flush_batch(w);
-    if (h < 2) FAILF("the flush should split into chunks, got height %d", h);
-    hpplite_node_exec(w, "INSERT INTO t VALUES('next series')", NULL);
-    int h2 = (int)hpplite_node_flush_batch(w);
-    if (h2 != h + 1) FAIL("the next flush");
-    for (int i = 1; i <= 4 && i <= h2; i++) {
-        size_t len = 0, outLen = 0;
-        uint8_t *raw = hpplite_l1_get_batch(l1, (uint64_t)i, &len);
-        uint8_t *pt = raw ? hpplite_envelope_open_pk(privR, (uint64_t)i, raw, len, &outLen, NULL, dek[i - 1]) : NULL;
-        free(raw);
-        if (!pt) FAILF("the reader opens chunk %d", i);
-        free(pt);
-    }
-    if (memcmp(dek[0], dek[1], 32) != 0) FAIL("the chunks of one series share the data key");
-    if (memcmp(dek[h2 - 1], dek[0], 32) == 0) FAIL("the next series has its own data key");
-    hpplite_node_destroy(w);
-    PASS();
-}
 
 int main(void) {
     printf("=== Readers and viewing keys (#15) ===\n");
     test_suite_init("readers", NULL, DIR);
     test_grant_and_read();
     test_reader_from_the_start_and_revoke();
-    test_series_key();
     remove_dir();
     return test_report();
 }

@@ -22,7 +22,6 @@ static HppliteNode *open_pages_role(const char *dbPath, HppliteL1 *l1, int noEnc
     config.hasPrivkey = 1;
     config.dataDir = (char *)DIR;
     config.dbPath = (char *)dbPath;
-    config.capturePages = 1;
     config.noEncrypt = noEncrypt;
     config.noCompress = noCompress;
     config.checkpointInterval = 1000;
@@ -366,7 +365,7 @@ static void test_no_local_finalize_with_an_l1_configured(void) {
     HppliteNodeConfig config;
     memset(&config, 0, sizeof config);
     config.nodeId = "nol1"; config.dataDir = DIR; config.dbPath = DIR "/nol1.db";
-    config.capturePages = 1; config.noEncrypt = 1;
+    config.noEncrypt = 1;
     config.rpcUrl = "http://127.0.0.1:9"; config.hasFactory = 1;          /* an L1 named, no key: no connection comes of it */
     HppliteNode *n = hpplite_node_create(&config);
     if (!n) FAIL("open");
@@ -387,7 +386,7 @@ static void test_open_fails_when_wal_cannot_be_set(void) {
     sqlite3 *other = NULL;
     if (sqlite3_open(DIR "/held.db", &other) != SQLITE_OK) FAIL("plain open");
     sqlite3_exec(other, "CREATE TABLE t(x); BEGIN IMMEDIATE; INSERT INTO t VALUES(1)", NULL, NULL, NULL);
-    TestNodeOpts o = { .capturePages = 1, .noEncrypt = 1, .localOnly = 1 };
+    TestNodeOpts o = { .noEncrypt = 1, .localOnly = 1 };
     HppliteNode *n = test_open_node(DIR "/held.db", NULL, &o);
     const char *why = hpplite_init_error();
     sqlite3_exec(other, "COMMIT", NULL, NULL, NULL);
@@ -406,7 +405,7 @@ static void test_batch_one_carries_the_name(void) {
     HppliteNodeConfig config;
     memset(&config, 0, sizeof config);
     config.nodeId = "named"; config.dataDir = DIR; config.dbPath = DIR "/named.db";
-    config.capturePages = 1; config.noEncrypt = 1; config.noCompress = 1; config.dbName = "alpha";
+    config.noEncrypt = 1; config.noCompress = 1; config.dbName = "alpha";
     for (int i = 0; i < 32; i++) config.privkey[i] = (unsigned char)(i + 1);          /* a key: the lease is claimed with it */
     config.hasPrivkey = 1;
     HppliteNode *n = hpplite_node_create(&config);
@@ -463,7 +462,7 @@ static void test_commit_over_the_limit_is_cut_into_pieces(void) {
     TEST("a commit larger than the posting limit is posted as pieces under the limit; a replica applies the series and equals; the next commit follows");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .capturePages = 1, .noEncrypt = 1, .noCompress = 1, .maxBatchBytes = 16 * 1024, .checkpointInterval = TEST_INTERVAL_1000 };
+    TestNodeOpts o = { .noEncrypt = 1, .noCompress = 1, .maxBatchBytes = 16 * 1024, .checkpointInterval = TEST_INTERVAL_1000 };
     HppliteNode *s = test_open_node(DIR "/big.db", l1, &o);
     if (!s) FAIL("open");
     hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)", NULL);
@@ -509,7 +508,7 @@ static void test_death_between_pieces(void) {
 #else
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
-    TestNodeOpts o = { .capturePages = 1, .noEncrypt = 1, .noCompress = 1, .maxBatchBytes = 16 * 1024, .checkpointInterval = TEST_INTERVAL_1000 };
+    TestNodeOpts o = { .noEncrypt = 1, .noCompress = 1, .maxBatchBytes = 16 * 1024, .checkpointInterval = TEST_INTERVAL_1000 };
     HppliteNode *s = test_open_node(DIR "/dp.db", l1, &o);
     if (!s) FAIL("open");
     hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)", NULL);
@@ -538,68 +537,103 @@ static void test_death_between_pieces(void) {
 #endif
 }
 
-/* capture=auto, the default (#146): a new rollup is pages; a file that
-** carries HPPLite's tables keeps rows; a fresh file on a rollup whose
-** history is statements switches to rows at its sync */
-static void test_capture_auto(void) {
-    TEST("capture=auto: a new rollup is pages, a file with the log keeps rows, a fresh file on a statement history switches to rows");
-    if (getenv("HPPLITE_CAPTURE")) { printf("SKIP (HPPLITE_CAPTURE says %s: nothing is automatic) ", getenv("HPPLITE_CAPTURE")); PASS(); return; }
+/* The first batch of a rollup can be the file as opened, with no commit in it (a node opened, flushed or closed,
+** wrote nothing). A second sequencer on a fresh file for that rollup - a signer's node, a machine resumed elsewhere -
+** must take that image as the history it is behind and apply it, then post its own (#253; anvil 23) */
+static void test_image_batch_adopted_by_a_fresh_sequencer(void) {
+    TEST("a rollup whose batch 1 is the file's image with no commit: a fresh sequencer applies it and posts after it");
     reset_dir();
-    HppliteL1 *rowsL1 = hpplite_l1_create_mock(), *pagesL1 = hpplite_l1_create_mock();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_pages(DIR "/img_a.db", l1, 1, 1);
+    if (!a) FAIL("open a");
+    long long h1 = hpplite_node_flush_batch(a);                 /* nothing written: the file as opened is the batch */
+    hpplite_node_destroy(a);
+    if (h1 != 1) FAILF("the empty file's image should be batch 1 (flush %lld)", h1);
+    HppliteNode *b = open_pages(DIR "/img_b.db", l1, 1, 1);
+    if (!b) FAIL("open b");
+    int synced = hpplite_node_sync_from_l1(b, 1);
+    hpplite_node_exec(b, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    long long h2 = hpplite_node_flush_batch(b);
+    int err = b->state == HPPLITE_STATE_ERROR;
+    if (err || h2 != 2) printf("(synced %d, flush %lld, state %s: %s) ", synced, h2, err ? "error" : "ok", b->ctx->zLastError);
+    hpplite_node_destroy(b);
+    hpplite_l1_disconnect(l1);
+    if (err) FAIL("the fresh sequencer stopped on the image batch");
+    if (h2 != 2) FAIL("the fresh sequencer should post its own batch after the image");
+    PASS();
+}
+
+/* A signer's node (#17) holds no key at open: the rollup's sealed history cannot be read until the batch key is given
+** apart. With page capture the node's own writes must come after that history is applied to its fresh file, so the key's
+** arrival reads the chain before anything else happens (#253; anvil 23) */
+static void test_key_given_later_reads_the_history_first(void) {
+    TEST("a node opened without a key on a sealed history: the batch key given later reads the history first, then it posts its own");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_pages(DIR "/late_a.db", l1, 0, 1);                      /* sealed with the suite's key */
+    if (!a) FAIL("open a");
+    hpplite_node_exec(a, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(a) != 1) FAIL("a posts batch 1");
+    unsigned char derived[32]; memcpy(derived, a->encKey, 32);                     /* the batch key the owner would hand over */
+    hpplite_node_destroy(a);
     HppliteNodeConfig config;
-    char cap[16];
-    /* a rows history, made with capture=rows said */
     memset(&config, 0, sizeof config);
-    config.nodeId = "rw"; config.dataDir = DIR; config.dbPath = DIR "/auto_rows.db"; config.noEncrypt = 1; config.noCompress = 1;
+    config.nodeId = "late"; config.dataDir = DIR; config.dbPath = DIR "/late_b.db"; config.noCompress = 1;
+    HppliteNode *b = hpplite_node_create(&config);                                /* no key: the history is sealed to it */
+    if (!b) FAIL("open b");
+    hpplite_node_set_l1(b, l1); hpplite_node_sync_from_l1(b, 1); hpplite_node_start(b);
+    int unreadable = b->state == HPPLITE_STATE_ERROR || hpplite_node_get_height(b) == 1;
+    if (hpplite_node_set_batch_key(b, derived) != 0) FAIL("set the batch key");
+    long long height = hpplite_node_get_height(b);
+    hpplite_node_exec(b, "INSERT INTO t VALUES(2)", NULL);                        /* t exists: the history was applied by the key's arrival */
+    long long h2 = hpplite_node_flush_batch(b);
+    int err = b->state == HPPLITE_STATE_ERROR;
+    long long rows = scalar(b->db, "SELECT count(*) FROM t");
+    if (!unreadable || height != 2 || h2 != 2 || err || rows != 2) printf("(unreadable before %d, height after the key %lld, flush %lld, rows %lld, state %s: %s) ", unreadable, height, h2, rows, err ? "error" : "ok", b->ctx->zLastError);
+    hpplite_node_destroy(b);
+    hpplite_l1_disconnect(l1);
+    if (!unreadable) FAIL("the history should be unreadable without the key");
+    if (height != 2) FAIL("the key's arrival should read the history: height 2");
+    if (err || h2 != 2 || rows != 2) FAIL("the node should post its own batch after the history, on the history");
+    PASS();
+}
+
+/* Histories from v0.7 and earlier are statements or rows: a file carrying HPPLite's tables in itself, or a rollup
+** whose batch 1 is not a page batch. Neither is read since v0.8 (#253): the open, or the sync, refuses and says so */
+static void test_rows_history_refused(void) {
+    TEST("a file with a v0.7 log inside it is refused at open; a rollup whose batch 1 is not a page batch stops the replica");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNodeConfig config;
+    memset(&config, 0, sizeof config);
+    config.nodeId = "old"; config.dataDir = DIR; config.dbPath = DIR "/old_rows.db"; config.noEncrypt = 1;
     for (int i = 0; i < 32; i++) config.privkey[i] = (unsigned char)(i + 1);
     config.hasPrivkey = 1;
+    {   /* a v0.7 file: the meta table in the database itself */
+        sqlite3 *plain = NULL;
+        sqlite3_open(DIR "/old_rows.db", &plain);
+        sqlite3_exec(plain, "CREATE TABLE _hpplite_meta(id INTEGER PRIMARY KEY, next_height INTEGER); INSERT INTO _hpplite_meta VALUES(1, 5)", NULL, NULL, NULL);
+        sqlite3_close(plain);
+    }
     HppliteNode *w = hpplite_node_create(&config);
-    if (!w) FAIL("open the rows writer");
-    hpplite_node_set_l1(w, rowsL1); hpplite_node_sync_from_l1(w, 1); hpplite_node_start(w);
-    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
-    if (hpplite_node_flush_batch(w) != 1) FAIL("rows flush");
-    text_of(w->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
-    if (strcmp(cap, "rows") != 0) FAILF("capture=rows said, status says %s", cap);
-    hpplite_node_destroy(w);
-    /* the same file again, nothing said: the log in the file keeps rows */
-    config.captureAuto = 1;
-    w = hpplite_node_create(&config);
-    if (!w) FAIL("reopen the rows file");
-    hpplite_node_set_l1(w, rowsL1); hpplite_node_sync_from_l1(w, 1); hpplite_node_start(w);
-    text_of(w->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
-    if (strcmp(cap, "rows") != 0 || w->pm) FAILF("a file with the log, nothing said: status says %s", cap);
-    hpplite_node_destroy(w);
-    /* a fresh file on that history, nothing said: pages first, rows at the sync */
-    config.nodeId = "rr"; config.dbPath = DIR "/auto_rows_replica.db";
+    if (w) { hpplite_node_destroy(w); FAIL("a file with a rows/statements log opened"); }
+    if (!hpplite_init_error() || !strstr(hpplite_init_error(), "statements or rows")) FAIL("the refusal should name the history's kind");
+    /* a chain whose batch 1 is plaintext JSON (a statements batch): the replica stops at it and says so */
+    const char *json = "{\"height\":1,\"txns\":[{\"sql\":\"CREATE TABLE t(x)\"}]}";
+    hpplite_l1_mock_inject_batch(l1, (const uint8_t *)json, strlen(json));
+    config.nodeId = "oldr"; config.dbPath = DIR "/old_replica.db";
     HppliteNode *r = hpplite_node_create(&config);
     if (!r) FAIL("open the replica");
-    hpplite_node_set_l1(r, rowsL1); hpplite_node_sync_from_l1(r, 1); hpplite_node_start(r);
-    text_of(r->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
-    long long rows = scalar(r->db, "SELECT count(*) FROM t");
+    hpplite_node_set_l1(r, l1);
+    int synced = hpplite_node_sync_from_l1(r, 1);
     int err = r->state == HPPLITE_STATE_ERROR;
-    printf("(replica of a statement history: capture %s, %lld rows%s%s) ", cap, rows, err ? ", error: " : "", err ? r->ctx->zLastError : "");
+    const char *why = r->ctx->zLastError;
+    int named = strstr(why, "not a page batch") != NULL;
+    if (!err || synced >= 0 || !named) printf("(synced %d, error %d: %s) ", synced, err, why);
     hpplite_node_destroy(r);
-    if (err || strcmp(cap, "rows") != 0 || rows != 1) FAIL("a fresh file on a statement history should switch to rows and replay");
-    /* a new rollup, nothing said: pages */
-    config.nodeId = "np"; config.dbPath = DIR "/auto_new.db";
-    HppliteNode *n = hpplite_node_create(&config);
-    if (!n) FAIL("open on a new rollup");
-    hpplite_node_set_l1(n, pagesL1); hpplite_node_sync_from_l1(n, 1); hpplite_node_start(n);
-    hpplite_node_exec(n, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
-    if (hpplite_node_flush_batch(n) != 1) FAIL("pages flush");
-    text_of(n->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
-    if (strcmp(cap, "pages") != 0 || !n->pm) FAILF("a new rollup, nothing said: status says %s", cap);
-    hpplite_node_destroy(n);
-    /* a fresh file on the page history, nothing said: pages */
-    config.nodeId = "nr"; config.dbPath = DIR "/auto_new_replica.db";
-    r = hpplite_node_create(&config);
-    if (!r) FAIL("open the page replica");
-    hpplite_node_set_l1(r, pagesL1); hpplite_node_sync_from_l1(r, 1); hpplite_node_start(r);
-    text_of(r->db, "SELECT capture FROM hpplite_status", cap, sizeof cap);
-    rows = scalar(r->db, "SELECT count(*) FROM t");
-    hpplite_node_destroy(r);
-    hpplite_l1_disconnect(rowsL1); hpplite_l1_disconnect(pagesL1);
-    if (strcmp(cap, "pages") != 0 || rows != 1) FAILF("a fresh file on a page history: capture %s, %lld rows", cap, rows);
+    hpplite_l1_disconnect(l1);
+    if (!err || synced >= 0) FAIL("a statements batch should stop the replica");
+    if (!named) FAIL("the error should say the batch is not a page batch");
     PASS();
 }
 
@@ -615,7 +649,7 @@ static void test_foreign_checkpoint_and_restart_lose_nothing(void) {
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNodeConfig config;
     memset(&config, 0, sizeof config);
-    config.nodeId = "fc"; config.dataDir = DIR; config.dbPath = DIR "/fc.db"; config.capturePages = 1; config.noEncrypt = 1; config.noCompress = 1;
+    config.nodeId = "fc"; config.dataDir = DIR; config.dbPath = DIR "/fc.db"; config.noEncrypt = 1; config.noCompress = 1;
     config.checkpointInterval = TEST_INTERVAL_1000; config.batchIntervalMs = 3600 * 1000;   /* a timer: its ticks checkpoint and move the pin, the interval never comes */
     for (int i = 0; i < 32; i++) config.privkey[i] = (unsigned char)(i + 1);
     config.hasPrivkey = 1;
@@ -680,7 +714,6 @@ static void test_pending_counts_foreign_commits(void) {
 ** status says so - not the connection's default */
 static void test_follower_reports_pages(void) {
     TEST("a verify connection on a page-mode file the sequencer holds reports capture = pages (#174)");
-    if (getenv("HPPLITE_CAPTURE")) { printf("SKIP (HPPLITE_CAPTURE says %s: nothing is automatic) ", getenv("HPPLITE_CAPTURE")); PASS(); return; }
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *s = open_pages(DIR "/held_pages.db", l1, 1, 1);
@@ -691,7 +724,6 @@ static void test_follower_reports_pages(void) {
     char cap[16];
     memset(&config, 0, sizeof config);
     config.nodeId = "vf"; config.dataDir = DIR; config.dbPath = DIR "/held_pages.db";
-    config.captureAuto = 1;                              /* nothing said: what stock Python opening the demo's file gets */
     config.verifyOnly = 1;
     HppliteNode *v = hpplite_node_create(&config);
     if (!v) FAIL("open the verify connection");
@@ -725,7 +757,9 @@ int main(void) {
     test_fresh_plain_node_reads_the_applied_pages();
     test_commit_over_the_limit_is_cut_into_pieces();
     test_death_between_pieces();
-    test_capture_auto();
+    test_rows_history_refused();
+    test_image_batch_adopted_by_a_fresh_sequencer();
+    test_key_given_later_reads_the_history_first();
     test_foreign_checkpoint_and_restart_lose_nothing();
     test_pending_counts_foreign_commits();
     test_follower_reports_pages();

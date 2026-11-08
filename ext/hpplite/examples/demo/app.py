@@ -46,14 +46,14 @@ with lock:
 
 def status():
     with lock:
-        r = db.execute("SELECT height, pending, state_root, last_checkpoint_height, lease, log_errors, "
-                       "replay_skipped, encryption, keyed, nondeterministic, contract, da_contract, last_batch_tx, "
+        r = db.execute("SELECT height, pending, state_root, last_checkpoint_height, lease, "
+                       "encryption, keyed, contract, da_contract, last_batch_tx, "
                        "anchored, last_anchor_tx, store, store_state, store_calls, last_checkpoint_root, "
                        "store_funder, store_covered_until FROM hpplite_status").fetchone()
         n = db.execute("SELECT count(*) FROM entries").fetchone()[0]
         size = db.execute("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()").fetchone()[0]
-    keys = ["height", "pending", "state_root", "last_checkpoint_height", "lease", "log_errors",
-            "replay_skipped", "encryption", "keyed", "nondeterministic", "contract", "da_contract", "last_batch_tx",
+    keys = ["height", "pending", "state_root", "last_checkpoint_height", "lease",
+            "encryption", "keyed", "contract", "da_contract", "last_batch_tx",
             "anchored", "last_anchor_tx", "store", "store_state", "store_calls", "last_checkpoint_root",
             "store_funder", "store_covered_until"]
     d = dict(zip(keys, r)); d["entries"] = n; d["db_bytes"] = size; d["explorer"] = EXPLORER

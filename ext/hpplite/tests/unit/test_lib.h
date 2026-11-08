@@ -27,14 +27,7 @@ extern int tests_run, tests_passed;
 #define FAIL(msg) do { printf("FAIL: %s\n", msg); return; } while(0)
 #define FAILF(...) do { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); return; } while(0)
 
-/* Row capture (#19) is the default; cases about statement capture run with
-** HPPLITE_CAPTURE=text (the _text tests) and skip otherwise */
-int test_rows_mode(void);
-int test_pages_mode(void);                   /* HPPLITE_CAPTURE=pages: page capture (#146) */
-#define SKIP_IF_ROWS(why) do { if (test_rows_mode()) { printf("SKIP (text capture: %s) ", why); PASS(); return; } } while(0)
-/* Cases about statements, the log table or the content root do not apply to page capture (#146) */
-#define SKIP_IF_PAGES(why) do { if (test_pages_mode()) { printf("SKIP (page capture: %s) ", why); PASS(); return; } } while(0)
-/* pending is n commits; in page mode the file as opened (its pages, never shipped) may count as one more */
+/* pending is n commits; the file as opened (its pages, never shipped) may count as one more (#146) */
 int test_pending_is(long long pending, int n);
 
 /* A TCP port on 127.0.0.1 free right now, from the OS (bind to port 0), for
@@ -84,9 +77,6 @@ typedef struct TestNodeOpts {
     int noCompress;                          /* the batch JSON as is (#12) */
     int localOnly;                           /* 0: when there is no L1; 1: always; -1: never (no chain: the log stays pending) */
     int verifyOnly;                          /* role=verify (#5) */
-    int determinismWarn;                     /* warn about non-deterministic SQL instead of refusing it */
-    int captureText;                         /* statement capture, as v0.1 */
-    int capturePages;                        /* page capture (#146); also from HPPLITE_CAPTURE=pages */
     const char *dbName;                      /* dbname= (#61): its own rollup among the wallet's, named in its first batch and its snapshots */
     int noSync;                              /* attach the L1 without syncing from it first */
     int start;                               /* start the node even without an L1 */

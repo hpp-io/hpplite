@@ -228,16 +228,16 @@ int main(int argc, char **argv) {
         }
     }
     /* the verifier's own datadir, first so it wins over one in the parameters */
-    const char *zCapture = "", *zFrom = "";
-    int triedPages = 0, triedSnapshot = 0;
+    const char *zFrom = "";
+    int triedSnapshot = 0;
     sqlite3 *db;
 open_again:
     /* the hard tier first: soft=off keeps the rebuild at the anchored height, the soft tier is reported after (#166) */
     { char to[40] = "";
       if (stopAt) snprintf(to, sizeof to, "&syncto=%llu", (unsigned long long)stopAt);    /* the stop, from the first sync at open */
       else if (atMs) snprintf(to, sizeof to, "&syncat=%llu", (unsigned long long)atMs);
-      /* the retry's capture= and from= before the user's params: the first of a key wins (#239) */
-      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s%s%s%s&%s%s", dir, dir, zCapture, to, zFrom, params, zStore);
+      /* the retry's from= before the user's params: the first of a key wins (#239) */
+      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&soft=off&datadir=%s%s%s&%s%s", dir, dir, to, zFrom, params, zStore);
       db = uri ? hpplite_open(uri) : NULL;
       sqlite3_free(uri); }
     if (!db) {
@@ -270,19 +270,6 @@ open_again:
     }
     const char *zState = status_text(db, "state");
     const char *zErr = status_text(db, "last_error");
-    if (!triedPages && strstr(zErr, "capture=pages")) {
-        /* a page history (#146): the rebuild is a file written page by page,
-        ** in page mode; the parameters did not say so, the first batch did */
-        char path[1100];
-        triedPages = 1;
-        sqlite3_close(db);
-        snprintf(path, sizeof path, "%s/rebuilt.db", dir); unlink(path);
-        snprintf(path, sizeof path, "%s/rebuilt.db-wal", dir); unlink(path);
-        snprintf(path, sizeof path, "%s/rebuilt.db-shm", dir); unlink(path);
-        snprintf(path, sizeof path, "%s/rebuilt.db-hpplite.db", dir); unlink(path);
-        zCapture = "&capture=pages";
-        goto open_again;
-    }
     if (!triedSnapshot && rebuilt == 0 && onChain > 0 && node->state == HPPLITE_STATE_ERROR) {
         /* not even batch 1: a history pruned at the store (keep=, #223)? From the oldest snapshot it
         ** still keeps (#224): its root checked against the one the chain anchored there, then the batches after */
@@ -294,15 +281,12 @@ open_again:
         snprintf(path, sizeof path, "%s/rebuilt.db-wal", dir); unlink(path);
         snprintf(path, sizeof path, "%s/rebuilt.db-shm", dir); unlink(path);
         snprintf(path, sizeof path, "%s/rebuilt.db-hpplite.db", dir); unlink(path);
-        zCapture = "&capture=pages";              /* snapshots are page images */
         zFrom = "&from=earliest";
         goto open_again;
     }
     sqlite3_int64 fromSnap = scalar(db, "SELECT snapshot_height FROM hpplite_status");
     sqlite3_int64 compared = scalar(db, "SELECT roots_compared FROM hpplite_status");
     sqlite3_int64 mismatches = scalar(db, "SELECT root_mismatches FROM hpplite_status");
-    sqlite3_int64 skipped = scalar(db, "SELECT replay_skipped FROM hpplite_status");
-    sqlite3_int64 dropped = scalar(db, "SELECT txns_dropped FROM hpplite_status");
     char contract[43] = "", da[43] = "";
     hpplite_l1_get_addresses(node->l1, contract, da);
 
@@ -346,11 +330,6 @@ open_again:
     printf("posted roots compared: %lld, mismatches: %lld", (long long)compared, (long long)mismatches);
     if (mismatches > 0) { printf(" <- the content does not match what was posted"); rc = 1; }
     printf("\n");
-    if (skipped > 0 || dropped > 0) {
-        printf("statements skipped on replay: %lld, transactions dropped: %lld (replica differs from the writer)\n",
-               (long long)skipped, (long long)dropped);
-        rc = 1;
-    }
 
     /* the root the contract anchors, against the rebuilt content at that height */
     {

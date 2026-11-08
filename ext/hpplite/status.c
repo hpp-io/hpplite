@@ -53,48 +53,43 @@ typedef struct StatusCursor {
 #define STATUS_COL_PREV_BLOCK_HASH 3
 #define STATUS_COL_LAST_CHECKPOINT 4
 #define STATUS_COL_LEASE 5
-#define STATUS_COL_LOG_ERRORS 6
-#define STATUS_COL_REPLAY_SKIPPED 7
-#define STATUS_COL_ENCRYPTION 8
-#define STATUS_COL_KEYED 9
-#define STATUS_COL_NONDETERMINISTIC 10
-#define STATUS_COL_CONTRACT         11
-#define STATUS_COL_DA_CONTRACT      12
-#define STATUS_COL_LAST_BATCH_TX    13
-#define STATUS_COL_FOREIGN_BATCHES  14
-#define STATUS_COL_HOOKS_REPLACED   15
-#define STATUS_COL_ROOTS_COMPARED   16
-#define STATUS_COL_ROOT_MISMATCHES  17
-#define STATUS_COL_TXNS_DROPPED     18
-#define STATUS_COL_LAST_REFUSAL     19
-#define STATUS_COL_SEQUENCER        20
-#define STATUS_COL_CAPTURE          21
-#define STATUS_COL_FOREIGN_WRITES   22
-#define STATUS_COL_STATE            23
-#define STATUS_COL_LAST_ERROR       24
-#define STATUS_COL_CHAIN_HASH       25
-#define STATUS_COL_ROOT_VERSION     26
-#define STATUS_COL_STORE            27     /* the store= URL (#11); NULL: the bytes go on the chain */
-#define STATUS_COL_STORE_STATE      28     /* ok, unreachable, over cap, error: the last put's outcome */
-#define STATUS_COL_STORE_SPENT      29     /* paid to the store by this process, atomic units of its asset */
-#define STATUS_COL_STORE_CALLS      30     /* puts and gets that succeeded */
-#define STATUS_COL_STORE_PRICE      31     /* what the provider charges for a put of the last batch's size; NULL when free */
-#define STATUS_COL_STORE_BALANCE    32     /* the wallet's balance of the store's asset on the chain; NULL when not readable */
-#define STATUS_COL_READERS          33     /* readers granted besides the wallet (#15) */
-#define STATUS_COL_ANCHORED         34     /* the chain's last height (#164): above it the store alone holds the batches; NULL without a chain */
-#define STATUS_COL_LAST_ANCHOR_TX   35     /* the transaction of the last anchor this node made */
-#define STATUS_COL_LAST_CHECKPOINT_ROOT 36 /* the root the last checkpoint (or anchor) carried, hex; NULL before one */
-#define STATUS_COL_RELAY          37  /* relay= (#126): the URL; NULL without one */
-#define STATUS_COL_RELAY_SPENT    38  /* ...paid to it, atomic units of its asset */
-#define STATUS_COL_LAST_TX_PATH   39  /* "relay" or "direct": how the last write went to the chain; NULL before one */
-#define STATUS_COL_STORE_FUNDER   40  /* hpplite-store/2 (#214): the funding wallet's address (send USDC.e there); NULL otherwise */
-#define STATUS_COL_STORE_COVERED  41  /* ...when the bucket's account runs out at the current cost (unix seconds); NULL before a statement */
-#define STATUS_COL_SPENT_WINDOW   42  /* paid to the store and the relay in spendcap='s window (a day without one), #173 */
-#define STATUS_COL_SOFT_DISAGREE  45  /* ...times the chain named another batch than the store served, each followed by a rebuild */
-#define STATUS_COL_SOFT_HEIGHT    44  /* a verifier with a store (#166): the height it applied to, soft batches included; NULL otherwise */
-#define STATUS_COL_SPEND_WARNING  43  /* what runs out and when at the recent rate (lowbalance=); NULL when nothing does */
-#define STATUS_COL_STORE_BUCKET   46  /* ...the bucket's state at the store: covered, parked, deleted; NULL before one is known */
-#define STATUS_COL_SNAPSHOT       47  /* the latest snapshot's height: the one this sequencer's anchors name, or a replica started from (#221, #222); NULL: none */
+#define STATUS_COL_ENCRYPTION 6
+#define STATUS_COL_KEYED 7
+#define STATUS_COL_CONTRACT         8
+#define STATUS_COL_DA_CONTRACT      9
+#define STATUS_COL_LAST_BATCH_TX    10
+#define STATUS_COL_FOREIGN_BATCHES  11
+#define STATUS_COL_ROOTS_COMPARED   12
+#define STATUS_COL_ROOT_MISMATCHES  13
+#define STATUS_COL_LAST_REFUSAL     14
+#define STATUS_COL_SEQUENCER        15
+#define STATUS_COL_CAPTURE          16
+#define STATUS_COL_FOREIGN_WRITES   17
+#define STATUS_COL_STATE            18
+#define STATUS_COL_LAST_ERROR       19
+#define STATUS_COL_CHAIN_HASH       20
+#define STATUS_COL_ROOT_VERSION     21
+#define STATUS_COL_STORE            22     /* the store= URL (#11); NULL: the bytes go on the chain */
+#define STATUS_COL_STORE_STATE      23     /* ok, unreachable, over cap, error: the last put's outcome */
+#define STATUS_COL_STORE_SPENT      24     /* paid to the store by this process, atomic units of its asset */
+#define STATUS_COL_STORE_CALLS      25     /* puts and gets that succeeded */
+#define STATUS_COL_STORE_PRICE      26     /* what the provider charges for a put of the last batch's size; NULL when free */
+#define STATUS_COL_STORE_BALANCE    27     /* the wallet's balance of the store's asset on the chain; NULL when not readable */
+#define STATUS_COL_READERS          28     /* readers granted besides the wallet (#15) */
+#define STATUS_COL_ANCHORED         29     /* the chain's last height (#164): above it the store alone holds the batches; NULL without a chain */
+#define STATUS_COL_LAST_ANCHOR_TX   30     /* the transaction of the last anchor this node made */
+#define STATUS_COL_LAST_CHECKPOINT_ROOT 31 /* the root the last checkpoint (or anchor) carried, hex; NULL before one */
+#define STATUS_COL_RELAY          32  /* relay= (#126): the URL; NULL without one */
+#define STATUS_COL_RELAY_SPENT    33  /* ...paid to it, atomic units of its asset */
+#define STATUS_COL_LAST_TX_PATH   34  /* "relay" or "direct": how the last write went to the chain; NULL before one */
+#define STATUS_COL_STORE_FUNDER   35  /* hpplite-store/2 (#214): the funding wallet's address (send USDC.e there); NULL otherwise */
+#define STATUS_COL_STORE_COVERED  36  /* ...when the bucket's account runs out at the current cost (unix seconds); NULL before a statement */
+#define STATUS_COL_SPENT_WINDOW   37  /* paid to the store and the relay in spendcap='s window (a day without one), #173 */
+#define STATUS_COL_SOFT_DISAGREE  40  /* ...times the chain named another batch than the store served, each followed by a rebuild */
+#define STATUS_COL_SOFT_HEIGHT    39  /* a verifier with a store (#166): the height it applied to, soft batches included; NULL otherwise */
+#define STATUS_COL_SPEND_WARNING  38  /* what runs out and when at the recent rate (lowbalance=); NULL when nothing does */
+#define STATUS_COL_STORE_BUCKET   41  /* ...the bucket's state at the store: covered, parked, deleted; NULL before one is known */
+#define STATUS_COL_SNAPSHOT       42  /* the latest snapshot's height: the one this sequencer's anchors name, or a replica started from (#221, #222); NULL: none */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -104,10 +99,10 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
     rc = sqlite3_declare_vtab(db,
         "CREATE TABLE x(height INTEGER, pending INTEGER, state_root TEXT,"
         " prev_block_hash TEXT, last_checkpoint_height INTEGER, lease INTEGER,"
-        " log_errors INTEGER, replay_skipped INTEGER, encryption TEXT, keyed INTEGER,"
-        " nondeterministic INTEGER, contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
-        " foreign_batches INTEGER, hooks_replaced INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
-        " txns_dropped INTEGER, last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
+        " encryption TEXT, keyed INTEGER,"
+        " contract TEXT, da_contract TEXT, last_batch_tx TEXT,"
+        " foreign_batches INTEGER, roots_compared INTEGER, root_mismatches INTEGER,"
+        " last_refusal TEXT, sequencer INTEGER, capture TEXT, foreign_writes INTEGER,"
         " state TEXT, last_error TEXT, chain_hash TEXT, root_version INTEGER,"
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
@@ -223,7 +218,7 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             statusResultHex(ctx, node->ctx->prevBlockHash);
             break;
         case STATUS_COL_ROOT_VERSION:            /* how state_root is computed (#9; 4: over pages, #146) */
-            sqlite3_result_int(ctx, node->pm ? 4 : HPPLITE_ROOT_VERSION);
+            sqlite3_result_int(ctx, 4);                 /* the root over the file's pages (#146) */
             break;
         case STATUS_COL_CHAIN_HASH: {            /* the DA contract's rolling hash as this node tracks it (#33); NULL until known */
             static const unsigned char zero[32];
@@ -237,20 +232,11 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_LEASE:
             sqlite3_result_int(ctx, node->hasLease);
             break;
-        case STATUS_COL_LOG_ERRORS:
-            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nLogErrors);
-            break;
-        case STATUS_COL_REPLAY_SKIPPED:
-            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nReplaySkipped);
-            break;
         case STATUS_COL_ENCRYPTION:
             sqlite3_result_text(ctx, node->cipher ? node->cipher->name : "none", -1, SQLITE_STATIC);
             break;
         case STATUS_COL_KEYED:
             sqlite3_result_int(ctx, (node->config.hasPrivkey || node->hasSigner) ? 1 : 0);
-            break;
-        case STATUS_COL_NONDETERMINISTIC:
-            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nNondeterministic);
             break;
         case STATUS_COL_CONTRACT:
         case STATUS_COL_DA_CONTRACT: {
@@ -266,17 +252,11 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_FOREIGN_BATCHES:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nForeignBatches);
             break;
-        case STATUS_COL_HOOKS_REPLACED:
-            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nHooksReplaced);
-            break;
         case STATUS_COL_ROOTS_COMPARED:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nRootsCompared);
             break;
         case STATUS_COL_ROOT_MISMATCHES:
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nRootMismatches);
-            break;
-        case STATUS_COL_TXNS_DROPPED:
-            sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nTxnsDropped);
             break;
         case STATUS_COL_LAST_REFUSAL:
             if (node->ctx->zLastRefusal[0]) sqlite3_result_text(ctx, node->ctx->zLastRefusal, -1, SQLITE_TRANSIENT);
@@ -285,10 +265,8 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
         case STATUS_COL_SEQUENCER:
             sqlite3_result_int(ctx, node->follower ? 0 : 1);
             break;
-        case STATUS_COL_CAPTURE:              /* what the file's history is captured as: records, statements or pages (#83) */
-            /* a follower or verify connection on a page-mode file runs no page machinery of its own, but the file is a
-            ** page-mode file: its configuration says so (#174) */
-            sqlite3_result_text(ctx, node->pm || node->config.capturePages ? "pages" : node->ctx->bRows ? "rows" : "text", -1, SQLITE_STATIC);
+        case STATUS_COL_CAPTURE:              /* pages, the one capture since v0.8 (#253); kept for the programs that read it (#83) */
+            sqlite3_result_text(ctx, "pages", -1, SQLITE_STATIC);
             break;
         case STATUS_COL_FOREIGN_WRITES:       /* the file changed with no HPPLite write to show for it (#37) */
             sqlite3_result_int64(ctx, (sqlite3_int64)node->ctx->nForeignWrites);

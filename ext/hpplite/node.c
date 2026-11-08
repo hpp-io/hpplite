@@ -32,12 +32,10 @@ static int node_ranges(HppliteNode *node);
 static int node_anchor(HppliteNode *node);
 static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch);
 static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
-static int node_switch_to_rows(HppliteNode *node);
 static int node_check_rollup(HppliteNode *node);
 static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1);
 static uint8_t *node_store_get_checked(HppliteNode *node, const char *zRef, const unsigned char want[32], size_t *pLen);
 static struct cJSON *node_snapshot_index(HppliteNode *node, const char *zIndex, const unsigned char sha[32]);
-static void node_checkpoint_wal(HppliteNode *node, int64_t now);
 #include "da_uri.h"
 #include "capture_rows.h"
 #include "cJSON.h"
@@ -199,22 +197,8 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node_cap_batch_limit(node);
     node->config.noEncrypt = config->noEncrypt;
     node->config.noCompress = config->noCompress;
-    node->config.determinismWarn = config->determinismWarn;
-    node->config.captureText = config->captureText;
-    node->config.capturePages = config->capturePages;
-    node->config.captureAuto = config->captureAuto && !config->capturePages && !config->captureText;
     node->config.localOnly = config->localOnly;
     node->config.verifyOnly = config->verifyOnly;
-    /* the environment chooses for any node whose configuration did not say
-    ** (every suite runs in both modes); a URI's capture= stands (#80) */
-    if (getenv("HPPLITE_CAPTURE") && config->captureSource < 2) {
-        const char *z = getenv("HPPLITE_CAPTURE");
-        if (strcasecmp(z, "text") == 0) { node->config.captureText = 1; node->config.capturePages = 0; node->config.captureAuto = 0; }
-        else if (strcasecmp(z, "rows") == 0) { node->config.captureText = 0; node->config.capturePages = 0; node->config.captureAuto = 0; }
-        else if (strcasecmp(z, "pages") == 0) { node->config.captureText = 0; node->config.capturePages = 1; node->config.captureAuto = 0; }
-        else if (strcasecmp(z, "auto") == 0) { node->config.captureText = 0; node->config.capturePages = 0; node->config.captureAuto = 1; }
-        else fprintf(stderr, "hpplite: HPPLITE_CAPTURE=%s is none of auto, rows, text, pages; ignored\n", z);
-    }
 
     /* Generate unique instance ID (a file's sequencer replaces it with the
     ** file's own, node_take_file_lock) */
@@ -297,18 +281,6 @@ static size_t node_envelope_overhead(HppliteNode *node) {
     return hpplite_envelope_overhead(node->cipher);
 }
 
-static void node_set_stmt_limit(HppliteNode *node) {
-    size_t limit = node->config.maxBatchBytes;
-    if (!node->ctx) return;
-    if (limit > 0) {
-        size_t overhead = hpplite_batch_json_overhead();
-        if (node->cipher) overhead += node_envelope_overhead(node);
-        /* capture compares the statement's JSON-escaped size (what is posted)
-        ** against this, the same arithmetic the batch builder uses */
-        limit = limit > overhead ? (limit - overhead) : 1;
-    }
-    node->ctx->maxStmtBytes = limit;
-}
 
 /*
 ** Across processes, a file's sequencer is whoever holds an exclusive flock on
@@ -469,80 +441,32 @@ static int node_start_pages(HppliteNode *node, const char *zFile) {
     return SQLITE_OK;
 }
 
-/* Row or text capture on the application's connection: the hooks, the
-** bookkeeping tables in the file, a bookkeeping connection of its own */
-static int node_init_rows(HppliteNode *node, const char *zFile) {
-    int rc;
-    if (zFile && zFile[0]) {
-        sqlite3_exec(node->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
-        sqlite3_busy_timeout(node->db, 5000);
-    }
-
-    /* a SQLite that cuts bound values in expanded SQL serves row capture (#62) */
-    rc = hpplite_init_ex(node->db, &node->ctx, !node->config.captureText);
-    if (rc != SQLITE_OK) return rc;
-    node->ctx->bDeterminismWarn = node->config.determinismWarn;
-    node->ctx->bTrackRoots = node->config.verifyOnly;          /* hpplite-verify checks the chain's checkpoint at any recent height (#120) */
-    if (node->config.dbName && node->config.dbName[0]) {
-        /* {file}: the file's own name, so one setting names every database
-        ** of an application (HPPLITE_FILES, #61) */
-        if (strcmp(node->config.dbName, "{file}") == 0) {
-            const char *z = zFile && zFile[0] ? zFile : "memory";
-            const char *slash = strrchr(z, '/');
-            node->ctx->zDbName = sqlite3_mprintf("%s", slash ? slash + 1 : z);
-        } else {
-            node->ctx->zDbName = sqlite3_mprintf("%s", node->config.dbName);
-        }
-    }
-    if (!node->config.captureText) {
-        rc = hpplite_rows_enable(node->ctx);
-        if (rc != SQLITE_OK) {
-            fprintf(stderr, "hpplite: cannot set up row capture (%s); capture=text captures statements\n", sqlite3_errmsg(node->db));
-            return rc;
-        }
-    }
-
-    if (zFile && zFile[0]) {
-        hpplite_internal_open_begin();
-        rc = sqlite3_open_v2(zFile, &node->bkDb, SQLITE_OPEN_READWRITE, NULL);
-        hpplite_internal_open_end();
-        if (rc != SQLITE_OK) {
-            if (node->bkDb) sqlite3_close(node->bkDb);
-            node->bkDb = NULL;
-        } else {
-            sqlite3_busy_timeout(node->bkDb, 5000);
-            /* No fsync per bookkeeping commit (#142): in WAL mode the file stays
-            ** consistent, and a power loss can lose only the last bookkeeping
-            ** commits, which the next flush adopts from the chain (#90, #119).
-            ** The application's own setting is its own; its next fsync carries
-            ** the bookkeeping frames before it. */
-            sqlite3_exec(node->bkDb, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
-            hpplite_set_bookkeeping_db(node->ctx, node->bkDb);
-        }
-    }
-    return SQLITE_OK;
-}
-
-/* capture=auto (the default, #146): a file that carries HPPLite's tables
-** keeps row or text capture; any other starts in page mode, and switches
-** to rows at the sync if the rollup's history turns out to be statements */
+/* A file from v0.7 and earlier carries HPPLite's tables in the file itself: its history is statements or rows,
+** which this release does not read (#253) */
 static int node_file_has_log(sqlite3 *db) {
     return sqlite3_table_column_metadata(db, "main", "_hpplite_meta", "next_height", NULL, NULL, NULL, NULL, NULL) == SQLITE_OK;
 }
 
+/* Page capture is the one capture (#253): the pages each commit wrote, read from the WAL, the bookkeeping in a
+** sidecar. It needs a file: an in-memory database has no WAL and no path */
 static int node_init_tracking(HppliteNode *node) {
     const char *zFile = sqlite3_db_filename(node->db, "main");
     int rc;
 
-    if (node->config.captureAuto && zFile && zFile[0]) node->config.capturePages = !node_file_has_log(node->db);
-    if (zFile && zFile[0] && node->config.capturePages) {
-        sqlite3_busy_timeout(node->db, 5000);
-        rc = node_init_pages(node, zFile);
-        if (rc != SQLITE_OK) return rc;
-    } else {
-        rc = node_init_rows(node, zFile);
-        if (rc != SQLITE_OK) return rc;
+    if (!zFile || !zFile[0]) {
+        hpplite_set_init_error("an in-memory database has no WAL to capture: HPPLite needs a file (page capture, v0.8, #253)");
+        fprintf(stderr, "hpplite: %s\n", hpplite_init_error());
+        return SQLITE_MISUSE;
     }
+    if (node_file_has_log(node->db)) {
+        hpplite_set_init_error("this file's history is statements or rows (v0.7 and earlier), which this release does not read (#253): "
+                               "v0.7 is the last release that does; a page-capture database starts from a fresh file");
+        fprintf(stderr, "hpplite: %s\n", hpplite_init_error());
+        return SQLITE_ERROR;
+    }
+    sqlite3_busy_timeout(node->db, 5000);
+    rc = node_init_pages(node, zFile);
+    if (rc != SQLITE_OK) return rc;
 
     node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
     memcpy(node->lastCheckpointRoot, node->ctx->lastCheckpointRoot, HPPLITE_HASH_SIZE);
@@ -552,40 +476,11 @@ static int node_init_tracking(HppliteNode *node) {
     if (node->ctx->blockHeight > node->lastCheckpointHeight + 1)
         node->batchesSinceCheckpoint = (int)(node->ctx->blockHeight - 1 - node->lastCheckpointHeight);
     node->lastFlushTime = node_current_time_ms();
-    node_set_stmt_limit(node);
     node_detect_follower(node);
-    if (node->config.capturePages && zFile && zFile[0] && !node->follower) {
+    if (!node->follower) {
         rc = node_start_pages(node, zFile);
         if (rc != SQLITE_OK) return rc;
     }
-    return SQLITE_OK;
-}
-
-/* capture=auto: the page mode let go, the sidecar removed, row capture set
-** up on the same connection (the rollup's history is statements) */
-static int node_switch_to_rows(HppliteNode *node) {
-    const char *zFile = sqlite3_db_filename(node->db, "main");
-    char *zSide;
-    int rc;
-    if (!zFile || !zFile[0]) return SQLITE_MISUSE;
-    if (node->pm) { hpplite_pagemode_stop(node->pm); node->pm = NULL; }
-    if (node->pieceDb) { sqlite3_exec(node->pieceDb, "ROLLBACK", NULL, NULL, NULL); sqlite3_close(node->pieceDb); node->pieceDb = NULL; }
-    node_ck_close(node);
-    node_pins_close(node);
-    if (node->ctx) { hpplite_shutdown(node->ctx); node->ctx = NULL; }
-    if (node->bkDb) { sqlite3_close(node->bkDb); node->bkDb = NULL; }
-    zSide = sqlite3_mprintf("%s-hpplite.db", zFile);
-    if (zSide) { unlink(zSide); sqlite3_free(zSide); }
-    node->config.capturePages = 0;
-    node->pagesSnapshotDecided = 0; node->pagesWalSuspended = 0;
-    rc = node_init_rows(node, zFile);
-    if (rc != SQLITE_OK) return rc;
-    node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
-    memcpy(node->lastCheckpointRoot, node->ctx->lastCheckpointRoot, HPPLITE_HASH_SIZE);
-    node->batchesSinceCheckpoint = 0;
-    node_set_stmt_limit(node);
-    node_check_rollup(node);                        /* the fresh context bound to the rollup */
-    fprintf(stderr, "hpplite: the rollup's history is statements: row capture on %s (capture=auto)\n", zFile);
     return SQLITE_OK;
 }
 
@@ -880,7 +775,7 @@ static int node_try_promote(HppliteNode *node) {
     if (node->lockFd < 0 && !node_take_file_lock(node)) return 0;
     if (node->lockFd < 0) return 0;
     node->follower = 0;
-    if (node->config.capturePages && !node->pm) {
+    if (!node->pm) {
         hppliteLoadMeta(node->ctx);                   /* the sidecar as the sequencer left it */
         node_start_pages(node, sqlite3_db_filename(node->db, "main"));
     }
@@ -994,7 +889,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     ** the sequencer is gone, and its page mode then finds what the file holds
     ** beyond the chain) */
     if (node->follower && node->ctx && !node->ctx->bDbClosed
-        && (hpplite_node_pending_count(node) > 0 || (node->config.capturePages && !node->pm)) && node->flushMutex) {
+        && (hpplite_node_pending_count(node) > 0 || !node->pm) && node->flushMutex) {
         pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);
         node_try_promote(node);
         pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
@@ -1176,7 +1071,6 @@ static void node_learn_batch_limit(HppliteNode *node) {
         hpplite_l1_system_config_free(cfg);
     }
     node_cap_batch_limit(node);
-    node_set_stmt_limit(node);
     hpplite_l1_set_max_tx_gas(node->l1, node->config.maxTxGas ? node->config.maxTxGas
                                          : hpplite_network_max_tx_gas(node->config.chainId));
     node_check_rollup(node);
@@ -1228,7 +1122,7 @@ static HppliteBatch *node_batch_from_plain(uint64_t height, const uint8_t *plain
           if (pb) { memcpy(b->postStateRoot, pb->root, 32); b->hasRoot = 1; if (pb->nName) b->zDbName = sqlite3_mprintf("%.*s", (int)pb->nName, pb->zName); hpplite_pagebatch_free(pb); } }
         return b;
     }
-    return hpplite_batch_from_json((const char *)plain);
+    return NULL;                       /* a statements or rows batch (v0.7 and earlier): not read (#253) */
 }
 
 /*
@@ -1337,7 +1231,7 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
         return NULL;
     }
     if (!batch) {
-        hpplite_error(node->ctx, "batch %llu on L1 is not a batch this version can decode (%zu bytes)",
+        hpplite_error(node->ctx, "batch %llu is not a page batch (%zu bytes): a statements or rows history from v0.7 or earlier, which this release does not read (#253)",
                 (unsigned long long)height, dataLen);
     }
     return batch;
@@ -1521,7 +1415,7 @@ static int node_adopt_existing(HppliteNode *node) {
         if (node->lastFetchForeign && node_skip_foreign_height(node, node->ctx->blockHeight) == 0) return 1;
         return 0;
     }
-    rc = batch->bPages ? node_adopt_pages(node, batch) : hpplite_adopt_batch(node->ctx, batch);
+    rc = node_adopt_pages(node, batch);
     hpplite_batch_free(batch);
     if (rc == SQLITE_OK) {
         node->batchesProduced++;
@@ -2856,16 +2750,7 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     HppliteBatch *batch;
     sqlite3_int64 maxId = 0;
     uint64_t height;
-    int confirmed = 0;
-    char zStoreWhy[240];               /* why the store did not take the batch (#11): the reason the error keeps */
-    int storedOnly = 0;                /* the store has it and the chain's commitment comes with the anchor (#164) */
-
     *pMore = 0;
-    zStoreWhy[0] = 0;
-    /* A root is embedded only on the batch that closes a checkpoint interval
-    ** (the checkpoint is submitted from it); the trees keep it incrementally
-    ** (#9), and page mode carries one per batch regardless */
-    int withRoot = node->batchesSinceCheckpoint + 1 >= node->config.checkpointInterval;
     /* The DA limit applies to the posted bytes: leave room for the envelope */
     size_t maxBytes = node->config.maxBatchBytes;
     if (node->cipher && maxBytes > 0) {
@@ -2894,243 +2779,14 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         if (!node->warnedNoChain) {
             fprintf(stderr, "hpplite: no chain configured: the log is kept pending (%lld rows) until l1= names one; "
                             "l1=local finalizes batches locally and keeps no history\n",
-                    (long long)hpplite_pending_count(ctx));
+                    (long long)hpplite_node_pending_count(node));
             node->warnedNoChain = 1;
         }
         *pMore = 0;
         return 0;
     }
 
-    if (node->pm) return node_flush_pages(node, pMore, maxBytes);
-
-    batch = hpplite_build_batch_limited(ctx, maxBytes, withRoot, &maxId);
-    if (!batch) return 0;
-    height = batch->height;
-    *pMore = batch->partial;
-
-    if (node->l1) {
-        /* No key means no encryption key: never post plaintext by accident.
-        ** encrypt=off is the only way to post in the clear, and it is explicit. */
-        if (!node->cipher && !node->config.noEncrypt) {
-            if (!node->warnedNoKey) {
-                hpplite_error(node->ctx, "no private key: batches are kept pending and not posted "
-                                "(set privkey=/keyfile=/HPPLITE_PRIVATE_KEY, or encrypt=off to post plaintext)");
-                node->warnedNoKey = 1;
-            }
-            hpplite_batch_free(batch);
-            *pMore = 0;
-            return 0;
-        }
-
-        /* Only the lease holder may post; never submit into someone else's lease */
-        if (!node_ensure_lease(node)) {
-            hpplite_batch_free(batch);
-            *pMore = 0;
-            return 0;
-        }
-        /* the rollup may only now be known (created at the first post) */
-        if (node_check_rollup(node) < 0) {
-            hpplite_batch_free(batch);
-            *pMore = 0;
-            return 0;
-        }
-
-        char *json = hpplite_batch_to_json(batch);
-        uint8_t *postedCopy = NULL;
-        size_t postedLen = 0;
-        if (json) {
-            const uint8_t *payload = (const uint8_t *)json;
-            size_t payloadLen = strlen(json);
-            uint8_t *sealed = NULL, *packed = NULL;
-            uint8_t encoding = HPPLITE_ENCODING_NONE;
-            if (!node->config.noCompress) {
-                /* deflate the JSON before it is sealed (#12): ciphertext does not
-                ** compress. Only when it shrinks; a tiny batch stays as it was. */
-                size_t n = 0;
-                uint8_t *c = hpplite_deflate(payload, payloadLen, &n);
-                if (c && n + HPPLITE_PLAIN_MAGIC_LEN < payloadLen) {
-                    packed = c;
-                    payload = c;
-                    payloadLen = n;
-                    encoding = HPPLITE_ENCODING_DEFLATE;
-                } else {
-                    free(c);
-                }
-            }
-            if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
-                /* readers besides the wallet (#15) - the owner (#209), the keys granted: sealed to every one of
-                ** them and to the wallet, under the series' data key */
-                uint8_t *aTo = NULL;
-                int nTo = node_recipients(node, &aTo);
-                if (aTo && nTo > 1) {
-                    if (!node->seriesDekValid) { hpplite_random_bytes(node->seriesDek, 32); node->seriesDekValid = 1; }
-                    sealed = hpplite_envelope_seal_pk(node->cipher, node->seriesDek, aTo, nTo, height,
-                                                      encoding, payload, payloadLen, &payloadLen);
-                    free(aTo);
-                    if (!batch->partial) node->seriesDekValid = 0;       /* the series ends with this batch: a new key next */
-                }
-                payload = sealed;
-            } else if (node->cipher) {
-                sealed = hpplite_envelope_seal(node->cipher, node->encKey, height,
-                                               encoding, payload, payloadLen, &payloadLen);
-                payload = sealed;
-            } else if (encoding == HPPLITE_ENCODING_DEFLATE) {
-                /* plaintext: the HPZ1 frame says what follows */
-                uint8_t *framed = malloc(HPPLITE_PLAIN_MAGIC_LEN + payloadLen);
-                if (framed) {
-                    memcpy(framed, HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN);
-                    memcpy(framed + HPPLITE_PLAIN_MAGIC_LEN, payload, payloadLen);
-                    free(packed);
-                    packed = framed;
-                    payload = framed;
-                    payloadLen += HPPLITE_PLAIN_MAGIC_LEN;
-                }
-            }
-            if (payload) {
-                char *txHash;
-                if (node->store) {
-                    /* the bytes to the store, the commitment to the chain (#11) */
-                    char *zRef;
-            node_store_bucket(node);
-            zRef = hpplite_store_put_at(node->store, height, payload, payloadLen);
-                    node->storeBalanceOk = 0;                 /* a put may have paid: the status row reads the balance again */
-                    if (!zRef) {
-                        if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
-                            && !(node_ranges(node) && node_unanchored_above(node, node->anchoredHeight))) {
-                            /* the store does not answer: the chain carries the bytes meanwhile, as
-                            ** before the store (#11); availability never waits on a provider.
-                            ** Not past batches waiting for their anchor (#164): the chain takes
-                            ** only the next height, and the anchor needs the store */
-                            txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
-                            if (!node->warnedStoreDown) {
-                                fprintf(stderr, "hpplite: store %s does not answer (%s): batch %llu %s on the chain instead\n",
-                                        hpplite_store_url(node->store), hpplite_store_error(node->store), (unsigned long long)height,
-                                        txHash ? "posted" : "could not be posted");
-                                node->warnedStoreDown = 1;
-                            }
-                        } else {
-                            snprintf(zStoreWhy, sizeof zStoreWhy, "the store did not take it: %s", hpplite_store_error(node->store));
-                            txHash = NULL;
-                        }
-                    } else {
-                        unsigned char h[32];
-                        node->warnedStoreDown = 0;
-                        hpplite_keccak256(payload, payloadLen, h);
-                        if (node_ranges(node)) {
-                            /* the store has it: the chain gets one commitment per anchor (#164) */
-                            node_anchor_row(node, h, zRef, NULL, 0);
-                            node_name_batch(node, height, payload, payloadLen);
-                            txHash = NULL;
-                            storedOnly = 1;
-                        } else {
-                            txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef, NULL, 0);
-                            if (!txHash) hpplite_error(node->ctx, "the chain did not take the commitment of batch %llu (ref %s)",
-                                                       (unsigned long long)height, zRef);
-                        }
-                    }
-                    sqlite3_free(zRef);
-                } else {
-                    txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
-                }
-                if (!txHash && hpplite_l1_submit_was_oversized(node->l1) && payloadLen > 1024) {
-                    /* The RPC takes less per transaction than the contract per
-                    ** batch (an unknown chain's limit): post smaller batches,
-                    ** right away - nothing was sent */
-                    size_t smaller = payloadLen / 4 * 3;
-                    if (smaller < node->config.maxBatchBytes) node->config.maxBatchBytes = smaller;
-                    node_set_stmt_limit(node);
-                    fprintf(stderr, "hpplite: the RPC refused a %zu-byte batch as oversized; posting batches of "
-                            "at most %zu bytes (set maxtx= to the chain's limit)\n",
-                            payloadLen, node->config.maxBatchBytes);
-                    free(sealed);
-                    sqlite3_free(json);
-                    hpplite_batch_free(batch);
-                    *pMore = 1;
-                    return 0;
-                }
-                if (txHash) {
-                    confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1);
-                    if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash);
-                    if (confirmed && (postedCopy = malloc(payloadLen)) != NULL) {
-                        memcpy(postedCopy, payload, payloadLen);   /* kept with the batch (#49) */
-                        postedLen = payloadLen;
-                    }
-                    if (confirmed && node->onBatchPosted) {
-                        node->onBatchPosted(node->callbackArg, height, txHash);
-                    }
-                    sqlite3_free(txHash);
-                }
-                if (storedOnly) {
-                    confirmed = 1;
-                    if ((postedCopy = malloc(payloadLen)) != NULL) { memcpy(postedCopy, payload, payloadLen); postedLen = payloadLen; }
-                    if (node->onBatchPosted) node->onBatchPosted(node->callbackArg, height, "stored");
-                }
-            }
-            free(sealed);
-            free(packed);
-            sqlite3_free(json);
-        }
-        batch->pPosted = postedCopy;
-        batch->nPosted = postedLen;
-        node->postedCopy = postedCopy;     /* freed after finalize */
-        if (confirmed) test_crash_point("after_submit");
-        if (!confirmed) {
-            /* The transaction may have landed despite the error */
-            int adopted = node_adopt_existing(node);
-            confirmed = adopted == 1;
-            if (adopted == 2) {
-                node->retryAt = 0;         /* on L1, finalized at the next flush: not a failure (#90) */
-                *pMore = 0;
-            } else if (!confirmed) {
-                int64_t wait = (int64_t)node->config.batchIntervalMs;
-                if (wait <= 0) wait = 5000;
-                if (node->failStreak < 6) node->failStreak++;
-                wait <<= node->failStreak;                 /* 2x per failure */
-                if (wait > 300000) wait = 300000;          /* ... up to the lease length */
-                node->retryAt = node_current_time_ms() + wait;
-                if (zStoreWhy[0]) {
-                    hpplite_error(node->ctx, "batch %llu kept pending: %s (retry in %llds)",
-                            (unsigned long long)height, zStoreWhy, (long long)(wait / 1000));
-                } else {
-                    hpplite_error(node->ctx, "batch %llu not confirmed on L1, kept pending (retry in %llds)",
-                            (unsigned long long)height, (long long)(wait / 1000));
-                }
-                *pMore = 0;
-            }
-            hpplite_batch_free(batch);
-            return confirmed ? height : 0;
-        }
-    }
-
-    ctx->pAnchorRow = storedOnly ? &node->anchorRow : NULL;
-    frc = hpplite_finalize_batch(ctx, batch, maxId);
-    ctx->pAnchorRow = NULL;
-    if (frc != SQLITE_OK) {
-        /* Typically: an application statement is mid-step, so bookkeeping
-        ** must not commit now (see hppliteBkBegin). The batch is on L1 (when there
-        ** is one) and the next flush adopts it; locally nothing changed. */
-        node->retryAt = 0;        /* not an L1 failure: try again next tick */
-        if (ctx->nAppStmtActive == 0 && !ctx->bAppTxnOpen && ctx->txnGate != 1) {
-            /* not a deferral for an application statement or transaction
-            ** (the gate): something is actually wrong */
-            hpplite_error(node->ctx, "could not finalize batch %llu locally",
-                    (unsigned long long)height);
-        }
-        height = 0;
-        *pMore = 0;
-    } else {
-        node->batchesProduced++;
-        node->batchesSinceCheckpoint++;
-        node->failStreak = 0;
-        node->retryAt = 0;
-        hpplite_error_clear(ctx);          /* posted and finalized: whatever was wrong is not now (#32) */
-        test_crash_point(*pMore ? "mid_series" : "after_finalize");
-    }
-
-    hpplite_batch_free(batch);
-    free(node->postedCopy);
-    node->postedCopy = NULL;
-    return height;
+    return node_flush_pages(node, pMore, maxBytes);
 }
 
 static uint64_t node_flush_unlocked(HppliteNode *node) {
@@ -3168,7 +2824,6 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
         }
         if (rc == 2) return 0;           /* ours is on L1, waiting for the gate: nothing to post (#90) */
     }
-    hpplite_rows_seq_flush(node->ctx);   /* busy now: the next flush */
 
     /* One batch per call normally; several when the size limit splits them */
     do {
@@ -3295,8 +2950,7 @@ static int node_soft_walk(HppliteNode *node) {
         if (!batch) { hpplite_error(node->ctx, "batch %llu at the store could not be read; recovery stops before it", (unsigned long long)h); free(data); break; }
         batch->pPosted = data; batch->nPosted = n; batch->bOwnsPosted = 1;
         memcpy(before, node->ctx->chainHash, 32);
-        if (batch->bPages) rc = (node->pm && !node->config.verifyOnly && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
-        else { rc = hpplite_replay_batch(node->ctx, batch, 1); if (rc == SQLITE_DONE) rc = SQLITE_OK; }
+        rc = (node->pm && !node->config.verifyOnly && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
         if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
             hpplite_error(node->ctx, "batch %llu at the store does not apply on this history (rc=%d); recovery stops before it", (unsigned long long)h, rc);
             hpplite_batch_free(batch);
@@ -3574,8 +3228,7 @@ static int node_soft_follow(HppliteNode *node) {
         batch->pPosted = data; batch->nPosted = n; batch->bOwnsPosted = 1;
         hpplite_keccak256(data, n, k);
         hpplite_chain_hash_next(node->ctx->chainHash, h, k, after);
-        if (batch->bPages) rc = node_apply_pages(node, batch);
-        else { rc = hpplite_replay_batch(node->ctx, batch, 1); if (rc == SQLITE_DONE) rc = SQLITE_OK; }
+        rc = node_apply_pages(node, batch);
         hpplite_batch_free(batch);
         if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
             fprintf(stderr, "hpplite: batch %llu at the store does not apply on this history (rc=%d): the soft tier stops before it\n", (unsigned long long)h, rc);
@@ -3629,8 +3282,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
             ** at that time is applied, so the database is never left halfway through one */
             uint64_t ms = 0;
             int more = 0;
-            if (batch->bPages) hpplite_pagebatch_meta(batch->pPagesRaw, batch->nPagesRaw, &ms, &more);
-            else { ms = batch->timestamp * 1000; more = batch->openTxn || batch->partial; }
+            hpplite_pagebatch_meta(batch->pPagesRaw, batch->nPagesRaw, &ms, &more);
             if (ms > node->syncAtMs && !node->syncAtInFlight) { hpplite_batch_free(batch); node->syncAtReached = 1; break; }
             node->syncAtInFlight = more;
             node->lastAppliedMs = ms;
@@ -3650,46 +3302,15 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
             node->state = HPPLITE_STATE_ERROR;
             return synced ? synced : -1;
         }
-        if (!batch->bPages && node->pm && node->config.captureAuto && batch->height == 1 && hpplite_pagemode_captured(node->pm) == 0) {
-            /* capture=auto on a file that started in page mode, and the rollup's
-            ** history is statements: the node switches to rows here, before
-            ** anything of its own was captured, and goes on replaying */
-            if (node_switch_to_rows(node) != SQLITE_OK) { hpplite_batch_free(batch); node->state = HPPLITE_STATE_ERROR; return -1; }
-        }
-        if (batch->bPages) {
-            /* a page batch: applied to the file (a replica), or adopted (the sequencer's own) */
-            /* a sequencer (its file is where the pages come from) adopts; a verifier applies */
-            rc = (node->pm && !node->config.verifyOnly && !node->follower && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
-            if (rc != SQLITE_OK) { hpplite_batch_free(batch); node->state = HPPLITE_STATE_ERROR; return -1; }
-            node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
-            hpplite_batch_free(batch);
-            synced++;
-            continue;
-        }
-        if (hpplite_node_pending_count(node) > 0) {
-            /* Local writes exist: the L1 batch must be ours */
-            rc = hpplite_adopt_batch(node->ctx, batch);
-            if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-                hpplite_batch_free(batch);   /* matched; finalized by a later flush */
-                return synced;
-            }
-            if (rc != SQLITE_OK) {
-                hpplite_error(node->ctx, "local pending SQL diverges from L1 batch %llu",
-                        (unsigned long long)batch->height);
-                hpplite_batch_free(batch);
-                return -1;
-            }
-        } else {
-            rc = hpplite_replay_batch(node->ctx, batch, useTxn);
-            if (rc != SQLITE_OK && rc != SQLITE_DONE) {
-                hpplite_batch_free(batch);
-                return -1;
-            }
-        }
+        /* a page batch: a sequencer (its file is where the pages come from) adopts its own; a replica or a
+        ** verifier applies it to the file */
+        rc = (node->pm && !node->config.verifyOnly && !node->follower && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
+        if (rc != SQLITE_OK) { hpplite_batch_free(batch); node->state = HPPLITE_STATE_ERROR; return -1; }
         node->lastCheckpointHeight = node->ctx->lastCheckpointHeight;
         hpplite_batch_free(batch);
         synced++;
     }
+    (void)useTxn;
     /* Caught up: what we rebuilt must be what the contract committed to.
     ** The DA contract keeps a rolling hash over every batch (#33); ours
     ** advanced with every batch finalized, replayed or skipped. A file from
@@ -3723,21 +3344,6 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     return synced;
 }
 
-/* The WAL's checkpoint runs on the timer thread (#144). SQLite's automatic
-** one runs on whichever connection's commit finds a thousand frames in the
-** WAL, with an fsync of the database: on the application's thread, once
-** per thousand pages, and the bookkeeping traffic (the log rows, their
-** pruning, the posted copies) fills the WAL several times faster than the
-** application's own writes. It was the writer's p99. Here it is passive:
-** it never waits for the application and the application never waits for
-** it. The bookkeeping connection's wal hook says how big the WAL is after
-** each batch; between batches the timer looks once a second. */
-static int node_wal_hook(void *pArg, sqlite3 *db, const char *zDb, int nFrames) {
-    HppliteNode *node = (HppliteNode *)pArg;
-    (void)db; (void)zDb;
-    node->walPages = nFrames;
-    return SQLITE_OK;
-}
 
 /* The connection the timer checkpoints the file's WAL on: the bookkeeping
 ** one, a second connection to the same file; in page mode that one is the
@@ -3802,20 +3408,9 @@ static void node_wal_maintenance(void *pArg) {
     if (node->pinDb[node->pinActive]) sqlite3_exec(node->pinDb[node->pinActive], "COMMIT", NULL, NULL, NULL);
     if (fresh) node->pinActive = !node->pinActive;
     node_ck_open(node);
-    node_checkpoint_wal(node, node_current_time_ms());
     pthread_mutex_unlock((pthread_mutex_t *)node->walMaintMutex);
 }
 
-static void node_checkpoint_wal(HppliteNode *node, int64_t now) {
-    int nLog = 0, nCkpt = 0;
-    sqlite3 *ck = node_ck_conn(node);
-    if (!ck) return;
-    if (node->walPages < 1000 && now < node->walCheckAt) return;
-    node->walCheckAt = now + 1000;
-    if (sqlite3_wal_checkpoint_v2(ck, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt) == SQLITE_OK) {
-        node->walPages = nCkpt >= nLog ? 0 : nLog;       /* all of it in the database: the next writer restarts the WAL */
-    }
-}
 
 /*
 ** Timer thread function - auto-flush batches on interval.
@@ -3863,10 +3458,9 @@ static void *node_timer_thread_func(void *arg) {
         /* Flush on the interval, or early once pending SQL nears the DA limit */
         int64_t now = node_current_time_ms();
         int64_t elapsed = now - node->lastFlushTime;
-        int sizeTrigger = node->config.maxBatchBytes > 0 &&
-            (node->pm ? hpplite_pagemode_pending_bytes(node->pm) >= node->config.maxBatchBytes * HPPLITE_PAGE_DEFLATE_GUESS / 2
-                      : hpplite_pending_bytes(node->ctx) >= (sqlite3_int64)(node->config.maxBatchBytes / 2));
-        if (node->pm) node_wal_maintenance(node); else node_checkpoint_wal(node, now);
+        int sizeTrigger = node->config.maxBatchBytes > 0 && node->pm
+            && hpplite_pagemode_pending_bytes(node->pm) >= node->config.maxBatchBytes * HPPLITE_PAGE_DEFLATE_GUESS / 2;
+        if (node->pm) node_wal_maintenance(node);
 
         if (node->follower) {
             /* capture only; every second, see whether the sequencer is gone */
@@ -3941,7 +3535,6 @@ void hpplite_node_start_timer(HppliteNode *node) {
     node->timerThread = thread;
     /* the WAL's checkpoint is this thread's now (#144); the application's
     ** commits stop doing it. interval=0 (no timer) leaves SQLite's own. */
-    if (!node->pm) sqlite3_wal_hook(node->bkDb, node_wal_hook, node);
     /* page mode: the connection's wal hook is the capture's (#155) and already
     ** stands in for SQLite's checkpoint; the pragma would replace it */
     if (node->ctx && !node->pm) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=0");
@@ -3956,7 +3549,6 @@ void hpplite_node_stop_timer(HppliteNode *node) {
     /* Signal thread to stop, and wake it */
     pthread_mutex_lock((pthread_mutex_t *)node->timerWakeMutex);
     node->timerRunning = 0;
-    if (!node->pm && node->bkDb) sqlite3_wal_hook(node->bkDb, NULL, NULL);
     if (node->ctx && node->db && !node->pm) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=1000");   /* SQLite's own again */
     pthread_cond_signal((pthread_cond_t *)node->timerWake);
     pthread_mutex_unlock((pthread_mutex_t *)node->timerWakeMutex);
@@ -4117,14 +3709,12 @@ int hpplite_node_exec(HppliteNode *node, const char *sql, char **errMsg) {
 */
 int hpplite_node_pending_count(HppliteNode *node) {
     if (!node || !node->ctx) return 0;
-    if (node->pm) {
-        /* what another connection or process committed since the last look
-        ** is pending too (#153): a look at the WAL first, cheap when nothing
-        ** was added */
-        if (node->ctx->zWalKey && !node->config.verifyOnly) hpplite_walread_poll(node->ctx->zWalKey, 0);
-        return (int)hpplite_pagemode_pending(node->pm);
-    }
-    return hpplite_pending_count(node->ctx);
+    if (!node->pm) return 0;       /* a follower or a verifier runs no page machinery of its own: nothing of theirs waits */
+    /* what another connection or process committed since the last look
+    ** is pending too (#153): a look at the WAL first, cheap when nothing
+    ** was added */
+    if (node->ctx->zWalKey && !node->config.verifyOnly) hpplite_walread_poll(node->ctx->zWalKey, 0);
+    return (int)hpplite_pagemode_pending(node->pm);
 }
 
 /*
@@ -4194,7 +3784,6 @@ static void node_load_readers(HppliteNode *node) {
     sqlite3_finalize(q);
     hppliteBkLeave(node->ctx, saved);
     node->readersLoaded = 1;
-    node_set_stmt_limit(node);                     /* the envelope grew or shrank with them */
 }
 
 int hpplite_node_set_batch_key(HppliteNode *node, const unsigned char key[32]) {
@@ -4204,6 +3793,15 @@ int hpplite_node_set_batch_key(HppliteNode *node, const unsigned char key[32]) {
     node->hasEncKey = 1;
     if (!node->config.noEncrypt) node->cipher = hpplite_cipher_default();
     node->warnedNoKey = 0;
+    if (node->l1 && !node->follower) {
+        /* the history could not be read without the key: it is read now, before anything of this node's own is
+        ** captured - a fresh sequencer's file must be the chain's before it posts (#253; a signer's node, anvil 23) */
+        int wasError = node->state == HPPLITE_STATE_ERROR;
+        if (hpplite_node_sync_from_l1(node, 1) >= 0 && wasError && node->state == HPPLITE_STATE_ERROR) {
+            node->state = HPPLITE_STATE_RUNNING;             /* the error was the sealed history: read now */
+            hpplite_error_clear(node->ctx);
+        }
+    }
     if (node->l1 && node->hasSigner && !node->follower && !node->config.verifyOnly) { node->leaseRecheckAt = 0; node_ensure_lease(node); }
     if (node->flushMutex) pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
     return 0;

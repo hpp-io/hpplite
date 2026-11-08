@@ -62,7 +62,6 @@ static void test_load_and_use(void) {
     if (rc != SQLITE_OK) { printf("(%s) ", err ? err : "?"); sqlite3_free(err); FAIL("second load of the same module should succeed"); }
     sqlite3_free(err); err = NULL;
     if (scalar(db, "SELECT height FROM hpplite_status", &ok) != 1 || !ok) FAIL("first instance must stay intact");
-    if (scalar(db, "SELECT hooks_replaced FROM hpplite_status", &ok) != 0 || !ok) FAIL("its hooks must stay its own");
     PASS();
 
     TEST("a connection opened after the first load has HPPLite already; loading it there is a no-op too");
@@ -89,8 +88,8 @@ static void test_load_and_use(void) {
         "BEGIN; INSERT INTO t VALUES(2,'b'); INSERT INTO t VALUES(3,'c'); COMMIT;",
         NULL, NULL, &err);
     if (rc != SQLITE_OK) { printf("(%s) ", err); sqlite3_free(err); FAIL("exec"); }
-    { long long p = scalar(db, "SELECT pending FROM hpplite_status", &ok), pages = getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "pages") == 0;
-      if (p != 4 && !(pages && p == 5)) { printf("(pending %lld) ", p); FAIL("expected 4 pending"); } }   /* page capture: the file as opened counts too */
+    { long long p = scalar(db, "SELECT pending FROM hpplite_status", &ok);
+      if (p != 4 && p != 5) { printf("(pending %lld) ", p); FAIL("expected 4 pending"); } }   /* the file as opened counts too */
     if (scalar(db, "SELECT hpplite_flush()", &ok) != 1) FAIL("flush should produce height 1");
     if (scalar(db, "SELECT pending FROM hpplite_status", &ok) != 0) FAIL("pending should be 0");
     if (scalar(db, "SELECT height FROM hpplite_status", &ok) != 2) FAIL("height should be 2");

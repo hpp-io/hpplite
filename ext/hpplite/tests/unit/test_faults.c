@@ -226,8 +226,7 @@ int main(void) {
     snprintf(g_wdb, sizeof g_wdb, "%s", tpath("w.db"));
     snprintf(g_rdb, sizeof g_rdb, "%s", tpath("r.db"));
     unsigned nSeeds = many ? (unsigned)atoi(many) : 60, failed = 0;
-    printf("=== HPPLite under injected faults (#98), %s capture ===\n",
-           test_pages_mode() ? "page" : getenv("HPPLITE_CAPTURE") && strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0 ? "statement" : "row");
+    printf("=== HPPLite under injected faults (#98), page capture ===\n");
     if (one) {
         g_verbose = 1;
         const char *why = run_seed((unsigned)atoi(one), 0);

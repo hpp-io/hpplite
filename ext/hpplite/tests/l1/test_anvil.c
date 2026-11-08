@@ -24,6 +24,7 @@
 #include "l1_interface.h"
 #include "eth/eth_client.h"
 #include "batch.h"
+#include "pages.h"
 #include <sys/wait.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -284,188 +285,23 @@ static void test_stranger_after_expiry(void) {
 }
 
 
-/* 6. Edge-case SQL and full-size batches end to end (#51). KEY2's own,
-** fresh rollup: writer posts, a replica on another file rebuilds from the
-** chain, roots must match, every posted batch within the contract's limit. */
-static const char *aAllowed[] = {
-    "CREATE TABLE e(id INTEGER PRIMARY KEY, v)",
-    "INSERT INTO e(v) VALUES('random()')",
-    "INSERT INTO e(v) VALUES('now')",
-    "INSERT INTO e(v) VALUES('datetime(''now'')')",
-    "INSERT INTO e(v) VALUES('CURRENT_TIMESTAMP')",
-    "INSERT INTO e(v) VALUES('DELETE FROM _hpplite_pending')",
-    "INSERT INTO e(v) VALUES('it''s now or never')",
-    "INSERT INTO e(v) VALUES(upper('now'))",
-    "INSERT INTO e(v) VALUES(datetime('2024-01-01 00:00:00'))",
-    "INSERT INTO e(v) VALUES(date('2024-01-01', '+1 day'))",
-    "INSERT INTO e(v) VALUES(strftime('%Y-%m-%d %H', '2024-02-29 13:00'))",
-    "INSERT INTO e(v) VALUES(unixepoch('2024-01-01'))",
-    "INSERT INTO e(v) VALUES(julianday('2024-01-01'))",
-    "SELECT count(*) FROM _hpplite_pending",                  /* reads are fine; a write that reads the log is refused */
-    "PRAGMA foreign_keys = OFF",
-    "INSERT INTO e(v) VALUES('back\\slash \"double\" ''single'' tab\there')",
-    "INSERT INTO e(v) VALUES('line one' || char(10) || 'line two' || char(13) || char(1) || char(31) || char(127))",
-    "INSERT INTO e(v) VALUES('한국어 日本語 emoji 🚀🔥 ünïcödé')",
-    "INSERT INTO e(v) VALUES(char(55357, 56832))",
-    "INSERT INTO e(v) VALUES(x'00ff10ab')",
-    "INSERT INTO e(v) VALUES(zeroblob(64))",
-    "INSERT INTO e(v) VALUES(9223372036854775807)",
-    "INSERT INTO e(v) VALUES(-9223372036854775808)",
-    "INSERT INTO e(v) VALUES(1e308)",
-    "INSERT INTO e(v) VALUES(NULL)",
-    "INSERT INTO e(v) VALUES('')",
-    "UPDATE e SET v = v || '/' WHERE typeof(v) = 'text'",
-    /* foreign key actions and recursive triggers replay in the mode they ran in (#52) */
-    "PRAGMA foreign_keys = ON",
-    "CREATE TABLE fp(id INTEGER PRIMARY KEY)",
-    "CREATE TABLE fc(id INTEGER PRIMARY KEY, p INTEGER REFERENCES fp(id) ON DELETE CASCADE)",
-    "INSERT INTO fp VALUES(1), (2)",
-    "INSERT INTO fc VALUES(10, 1), (20, 2)",
-    "DELETE FROM fp WHERE id = 1",
-    "PRAGMA foreign_keys = OFF",
-    "PRAGMA recursive_triggers = ON",
-    "CREATE TABLE cd(v INTEGER)",
-    "CREATE TRIGGER cd_down AFTER INSERT ON cd WHEN new.v > 0 BEGIN INSERT INTO cd VALUES(new.v - 1); END",
-    "INSERT INTO cd VALUES(4)",
-    "PRAGMA recursive_triggers = OFF",
-    "CREATE TABLE \"we\"\"ird \"\"name\"(\"col \"\"x\"\"\")",
-    "INSERT INTO \"we\"\"ird \"\"name\" VALUES('}]\\\",{\"sql\":\"DROP TABLE e\"}')",
-    NULL
-};
-
-/* An INSERT whose posted (JSON-escaped) size is exactly `target` bytes:
-** an escape-heavy head, then plain padding one byte at a time. */
-static char *sized_insert(size_t target) {
-    size_t cap = target + 64, at;
-    char *sql = malloc(cap);
-    at = (size_t)snprintf(sql, cap, "INSERT INTO big VALUES('");
-    for (int i = 0; i < 200; i++) { sql[at++] = '"'; sql[at++] = '\\'; sql[at++] = '\n'; }
-    while (at + 3 < cap) {
-        memcpy(sql + at, "')", 3);                      /* close the statement to measure it */
-        size_t sz = hpplite_batch_stmt_json_size(sql, -1, 0);
-        if (sz == target) return sql;
-        if (sz > target) break;
-        sql[at++] = 'a';                                /* plain byte: +1 posted byte */
-    }
-    free(sql);
-    return NULL;
-}
-
-static void test_edge_sql_end_to_end(void) {
-    TEST("edge-case SQL and full-size batches: posted on the real contract, replica root matches");
-    /* compress=off: this is about batches cut at the DA limit, and the filler
-    ** here deflates a thousandfold (#12 would post 200-byte batches) */
-    sqlite3 *w = open_db("e_writer.db", KEY2, "&compress=off&capture=rows");      /* what row capture refuses and accepts: rows said */
-    if (!w) FAIL("open writer");
-    HppliteNode *nw = hpplite_get_node(w);
-    if (!nw || !nw->l1 || !nw->ctx) FAIL("writer has no L1");
-    HppliteSystemConfig *cfg = hpplite_l1_get_system_config(nw->l1);
-    if (!cfg) FAIL("system config");
-    size_t limit = (size_t)cfg->batchSizeLimit;
-    hpplite_l1_system_config_free(cfg);
-    size_t stmtLimit = nw->ctx->maxStmtBytes;
-    if (limit == 0 || stmtLimit == 0 || stmtLimit >= limit) FAIL("no batch limit learned from the contract");
-
-    for (int i = 0; aAllowed[i]; i++) {
-        char *err = NULL;
-        if (sqlite3_exec(w, aAllowed[i], NULL, NULL, &err) != SQLITE_OK) {
-            printf("[%s: %s] ", aAllowed[i], err ? err : "?"); sqlite3_free(err); sqlite3_close(w); FAIL("an allowed statement was refused");
-        }
-    }
-    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("corpus batch not posted"); }
-
-    /* one statement at exactly the per-statement limit, alone in its batch:
-    ** the largest batch the node will ever post, on the real contract; and
-    ** one a byte over it, posted in pieces (#59) */
-    sqlite3_exec(w, "CREATE TABLE big(v)", NULL, NULL, NULL);
-    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("flush before the big statement"); }
-    uint64_t hBig0 = (uint64_t)scalar(w, "SELECT height FROM hpplite_status");
-    char *atLimit = sized_insert(stmtLimit);
-    char *overLimit = sized_insert(stmtLimit + 1);
-    if (!atLimit || !overLimit) { sqlite3_close(w); FAIL("could not build statements of the target size"); }
-    int rcAt = sqlite3_exec(w, atLimit, NULL, NULL, NULL);
-    uint64_t hAt = rcAt == SQLITE_OK ? (uint64_t)scalar(w, "SELECT hpplite_flush()") : 0;
-    int rcOver = sqlite3_exec(w, overLimit, NULL, NULL, NULL);
-    free(atLimit); free(overLimit);
-    if (rcAt != SQLITE_OK) { sqlite3_close(w); FAIL("a statement exactly at the limit was refused"); }
-    if (rcOver != SQLITE_OK) { sqlite3_close(w); FAIL("a statement one byte over the limit was refused (#59: pieces)"); }
-    uint64_t hBig = (uint64_t)scalar(w, "SELECT hpplite_flush()");
-    if (hAt == 0 || hBig == 0) { dump_state(nw->l1, nw->instanceId, "big flush"); sqlite3_close(w); FAIL("the contract did not take the large batches (gas or size)"); }
-    if (hBig < hAt + 2) { sqlite3_close(w); FAIL("the statement over the limit did not span batches"); }
-    size_t bigLen = 0, atLen = 0;
-    for (uint64_t h = hBig0; h <= hBig; h++) {
-        size_t len = 0;
-        uint8_t *raw = hpplite_l1_get_batch(nw->l1, h, &len);
-        free(raw);
-        if (len > bigLen) bigLen = len;
-        if (h == hAt) atLen = len;
-    }
-    printf("(limit %zu, at-limit batch %zu, largest %zu) ", limit, atLen, bigLen);
-    if (bigLen > limit) { sqlite3_close(w); FAIL("posted batch over the contract's limit"); }
-    if (bigLen < limit - limit / 20) { sqlite3_close(w); FAIL("no batch near the limit: the test is not exercising it"); }
-
-    /* a backlog of escape-heavy rows that fills several batches */
-    uint64_t hBefore = (uint64_t)scalar(w, "SELECT height FROM hpplite_status");
-    sqlite3_exec(w, "CREATE TABLE fill(i, v)", NULL, NULL, NULL);
-    char row[1200];
-    for (int i = 0; i < 300; i++) {
-        int at = snprintf(row, sizeof(row), "INSERT INTO fill VALUES(%d, '", i);
-        for (int k = 0; k < 250; k++) { row[at++] = (k % 3) ? 'q' : '"'; row[at++] = (k % 5) ? 'z' : '\\'; }
-        snprintf(row + at, sizeof(row) - (size_t)at, " %d🚀')", i);
-        if (sqlite3_exec(w, row, NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(w); FAIL("fill insert"); }
-    }
-    uint64_t hLast = (uint64_t)scalar(w, "SELECT hpplite_flush()");
-    /* hBefore is the next height to post, so the backlog is hBefore..hLast */
-    if (hLast < hBefore) { sqlite3_close(w); FAIL("backlog not posted"); }
-    if (hLast == hBefore) { sqlite3_close(w); FAIL("the backlog fit in one batch: the test is not exercising the cut"); }
-    for (uint64_t h = hBefore; h <= hLast; h++) {
-        size_t len = 0;
-        uint8_t *b = hpplite_l1_get_batch(nw->l1, h, &len);
-        free(b);
-        if (len > limit) { sqlite3_close(w); FAIL("a backlog batch is over the contract's limit"); }
-    }
-    if (scalar(w, "SELECT pending FROM hpplite_status") != 0) { sqlite3_close(w); FAIL("pending left after flush"); }
-
-    unsigned char rootW[32], rootR[32];
-    hpplite_state_root(w, rootW);
-    sqlite3_int64 rowsW = scalar(w, "SELECT (SELECT count(*) FROM e) + (SELECT count(*) FROM big) + (SELECT count(*) FROM fill)");
-    if (scalar(w, "SELECT count(*) FROM fc") != 1 || scalar(w, "SELECT count(*) FROM cd") != 5) { sqlite3_close(w); FAIL("test premise: cascade or recursion did not run on the writer"); }
-    sqlite3_int64 heightW = scalar(w, "SELECT height FROM hpplite_status");
-    sqlite3_close(w);                       /* releases the lease */
-
-    sqlite3 *r = open_db("e_replica.db", KEY2, NULL);
-    if (!r) FAIL("open replica");
-    if (scalar(r, "SELECT height FROM hpplite_status") != heightW) { sqlite3_close(r); FAIL("replica did not sync to the writer's height"); }
-    hpplite_state_root(r, rootR);
-    sqlite3_int64 rowsR = scalar(r, "SELECT (SELECT count(*) FROM e) + (SELECT count(*) FROM big) + (SELECT count(*) FROM fill)");
-    sqlite3_int64 bigR = scalar(r, "SELECT length(v) FROM big");
-    sqlite3_int64 fcR = scalar(r, "SELECT count(*) FROM fc"), cdR = scalar(r, "SELECT count(*) FROM cd");
-    sqlite3_close(r);
-    if (rowsR != rowsW) FAIL("replica row count differs");
-    if (bigR <= 0) FAIL("the at-limit row is missing on the replica");
-    if (fcR != 1) FAIL("the cascade did not replay on the replica (#52)");
-    if (cdR != 5) FAIL("the recursive trigger did not replay on the replica (#52)");
-    if (memcmp(rootW, rootR, 32) != 0) FAIL("replica state root differs from the writer's");
-    PASS();
-}
-
 /* 7. A transaction several batches long on the real contract (#57). KEY3's
 ** own rollup. Every posted batch is within the contract's limit; a replica
 ** rebuilt from the chain has all of it and the writer's root. */
 static void test_big_transaction_end_to_end(void) {
     TEST("a transaction larger than a batch spans batches on the real contract; replica root matches");
-    sqlite3 *w = open_db("b_writer.db", KEY3, "&capture=rows");                 /* open/cont marks are statements'; a commit cut into pieces: test_pagemode */
+    sqlite3 *w = open_db("b_writer.db", KEY3, NULL);
     if (!w) FAIL("open writer");
     HppliteNode *nw = hpplite_get_node(w);
     if (!nw || !nw->l1) FAIL("writer has no L1");
     if (sqlite3_exec(w, "CREATE TABLE seed(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL) != SQLITE_OK) FAIL("create");
     if (scalar(w, "SELECT hpplite_flush()") <= 0) FAIL("schema batch");
     sqlite3_int64 h0 = scalar(w, "SELECT height FROM hpplite_status");
-    /* ~400 KB as posted: three batches or more at the 128 KB limit */
+    /* ~400 KB of pages that do not deflate (random text, #146): three batches or more at the 128 KB limit */
     if (sqlite3_exec(w, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) FAIL("begin");
     for (int i = 0; i < 3000; i++) {
         char sql[256];
-        snprintf(sql, sizeof(sql), "INSERT INTO seed VALUES(%d, '%0120d')", i, i);
+        snprintf(sql, sizeof(sql), "INSERT INTO seed VALUES(%d, hex(randomblob(60)))", i);
         if (sqlite3_exec(w, sql, NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(w); FAIL("a statement of the large transaction was refused"); }
     }
     if (sqlite3_exec(w, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) { sqlite3_close(w); FAIL("commit"); }
@@ -476,21 +312,19 @@ static void test_big_transaction_end_to_end(void) {
     for (sqlite3_int64 h = h0; h < h1; h++) {
         HppliteBatch *b = hpplite_node_fetch_batch(nw, (uint64_t)h);
         if (!b) { sqlite3_close(w); FAIL("fetch"); }
-        nOpen += b->openTxn;
+        { int more = 0; hpplite_pagebatch_meta(b->pPagesRaw, b->nPagesRaw, NULL, &more); nOpen += more; }   /* a commit cut into pieces: every piece but the last says more follows (#152) */
         hpplite_batch_free(b);
     }
-    if (nOpen < 2) { sqlite3_close(w); FAIL("batches not marked open"); }
+    if (nOpen < 2) { sqlite3_close(w); FAIL("the pieces of the commit are not marked as having more to come"); }
     unsigned char rootW[32], rootR[32];
     hpplite_state_root(w, rootW);
     sqlite3_close(w);
     sqlite3 *r = open_db("b_replica.db", KEY3, NULL);
     if (!r) FAIL("open replica");
     sqlite3_int64 rows = scalar(r, "SELECT count(*) FROM seed");
-    sqlite3_int64 dropped = scalar(r, "SELECT txns_dropped FROM hpplite_status");
     hpplite_state_root(r, rootR);
     sqlite3_close(r);
     if (rows != 3000) FAIL("replica does not have the whole transaction");
-    if (dropped != 0) FAIL("replica dropped a transaction");
     if (memcmp(rootW, rootR, 32) != 0) FAIL("replica state root differs from the writer's");
     PASS();
 }
@@ -508,7 +342,7 @@ static void anvil_signal(const char *sig) {
 }
 static void test_l1_outage(void) {
     TEST("L1 frozen mid-session: writes stay fast, flush and close return, all posts after recovery");
-    sqlite3 *w = open_db("o_writer.db", KEY4, "&capture=rows");                 /* the pending count is rows' */
+    sqlite3 *w = open_db("o_writer.db", KEY4, NULL);
     if (!w) FAIL("open writer");
     sqlite3_exec(w, "CREATE TABLE o(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
     if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); FAIL("first batch"); }
@@ -545,7 +379,7 @@ static void test_l1_outage(void) {
     hpplite_state_root(w, rootW);
     sqlite3_int64 left = scalar(w, "SELECT pending FROM hpplite_status");
     sqlite3_close(w);
-    if (pend != 50) { printf("(pending %lld) ", (long long)pend); FAIL("the outage's writes were not kept pending"); }
+    if (pend < 1) { printf("(pending %lld) ", (long long)pend); FAIL("the outage's writes were not kept pending"); }   /* page capture: the file as reopened, one pending image holding them (#146) */
     if (left != 0) FAIL("pending left after recovery");
     sqlite3 *r = open_db("o_replica.db", KEY4, NULL);
     if (!r) FAIL("replica");
@@ -1021,7 +855,7 @@ static void test_rpc_faults(void) {
     set_proxy_mode(modeFile, "");
     if (start_proxy(port, modeFile) != 0) { printf("SKIP (python3 or tests/l1/rpc_proxy.py not available) "); PASS(); return; }
     setenv("HPPLITE_RPC_TIMEOUT", "2", 1);                   /* read per request: a held answer costs 2 s, not 15 */
-    sqlite3 *w = open_db_at(proxyRpc, "rpc_writer.db", KEY8, "&interval=300ms&capture=rows");   /* entries on the chain are rows' */
+    sqlite3 *w = open_db_at(proxyRpc, "rpc_writer.db", KEY8, "&interval=300ms");
     if (!w) { kill_proxy(); unsetenv("HPPLITE_RPC_TIMEOUT"); FAIL("open through the proxy"); }
     HppliteNode *nw = hpplite_get_node(w);
     sqlite3_exec(w, "CREATE TABLE f(id INTEGER PRIMARY KEY, phase TEXT)", NULL, NULL, NULL);
@@ -1064,17 +898,13 @@ static void test_rpc_faults(void) {
     else if (pend != 0) why = "rows still pending once the endpoint is healthy";
     else why = chain_contiguous(nw);
     if (!why) {
-        /* each row in exactly one batch: the chain's entries are the schema statement plus every row */
-        uint64_t last = 0, total = 0;
-        long entries = 0;
-        hpplite_l1_get_da_state(nw->l1, &last, &total, NULL);
-        for (uint64_t h = 1; h <= last; h++) {
-            HppliteBatch *b = hpplite_node_fetch_batch(nw, h);
-            if (b) { entries += b->nTxns; hpplite_batch_free(b); }
-        }
-        if (entries != 1 + written) {
+        /* each row exactly once: a replica rebuilt from the chain holds every row written, no more */
+        sqlite3 *r = open_db("rpc_replica.db", KEY8, NULL);
+        long long rows = r ? scalar(r, "SELECT count(*) FROM f") : -1;
+        if (r) sqlite3_close(r);
+        if (rows != written) {
             static char dupWhy[120];
-            snprintf(dupWhy, sizeof dupWhy, "the chain holds %ld entries for %d rows and the schema: a row posted twice or lost", entries, written);
+            snprintf(dupWhy, sizeof dupWhy, "a replica holds %lld rows for %d written: a row posted twice or lost", rows, written);
             why = dupWhy;
         }
     }
@@ -1374,8 +1204,6 @@ static void test_soak(void) {
             vrc = run_verify(verifyCmd, out, sizeof out);
             tVerify = now_s() - t0;
             if (vrc != 0 || !strstr(out, "\nverified")) { snprintf(out + strlen(out), sizeof out - strlen(out), "\n(hpplite-verify exit %d)", vrc); why = out; break; }
-            if (scalar(w, "SELECT log_errors FROM hpplite_status") != 0) { why = "log_errors > 0"; break; }
-            if (scalar(w, "SELECT nondeterministic FROM hpplite_status") != 0) { why = "a non-deterministic statement was let through"; break; }
             if (tRebuild > worstRebuild) worstRebuild = tRebuild;
             if (tVerify > worstVerify) worstVerify = tVerify;
             printf("    %6.0f s  height %5lld  %7ld statements  %5ld txns  rebuild %.1f s  verify %.1f s  rows %lld\n",
@@ -1947,7 +1775,7 @@ static int anvil_signer_sign(void *arg, const unsigned char hash[32], unsigned c
 static void test_signer_posts(void) {
     TEST("a signer instead of a key (#17): on the rollup's contract, the lease and the batch are signed through the callback, the batch sealed with a key given apart");
     char contract[80], uri[1024];
-    sqlite3 *w = open_db("sg_owner.db", KEY0, "&dbname=signed&capture=rows");          /* the rollup exists, made with the key; rows: a signer's key given apart cannot open page history, and page mode cannot sequence past a batch it cannot read */
+    sqlite3 *w = open_db("sg_owner.db", KEY0, "&dbname=signed");          /* the rollup exists, made with the key */
     if (!w) FAIL("open owner");
     snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
     sqlite3_close(w);                                                      /* its lease released */
@@ -1958,17 +1786,20 @@ static void test_signer_posts(void) {
     hpplite_hex_to_bytes(KEY0, raw, 32);
     if (hpplite_crypto_keypair_from_privkey(ts.c, &ts.kp, raw) != 0) FAIL("keypair");
     signer.sign = anvil_signer_sign; signer.arg = &ts; memcpy(signer.address, ts.kp.address, 20);
-    snprintf(uri, sizeof uri, "file:" DIR "/sg_signer.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&datadir=" DIR "&interval=0&capture=rows", RPC, contract);
+    snprintf(uri, sizeof uri, "file:" DIR "/sg_signer.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&datadir=" DIR "&interval=0", RPC, contract);
     sqlite3 *s = NULL;
     if (sqlite3_open_v2(uri, &s, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(s); FAIL("open on the contract without a key"); }
     HppliteNode *n = hpplite_get_node(s);
     if (!n || hpplite_node_set_signer(n, &signer) != 0) { sqlite3_close(s); FAIL("set signer"); }
+    long long h0 = scalar(s, "SELECT hpplite_flush()");                   /* no batch key yet: nothing can be sealed or read */
+    unsigned char batchKey[32]; char batchSql[120];
+    hpplite_cipher_derive_key(raw, batchKey);                             /* the owner's derived batch key, given apart (#17) */
+    snprintf(batchSql, sizeof batchSql, "SELECT hpplite_batch_key('0x"); hpplite_bytes_to_hex(batchKey, 32, batchSql + strlen(batchSql)); strcat(batchSql, "')");
+    long long keyed = scalar(s, batchSql);
     sqlite3_exec(s, "CREATE TABLE sg(x); INSERT INTO sg VALUES('through the signer')", NULL, NULL, NULL);
-    long long h0 = scalar(s, "SELECT hpplite_flush()");
-    long long keyed = scalar(s, "SELECT hpplite_batch_key('0x5151515151515151515151515151515151515151515151515151515151515151')");
     long long h1 = scalar(s, "SELECT hpplite_flush()");
-    printf("(without the batch key: flush %lld; batch key %lld; then flush %lld, lease %lld, state %s, signer calls %d) ",
-           h0, keyed, h1, (long long)scalar(s, "SELECT lease FROM hpplite_status"), status_text(s, "state"), ts.calls);
+    printf("(without the batch key: flush %lld; batch key %lld; then flush %lld, lease %lld, state %s, last_error '%s', signer calls %d) ",
+           h0, keyed, h1, (long long)scalar(s, "SELECT lease FROM hpplite_status"), status_text(s, "state"), status_text(s, "last_error"), ts.calls);
     int ok = h0 == 0 && keyed == 1 && h1 >= 1 && scalar(s, "SELECT lease FROM hpplite_status") == 1 && ts.calls >= 2;
     sqlite3_close(s);
     hpplite_crypto_free(ts.c);
@@ -2101,10 +1932,10 @@ static void test_page_mode_end_to_end(void) {
     int rc;
     TEST("page capture on the real contract: batches of pages, checkpoint anchored, replica equal, hpplite-verify finds the page history by itself");
     if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
-    sqlite3 *db = open_db("pg.db", KEY0, "&dbname=pages&capture=pages&checkpoint=1");
+    sqlite3 *db = open_db("pg.db", KEY0, "&dbname=pages&checkpoint=1");
     if (!db) FAIL("open");
     HppliteNode *n = hpplite_get_node(db);
-    if (!n || !n->l1 || !n->pm) { sqlite3_close(db); FAIL("no L1 or no page mode after open with capture=pages"); }
+    if (!n || !n->l1 || !n->pm) { sqlite3_close(db); FAIL("no L1 or no page mode after open"); }
     sqlite3_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('one'), ('two')", NULL, NULL, NULL);
     if (scalar(db, "SELECT hpplite_flush()") < 1) { printf("(%s) ", status_text(db, "last_error")); sqlite3_close(db); FAIL("flush should post the pages"); }
     sqlite3_exec(db, "UPDATE t SET v = 'three' WHERE id = 2; INSERT INTO t(v) VALUES('four')", NULL, NULL, NULL);
@@ -2114,7 +1945,7 @@ static void test_page_mode_end_to_end(void) {
     if (cp < 1) { sqlite3_close(db); FAILF("checkpoint not anchored (last_checkpoint_height %lld, height %lld)", cp, height); }
     unsigned char rootW[32]; hpplite_node_get_state_root(n, rootW);
     /* a replica: the file written page by page from the chain */
-    sqlite3 *r = open_db("pg_r.db", KEY0, "&dbname=pages&capture=pages&role=verify");
+    sqlite3 *r = open_db("pg_r.db", KEY0, "&dbname=pages&role=verify");
     if (!r) { sqlite3_close(db); FAIL("open the replica"); }
     HppliteNode *rn = hpplite_get_node(r);
     long long rows = scalar(r, "SELECT count(*) FROM t"), three = scalar(r, "SELECT count(*) FROM t WHERE v = 'three'"), mism = scalar(r, "SELECT root_mismatches FROM hpplite_status");
@@ -2526,7 +2357,7 @@ static void test_snapshots_on_chain(void) {
     pid_t pid = start_pin_service_free(svc, port);
     if (pid < 0) FAIL("the store did not come up");
     char extra[300], params[500], out[8192], da[43], cmd[200], bucket[2000] = "";
-    snprintf(extra, sizeof extra, "&dbname=snapshots&capture=pages&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms&keep=3s", port);
+    snprintf(extra, sizeof extra, "&dbname=snapshots&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms&keep=3s", port);
     sqlite3 *w = open_db("sn_writer.db", KEY4, extra);
     if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open writer"); }
     sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
@@ -2576,7 +2407,7 @@ static void test_snapshots_on_chain(void) {
         char rx[300], err[4096] = "";
         int saved = dup(2), fd = open(DIR "/sn_lookup.err", O_WRONLY | O_CREAT | O_TRUNC, 0644);
         FILE *f;
-        snprintf(rx, sizeof rx, "&dbname=snapshots&capture=pages&store=http://127.0.0.1:%d&role=verify&from=snapshot&soft=off", port);
+        snprintf(rx, sizeof rx, "&dbname=snapshots&store=http://127.0.0.1:%d&role=verify&from=snapshot&soft=off", port);
         fflush(stderr); dup2(fd, 2); close(fd);
         sqlite3 *r = open_db("sn_replica.db", KEY4, rx);
         long long rRows = r ? scalar(r, "SELECT count(*) FROM n") : -1, rSnap = r ? scalar(r, "SELECT snapshot_height FROM hpplite_status") : -1;
@@ -2607,7 +2438,7 @@ static void test_two_rollups_same_range_bounds(void) {
     char betaContract[64] = "";
     for (int r = 0; r < 2; r++) {
         char extra[300], file[64];
-        snprintf(extra, sizeof extra, "&dbname=%s&capture=pages&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms", names[r], port);   /* a snapshot at 3, nothing pruned (#239) */
+        snprintf(extra, sizeof extra, "&dbname=%s&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms", names[r], port);   /* a snapshot at 3, nothing pruned (#239) */
         snprintf(file, sizeof file, "tr_%s.db", names[r]);
         char errPath[200];
         int saved = dup(2), fd;
@@ -2662,7 +2493,7 @@ static void test_two_rollups_same_range_bounds(void) {
         ** - it must not create a second one under the name; it writes locally and finds its own when the store is
         ** back. A store that answers but has none of the bytes (a fresh one: every read a 404) is no reason to wait */
         char extra[300], contract[64] = "", err[256] = "", later[64] = "", gamma[64] = "";
-        snprintf(extra, sizeof extra, "&dbname=beta&capture=pages&store=http://127.0.0.1:%d&anchor=0", port);
+        snprintf(extra, sizeof extra, "&dbname=beta&store=http://127.0.0.1:%d&anchor=0", port);
         sqlite3 *w = open_db("tr_beta2.db", KEY4, extra);          /* the store is down: killed above */
         if (!w) FAIL("open a fresh file for beta with the store down");
         snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
@@ -2684,7 +2515,7 @@ static void test_two_rollups_same_range_bounds(void) {
         kill(pid, SIGTERM); waitpid(pid, NULL, 0);
         pid = start_pin_service_dir(svc, port, DIR "/store_pins_empty");   /* answers, holds nothing: every read a 404 */
         if (pid < 0) FAIL("the empty store did not come up");
-        snprintf(extra, sizeof extra, "&dbname=gamma&capture=pages&store=http://127.0.0.1:%d&anchor=0", port);
+        snprintf(extra, sizeof extra, "&dbname=gamma&store=http://127.0.0.1:%d&anchor=0", port);
         w = open_db("tr_gamma.db", KEY4, extra);
         if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open gamma at the empty store"); }
         snprintf(gamma, sizeof gamma, "%s", status_text(w, "contract"));
@@ -2714,7 +2545,6 @@ int main(void) {
     if (wanted(4)) test_concurrent_rpc();
     if (wanted(5)) test_sleep_and_wake();
     if (wanted(6)) test_stranger_after_expiry();
-    if (wanted(7)) test_edge_sql_end_to_end();
     if (wanted(8)) test_big_transaction_end_to_end();
     if (wanted(9)) test_l1_outage();
     if (wanted(10)) test_reorg();

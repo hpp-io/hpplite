@@ -126,51 +126,6 @@ int main(void) {
         passed++;
     }
 
-    /* Test 5: State root changes after INSERT */
-    tests++;
-    TEST("State root changes after INSERT");
-    if (!(getenv("HPPLITE_CAPTURE") && (strcasecmp(getenv("HPPLITE_CAPTURE"), "rows") == 0 || strcasecmp(getenv("HPPLITE_CAPTURE"), "text") == 0))) { printf("skipped (page capture, the default: the root is the posted file's, not the content's)\n"); passed++; } else {
-        unlink("/tmp/test_simple_open.db");
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&l1=local&datadir=/tmp/hpplite_test_simple";
-        sqlite3 *db = hpplite_open(uri);
-        if (!db) FAIL("hpplite_open failed");
-
-        HppliteCtx *ctx = hpplite_context(db);
-        if (!ctx) FAIL("no context");
-
-        unsigned char root1[HPPLITE_HASH_SIZE];
-        hpplite_state_root(db, root1);
-
-        /* Create table and insert data using standard sqlite3_exec */
-        char *errMsg = NULL;
-        int rc = sqlite3_exec(db,
-            "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);"
-            "INSERT INTO users(id, name) VALUES(1, 'Alice');",
-            NULL, NULL, &errMsg);
-        if (rc != SQLITE_OK) {
-            printf("SQL error: %s\n", errMsg);
-            sqlite3_free(errMsg);
-            FAIL("sqlite3_exec failed");
-        }
-
-        unsigned char root2[HPPLITE_HASH_SIZE];
-        hpplite_state_root(db, root2);
-
-        /* State root should have changed */
-        if (memcmp(root1, root2, HPPLITE_HASH_SIZE) == 0) {
-            printf("(root unchanged, enabled=%d) ", ctx->bEnabled);
-            FAIL("state root did not change after INSERT");
-        }
-
-        printf("(");
-        printHex(root2, 8);
-        printf("...) ");
-
-        hpplite_close(db);
-        PASS();
-        passed++;
-    }
-
     /* Test 6: Manual flush creates batch */
     tests++;
     TEST("Manual flush creates batch");
@@ -212,9 +167,8 @@ int main(void) {
         sqlite3_exec(db, "INSERT INTO t1 VALUES(2);", NULL, NULL, NULL);
         sqlite3_exec(db, "INSERT INTO t1 VALUES(3);", NULL, NULL, NULL);
 
-        /* Get context to check pending count */
-        HppliteCtx *ctx = hpplite_context(db);
-        int pending = hpplite_pending_count(ctx);
+        /* the pending count: the commits waiting */
+        int pending = hpplite_node_pending_count(hpplite_get_node(db));
         printf("(%d pending) ", pending);
 
         /* Flush all at once */

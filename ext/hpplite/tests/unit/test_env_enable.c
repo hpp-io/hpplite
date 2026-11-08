@@ -75,64 +75,7 @@ static void test_uri_still_wins(void) {
     PASS();
 }
 
-static void test_truncating_sqlite_refused(void) {
-    TEST("a SQLite that truncates bound values in expanded SQL (better-sqlite3): statement capture is refused at open");
-    reset_dir();
-    setenv("HPPLITE_TEST_TRUNCATING_EXPAND", "1", 1);      /* as SQLITE_TRACE_SIZE_LIMIT=32 builds do */
-    sqlite3 *db = NULL;
-    int rc = sqlite3_open_v2("file:" DIR "/trunc.db?hpplite=on&capture=text&privkey=" KEY "&datadir=" DIR, &db,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
-    const char *msg = db ? sqlite3_errmsg(db) : "";
-    int named = strstr(msg, "SQLITE_TRACE_SIZE_LIMIT") != NULL;
-    sqlite3_close(db);
-    unsetenv("HPPLITE_TEST_TRUNCATING_EXPAND");
-    if (rc == SQLITE_OK) FAIL("opened: writes would replay with truncated values");
-    if (!named) FAIL("the error does not say why");
-    PASS();
-}
 
-/* #62: row capture does not read bound values back from expanded SQL, so
-** such a SQLite serves it; what it still logs as text may bind nothing */
-static void test_truncating_sqlite_rows(void) {
-    TEST("the same SQLite with row capture: opens, records long bound values whole, refuses a bound text-logged write");
-    SKIP_IF_PAGES("records are row capture's");
-    reset_dir();
-    setenv("HPPLITE_TEST_TRUNCATING_EXPAND", "1", 1);
-    sqlite3 *db = NULL;
-    sqlite3_stmt *st = NULL;
-    char longv[301];
-    memset(longv, 'x', 300); longv[300] = 0;
-    int rc = sqlite3_open_v2("file:" DIR "/trunc_rows.db?hpplite=on&capture=rows&privkey=" KEY "&datadir=" DIR, &db,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
-    int created = 0, bound = 0, ftsRefused = 0, ftsLiteral = 0;
-    long long recBytes = -1;
-    if (rc == SQLITE_OK) {
-        created = sqlite3_exec(db, "CREATE TABLE t(v); CREATE VIRTUAL TABLE f USING fts5(body)", NULL, NULL, NULL) == SQLITE_OK;
-        if (sqlite3_prepare_v2(db, "INSERT INTO t VALUES(?1)", -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, longv, -1, SQLITE_STATIC);
-            bound = sqlite3_step(st) == SQLITE_DONE;
-            sqlite3_finalize(st);
-        }
-        if (sqlite3_prepare_v2(db, "INSERT INTO f VALUES(?1)", -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, longv, -1, SQLITE_STATIC);
-            ftsRefused = sqlite3_step(st) == SQLITE_INTERRUPT;
-            sqlite3_finalize(st);
-        }
-        ftsLiteral = sqlite3_exec(db, "INSERT INTO f VALUES('values in the text')", NULL, NULL, NULL) == SQLITE_OK;
-        if (sqlite3_prepare_v2(db, "SELECT max(length(rec)) FROM _hpplite_pending WHERE tbl = 't'", -1, &st, NULL) == SQLITE_OK) {
-            if (sqlite3_step(st) == SQLITE_ROW) recBytes = sqlite3_column_int64(st, 0);
-            sqlite3_finalize(st);
-        }
-    }
-    sqlite3_close(db);
-    unsetenv("HPPLITE_TEST_TRUNCATING_EXPAND");
-    if (rc != SQLITE_OK) FAIL("row capture refused at open");
-    if (!created || !bound) FAIL("schema or the bound insert failed");
-    if (recBytes < 300) { printf("(%lld) ", recBytes); FAIL("the record does not carry the whole value"); }
-    if (!ftsRefused) FAIL("a bound write logged as text ran: it would replay cut");
-    if (!ftsLiteral) FAIL("a text-logged write without bound values must run");
-    PASS();
-}
 
 /* A read-only connection writes nothing to capture: it opens as it would
 ** without HPPLite (it failed: "cannot start", found by SQLite's delete.test) */
@@ -159,36 +102,33 @@ static void test_read_only_open(void) {
     PASS();
 }
 
-/* capture= takes rows or text, nothing else; a URI's choice stands over
-** HPPLITE_CAPTURE (#80) */
+/* capture= and determinism= are gone (#253): a URI or an environment from before refuses the open and says so */
 static void test_capture_values(void) {
-    TEST("capture=rowz fails the open; a URI's capture=text stands over HPPLITE_CAPTURE=rows");
+    TEST("capture= and determinism= refuse the open (gone in v0.8); HPPLITE_CAPTURE too");
     reset_dir();
     sqlite3 *db = NULL;
-    int rc = sqlite3_open_v2("file:" DIR "/cap.db?hpplite=on&capture=rowz&privkey=" KEY "&datadir=" DIR, &db,
+    int rc = sqlite3_open_v2("file:" DIR "/cap.db?hpplite=on&capture=rows&privkey=" KEY "&datadir=" DIR, &db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     int opened = rc == SQLITE_OK && hpplite_get_node(db) != NULL;
+    const char *msg = db ? sqlite3_errmsg(db) : "";
+    int said = strstr(msg, "capture= is gone") != NULL;
     sqlite3_close(db);
-    if (opened) FAIL("capture=rowz opened (as rows)");
-    setenv("HPPLITE_CAPTURE", "rows", 1);
+    if (opened) FAIL("capture=rows opened");
+    if (!said) FAIL("the refusal should say capture= is gone");
     db = NULL;
-    rc = sqlite3_open_v2("file:" DIR "/cap2.db?hpplite=on&capture=text&privkey=" KEY "&datadir=" DIR "&interval=0", &db,
+    rc = sqlite3_open_v2("file:" DIR "/det.db?hpplite=on&determinism=warn&privkey=" KEY "&datadir=" DIR, &db,
                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
-    HppliteNode *n = rc == SQLITE_OK ? hpplite_get_node(db) : NULL;
-    int text = n && n->config.captureText;
-    char status[16] = "";
-    if (n) {
-        sqlite3_stmt *q;
-        if (sqlite3_prepare_v2(db, "SELECT capture FROM hpplite_status", -1, &q, NULL) == SQLITE_OK) {
-            if (sqlite3_step(q) == SQLITE_ROW) snprintf(status, sizeof(status), "%s", sqlite3_column_text(q, 0));
-            sqlite3_finalize(q);
-        }
-    }
+    opened = rc == SQLITE_OK && hpplite_get_node(db) != NULL;
+    sqlite3_close(db);
+    if (opened) FAIL("determinism=warn opened");
+    setenv("HPPLITE_CAPTURE", "pages", 1);
+    db = NULL;
+    rc = sqlite3_open_v2("file:" DIR "/env.db?hpplite=on&privkey=" KEY "&datadir=" DIR, &db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    opened = rc == SQLITE_OK && hpplite_get_node(db) != NULL;
     sqlite3_close(db);
     unsetenv("HPPLITE_CAPTURE");
-    if (!n) FAIL("capture=text did not open");
-    if (!text) FAIL("HPPLITE_CAPTURE=rows overrode the URI's capture=text");
-    if (strcmp(status, "text") != 0) FAILF("hpplite_status.capture is '%s', want 'text' (#83)", status);
+    if (opened) FAIL("HPPLITE_CAPTURE=pages opened: the variable is gone, even for the value that stayed");
     PASS();
 }
 
@@ -223,8 +163,6 @@ int main(void) {
     test_plain_path_enabled();
     test_others_untouched();
     test_uri_still_wins();
-    test_truncating_sqlite_refused();
-    test_truncating_sqlite_rows();
     test_read_only_open();
     test_capture_values();
     test_params_under_uri();

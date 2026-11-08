@@ -907,11 +907,6 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->batchIntervalMs = cfg->batchIntervalMs;
     nc->noEncrypt = !cfg->encrypt;
     nc->noCompress = !cfg->compress;
-    nc->determinismWarn = cfg->determinismWarn;
-    nc->captureText = cfg->captureText;
-    nc->capturePages = cfg->capturePages;
-    nc->captureSource = cfg->captureSource;
-    nc->captureAuto = cfg->captureAuto;
     nc->localOnly = cfg->localOnly;
     nc->verifyOnly = cfg->roleVerify;
     nc->dbName = cfg->dbName;

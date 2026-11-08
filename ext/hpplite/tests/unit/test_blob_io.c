@@ -22,10 +22,8 @@ static const unsigned char PRIVKEY[32] = {
 
 #define DIR "/tmp/hpplite_test_blob_io"
 
-static int captureText(void) { return !test_rows_mode() && !test_pages_mode(); }
-
 static HppliteNode *open_writer(const char *file, HppliteL1 *l1) {
-    TestNodeOpts o = { .checkpointInterval = TEST_INTERVAL_1000, .captureText = captureText() };
+    TestNodeOpts o = { .checkpointInterval = TEST_INTERVAL_1000 };
     return test_open_node(tpath(file), l1, &o);
 }
 
@@ -62,14 +60,8 @@ static void test_autocommit(void) {
     int rc = blob_write(w->db, 1, 8, "written");
     char head[64];
     text_of(w->db, "SELECT hex(substr(data, 9, 7)) FROM f WHERE id = 1", head, sizeof head);
-    if (test_pages_mode()) {
-        if (rc != SQLITE_OK) FAILF("page capture refused it: rc %d (%s)", rc, sqlite3_errmsg(w->db));
-        if (strcmp(head, "7772697474656E")) FAILF("page capture: the write is not in the file (%s)", head);
-    } else {
-        if (rc == SQLITE_OK) FAILF("not refused: the file has %s, which no record carries", head);
-        if (strcmp(head, "00000000000000")) FAILF("refused, yet the file has %s", head);
-        if (!strstr(status_text(w->db, "last_refusal"), "page capture")) FAILF("last_refusal: %s", status_text(w->db, "last_refusal"));
-    }
+    if (rc != SQLITE_OK) FAILF("page capture refused it: rc %d (%s)", rc, sqlite3_errmsg(w->db));
+    if (strcmp(head, "7772697474656E")) FAILF("page capture: the write is not in the file (%s)", head);
     /* ordinary writes still go through after it */
     if (exec_sql(w->db, "INSERT INTO f(data) VALUES(x'0102')") != SQLITE_OK) FAILF("an INSERT after it: %s", sqlite3_errmsg(w->db));
     const char *why = replica_matches(w, l1, "auto_r.db");
@@ -93,13 +85,9 @@ static void test_in_transaction(void) {
     int rc = exec_sql(w->db, "COMMIT");
     if (!sqlite3_get_autocommit(w->db)) exec_sql(w->db, "ROLLBACK");
     sqlite3_int64 n = scalar(w->db, "SELECT count(*) FROM f");
-    if (test_pages_mode()) {
+    {
         if (rc != SQLITE_OK) FAILF("page capture refused the COMMIT: %s", sqlite3_errmsg(w->db));
         if (n != 3) FAILF("%lld rows, want 3", (long long)n);
-    } else {
-        if (rc == SQLITE_OK) FAIL("COMMIT not refused: the blob write is in the file, in no record");
-        if (n != 2) FAILF("refused, yet %lld rows (the INSERT stayed)", (long long)n);
-        if (!strstr(status_text(w->db, "last_refusal"), "page capture")) FAILF("last_refusal: %s", status_text(w->db, "last_refusal"));
     }
     /* the next transaction is not refused for the last one's write */
     const char *after[] = { "BEGIN", "UPDATE f SET data = x'0b' WHERE id = 1", "COMMIT", NULL };
@@ -110,37 +98,11 @@ static void test_in_transaction(void) {
     PASS();
 }
 
-/* 3. A host SQLite without the pre-update hook: the autocommitted write is
-** still refused (a commit with no statement running); statements, a
-** comment-led one too, are not */
-static void test_no_preupdate(void) {
-    TEST("no pre-update hook in the host SQLite: an autocommitted blob write still refused, statements not");
-    if (test_pages_mode()) { printf("SKIP (page capture ships the pages) "); PASS(); return; }
-    reset_dir();
-    hpplite_test_no_preupdate = 1;
-    HppliteL1 *l1 = hpplite_l1_create_mock();
-    HppliteNode *w = open_writer("nopu.db", l1);
-    hpplite_test_no_preupdate = 0;
-    if (!w) FAIL("open");
-    if (run(w, SETUP) != 0) FAIL("setup");
-    const char *sql[] = {
-        "-- a comment first\nINSERT INTO f(data) VALUES(x'cc')",
-        "INSERT INTO f(data) VALUES(x'dd') RETURNING id",
-        "BEGIN", "INSERT INTO f(data) VALUES(x'ee')", "COMMIT",
-        NULL };
-    if (run(w, sql) != 0) FAILF("statements refused: %s", sqlite3_errmsg(w->db));
-    if (blob_write(w->db, 1, 0, "nohook") == SQLITE_OK) FAIL("an autocommitted blob write was not refused");
-    const char *why = replica_matches(w, l1, "nopu_r.db");
-    hpplite_l1_disconnect(l1);
-    if (why) FAIL(why);
-    PASS();
-}
 
 int main(void) {
-    printf("=== HPPLite incremental blob I/O (#169), %s capture ===\n", test_pages_mode() ? "page" : test_rows_mode() ? "row" : "statement");
+    printf("=== HPPLite incremental blob I/O (#169), page capture ===\n");
     test_suite_init("blobio", PRIVKEY, DIR);
     test_autocommit();
     test_in_transaction();
-    test_no_preupdate();
     return test_report();
 }
