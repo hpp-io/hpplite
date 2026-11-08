@@ -914,6 +914,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     }
     if (node->manifest) { cJSON_Delete(node->manifest); node->manifest = NULL; }
     free(node->softChain);
+    free(node->aEarlier);
     free(node->zAnchorRef);
     node->zAnchorRef = NULL;
 
@@ -1866,9 +1867,9 @@ static int json_hex32(const cJSON *j, unsigned char out[32]) {
     return cJSON_IsString(j) && j->valuestring && hpplite_hex_to_bytes(j->valuestring, out, 32) == 32;
 }
 
-/* the snapshot a manifest names: 0 and its height, -1 none */
-static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex[64], int64_t *pAt, unsigned char sha[32]) {
-    const cJSON *sn = m ? cJSON_GetObjectItemCaseSensitive(m, "snapshot") : NULL;
+/* a snapshot a manifest names - "snapshot" the latest, "earliest" the oldest still kept (#257): 0 and its height, -1 none */
+static int node_manifest_snapshot_key(const cJSON *m, const char *zKey, uint64_t *pHeight, char zIndex[64], int64_t *pAt, unsigned char sha[32]) {
+    const cJSON *sn = m ? cJSON_GetObjectItemCaseSensitive(m, zKey) : NULL;
     const cJSON *h = sn ? cJSON_GetObjectItemCaseSensitive(sn, "height") : NULL;
     const cJSON *ix = sn ? cJSON_GetObjectItemCaseSensitive(sn, "index") : NULL;
     const cJSON *at = sn ? cJSON_GetObjectItemCaseSensitive(sn, "at") : NULL;
@@ -1879,6 +1880,59 @@ static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex
     snprintf(zIndex, 64, "%s", ix->valuestring);
     if (pAt) *pAt = cJSON_IsNumber(at) ? (int64_t)at->valuedouble : 0;
     return 0;
+}
+static int node_manifest_snapshot(const cJSON *m, uint64_t *pHeight, char zIndex[64], int64_t *pAt, unsigned char sha[32]) {
+    return node_manifest_snapshot_key(m, "snapshot", pHeight, zIndex, pAt, sha);
+}
+
+/* The older snapshots still kept (#223): the sequencer's own list, oldest first, in the sidecar's _hpplite_snapshots
+** (#257) - a restart on this file has it; the manifest names only the latest and the oldest. */
+static int node_earlier_push(HppliteNode *node, uint64_t height, const char *zIndex, const unsigned char sha[32], int64_t at) {
+    HppliteSnapRef *e;
+    if (node->nEarlier == node->nEarlierAlloc) {
+        int n = node->nEarlierAlloc ? node->nEarlierAlloc * 2 : 8;
+        HppliteSnapRef *a = realloc(node->aEarlier, (size_t)n * sizeof *a);
+        if (!a) return -1;
+        node->aEarlier = a;
+        node->nEarlierAlloc = n;
+    }
+    e = &node->aEarlier[node->nEarlier++];
+    e->height = height;
+    snprintf(e->index, sizeof e->index, "%s", zIndex);
+    memcpy(e->sha, sha, 32);
+    e->at = at;
+    return 0;
+}
+/* the list from the sidecar, oldest first; entries below `floor` are gone from the store (a prune this file did not
+** record: the chain's manifest, which names the oldest kept, is right about it) */
+static void node_snapshots_load(HppliteNode *node, uint64_t floor) {
+    sqlite3_stmt *q = NULL;
+    node->nEarlier = 0;
+    if (!node->ctx || !node->ctx->bkDb) return;
+    if (sqlite3_prepare_v2(node->ctx->bkDb, "SELECT height, idx, sha, at FROM _hpplite_snapshots WHERE height >= ?1 ORDER BY height", -1, &q, NULL) != SQLITE_OK) return;
+    sqlite3_bind_int64(q, 1, (sqlite3_int64)floor);
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        const char *ix = (const char *)sqlite3_column_text(q, 1);
+        if (ix && sqlite3_column_bytes(q, 2) == 32 && strlen(ix) < 64)
+            node_earlier_push(node, (uint64_t)sqlite3_column_int64(q, 0), ix, sqlite3_column_blob(q, 2), sqlite3_column_int64(q, 3));
+    }
+    sqlite3_finalize(q);
+}
+static void node_snapshots_save(HppliteNode *node) {
+    sqlite3_stmt *q = NULL;
+    int i;
+    if (!node->ctx || !node->ctx->bkDb) return;
+    sqlite3_exec(node->ctx->bkDb, "DELETE FROM _hpplite_snapshots", NULL, NULL, NULL);
+    if (sqlite3_prepare_v2(node->ctx->bkDb, "INSERT INTO _hpplite_snapshots(height, idx, sha, at) VALUES(?1, ?2, ?3, ?4)", -1, &q, NULL) != SQLITE_OK) return;
+    for (i = 0; i < node->nEarlier; i++) {
+        sqlite3_bind_int64(q, 1, (sqlite3_int64)node->aEarlier[i].height);
+        sqlite3_bind_text(q, 2, node->aEarlier[i].index, -1, SQLITE_STATIC);
+        sqlite3_bind_blob(q, 3, node->aEarlier[i].sha, 32, SQLITE_STATIC);
+        sqlite3_bind_int64(q, 4, (sqlite3_int64)node->aEarlier[i].at);
+        sqlite3_step(q);
+        sqlite3_reset(q);
+    }
+    sqlite3_finalize(q);
 }
 
 #define HPPLITE_SNAPSHOT_CHUNK (8u << 20)     /* well under a store's size limit (16 MiB on Sepolia) */
@@ -2078,30 +2132,22 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
         }
         if (prev && node_manifest_snapshot(prev, &node->snapHeight, node->snapIndex, &node->snapAt, node->snapIndexSha) != 0) node->snapHeight = 0;
         if (prev && node->snapHeight) {
-            /* keep= (#223): the older snapshots still kept */
-            const cJSON *e, *list = cJSON_GetObjectItemCaseSensitive(prev, "earlier");
-            node->nEarlier = 0;
-            cJSON_ArrayForEach(e, list) {
-                cJSON *one = cJSON_CreateObject();
-                cJSON_AddItemReferenceToObject(one, "snapshot", (cJSON *)e);
-                if (node->nEarlier < (int)(sizeof node->aEarlier / sizeof node->aEarlier[0])
-                    && node_manifest_snapshot(one, &node->aEarlier[node->nEarlier].height, node->aEarlier[node->nEarlier].index,
-                                              &node->aEarlier[node->nEarlier].at, node->aEarlier[node->nEarlier].sha) == 0) node->nEarlier++;
-                cJSON_Delete(one);
+            /* keep= (#223): the older snapshots still kept - this file's list (#257), below the oldest the chain's
+            ** manifest names nothing is kept; a fresh file (a sequencer rebuilt, #167) knows the oldest from the manifest
+            ** and nothing between it and the latest: those go when the latest is pruned */
+            uint64_t eh = 0; int64_t eat = 0; char eIndex[64]; unsigned char eSha[32];
+            int named = node_manifest_snapshot_key(prev, "earliest", &eh, eIndex, &eat, eSha) == 0 && eh < node->snapHeight;
+            node_snapshots_load(node, named ? eh : node->snapHeight);
+            if (named && node->nEarlier == 0) {
+                node_earlier_push(node, eh, eIndex, eSha, eat);
+                fprintf(stderr, "hpplite: snapshots: this file's bookkeeping has none; the anchor's manifest names the oldest kept (%llu) and the latest (%llu) - "
+                                "any between them are kept at the store until the latest is pruned\n", (unsigned long long)eh, (unsigned long long)node->snapHeight);
             }
         }
         cJSON_Delete(prev);
         node->snapLooked = 1;
     }
-    if (node->config.snapshotIntervalMs > 0 && node->config.keepSeconds > 0 && node->snapHeight
-        && node->nEarlier == (int)(sizeof node->aEarlier / sizeof node->aEarlier[0])) {
-        /* the list is full and none of it is keep= old yet (settings changed between runs: the open refuses such a pair,
-        ** #231): a new snapshot would push the oldest out, kept at the store and named by nothing - none until a prune */
-        if (!node->warnedSnapshot) {
-            fprintf(stderr, "hpplite: snapshot: %d older snapshots are named and none is keep= old yet; no new snapshot until one is pruned\n", node->nEarlier);
-            node->warnedSnapshot = 1;
-        }
-    } else if (node->config.snapshotIntervalMs > 0
+    if (node->config.snapshotIntervalMs > 0
         && (node->snapHeight == 0 || ((int64_t)time(NULL) - node->snapAt) * 1000 >= (int64_t)node->config.snapshotIntervalMs)) {
         uint64_t ph = node->snapHeight;
         char pIndex[64];
@@ -2120,14 +2166,8 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
             made = 0;
         } else made = node_make_snapshot(node, to, root);
         node->spare.height = 0;
-        if (made == 0 && ph && node->config.keepSeconds > 0) {
-            /* keep= (#223): the one it replaces stays named until a prune passes it (the list has room: above) */
-            node->aEarlier[node->nEarlier].height = ph;
-            snprintf(node->aEarlier[node->nEarlier].index, sizeof node->aEarlier[0].index, "%s", pIndex);
-            memcpy(node->aEarlier[node->nEarlier].sha, pSha, 32);
-            node->aEarlier[node->nEarlier].at = pAt;
-            node->nEarlier++;
-        }
+        if (made == 0 && ph && node->config.keepSeconds > 0)
+            node_earlier_push(node, ph, pIndex, pSha, pAt);    /* keep= (#223): the one it replaces stays kept until a prune passes it */
     }
     if (node->snapHeight == 0) return;
     node_prune_plan(node);                          /* keep= (#223): decided before the manifest, so it names only what is kept; sent once the chain accepts (#238) */
@@ -2137,17 +2177,14 @@ static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch
     cJSON_AddNumberToObject(sn, "at", (double)node->snapAt);
     { char hx[67]; hex32(node->snapIndexSha, hx); cJSON_AddStringToObject(sn, "sha256", hx); }
     if (node->config.keepSeconds > 0 && node->nEarlier > 0) {
-        cJSON *list = cJSON_AddArrayToObject(m, "earlier");
-        int i;
-        for (i = 0; i < node->nEarlier; i++) {
-            cJSON *e = cJSON_CreateObject();
-            char hx[67];
-            cJSON_AddNumberToObject(e, "height", (double)node->aEarlier[i].height);
-            cJSON_AddStringToObject(e, "index", node->aEarlier[i].index);
-            cJSON_AddNumberToObject(e, "at", (double)node->aEarlier[i].at);
-            hex32(node->aEarlier[i].sha, hx); cJSON_AddStringToObject(e, "sha256", hx);
-            cJSON_AddItemToArray(list, e);
-        }
+        /* the oldest snapshot still kept (#257): where a verifier starts when batch 1 is pruned (#224); the ones
+        ** between it and the latest are the sequencer's own bookkeeping */
+        cJSON *e = cJSON_AddObjectToObject(m, "earliest");
+        char hx[67];
+        cJSON_AddNumberToObject(e, "height", (double)node->aEarlier[0].height);
+        cJSON_AddStringToObject(e, "index", node->aEarlier[0].index);
+        cJSON_AddNumberToObject(e, "at", (double)node->aEarlier[0].at);
+        hex32(node->aEarlier[0].sha, hx); cJSON_AddStringToObject(e, "sha256", hx);
     }
 }
 
@@ -2225,16 +2262,10 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
     m = node_range_manifest(node, lastBatch);
     if (!m || node_manifest_snapshot(m, &h, zIndex, &at, ixSha) != 0 || h < 2) { cJSON_Delete(m); return 0; }
     if (earliest) {
-        /* the oldest snapshot still kept (keep=, #223; #224) - the most history verified */
-        const cJSON *first = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(m, "earlier"), 0);
-        if (first) {
-            cJSON *one = cJSON_CreateObject();
-            uint64_t eh = 0; int64_t eat = 0; char eIndex[64]; unsigned char eSha[32];
-            cJSON_AddItemReferenceToObject(one, "snapshot", (cJSON *)first);
-            if (node_manifest_snapshot(one, &eh, eIndex, &eat, eSha) == 0 && eh >= 2 && eh < h) {
-                h = eh; at = eat; snprintf(zIndex, sizeof zIndex, "%s", eIndex); memcpy(ixSha, eSha, 32);
-            }
-            cJSON_Delete(one);
+        /* the oldest snapshot still kept (keep=, #223; #224, "earliest" #257) - the most history verified */
+        uint64_t eh = 0; int64_t eat = 0; char eIndex[64]; unsigned char eSha[32];
+        if (node_manifest_snapshot_key(m, "earliest", &eh, eIndex, &eat, eSha) == 0 && eh >= 2 && eh < h) {
+            h = eh; at = eat; snprintf(zIndex, sizeof zIndex, "%s", eIndex); memcpy(ixSha, eSha, 32);
         }
     }
     cJSON_Delete(m);
@@ -2448,16 +2479,21 @@ static int node_anchor(HppliteNode *node) {
     unsigned char wasSha[32];
     int64_t wasAt = node->snapAt;
     int rc, wasN = node->nEarlier, wasLooked = node->snapLooked;
-    HppliteSnapRef wasEarlier[HPPLITE_SNAPSHOTS_NAMED];
+    HppliteSnapRef *wasEarlier = wasN ? malloc((size_t)wasN * sizeof *wasEarlier) : NULL;
     snprintf(wasIndex, sizeof wasIndex, "%s", node->snapIndex);
     memcpy(wasSha, node->snapIndexSha, 32);
-    memcpy(wasEarlier, node->aEarlier, sizeof wasEarlier);
+    if (wasEarlier) memcpy(wasEarlier, node->aEarlier, (size_t)wasN * sizeof *wasEarlier);
     rc = node_anchor_once(node);
-    if (rc == 1) node_prune_send(node);             /* keep= (#223, #238): the chain has the anchor; now the store lets go */
-    else {
+    if (rc == 1) {
+        node_snapshots_save(node);                  /* the list the manifest on chain describes (#257) */
+        node_prune_send(node);                      /* keep= (#223, #238): the chain has the anchor; now the store lets go */
+        free(wasEarlier);
+    } else {
         /* the list as it was (a planned prune filtered it, #238; a snapshot made now was pushed to it) */
         node->prunePlanned = 0;
-        memcpy(node->aEarlier, wasEarlier, sizeof wasEarlier); node->nEarlier = wasN;
+        if (wasN) { memcpy(node->aEarlier, wasEarlier, (size_t)wasN * sizeof *wasEarlier); }
+        node->nEarlier = wasN;
+        free(wasEarlier);
         if (node->snapHeight != was) {
             /* a snapshot made for a range the chain did not take: no commitment ends at its height for a
             ** replica to check it against; the one before stands. Kept aside (#237): the retry, anchoring the

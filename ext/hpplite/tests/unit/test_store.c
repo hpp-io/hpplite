@@ -577,6 +577,8 @@ static int store_has(HppliteStore *rs, const char *zRef) {
     return d != NULL;
 }
 
+static long long range_earliest(HppliteL1 *l1, HppliteStore *rs, uint64_t to);
+
 /* 1 when the manifest ending at `to` names a snapshot at `height` anywhere (the latest, or an older one kept); 0 not; -1 unreadable */
 static int manifest_names_snapshot(HppliteL1 *l1, HppliteStore *rs, uint64_t to, uint64_t height) {
     HppliteRange r;
@@ -603,7 +605,7 @@ static int manifest_names_snapshot(HppliteL1 *l1, HppliteStore *rs, uint64_t to,
 }
 
 /* 6d. keep= (#223): the history behind the newest snapshot made at least `keep` ago is pruned at the store;
-** a replica still starts from the snapshot, and the earlier snapshots still kept are named */
+** a replica still starts from the snapshot, and the manifest names the oldest snapshot still kept (#257) */
 static void test_keep(const char *url) {
     TEST("keep=: after an anchor, the batches and snapshots below the newest snapshot older than keep are pruned at the store; the snapshot and what follows stay; a replica still starts there; an anchor the chain refuses prunes nothing (#238)");
     static const unsigned char kseq[32] = { [31] = 0x7b };
@@ -634,6 +636,7 @@ static void test_keep(const char *url) {
     if (!store_has(rs, b1) || !store_has(rs, zIndex3)) { printf("(batch 1 %d, snapshot 3 %d) ", store_has(rs, b1), store_has(rs, zIndex3)); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("a refused anchor must not prune: batch 1 and the snapshot at 3 still named by the chain's manifest"); }
     hpplite_l1_mock_set_fail_submit(l1, 0);
     if (hpplite_node_anchor(w) != 5 || range_snapshot(l1, rs, 5, &h, zIndex) != 0 || h != 5) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 4-5 with a new snapshot at 5"); }
+    if (range_earliest(l1, rs, 5) != 3) { printf("(earliest at 5: %lld) ", range_earliest(l1, rs, 5)); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the manifest at 5 names the snapshot at 3 as the oldest kept (#257)"); }
     if (manifest_names_snapshot(l1, rs, 5, 3) != 1) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the manifest at 5 must still name the snapshot at 3 after a restart and a refused anchor (#259)"); }
     /* the snapshot at 3 is older than keep: below it is pruned; it and what follows stay */
     range_batch_ref(l1, rs, 5, 4, b4);
@@ -644,6 +647,7 @@ static void test_keep(const char *url) {
     sleep(4);                                   /* keep=3s, by whole seconds: a margin over the boundary */
     hpplite_node_exec(w, "INSERT INTO t(v) VALUES('six')", NULL); hpplite_node_flush_batch(w);
     if (hpplite_node_anchor(w) != 6) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 6"); }
+    if (range_earliest(l1, rs, 6) != 5) { printf("(earliest at 6: %lld) ", range_earliest(l1, rs, 6)); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the manifest at 6 names the snapshot at 5 as the oldest kept: the one at 3 is pruned (#257)"); }
     /* now the snapshot at 5 is older than keep: the one at 3 and batches 3-4 go */
     if (store_has(rs, zIndex3) || store_has(rs, b3) || store_has(rs, b4)) {
         printf("(snapshot 3 %d, batch 3 %d, batch 4 %d) ", store_has(rs, zIndex3), store_has(rs, b3), store_has(rs, b4));
@@ -729,14 +733,16 @@ static void test_store_down_at_open(const char *dir) {
     PASS();
 }
 
-/* the heights the manifest ending at `to` names in "earlier", oldest first; -1 none */
-static int range_earlier(HppliteL1 *l1, HppliteStore *rs, uint64_t to, uint64_t *out, int max) {
+/* the oldest snapshot still kept that the manifest ending at `to` names ("earliest", #257): its height; 0 when the
+** manifest names none; -1 when the manifest cannot be read or still carries the "earlier" list of before */
+static long long range_earliest(HppliteL1 *l1, HppliteStore *rs, uint64_t to) {
     HppliteRange r;
     char cid[64];
     size_t n = 0;
     uint8_t *text;
-    cJSON *m, *e;
-    int k = 0;
+    cJSON *m;
+    const cJSON *e, *h;
+    long long out;
     memset(&r, 0, sizeof r);
     if (hpplite_l1_get_range(l1, to, &r) != 0) return -1;
     hpplite_store_cid_from_sha256(r.manifestDigest, cid);
@@ -745,12 +751,12 @@ static int range_earlier(HppliteL1 *l1, HppliteStore *rs, uint64_t to, uint64_t 
     m = text ? cJSON_ParseWithLength((const char *)text, n) : NULL;
     free(text);
     if (!m) return -1;
-    cJSON_ArrayForEach(e, cJSON_GetObjectItemCaseSensitive(m, "earlier")) {
-        const cJSON *h = cJSON_GetObjectItemCaseSensitive(e, "height");
-        if (k < max && cJSON_IsNumber(h)) out[k++] = (uint64_t)h->valuedouble;
-    }
+    if (cJSON_GetObjectItemCaseSensitive(m, "earlier")) { cJSON_Delete(m); return -1; }
+    e = cJSON_GetObjectItemCaseSensitive(m, "earliest");
+    h = e ? cJSON_GetObjectItemCaseSensitive(e, "height") : NULL;
+    out = !e ? 0 : cJSON_IsNumber(h) ? (long long)h->valuedouble : -1;
     cJSON_Delete(m);
-    return k;
+    return out;
 }
 
 /* 6e. A restart whose first anchor cannot read the previous manifest decides nothing (#236): with the store not
@@ -760,8 +766,8 @@ static void test_restart_store_down(const char *dir) {
     TEST("a restart with the store not answering at its first anchor (#236): no snapshot made, nothing decided; the next anchor reads the previous manifest and names the latest snapshot and the earlier ones");
     int port = test_free_port();
     char url[64], storeDir[600];
-    uint64_t h = 0, earlier[8];
-    int n;
+    uint64_t h = 0;
+    long long n;
     pid_t pid;
     static const unsigned char kseq[32] = { [31] = 0x7c };
     HppliteL1 *l1 = hpplite_l1_create_mock();
@@ -784,8 +790,8 @@ static void test_restart_store_down(const char *dir) {
     sleep(2);                                   /* snapshot=1ms, by whole seconds: the next anchor makes a new one */
     for (int i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four and five')", NULL); hpplite_node_flush_batch(w); }
     if (hpplite_node_anchor(w) != 5 || range_snapshot(l1, rs, 5, &h, zIndex) != 0 || h != 5) { hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor 4-5 with a snapshot at 5"); }
-    n = range_earlier(l1, rs, 5, earlier, 8);
-    if (n != 1 || earlier[0] != 3) { printf("(earlier: %d) ", n); hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the manifest at 5 names the snapshot at 3 as earlier"); }
+    n = range_earliest(l1, rs, 5);
+    if (n != 3) { printf("(earliest: %lld) ", n); hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the manifest at 5 names the snapshot at 3 as the earliest kept"); }
     hpplite_node_exec(w, "INSERT INTO t(v) VALUES('six, at the store, unanchored')", NULL);
     if (hpplite_node_flush_batch(w) != 6) { hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 6 at the store"); }
     /* the process dies (no anchor at close); the store goes down; the next run's first anchor cannot read the manifest at 5 */
@@ -805,13 +811,13 @@ static void test_restart_store_down(const char *dir) {
         int got = range_snapshot(l1, rs, 6, &h, zIndex);
         if (a != 6 || got != 0 || h != 6) { printf("(anchor %llu, snapshot %d at %llu, error '%s') ", (unsigned long long)a, got, (unsigned long long)h, w->ctx->zLastError); hpplite_node_destroy(w); hpplite_store_close(rs); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the anchor 6 with a snapshot at 6"); }
     }
-    n = range_earlier(l1, rs, 6, earlier, 8);
-    printf("(earlier at 6: %d%s%llu%s%llu) ", n, n > 0 ? ": " : "", n > 0 ? (unsigned long long)earlier[0] : 0ULL, n > 1 ? ", " : "", n > 1 ? (unsigned long long)earlier[1] : 0ULL);
+    n = range_earliest(l1, rs, 6);
+    printf("(earliest at 6: %lld) ", n);
     hpplite_node_destroy(w);
     hpplite_store_close(rs);
     hpplite_l1_disconnect(l1);
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
-    if (n != 2 || earlier[0] != 3 || earlier[1] != 5) FAIL("the manifest at 6 names the snapshots at 3 and 5 as earlier: the restart learnt them once the store answered");
+    if (n != 3) FAIL("the manifest at 6 names the snapshot at 3 as the earliest kept: the restart kept its sidecar's list (the one at 5 is between)");
     PASS();
 }
 

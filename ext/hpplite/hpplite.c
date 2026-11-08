@@ -76,6 +76,14 @@ static const char *HPPLITE_SCHEMA =
   "  pubkey BLOB PRIMARY KEY,"
   "  added_height INTEGER NOT NULL DEFAULT 0"
   ") WITHOUT ROWID;"
+  /* keep= (#223, #257): the older snapshots still kept at the store, the sequencer's own bookkeeping - the manifest
+  ** names only the latest and the oldest of them */
+  "CREATE TABLE IF NOT EXISTS _hpplite_snapshots("
+  "  height INTEGER PRIMARY KEY,"
+  "  idx TEXT NOT NULL,"           /* the index's CID at the store */
+  "  sha BLOB NOT NULL,"           /* ...and its sha-256 */
+  "  at INTEGER NOT NULL"          /* when it was made (seconds) */
+  ");"
   "CREATE TABLE IF NOT EXISTS _hpplite_pending("
   "  id INTEGER PRIMARY KEY,"
   "  txn INTEGER NOT NULL,"
@@ -213,18 +221,21 @@ void hpplite_internal_open_end(void) { tlInternalOpen--; }
 int hpplite_internal_open_active(void) { return tlInternalOpen > 0; }
 
 /* Every table of HPPLITE_SCHEMA, every column added since (#52, #56, #57,
-** #59, the rollup column, the tree columns of #9) and the meta row: nothing
-** of the schema would write. A missing table makes the query fail to
-** prepare, which is "no". Anything added later must be listed here too, or
-** a file from before never gets it (#131). */
+** #59, the rollup column) and the meta row: nothing of the schema would
+** write. A missing table makes the query fail to prepare, which is "no".
+** Anything added later must be listed here too, or a file from before never
+** gets it (#131). The tree table and columns of #9 went with the trees (#253);
+** listed here after that, the check said "no" to every file and the schema
+** ran at every open - harmless, every statement of it is IF NOT EXISTS. */
 static int bookkeepingIsCurrent(sqlite3 *db) {
   static const char zSql[] =
     "SELECT (SELECT count(*) FROM pragma_table_info('_hpplite_meta')"
-    "          WHERE name IN ('open_txn','frag_id','frag_off','rollup','chain_hash','tree_seq','tree_stale')) = 7"
+    "          WHERE name IN ('open_txn','frag_id','frag_off','rollup','chain_hash')) = 5"
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_pending') WHERE name IN ('mode','now')) = 2"
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_carry') WHERE name IN ('now','frag')) = 2"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_posted'))"
-    "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_tree'))"
+    "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_unanchored'))"
+    "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_snapshots'))"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_readers'))"
     "   AND EXISTS(SELECT 1 FROM _hpplite_meta WHERE id = 1)";
   sqlite3_stmt *q = NULL;

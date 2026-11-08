@@ -186,7 +186,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `relay` | No | `on` for the network's canonical relay (`l1=hpp-sepolia`: `https://relay.sepolia.hpplite.hpp.io`, #192), or `http://host:port` of a relay ([operators/relay](operators/relay/README.md), #170): every write to the chain goes there as its EIP-712 signed form, paid over x402 like the store: creating the rollup (VERSION 10 factories), the lease, anchors, commitments, checkpoints. A wallet with USDC.e and no ETH runs this way. When the relay fails, the wallet sends the plain transaction itself if it holds ETH; otherwise the write waits and `last_error` says why (#126). The protocol: [doc/relay-protocol.md](doc/relay-protocol.md) (#188). Also `HPPLITE_RELAY` |
 | `anchor` | No | With `store=` on a chain that takes ranges (VERSION 9 and later, #164, the `hpp-sepolia` factory): how often the batches the store holds are anchored on the chain in one commitment: `5m`, `30m` (default: HPP's cadence), `1h`; `0` = at close and on `hpplite_anchor()` only. Also `HPPLITE_ANCHOR`. See Stores and commitments |
 | `datadir` | No | Where the per-wallet spending ledger `spend-<wallet>.json` lives (`HPPLITE_SPEND_CAP`, #173). It spans every database the wallet writes, so it cannot live in a database's sidecar, where everything else HPPLite keeps is. Default `/tmp/hpplite`. Also `HPPLITE_DATA_DIR` |
-| `keep` | No | With `snapshot=`: how long the store keeps the history behind a snapshot - `all` (default: every batch, an audit log) or `7d`, `24h`, `30m` (#223). After each anchor the sequencer signs a `Prune` at the newest snapshot made at least that long ago; the store lets go of the batches and older snapshots below it. The snapshots kept are named in each manifest, at most 64 besides the latest, so `keep` divided by the snapshot cadence (the longer of `snapshot=` and `anchor=`: a snapshot is made at an anchor) must not exceed 64 (`snapshot=1h` with `keep=30d` would keep 720: the open refuses it and says so, #231; with anchors by hand, `anchor=0`, the anchor itself makes no snapshot while the list is full). The current state stays provable (that snapshot's root is anchored, then the batches after it); what is lost is replaying how the state got there, and `hpplite-verify --to`/`--at` before it. Also `HPPLITE_KEEP` |
+| `keep` | No | With `snapshot=`: how long the store keeps the history behind a snapshot - `all` (default: every batch, an audit log) or `7d`, `24h`, `30m` (#223). After each anchor the sequencer signs a `Prune` at the newest snapshot made at least that long ago; the store lets go of the batches and older snapshots below it. Each manifest names the latest snapshot and the oldest still kept; the ones between are the sequencer's own bookkeeping, in its sidecar (#257: no list to overflow, any `keep` with any `snapshot=` opens). The current state stays provable (that snapshot's root is anchored, then the batches after it); what is lost is replaying how the state got there, and `hpplite-verify --to`/`--at` before it. Also `HPPLITE_KEEP` |
 | `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min for a node without a store, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). With `store=` the chain's cadence goes to `anchor` instead and the interval stays 5 s: the batches reach the store in seconds, the chain gets one commitment per anchor (#164). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
 | `compress` | No | `on` (default): the page batch is deflated before it is sealed or posted when that shrinks it (#12); `off`: posted as is. Every reader takes both forms. Also `HPPLITE_COMPRESS` |
@@ -758,9 +758,11 @@ snapshot that fails a check is said on stderr and the replica replays from
 batch 1. `snapshot_height` in `hpplite_status` is the one it started from.
 
 With `keep=<duration>` (#223) the history is bounded: the manifests also
-name the older snapshots still kept (`"earlier": [...]`, oldest first),
+name the oldest snapshot still kept (`"earliest": {...}`, #257: where a
+verifier starts when batch 1 is pruned; the snapshots between it and the
+latest are the sequencer's own list, in its sidecar's `_hpplite_snapshots`),
 and at each anchor the sequencer signs a `Prune` (hpplite-store/2) at the
-height of the newest snapshot an earlier anchor named that is at least
+height of the newest snapshot it made that is at least
 `keep` old - decided before that anchor's manifest is written, so it names
 only what is kept (#227), sent once the chain has accepted the anchor, so
 an anchor the chain refuses leaves the store as the manifest on chain
@@ -980,7 +982,11 @@ the oldest snapshot kept - the fallback `hpplite-verify` used to retry with
 is the node's now - and the soft tier follows unless a stop is given.
 Under `store=` on a chain with ranges `checkpoint=` writes no contract
 (#256): the anchor is the one root cadence, and `hpplite-verify` checks
-the anchored root instead of saying there is no checkpoint yet.
+the anchored root instead of saying there is no checkpoint yet. A manifest
+names the latest snapshot and the oldest kept (`"earliest"`), not a list of
+up to 64 (#257): the sequencer keeps its list in the sidecar, and the #231
+cap on `keep=` with `snapshot=` is gone. Manifests from v0.7 that carry
+`"earlier"` are read for their latest snapshot only.
 
 Paying in the HPP token itself is open (#175).
 
@@ -993,7 +999,7 @@ Paying in the HPP token itself is open (#175).
 | v0.5 | HPP economics: store-based persistence and soft commitment, one chain anchor every 30 minutes (#162, #164-#167); replicas on the soft tier (#166); a node with USDC.e and no ETH through a relay (#126, #170); store and relay paid by voucher (#135, #179), spending caps (#173) | same | a store (soft) + one L1 commitment per 30 min (hard) |
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
-| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#256) | same | same |
+| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#257) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database

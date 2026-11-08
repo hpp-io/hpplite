@@ -21,7 +21,6 @@
 
 #ifndef HPPLITE_H
 #define HPPLITE_H
-#define HPPLITE_SNAPSHOTS_NAMED 64   /* the snapshots a manifest names besides the latest ("earlier", #223); keep=/snapshot= must fit (#231) */
 
 #include "hpplite_sqlite.h"
 #include <stdint.h>

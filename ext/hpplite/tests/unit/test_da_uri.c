@@ -306,32 +306,22 @@ static void test_operators_on(void) {
 }
 
 
-/* keep= and snapshot= together must fit the snapshots a manifest can name (#231) */
-static void test_keep_snapshot_cap(void) {
-    TEST("keep= with snapshot=: refused at open when they would keep more snapshots than a manifest names (64)");
-    HppliteConfig *cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&anchor=30m&snapshot=1h&keep=30d");
-    int ok = cfg && hpplite_config_resolve_operators(cfg) != 0 && hpplite_config_error() && strstr(hpplite_config_error(), "720 snapshots");
-    printf("  anchor=30m snapshot=1h keep=30d: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)");
-    if (cfg) hpplite_config_free(cfg);
-    if (!ok) { FAIL("720 snapshots would be kept: the open must be refused and say so"); }
-    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&anchor=30m&snapshot=1h&keep=48h");
-    ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
-    if (cfg) hpplite_config_free(cfg);
-    if (!ok) { printf("  snapshot=1h keep=48h: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)"); FAIL("48 snapshots fit"); }
-    /* a snapshot is made at an anchor: snapshot=1ms with anchor=1h is one an hour; 48 h of them fit */
-    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&anchor=1h&snapshot=1ms&keep=48h");
-    ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
-    if (cfg) hpplite_config_free(cfg);
-    if (!ok) { printf("  anchor=1h snapshot=1ms keep=48h: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)"); FAIL("the cadence is the anchor's: 48 fit"); }
-    /* anchors by hand (anchor=0): the cadence is not known here; the anchor refuses a snapshot when the list is full */
-    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&anchor=0&snapshot=1ms&keep=3s");
-    ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
-    if (cfg) hpplite_config_free(cfg);
-    if (!ok) { printf("  anchor=0 snapshot=1ms keep=3s: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)"); FAIL("anchors by hand: not refused at open"); }
-    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&snapshot=1h");
-    ok = cfg && hpplite_config_resolve_operators(cfg) == 0;
-    if (cfg) hpplite_config_free(cfg);
-    if (!ok) { FAIL("snapshot= without keep= (keep=all) is not capped"); }
+/* keep= with snapshot= is not capped (#257): the manifest names the latest snapshot and the oldest kept, and the
+** sequencer keeps the ones between in its sidecar - there is no list to overflow (#231 refused 'keep=30d with
+** snapshot=1h: 720 snapshots') */
+static void test_keep_not_capped(void) {
+    TEST("keep= with snapshot=: any pair opens (#257); the #231 cap of 64 named snapshots is gone");
+    static const char *uris[] = { "anchor=30m&snapshot=1h&keep=30d", "anchor=30m&snapshot=1h&keep=365d", "anchor=1h&snapshot=1ms&keep=48h",
+                                  "anchor=0&snapshot=1ms&keep=3s", "snapshot=1h" };
+    for (int i = 0; i < 5; i++) {
+        char uri[200];
+        snprintf(uri, sizeof uri, "hpplite://x?hpplite=1&l1=hpp-sepolia&store=on&%s", uris[i]);
+        HppliteConfig *cfg = hpplite_config_load(uri);
+        int ok = cfg && hpplite_config_resolve_operators(cfg) == 0 && hpplite_config_error() == NULL;
+        if (!ok) printf("\n  %s: %s", uris[i], hpplite_config_error() ? hpplite_config_error() : "(no error)");
+        if (cfg) hpplite_config_free(cfg);
+        if (!ok) { printf("\n"); FAIL("keep= with snapshot= must open whatever the ratio"); }
+    }
     PASS();
 }
 
@@ -439,7 +429,7 @@ int main(void) {
     test_uri_parse_file();
     test_alias_interval();
     test_operators_on();
-    test_keep_snapshot_cap();
+    test_keep_not_capped();
     test_relay_exact_only();
     test_money_knobs_env_only();
     test_from_soft_gone();

@@ -5,7 +5,7 @@
 */
 
 #include "config.h"
-#include "hpplite.h"               /* HPPLITE_SNAPSHOTS_NAMED (#231) */
+#include "hpplite.h"
 #include "spend.h"
 #include "keystore.h"
 #include <sys/stat.h>
@@ -834,19 +834,6 @@ int hpplite_config_resolve_operators(HppliteConfig *cfg) {
     struct { char **pz; const char *(*url)(uint64_t); const char *what; } k[2] = {
         { &cfg->storeUrl, hpplite_network_store_url, "store" }, { &cfg->relayUrl, hpplite_network_relay_url, "relay" } };
     int i;
-    if (cfg->keepSeconds > 0 && cfg->snapshotIntervalMs > 0 && cfg->anchorIntervalMs > 0) {
-        /* keep= with snapshot= (#231): the snapshots kept are named in each manifest, at most HPPLITE_SNAPSHOTS_NAMED
-        ** besides the latest; more would be dropped from the list silently - kept at the store, found by nothing.
-        ** A snapshot is made at an anchor, so its cadence is the longer of snapshot= and anchor=; with anchors by
-        ** hand (anchor=0) it cannot be known here, and the anchor itself refuses a snapshot when the list is full */
-        int64_t every = cfg->snapshotIntervalMs > cfg->anchorIntervalMs ? cfg->snapshotIntervalMs : cfg->anchorIntervalMs;
-        double n = (double)cfg->keepSeconds * 1000.0 / (double)every;
-        if (n > HPPLITE_SNAPSHOTS_NAMED) {
-            snprintf(gConfigError, sizeof(gConfigError), "keep=%llds with a snapshot every %llds (snapshot=, at most one per anchor) would keep up to %.0f snapshots;"
-                     " a manifest names at most %d (raise snapshot= or lower keep=)", (long long)cfg->keepSeconds, (long long)(every / 1000), n, HPPLITE_SNAPSHOTS_NAMED);
-            return -1;
-        }
-    }
     for (i = 0; i < 2; i++) {
         if (!*k[i].pz || strcasecmp(*k[i].pz, "on") != 0) continue;
         const char *url = cfg->chainId ? k[i].url(cfg->chainId) : NULL;

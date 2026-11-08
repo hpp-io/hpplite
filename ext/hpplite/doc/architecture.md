@@ -129,6 +129,7 @@ point loses nothing and a restart needs no special recovery:
 | the sidecar's `_hpplite_meta` | next batch height, previous block hash, the page root after the last finalized batch, checkpoint progress, the chain hash, the batch in flight (height and root) | when a batch is submitted (in flight) and when it is finalized |
 | the sidecar's `_hpplite_posted` | the posted batches, kept for a reorg | at finalize |
 | the sidecar's `_hpplite_unanchored` | the batches at the store that no anchor names yet (#164) | at finalize, cleared at the anchor |
+| the sidecar's `_hpplite_snapshots` | with `keep=`: the older snapshots still kept at the store, the sequencer's own list (#257); the manifest names only the latest and the oldest | at each anchor the chain accepts |
 | the sidecar's `_hpplite_readers` | the viewing keys granted (#15) | on grant and revoke |
 
 How a commit gets captured (#146, #155): after each commit SQLite runs the

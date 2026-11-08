@@ -180,8 +180,9 @@ typedef struct HppliteNode {
     unsigned char snapRoot[32];     /* the latest snapshot's root */
     HppliteSnapRef spare;           /* a snapshot made for an anchor the chain refused (#237): reused when the retry anchors the same height and root */
     unsigned char spareRoot[32];
-    HppliteSnapRef aEarlier[HPPLITE_SNAPSHOTS_NAMED];   /* keep= (#223): the older snapshots still kept, oldest first; the open refuses settings past it (#231) */
-    int nEarlier;
+    HppliteSnapRef *aEarlier;       /* keep= (#223): the older snapshots still kept, oldest first - the sequencer's own list, in the
+                                    ** sidecar's _hpplite_snapshots (#257); the manifest names the oldest of them as "earliest" */
+    int nEarlier, nEarlierAlloc;
     uint64_t prunedHeight;          /* the last Prune the store took (#223); 0: none */
     uint64_t prunePlanned;          /* the Prune this anchor sends once the chain accepts it (#238); 0: none */
     int snapApply;                  /* a replica writing a snapshot (#222): the bookkeeping set to its height, not advanced by a batch */
