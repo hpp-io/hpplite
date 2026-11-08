@@ -686,8 +686,8 @@ Three words the rest of this document uses precisely (#35, #11):
   S3 bucket (#11).
 - A **commitment** is what the chain holds per height: HPPLite's own hash
   of the batch and a reference into the store (on chain, the height itself;
-  later a CID or an object key), and, where a pinning service holds the
-  bytes, its signed receipt (#33). A replica reads the commitment, fetches
+  later a CID or an object key), and, with each anchor, the store's signed
+  bucket statement (#214). A replica reads the commitment, fetches
   by the reference, checks the hash, replays. Verification never depends on
   what the reference means.
 - **Data availability** is a property, not a place: anyone can fetch the
@@ -1243,7 +1243,7 @@ authentication, so it is provably not ours) is stepped over by every key
 holder the same way instead of stopping reconstruction.
 
 **Soft and hard.** A batch at the store carries the sequencer's signature
-over its height and bytes, and the store's signed receipt. That is the
+over its height and bytes, and the store's signed bucket statement. That is the
 sequencer's claim, checkable by anyone with the key against the wallet the
 coordinator names, but not yet settled. Two signed batches at one height are
 proof of equivocation. A pin service with `--rpc` refuses names from an

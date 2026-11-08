@@ -90,7 +90,8 @@ static void test_envelope(void) {
     if (hpplite_envelope_open(key, 7, sealed, sealedLen, &openLen, &scheme) != NULL || scheme != NULL) FAIL("unknown scheme accepted");
     free(sealed);
 
-    /* a v1 (HPE1) envelope, as written by the v0.1 pre-release, still opens */
+    /* the v0.1 pre-release layout "HPE1" (no encoding byte) is no envelope since v0.8 (#249): no tagged release wrote
+    ** it. It is neither recognized as sealed nor opened - it reads as a plaintext payload and fails as JSON there */
     {
         uint8_t v1[4 + 1 + 12 + 64], ad[9];
         const char *msg = "{\"height\":3}";
@@ -98,11 +99,9 @@ static void test_envelope(void) {
         memcpy(v1, "HPE1", 4); v1[4] = 1; memset(v1 + 5, 0x42, 12);
         ad[0] = 1; for (int i = 0; i < 8; i++) ad[1 + i] = (uint8_t)(3ULL >> (56 - 8 * i));
         HPPLITE_CIPHER_CHACHA20POLY1305.seal(key, v1 + 5, ad, 9, (const uint8_t*)msg, n, v1 + 17);
-        if (!hpplite_envelope_is_sealed(v1, 17 + n + 16)) FAIL("v1 not recognized");
-        if (hpplite_envelope_encoding(v1, 17 + n + 16) != HPPLITE_ENCODING_NONE) FAIL("v1 encoding");
-        uint8_t *o = hpplite_envelope_open(key, 3, v1, 17 + n + 16, &openLen, NULL);
-        if (!o || openLen != n || memcmp(o, msg, n) != 0) FAIL("v1 envelope does not open");
-        free(o);
+        if (hpplite_envelope_is_sealed(v1, 17 + n + 16)) FAIL("HPE1 still recognized as an envelope");
+        if (hpplite_envelope_encoding(v1, 17 + n + 16) != -1) FAIL("HPE1 given an encoding");
+        if (hpplite_envelope_open(key, 3, v1, 17 + n + 16, &openLen, NULL) != NULL) FAIL("HPE1 still opens");
     }
 
     if (hpplite_envelope_is_sealed((const uint8_t*)payload, strlen(payload))) FAIL("plaintext JSON mistaken for an envelope");

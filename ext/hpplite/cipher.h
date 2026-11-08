@@ -17,9 +17,9 @@
 ** 1 = deflate (compression lives inside the envelope: ciphertext does not
 ** compress). Associated data: scheme id | encoding | height (8 bytes
 ** big-endian), so a ciphertext cannot be moved to another height.
-** "HPE1" (no encoding byte) is the v0.1 pre-release layout and still opens.
-** A payload that starts with neither is plaintext JSON (history written
-** before encryption, or encrypt=off).
+** A payload that does not start with it is plaintext JSON (history written
+** before encryption, or encrypt=off). The v0.1 pre-release layout "HPE1"
+** (no encoding byte) is not read: no tagged release wrote it (#249).
 */
 
 #ifndef HPPLITE_CIPHER_H
@@ -34,7 +34,6 @@ extern "C" {
 
 #define HPPLITE_CIPHER_KEY_SIZE 32
 #define HPPLITE_ENVELOPE_MAGIC "HPE2"
-#define HPPLITE_ENVELOPE_MAGIC_V1 "HPE1"
 #define HPPLITE_ENVELOPE_MAGIC_LEN 4
 #define HPPLITE_ENVELOPE_HEADER_LEN (HPPLITE_ENVELOPE_MAGIC_LEN + 2)   /* magic, scheme, encoding */
 

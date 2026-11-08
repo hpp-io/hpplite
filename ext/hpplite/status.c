@@ -75,7 +75,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_CHAIN_HASH       25
 #define STATUS_COL_ROOT_VERSION     26
 #define STATUS_COL_STORE            27     /* the store= URL (#11); NULL: the bytes go on the chain */
-#define STATUS_COL_STORE_STATE      28     /* ok, unreachable, over cap, receipt, error: the last put's outcome */
+#define STATUS_COL_STORE_STATE      28     /* ok, unreachable, over cap, error: the last put's outcome */
 #define STATUS_COL_STORE_SPENT      29     /* paid to the store by this process, atomic units of its asset */
 #define STATUS_COL_STORE_CALLS      30     /* puts and gets that succeeded */
 #define STATUS_COL_STORE_PRICE      31     /* what the provider charges for a put of the last batch's size; NULL when free */
@@ -324,7 +324,6 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
                     case HPPLITE_STORE_FAIL_NONE:        z = "ok"; break;
                     case HPPLITE_STORE_FAIL_UNREACHABLE: z = "unreachable"; break;
                     case HPPLITE_STORE_FAIL_CAP:         z = "over cap"; break;
-                    case HPPLITE_STORE_FAIL_RECEIPT:     z = "receipt"; break;
                     default:                             z = "error"; break;
                 }
                 sqlite3_result_text(ctx, z, -1, SQLITE_STATIC);

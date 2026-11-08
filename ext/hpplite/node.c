@@ -2110,9 +2110,7 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
     node_store_bucket(node);
     for (off = 0; off < payloadLen; off += HPPLITE_SNAPSHOT_CHUNK) {
         size_t n = payloadLen - off < HPPLITE_SNAPSHOT_CHUNK ? payloadLen - off : HPPLITE_SNAPSHOT_CHUNK;
-        char *zReceipt = NULL;
-        zRef = hpplite_store_put_at(node->store, height, payload + off, n, &zReceipt);
-        sqlite3_free(zReceipt);
+        zRef = hpplite_store_put_at(node->store, height, payload + off, n);
         if (!zRef) { hpplite_error(ctx, "snapshot at %llu: the store did not take a chunk: %s", (unsigned long long)height, hpplite_store_error(node->store)); goto done; }
         {
             /* each chunk with its sha-256: a reader checks what any store serves (a Kubo CID of a large file is not one) */
@@ -2142,9 +2140,7 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
         sqlite3_free(nbytes);
         if (nsealed) {
             zNameWhy = hpplite_store_error(node->store);
-            char *zReceipt = NULL;
-            zRef = hpplite_store_put_at(node->store, height, nsealed, slen, &zReceipt);
-            sqlite3_free(zReceipt);
+            zRef = hpplite_store_put_at(node->store, height, nsealed, slen);
             if (zRef) {
                 cJSON *nm = cJSON_AddObjectToObject(ix, "name");
                 unsigned char d[32];
@@ -2165,11 +2161,7 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
     }
     text = cJSON_PrintUnformatted(ix);
     if (!text) goto done;
-    {
-        char *zReceipt = NULL;
-        zRef = hpplite_store_put_at(node->store, height, (const uint8_t *)text, strlen(text), &zReceipt);
-        sqlite3_free(zReceipt);
-    }
+    zRef = hpplite_store_put_at(node->store, height, (const uint8_t *)text, strlen(text));
     if (!zRef || strlen(zRef) >= sizeof node->snapIndex) { hpplite_error(ctx, "snapshot at %llu: the store did not take its index: %s", (unsigned long long)height, hpplite_store_error(node->store)); goto done; }
     node->snapHeight = height;
     snprintf(node->snapIndex, sizeof node->snapIndex, "%s", zRef);
@@ -2447,10 +2439,10 @@ static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch) {
 static int node_anchor_once(HppliteNode *node) {
     uint64_t lastBatch = 0, total = 0, from = 0, to = 0, expect;
     unsigned char latest[32], chainAfter[32], root[32], digest[32], payTo[20];
-    uint8_t compact[HPPLITE_STATEMENT_SIZE];   /* the larger: a /1 receipt or a /2 statement */
+    uint8_t compact[HPPLITE_STATEMENT_SIZE];   /* the /2 bucket statement */
     cJSON *m = NULL, *batches;
     sqlite3_stmt *q = NULL;
-    char *text = NULL, *zRef = NULL, *zReceipt = NULL, *txHash = NULL, cid[64], hx[67];
+    char *text = NULL, *zRef = NULL, *txHash = NULL, cid[64], hx[67];
     HppliteRange r;
     int saved, rc = -1, nCompact = -1, hasRoot = 0, confirmed = 0;
     HppliteCtx *ctx = node->ctx;
@@ -2514,26 +2506,25 @@ static int node_anchor_once(HppliteNode *node) {
     hpplite_store_sha256((const uint8_t *)text, strlen(text), digest);
     hpplite_store_cid_from_sha256(digest, cid);
     node_store_bucket(node);
-    zRef = hpplite_store_put_at(node->store, to, (const uint8_t *)text, strlen(text), &zReceipt);
+    zRef = hpplite_store_put_at(node->store, to, (const uint8_t *)text, strlen(text));
     node->storeBalanceOk = 0;
     if (!zRef) {
         hpplite_error(ctx, "anchor: the store did not take the manifest of batches %llu-%llu: %s", (unsigned long long)from, (unsigned long long)to, hpplite_store_error(node->store));
-        free(text); sqlite3_free(zReceipt); return -1;
+        free(text); return -1;
     }
     if (strcmp(zRef, cid) != 0) {
         /* a replica finds the manifest by the digest the chain carries: the store must name it so */
         hpplite_error(ctx, "anchor: the store names the manifest %s, not its digest's CID %s: replicas could not find it; not anchored", zRef, cid);
-        free(text); sqlite3_free(zRef); sqlite3_free(zReceipt); return -1;
+        free(text); sqlite3_free(zRef); return -1;
     }
-    if (hpplite_store_is_bucket(node->store)) nCompact = hpplite_store_statement(node->store, compact);   /* /2: the bucket statement (#214) */
-    else nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0) ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
+    nCompact = hpplite_store_is_bucket(node->store) ? hpplite_store_statement(node->store, compact) : -1;   /* /2: the bucket statement (#214); a store without buckets commits none */
     memset(&r, 0, sizeof r);
     r.fromHeight = from; r.toHeight = to;
     memcpy(r.chainHashAfter, chainAfter, 32);
     memcpy(r.stateRoot, root, 32);
     memcpy(r.manifestDigest, digest, 32);
     if (nCompact > 0) { r.receipt = compact; r.nReceipt = (size_t)nCompact; }
-    if (!node_ensure_lease(node)) { free(text); sqlite3_free(zRef); sqlite3_free(zReceipt); return -1; }
+    if (!node_ensure_lease(node)) { free(text); sqlite3_free(zRef); return -1; }
     txHash = hpplite_l1_commit_range(node->l1, node->instanceId, &r);
     if (txHash) {
         confirmed = hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1;
@@ -2570,7 +2561,7 @@ static int node_anchor_once(HppliteNode *node) {
                       (unsigned long long)from, (unsigned long long)to, zRelay ? " (relay: " : "", zRelay ? zRelay : "", zRelay ? ")" : "");
         rc = -1;
     }
-    free(text); sqlite3_free(zRef); sqlite3_free(zReceipt);
+    free(text); sqlite3_free(zRef);
     return rc;
 }
 
@@ -2804,10 +2795,9 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         if (hppliteMarkInflightPages(ctx, height, root) != SQLITE_OK) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); free(sealed); free(framed); *pMore = 0; return 0; }
         if (node->store) {
             /* the bytes to the store, the commitment to the chain (#11), as the row flush does */
-            char *zReceipt = NULL;
             char *zRef;
             node_store_bucket(node);
-            zRef = hpplite_store_put_at(node->store, height, payload, payloadLen, &zReceipt);
+            zRef = hpplite_store_put_at(node->store, height, payload, payloadLen);
             node->storeBalanceOk = 0;
             if (!zRef) {
                 if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
@@ -2823,23 +2813,20 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
                     txHash = NULL;
                 }
             } else {
-                unsigned char h[32], payTo[20];
-                uint8_t compact[HPPLITE_RECEIPT_SIZE];
-                int nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0) ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
+                unsigned char h[32];
                 node->warnedStoreDown = 0;
                 hpplite_keccak256(payload, payloadLen, h);
                 if (node_ranges(node)) {
-                    node_anchor_row(node, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);   /* the chain's commitment comes with the anchor (#164) */
+                    node_anchor_row(node, h, zRef, NULL, 0);   /* the chain's commitment comes with the anchor (#164); the store's word is its bucket statement there */
                     node_name_batch(node, height, payload, payloadLen);
                     txHash = NULL;
                     storedOnly = 1;
                 } else {
-                    txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                    txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef, NULL, 0);
                     if (!txHash) hpplite_error(ctx, "the chain did not take the commitment of page batch %llu (ref %s)", (unsigned long long)height, zRef);
                 }
             }
             sqlite3_free(zRef);
-            sqlite3_free(zReceipt);
         } else {
             txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
         }
@@ -3028,10 +3015,9 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                 char *txHash;
                 if (node->store) {
                     /* the bytes to the store, the commitment to the chain (#11) */
-                    char *zReceipt = NULL;
                     char *zRef;
             node_store_bucket(node);
-            zRef = hpplite_store_put_at(node->store, height, payload, payloadLen, &zReceipt);
+            zRef = hpplite_store_put_at(node->store, height, payload, payloadLen);
                     node->storeBalanceOk = 0;                 /* a put may have paid: the status row reads the balance again */
                     if (!zRef) {
                         if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
@@ -3052,27 +3038,22 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
                             txHash = NULL;
                         }
                     } else {
-                        unsigned char h[32], payTo[20];
-                        uint8_t compact[HPPLITE_RECEIPT_SIZE];
-                        int nCompact = (zReceipt && hpplite_store_domain(node->store, payTo, NULL) == 0)
-                                       ? hpplite_store_receipt_compact(zReceipt, payTo, compact) : -1;
+                        unsigned char h[32];
                         node->warnedStoreDown = 0;
                         hpplite_keccak256(payload, payloadLen, h);
                         if (node_ranges(node)) {
                             /* the store has it: the chain gets one commitment per anchor (#164) */
-                            node_anchor_row(node, h, zRef, nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                            node_anchor_row(node, h, zRef, NULL, 0);
                             node_name_batch(node, height, payload, payloadLen);
                             txHash = NULL;
                             storedOnly = 1;
                         } else {
-                            txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef,
-                                                             nCompact > 0 ? compact : NULL, nCompact > 0 ? (size_t)nCompact : 0);
+                            txHash = hpplite_l1_commit_batch(node->l1, node->instanceId, height, h, zRef, NULL, 0);
                             if (!txHash) hpplite_error(node->ctx, "the chain did not take the commitment of batch %llu (ref %s)",
                                                        (unsigned long long)height, zRef);
                         }
                     }
                     sqlite3_free(zRef);
-                    sqlite3_free(zReceipt);
                 } else {
                     txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
                 }

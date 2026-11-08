@@ -1,6 +1,6 @@
 /*
 ** HPPLite stores (#11): where a batch's bytes live when they are not on the
-** chain. The chain keeps the commitment (hash, reference, receipt; #33),
+** chain. The chain keeps the commitment (hash, reference; #33, and at an anchor the store's bucket statement, #214),
 ** the store keeps the bytes: put bytes, get by reference. The reference is
 ** opaque to the node (a CID at a pin service).
 **
@@ -52,13 +52,12 @@ void hpplite_store_set_channel(HppliteStore *s, uint64_t depositCap, const unsig
 /* The channel paid in: its id ("0x" + 64 hex), what it was charged and holds, and this process's deposits; -1 when none */
 int hpplite_store_channel(HppliteStore *s, char zId[67], uint64_t *pCharged, uint64_t *pBalance, uint64_t *pDeposited);
 
-/* Put bytes: the reference (sqlite3_mprintf, caller frees) and, when the
-** provider signed one, its receipt as compact JSON (sqlite3_mprintf, or
-** NULL). NULL on failure; hpplite_store_error() says why. */
-char *hpplite_store_put(HppliteStore *store, const uint8_t *data, size_t len, char **pzReceipt);
+/* Put bytes: the reference (sqlite3_mprintf, caller frees), NULL on failure; hpplite_store_error() says why.
+** No per-item receipt (#249: hpplite-store/1's went with /1): the store's word is the bucket statement an anchor carries */
+char *hpplite_store_put(HppliteStore *store, const uint8_t *data, size_t len);
 /* ...at a batch height: a hpplite-store/2 store takes the bytes into the rollup's bucket, signed for that
-** height (what a prune point counts); put is put_at height 0. No receipt at /2: the bucket statement is */
-char *hpplite_store_put_at(HppliteStore *store, uint64_t height, const uint8_t *data, size_t len, char **pzReceipt);
+** height (what a prune point counts); put is put_at height 0 */
+char *hpplite_store_put_at(HppliteStore *store, uint64_t height, const uint8_t *data, size_t len);
 /*
 ** hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket at the store, paid from a funding
 ** wallet whose key is derived from the node's. set_bucket names the rollup (its DA) and what the
@@ -112,15 +111,6 @@ int hpplite_store_payment(HppliteStore *store, unsigned char asset[20], uint64_t
 /* Seconds a payment authorization stays valid (default 120; a test chain whose clock ran ahead needs more) */
 void hpplite_store_set_valid_for(HppliteStore *store, uint64_t seconds);
 
-/*
-** A pin service's receipt, as the chain carries it (#33): 94 bytes,
-** version 1 | signer (20) | expires (8, big-endian seconds) | signature (65),
-** the provider's EIP-712 signature over Receipt(bytes32 hash, string cid,
-** uint256 expires) in its domain. Compact from the JSON the service
-** answers (94, or -1 when it is not a receipt); decode back for display
-** and verification.
-*/
-#define HPPLITE_RECEIPT_SIZE 114
 /* The name a store gives bytes whose sha-256 is `digest`: CIDv1, raw, base32 (what put returns for them);
 ** a reader that holds a digest (#164: the manifest's, from the chain) asks the store for this */
 void hpplite_store_cid_from_sha256(const uint8_t digest[32], char out[64]);
@@ -141,17 +131,7 @@ uint8_t *hpplite_store_get_named(HppliteStore *store, const char *zName, size_t 
 /* The wallet a named entry's signature recovers to (0), or -1 when it does not recover */
 int hpplite_store_batch_signer(const unsigned char da[20], uint64_t chainId, const unsigned char instance[32], uint64_t height,
                                const uint8_t *data, size_t len, const uint8_t sig[65], unsigned char out[20]);
-/* version 1 | signer (20) | payTo (20, the receipt domain's verifyingContract) | expires (8) | signature (65) */
-int hpplite_store_receipt_compact(const char *zReceiptJson, const unsigned char payTo[20], uint8_t out[HPPLITE_RECEIPT_SIZE]);
-int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char signer[20], unsigned char payTo[20],
-                                 uint64_t *pExpires, unsigned char sig[65]);
-/* The receipt's signature recovers to its signer over (hash, cid, expires) in the domain
-** ("HPPLitePinService", "1", chainId, payTo); and, when expected is given, that signer is
-** the expected one. 0 verified, -1 not. */
-int hpplite_store_receipt_verify(const uint8_t *receipt, size_t n, const unsigned char hash[32], const char *zCid,
-                                 uint64_t chainId, const unsigned char *expectedSigner);
-
-/* The provider's published signer and receipt domain (from its /status at open); 0 with them, -1 when the provider named none */
+/* The store's published signer and signing domain (from its /status at open); 0 with them, -1 when the store named none */
 int hpplite_store_signer(HppliteStore *store, unsigned char out[20]);
 int hpplite_store_domain(HppliteStore *store, unsigned char payTo[20], uint64_t *pChainId);
 
@@ -159,7 +139,6 @@ int hpplite_store_domain(HppliteStore *store, unsigned char payTo[20], uint64_t 
 #define HPPLITE_STORE_FAIL_NONE        0
 #define HPPLITE_STORE_FAIL_UNREACHABLE 1   /* no answer: the chain can carry the bytes meanwhile */
 #define HPPLITE_STORE_FAIL_CAP         2   /* the price is over storecap=: nothing signed, the batch waits */
-#define HPPLITE_STORE_FAIL_RECEIPT     3   /* the receipt does not verify: the provider is not to be trusted with this batch */
 #define HPPLITE_STORE_FAIL_OTHER       4
 int hpplite_store_last_failure(HppliteStore *store);
 long hpplite_store_take_status(HppliteStore *store);   /* the last request's HTTP status since last asked: -1 none, 0 no answer (#229) */

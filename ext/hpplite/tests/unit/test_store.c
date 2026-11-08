@@ -109,25 +109,23 @@ static void stop_service(void) {
 }
 
 static void test_roundtrip(HppliteStore *s) {
-    TEST("put bytes into the rollup's bucket (bound at the first put), get them back by the reference; no per-item receipt at /2");
+    TEST("put bytes into the rollup's bucket (bound at the first put), get them back by the reference");
     const uint8_t data[] = "a sealed batch, as the node would post it";
-    char *zReceipt = NULL, *zRef = hpplite_store_put_at(s, 1, data, sizeof(data) - 1, &zReceipt);
+    char *zRef = hpplite_store_put_at(s, 1, data, sizeof(data) - 1);
     if (!zRef) FAILF("put: %s", hpplite_store_error(s));
     if (strncmp(zRef, "bafkrei", 7) != 0) { sqlite3_free(zRef); FAIL("the reference is not a CIDv1 raw sha-256"); }
-    if (zReceipt) { sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("a /2 put carries no receipt"); }
     if (!hpplite_store_is_bucket(s) || !hpplite_store_bucket_state(s) || strcmp(hpplite_store_bucket_state(s), "covered") != 0) {
         sqlite3_free(zRef); FAIL("the bucket is bound and covered");
     }
     size_t n = 0;
     uint8_t *back = hpplite_store_get(s, zRef, &n);
-    if (!back || n != sizeof(data) - 1 || memcmp(back, data, n) != 0 || back[n] != 0) { free(back); sqlite3_free(zRef); sqlite3_free(zReceipt); FAIL("get: bytes or terminator"); }
+    if (!back || n != sizeof(data) - 1 || memcmp(back, data, n) != 0 || back[n] != 0) { free(back); sqlite3_free(zRef); FAIL("get: bytes or terminator"); }
     free(back);
     /* the same bytes again: the same reference, held already */
-    char *zRef2 = hpplite_store_put_at(s, 1, data, sizeof(data) - 1, NULL);
-    if (!zRef2 || strcmp(zRef, zRef2) != 0) { sqlite3_free(zRef); sqlite3_free(zRef2); sqlite3_free(zReceipt); FAIL("a second put of the same bytes should give the same reference"); }
+    char *zRef2 = hpplite_store_put_at(s, 1, data, sizeof(data) - 1);
+    if (!zRef2 || strcmp(zRef, zRef2) != 0) { sqlite3_free(zRef); sqlite3_free(zRef2); FAIL("a second put of the same bytes should give the same reference"); }
     sqlite3_free(zRef);
     sqlite3_free(zRef2);
-    sqlite3_free(zReceipt);
     if (hpplite_store_spent(s, NULL) != 0) FAIL("nothing should have been paid in free mode");
     PASS();
 }
@@ -165,7 +163,7 @@ static void test_statement(HppliteStore *s, const char *url) {
     HppliteStore *other = hpplite_store_open(url, k2, 0);
     memset(da, 0xa1, 20);
     hpplite_store_set_bucket(other, da, 0);
-    char *zRef = other ? hpplite_store_put_at(other, 2, (const uint8_t *)"not yours", 9, NULL) : NULL;
+    char *zRef = other ? hpplite_store_put_at(other, 2, (const uint8_t *)"not yours", 9) : NULL;
     const char *why = other ? hpplite_store_error(other) : "open";
     printf("(another key: %s) ", zRef ? "taken" : why);
     sqlite3_free(zRef);
@@ -181,11 +179,11 @@ static void test_errors(HppliteStore *s) {
     uint8_t *back = hpplite_store_get(s, "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &n);
     if (back || n != 0) { free(back); FAIL("get of an unknown reference"); }
     if (!hpplite_store_error(s)[0]) FAIL("no reason given");
-    if (hpplite_store_put(s, (const uint8_t *)"", 0, NULL) != NULL) FAIL("an empty put");
+    if (hpplite_store_put(s, (const uint8_t *)"", 0) != NULL) FAIL("an empty put");
     if (hpplite_store_open("ftp://nowhere", NULL, 0) != NULL) FAIL("ftp:// opened");
     HppliteStore *dead = hpplite_store_open("http://127.0.0.1:9", NULL, 0);
     if (!dead) FAIL("open of an unreachable store should succeed (it is reached at the first call)");
-    if (hpplite_store_put(dead, (const uint8_t *)"x", 1, NULL) != NULL) { hpplite_store_close(dead); FAIL("a put to a dead store"); }
+    if (hpplite_store_put(dead, (const uint8_t *)"x", 1) != NULL) { hpplite_store_close(dead); FAIL("a put to a dead store"); }
     if (!strstr(hpplite_store_error(dead), "unreachable")) { hpplite_store_close(dead); FAILF("reason: %s", hpplite_store_error(dead)); }
     hpplite_store_close(dead);
     PASS();
@@ -293,13 +291,11 @@ static void test_kubo(const char *url, const char *tag) {   /* tag: the files' s
     HppliteStore *s = hpplite_store_open(url, NULL, 0);
     if (!s) FAIL("kubo:// did not open");
     const uint8_t data[] = "bytes on a Kubo node";
-    char *zReceipt = (char *)"unset";
-    char *zRef = hpplite_store_put(s, data, sizeof(data) - 1, &zReceipt);
+    char *zRef = hpplite_store_put(s, data, sizeof(data) - 1);
     if (!zRef) { printf("(%s) ", hpplite_store_error(s)); hpplite_store_close(s); FAIL("put"); }
     if (strcmp(zRef, "bafkreihvqzvroh57j7qeruusyaoawj62ny72bxluzpmjzatjhtklrlwtte") != 0) {   /* CIDv1 raw sha-256 of the bytes */
         printf("(ref %s) ", zRef); sqlite3_free(zRef); hpplite_store_close(s); FAIL("the reference is not the bytes' CIDv1");
     }
-    if (zReceipt) { sqlite3_free(zRef); hpplite_store_close(s); FAIL("a Kubo node signs nothing: the receipt must be NULL"); }
     {
         size_t n = 0;
         uint8_t *back = hpplite_store_get(s, zRef, &n);
@@ -356,13 +352,11 @@ static void test_s3(const char *url, const char *secret, const char *tag) {
     HppliteStore *s = hpplite_store_open(url, NULL, 0);
     if (!s) FAIL("s3:// did not open");
     const uint8_t data[] = "bytes on a Kubo node";                 /* the same bytes, the same CID as case 5 */
-    char *zReceipt = (char *)"unset";
-    char *zRef = hpplite_store_put(s, data, sizeof(data) - 1, &zReceipt);
+    char *zRef = hpplite_store_put(s, data, sizeof(data) - 1);
     if (!zRef) { printf("(%s) ", hpplite_store_error(s)); hpplite_store_close(s); FAIL("put"); }
     if (strcmp(zRef, "bafkreihvqzvroh57j7qeruusyaoawj62ny72bxluzpmjzatjhtklrlwtte") != 0) {
         printf("(ref %s) ", zRef); sqlite3_free(zRef); hpplite_store_close(s); FAIL("the reference is not the bytes' CIDv1");
     }
-    if (zReceipt) { sqlite3_free(zRef); hpplite_store_close(s); FAIL("a bucket signs nothing: the receipt must be NULL"); }
     {
         size_t n = 0;
         uint8_t *back = hpplite_store_get(s, zRef, &n);
@@ -382,7 +376,7 @@ static void test_s3(const char *url, const char *secret, const char *tag) {
     s = hpplite_store_open(url, NULL, 0);
     if (secret) setenv("AWS_SECRET_ACCESS_KEY", secret, 1); else unsetenv("AWS_SECRET_ACCESS_KEY");
     if (!s) FAIL("reopen");
-    zRef = hpplite_store_put(s, data, sizeof(data) - 1, NULL);
+    zRef = hpplite_store_put(s, data, sizeof(data) - 1);
     if (zRef || !strstr(hpplite_store_error(s), "SignatureDoesNotMatch") || hpplite_store_last_failure(s) != HPPLITE_STORE_FAIL_OTHER) {
         printf("(ref %s, '%s') ", zRef ? zRef : "none", hpplite_store_error(s)); sqlite3_free(zRef); hpplite_store_close(s);
         FAIL("a wrong secret should be refused with SignatureDoesNotMatch");
@@ -1044,7 +1038,7 @@ static void test_manifest_short_hex(const char *url) {
     /* the manifest of 2-2 as a sequencer bug might write it: chain_before an empty string; the chain names its digest */
     text = sqlite3_mprintf("{\"v\":1,\"batches\":[{\"h\":2,\"hash\":\"0x%064d\",\"ref\":\"nothing\"}],\"from\":2,\"to\":2,\"chain_before\":\"\",\"chain_after\":\"0x%064d\",\"root\":\"0x%064d\"}", 0, 0, 0);
     hpplite_store_sha256((const uint8_t *)text, strlen(text), digest);
-    zRef = hpplite_store_put_at(w->store, 2, (const uint8_t *)text, strlen(text), NULL);
+    zRef = hpplite_store_put_at(w->store, 2, (const uint8_t *)text, strlen(text));
     if (!zRef) { printf("(%s) ", hpplite_store_error(w->store)); sqlite3_free(text); hpplite_node_destroy(w); FAIL("the crafted manifest at the store"); }
     sqlite3_free(zRef); sqlite3_free(text);
     memset(&bad, 0, sizeof bad);
@@ -1442,12 +1436,11 @@ static void test_protocol(const char *dir) {
         if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the store did not start"); }
         snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
         HppliteStore *st = hpplite_store_open(url, NULL, 0);
-        char *receipt = NULL;
-        char *ref = st ? hpplite_store_put(st, (const uint8_t *)"protocol", 8, &receipt) : NULL;
+        char *ref = st ? hpplite_store_put(st, (const uint8_t *)"protocol", 8) : NULL;
         const char *err = st ? hpplite_store_error(st) : "open";
         printf("(%s: %s) ", claims[k], ref ? "taken" : err);
         int refused = !ref && err && strstr(err, claims[k]);
-        sqlite3_free(ref); sqlite3_free(receipt);
+        sqlite3_free(ref);
         if (st) hpplite_store_close(st);
         kill(pid, SIGTERM); waitpid(pid, NULL, 0);
         if (!refused) FAIL("the node put to a store that speaks another protocol");

@@ -187,8 +187,8 @@ DA's names from `pruneHeight` to `height`, covered until `coveredUntil`
 (seconds; 2^53-1, 9007199254740991, when nothing is charged: a number every
 JSON encoder prints and every parser reads back exactly, #216). An
 anchor commits the latest statement in its `receipt` field (the contract
-takes opaque bytes: a compact form, version byte 2, in place of /1's
-receipt, version 1), so a store that deletes a covered bucket's bytes, or
+takes opaque bytes: a compact form, version byte 2; /1's per-item receipt,
+version 1, is neither written nor read since v0.8, #249), so a store that deletes a covered bucket's bytes, or
 bytes above a prune point, is caught by its own signature on chain.
 
 ## `GET /status`

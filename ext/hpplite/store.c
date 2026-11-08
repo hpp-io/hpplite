@@ -55,7 +55,7 @@ struct HppliteStore {
     uint64_t retentionSeconds;      /* what a put buys */
     int lastFailure;                /* HPPLITE_STORE_FAIL_* */
     long lastStatus;                /* the HTTP status of the last request, -1 none since taken (#229) */
-    int hasSigner;                  /* the provider's /status named its receipt signer and domain */
+    int hasSigner;                  /* the provider's /status named its signer and domain */
     unsigned char signer[20];
     unsigned char payTo[20];        /* the receipt domain's verifyingContract */
     uint64_t chainId;
@@ -928,7 +928,7 @@ static uint8_t *s3Get(HppliteStore *s, const char *zRef, size_t *pLen) {
 /* The provider's /status: its protocol, which key signs, in which domain, what it charges. The HTTP status */
 static long statusRead(HppliteStore *s) {
     long code;
-    /* the provider's /status: which key signs its receipts, in which domain */
+    /* the provider's /status: which key signs for it, in which domain */
     Buf out = {0};
     if ((code = storeRequest(s, "GET", "/status", NULL, 0, NULL, &out, NULL, NULL)) == 200 && out.p) {
         cJSON *st = cJSON_Parse(out.p);
@@ -1092,36 +1092,6 @@ void hpplite_store_close(HppliteStore *s) {
 }
 
 void hpplite_store_set_valid_for(HppliteStore *s, uint64_t seconds) { if (s && seconds) s->validFor = seconds; }
-
-int hpplite_store_receipt_compact(const char *zJson, const unsigned char payTo[20], uint8_t out[HPPLITE_RECEIPT_SIZE]) {
-    cJSON *r = zJson ? cJSON_Parse(zJson) : NULL;
-    cJSON *signer = r ? cJSON_GetObjectItem(r, "signer") : NULL, *expires = r ? cJSON_GetObjectItem(r, "expires") : NULL,
-          *sig = r ? cJSON_GetObjectItem(r, "signature") : NULL;
-    uint64_t exp;
-    int i;
-    if (!signer || !cJSON_IsString(signer) || strlen(signer->valuestring) != 42
-        || !sig || !cJSON_IsString(sig) || strlen(sig->valuestring) != 132 || !expires) { cJSON_Delete(r); return -1; }
-    exp = cJSON_IsNumber(expires) ? (uint64_t)expires->valuedouble : (uint64_t)strtoull(expires->valuestring ? expires->valuestring : "0", NULL, 10);
-    out[0] = 1;
-    if (hpplite_hex_to_bytes(signer->valuestring + 2, out + 1, 20) < 0 || hpplite_hex_to_bytes(sig->valuestring + 2, out + 49, 65) < 0) { cJSON_Delete(r); return -1; }
-    memcpy(out + 21, payTo, 20);
-    for (i = 0; i < 8; i++) out[41 + 7 - i] = (uint8_t)(exp >> (8 * i));
-    cJSON_Delete(r);
-    return HPPLITE_RECEIPT_SIZE;
-}
-
-int hpplite_store_receipt_decode(const uint8_t *receipt, size_t n, unsigned char signer[20], unsigned char payTo[20],
-                                 uint64_t *pExpires, unsigned char sig[65]) {
-    uint64_t exp = 0;
-    int i;
-    if (!receipt || n != HPPLITE_RECEIPT_SIZE || receipt[0] != 1) return -1;
-    if (signer) memcpy(signer, receipt + 1, 20);
-    if (payTo) memcpy(payTo, receipt + 21, 20);
-    for (i = 0; i < 8; i++) exp = (exp << 8) | receipt[41 + i];
-    if (pExpires) *pExpires = exp;
-    if (sig) memcpy(sig, receipt + 49, 65);
-    return 0;
-}
 
 /* === hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket and its funding wallet ===
 ** The funding key is derived from the node's (keccak256("hpplite funding key" || key)): backing up
@@ -1624,15 +1594,14 @@ long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *b
     return status;
 }
 
-char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len, char **pzReceipt) {
-    return hpplite_store_put_at(s, 0, data, len, pzReceipt);
+char *hpplite_store_put(HppliteStore *s, const uint8_t *data, size_t len) {
+    return hpplite_store_put_at(s, 0, data, len);
 }
 
-char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data, size_t len, char **pzReceipt) {
+char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data, size_t len) {
     Buf out = {0};
     char *zRequired = NULL, *zResponse = NULL, *zRef = NULL, *zHeader = NULL, path[160];
     long status;
-    if (pzReceipt) *pzReceipt = NULL;
     if (!s || !data || !len) return NULL;
     s->error[0] = 0;
     s->lastFailure = HPPLITE_STORE_FAIL_NONE;
@@ -1675,27 +1644,9 @@ char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data
     }
     {
         cJSON *r = out.p ? cJSON_Parse(out.p) : NULL;
-        cJSON *cid = r ? cJSON_GetObjectItem(r, "cid") : NULL, *receipt = r ? cJSON_GetObjectItem(r, "receipt") : NULL;
+        cJSON *cid = r ? cJSON_GetObjectItem(r, "cid") : NULL;
         if (cid && cJSON_IsString(cid) && cid->valuestring[0]) {
             zRef = sqlite3_mprintf("%s", cid->valuestring);
-            if (receipt && cJSON_IsObject(receipt)) {
-                char *z = cJSON_PrintUnformatted(receipt);
-                /* the receipt must be the provider's own promise over these bytes, or it is worth nothing */
-                if (z && s->hasSigner) {
-                    uint8_t compact[HPPLITE_RECEIPT_SIZE];
-                    unsigned char h[32];
-                    hpplite_keccak256(data, len, h);
-                    if (hpplite_store_receipt_compact(z, s->payTo, compact) != HPPLITE_RECEIPT_SIZE
-                        || hpplite_store_receipt_verify(compact, HPPLITE_RECEIPT_SIZE, h, zRef, s->chainId, s->signer) != 0) {
-                        snprintf(s->error, sizeof s->error, "the store's receipt for %s does not verify against its published signer", zRef);
-                        s->lastFailure = HPPLITE_STORE_FAIL_RECEIPT;
-                        sqlite3_free(zRef);
-                        zRef = NULL;
-                    }
-                }
-                if (zRef && pzReceipt && z) *pzReceipt = sqlite3_mprintf("%s", z);
-                free(z);
-            }
         } else {
             snprintf(s->error, sizeof s->error, "store's answer to put names no cid");
             s->lastFailure = HPPLITE_STORE_FAIL_OTHER;
@@ -1705,50 +1656,6 @@ char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data
     free(out.p);
     if (zRef) s->nOk++;
     return zRef;
-}
-
-/* The receipt's domain ("HPPLitePinService", "1", chainId, payTo) and struct Receipt(bytes32 hash, string cid, uint256 expires) */
-static void receiptDigest(const unsigned char hash[32], const char *zCid, uint64_t expires, uint64_t chainId,
-                          const unsigned char payTo[20], unsigned char digest[32]) {
-    static const char zDomainType[] = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
-    static const char zReceiptType[] = "Receipt(bytes32 hash,string cid,uint256 expires)";
-    unsigned char w[160], domain[32], st[32], pre[66];
-    hpplite_keccak256((const unsigned char *)zDomainType, sizeof(zDomainType) - 1, w);
-    hpplite_keccak256((const unsigned char *)"HPPLitePinService", 17, w + 32);
-    hpplite_keccak256((const unsigned char *)"1", 1, w + 64);
-    wordInt(chainId, w + 96);
-    memset(w + 128, 0, 32); memcpy(w + 128 + 12, payTo, 20);
-    hpplite_keccak256(w, 160, domain);
-    hpplite_keccak256((const unsigned char *)zReceiptType, sizeof(zReceiptType) - 1, w);
-    memcpy(w + 32, hash, 32);
-    hpplite_keccak256((const unsigned char *)zCid, strlen(zCid), w + 64);
-    wordInt(expires, w + 96);
-    hpplite_keccak256(w, 128, st);
-    pre[0] = 0x19; pre[1] = 0x01;
-    memcpy(pre + 2, domain, 32);
-    memcpy(pre + 34, st, 32);
-    hpplite_keccak256(pre, 66, digest);
-}
-
-int hpplite_store_receipt_verify(const uint8_t *receipt, size_t n, const unsigned char hash[32], const char *zCid,
-                                 uint64_t chainId, const unsigned char *expectedSigner) {
-    unsigned char signer[20], payTo[20], sig[65], digest[32], pub[33], addr[20];
-    uint64_t expires = 0;
-    HppliteSignature hs;
-    HppliteCrypto *crypto;
-    int rc;
-    if (hpplite_store_receipt_decode(receipt, n, signer, payTo, &expires, sig) != 0 || !hash || !zCid) return -1;
-    if (expectedSigner && memcmp(expectedSigner, signer, 20) != 0) return -1;
-    receiptDigest(hash, zCid, expires, chainId, payTo, digest);
-    memcpy(hs.sig, sig, 64);
-    hs.recid = sig[64] >= 27 ? sig[64] - 27 : sig[64];
-    if (hs.recid > 1) return -1;
-    crypto = hpplite_crypto_init();
-    if (!crypto) return -1;
-    rc = hpplite_crypto_recover_pubkey(crypto, digest, &hs, pub);
-    hpplite_crypto_free(crypto);
-    if (rc != 0 || eth_address_from_compressed_pubkey(pub, addr) != 0) return -1;
-    return memcmp(addr, signer, 20) == 0 ? 0 : -1;
 }
 
 /* What HPPLiteDA.batchDigest() computes (DA version 3): the sequencer's claim about one height */
