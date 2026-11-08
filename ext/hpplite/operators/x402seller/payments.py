@@ -21,7 +21,6 @@ class Payments:
         self.extra = {"name": asset_name, "version": asset_version}
         self.rpc = rpc
         self.settled = 0
-        self.channels = None        # channels.Channels when batch-settlement is offered (#135)
 
     @property
     def enabled(self):
@@ -36,7 +35,7 @@ class Payments:
             "accepts": [{
                 "scheme": "exact", "network": self.network, "amount": str(amount), "asset": self.asset,
                 "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": self.extra,
-            }] + ([self.channels.requirement(amount)] if self.channels else []),
+            }],
         }
         for a in out["accepts"]:
             a["extra"] = dict(a["extra"], **(extra or {}))

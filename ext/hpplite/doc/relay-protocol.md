@@ -46,8 +46,8 @@ The `402` quotes the call's gas (the estimate plus headroom) at the current
 fee, plus the relay's margin, converted to the asset's atomic units, at
 least its minimum fee: `max(ceil(gas × fee × (1 + margin) × ethUsd × 10^6 /
 10^18), minFee)` in IEEE doubles in that order (cases in
-`operators/conformance/vectors.json`). Offers as in the store protocol: `exact`, and
-`batch-settlement` when the relay offers channels.
+`operators/conformance/vectors.json`). The offer is x402's `exact` (the
+`batch-settlement` channels of v0.5-v0.7 were removed in v0.8, #251).
 
 Every offer's `extra.quote` is `{gas, until, mac}`: the gas the price was
 computed for, the quote's expiry (unix seconds), and a MAC by the relay over
@@ -57,10 +57,8 @@ a relay honours a quote it made, for that call, until `until`, with nothing
 remembered between the `402` and the retry. An `accepted` whose quote does
 not verify is priced anew.
 
-A payment is settled only after the transaction succeeded. Paid by voucher,
-the call is charged what it cost - `gasUsed` at its effective gas price,
-converted as quoted - at most the quote (`extra.chargedAmount` in
-`PAYMENT-RESPONSE`).
+A payment is settled only after the transaction succeeded, at the quoted
+amount.
 
 ## `GET /status`
 

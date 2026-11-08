@@ -3,8 +3,6 @@
 what the reference computes from them - keccak, addresses, signatures
 (RFC 6979, so deterministic), CIDs, the name's EIP-712 digest and
 hpplite-store/2's (Bind, Release, Content, Prune, BucketStatement, #213),
-x402 batch-settlement's channel id, voucher, refund and claim digests (the
-relay's), the store's write quote and the relay's prices, the relay's quote
 MAC and the selectors it takes. vectors.json is what another implementation (the
 canonical operators' TypeScript) tests itself against; this script checks
 the reference still computes it.
@@ -20,7 +18,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 sys.path.insert(0, os.path.join(here, "..", "store"))
 sys.path.insert(0, os.path.join(here, "..", "relay"))
-from x402seller import channels, eth  # noqa: E402
+from x402seller import eth  # noqa: E402
 import hpplite_store  # noqa: E402
 import relay  # noqa: E402
 
@@ -68,20 +66,6 @@ def generate():
         v["names"].append({"chainId": 181228, "name": name, "instance": instance, "data": "0x" + d.hex(), "key": KEYS[1],
                            "digest": "0x" + digest.hex(), "signature": "0x" + eth.sign(key(1), digest).hex(),
                            "signer": eth.address(key(1))})
-
-    # x402 batch-settlement (#135)
-    cfg = {"payer": eth.address(key(1)), "payerAuthorizer": eth.address(key(1)), "receiver": pay_to,
-           "receiverAuthorizer": eth.address(key(0)), "token": "0x401eCb1D350407f13ba348573E5630B83638E30D",
-           "withdrawDelay": 86400, "salt": "0x" + eth.keccak256(b"salt").hex()}
-    cid = channels.channel_id(cfg, 181228)
-    v["channels"] = {
-        "chainId": 181228, "escrow": channels.ESCROW, "config": cfg, "channelId": cid,
-        "vouchers": [{"maxClaimableAmount": m, "digest": "0x" + channels.voucher_digest(cid, m, 181228).hex(),
-                      "signature": "0x" + eth.sign(key(1), channels.voucher_digest(cid, m, 181228)).hex()} for m in (10, 123456789)],
-        "refund": {"nonce": 3, "amount": 500, "digest": "0x" + channels.refund_digest(cid, 3, 500, 181228).hex()},
-        "claimBatch": {"entries": [[cid, 1000, 990], ["0x" + "cd" * 32, 5, 5]],
-                       "digest": "0x" + channels.claim_batch_digest([(cid, 1000, 990), ("0x" + "cd" * 32, 5, 5)], 181228).hex()},
-    }
 
     # prices: the store's write quote (#172, #213), the relay's per call (#170); IEEE doubles in this order
     v["writePrices"] = [{"bytes": n, "pricePerWrite": pw, "pricePerMiBMonth": pm, "amount": hpplite_store.write_quote(n, pw, pm)}

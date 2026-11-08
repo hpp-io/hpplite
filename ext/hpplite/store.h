@@ -38,15 +38,6 @@ void hpplite_store_set_relay(HppliteStore *s);
 struct HppliteSpend;
 void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp);
 
-/* x402 batch-settlement (#135): with depositCap > 0 the node pays a 402 that offers it by
-** voucher in a channel of x402's escrow, depositing when the channel cannot cover the call,
-** never leaving more than depositCap unspent there (relaydeposit=; a /2 store offers no channels, #214). The channel's salt binds
-** it to the rollup (da); the running total survives a restart in zStatePath (NULL: memory
-** only, the seller's corrective 402 restores it). 0 turns it off: exact per call. */
-void hpplite_store_set_channel(HppliteStore *s, uint64_t depositCap, const unsigned char da[20], const char *zStatePath);
-/* The channel paid in: its id ("0x" + 64 hex), what it was charged and holds, and this process's deposits; -1 when none */
-int hpplite_store_channel(HppliteStore *s, char zId[67], uint64_t *pCharged, uint64_t *pBalance, uint64_t *pDeposited);
-
 /* Put bytes: the reference (sqlite3_mprintf, caller frees), NULL on failure; hpplite_store_error() says why.
 ** No per-item receipt (#249: hpplite-store/1's went with /1): the store's word is the bucket statement an anchor carries */
 char *hpplite_store_put(HppliteStore *store, const uint8_t *data, size_t len);

@@ -274,8 +274,6 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val && val[0] >= '0' && val[0] <= '9') { cfg->storePermit = (uint64_t)atoll(val); cfg->storePermitSet = 1; }
     val = getenv(HPPLITE_ENV_SOFT);
     if (val && val[0]) cfg->softOff = strcasecmp(val, "off") == 0 || strcmp(val, "0") == 0;
-    val = getenv(HPPLITE_ENV_RELAY_DEPOSIT);
-    if (val && atoll(val) > 0) cfg->relayDeposit = (uint64_t)atoll(val);
     val = getenv(HPPLITE_ENV_SPEND_CAP);
     if (val && val[0] && hpplite_spend_parse_cap(val, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: %s=%s: not N, N/hour or N/day; ignored\n", HPPLITE_ENV_SPEND_CAP, val);
     val = getenv(HPPLITE_ENV_LOW_BALANCE);
@@ -534,7 +532,8 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->storePermit = (uint64_t)atoll(buf);
         cfg->storePermitSet = 1;
     }
-    if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->relayDeposit = (uint64_t)atoll(buf);
+    if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)))
+        snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (relaycap= bounds a call)");
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf)) && buf[0]) cfg->softOff = strcasecmp(buf, "off") == 0 || strcmp(buf, "0") == 0;
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) { int64_t k = parse_keep_seconds(buf); if (k >= 0) cfg->keepSeconds = k; }
@@ -731,7 +730,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_AT);
     if (val && atoll(val) > 0) cfg->syncAtMs = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_DEPOSIT);
-    if (val && atoll(val) > 0) cfg->relayDeposit = (uint64_t)atoll(val);
+    if (val) snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (relaycap= bounds a call)");
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SPEND_CAP);
     if (val && val[0] && hpplite_spend_parse_cap(val, &cfg->spendCap, &cfg->spendWindow) != 0) fprintf(stderr, "hpplite: spendcap=%s: not N, N/hour or N/day; ignored\n", val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_LOW_BALANCE);
@@ -865,6 +864,7 @@ int hpplite_config_resolve_operators(HppliteConfig *cfg) {
         }
         free(*k[i].pz);
         *k[i].pz = strdup(url);
+        if (i == 1 && cfg->relayCap == 0) cfg->relayCap = HPPLITE_DEFAULT_RELAY_CAP;   /* relay=on pays: a cap of 0 could pay nothing (#251) */
     }
     return 0;
 }

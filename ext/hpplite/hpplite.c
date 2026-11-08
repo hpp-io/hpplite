@@ -921,7 +921,6 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->storeUrl = cfg->storeUrl;
     nc->storeCap = cfg->storeCap;
     nc->storePermit = cfg->storePermitSet ? cfg->storePermit : 20000000;   /* 20 USDC.e by default (#214) */
-    nc->relayDeposit = cfg->relayDeposit;
     nc->softOff = cfg->softOff;
     nc->syncTo = nc->verifyOnly ? cfg->syncTo : 0;      /* a stop for a verifier only: a sequencer must replay all (#206) */
     nc->keepSeconds = cfg->keepSeconds;                /* pruning behind a snapshot (#223) */

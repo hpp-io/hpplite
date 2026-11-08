@@ -14,7 +14,7 @@
 **   HPPLITE_L1_CHAIN_ID       - L1 chain ID (e.g., 181228)
 **   HPPLITE_FACTORY_ADDRESS   - Factory contract (auto-creates rollup per wallet)
 **   HPPLITE_CONTRACT_ADDRESS  - Existing rollup contract
-**   HPPLITE_DATA_DIR          - the per-wallet spending ledger and relay channel files (default /tmp/hpplite)
+**   HPPLITE_DATA_DIR          - the per-wallet spending ledger (default /tmp/hpplite)
 **   HPPLITE_BATCH_INTERVAL    - Batch flush interval (500ms, 5s, 1m, 1h; 0 = no timer)
 **   HPPLITE_ENCRYPT           - on|off: seal batches before posting (default on)
 **   HPPLITE_CHECKPOINT_INTERVAL - batches per checkpoint / state root (default 100)
@@ -62,7 +62,6 @@ extern "C" {
 #define HPPLITE_ENV_STORE_CAP     "HPPLITE_STORE_CAP"
 #define HPPLITE_ENV_STORE_PERMIT "HPPLITE_STORE_PERMIT"
 #define HPPLITE_ENV_SPEND_CAP     "HPPLITE_SPEND_CAP"
-#define HPPLITE_ENV_RELAY_DEPOSIT "HPPLITE_RELAY_DEPOSIT"
 #define HPPLITE_ENV_SOFT          "HPPLITE_SOFT"
 #define HPPLITE_ENV_LOW_BALANCE   "HPPLITE_LOW_BALANCE"
 #define HPPLITE_ENV_RELAY         "HPPLITE_RELAY"          /* a relay submits the signed forms of the writes, paid over x402 (#126) */
@@ -101,7 +100,7 @@ extern "C" {
 #define HPPLITE_URI_SYNC_TO      "syncto"      /* a verifier's stop: no batch past this height is applied (hpplite-verify --to, #206) */
 #define HPPLITE_URI_SYNC_AT      "syncat"      /* ...no batch written after this time, ms since the epoch (hpplite-verify --at, #205) */
 #define HPPLITE_URI_SOFT          "soft"        /* a verifier with a store follows the soft tier (#166); off: the anchored height only */
-#define HPPLITE_URI_RELAY_DEPOSIT "relaydeposit" /* batch-settlement for the relay (#179): the most unspent in its channel */
+#define HPPLITE_URI_RELAY_DEPOSIT "relaydeposit" /* gone (#251): refused at open, so a URI from before v0.8 fails loudly */
 #define HPPLITE_URI_SPEND_CAP     "spendcap"    /* the most paid to the store and the relay per hour or day (#173): N/hour, N/day */
 #define HPPLITE_URI_LOW_BALANCE   "lowbalance"  /* warn when the money left lasts fewer hours than this at the recent rate (#173) */
 #define HPPLITE_URI_RELAY         "relay"       /* relay=http://host:port: the writes go to the chain through it, no ETH needed (#126) */
@@ -114,6 +113,7 @@ extern "C" {
 #define HPPLITE_DEFAULT_CHAIN_ID   181228
 #define HPPLITE_DEFAULT_RPC_URL    "https://sepolia.hpp.io"
 #define HPPLITE_DEFAULT_DATA_DIR   "/tmp/hpplite"
+#define HPPLITE_DEFAULT_RELAY_CAP  1000000     /* relay=on without relaycap=: 1 USDC.e per call (a relayed call is cents, #251) */
 
 /*
 ** Role enum
@@ -167,7 +167,7 @@ typedef struct HppliteConfig {
     uint64_t maxTxGas;               /* Gas cap per transaction (0 = by chain id, else unknown) */
     char *storeUrl;                  /* store=: the batch bytes' store (#11); NULL = on chain */
     char *relayUrl;                  /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */
-    uint64_t relayCap;               /* relaycap=: the most to pay the relay per call (0 = pay nothing) */
+    uint64_t relayCap;               /* relaycap=: the most to pay the relay per call (0 = pay nothing; relay=on takes HPPLITE_DEFAULT_RELAY_CAP, #251) */
     uint64_t storeCap;               /* storecap=: the most to pay the store per call (0 = pay nothing) */
     uint64_t storePermit;            /* storepermit=: what the permit lets the store pull, atomic units (#214) */
     int storePermitSet;              /* ...given (0 is a value: no permit, the 402s paid) */
@@ -176,7 +176,6 @@ typedef struct HppliteConfig {
     int fromMode;                    /* from= (#222): 0 the default (a snapshot for a replica, batch 1 for a verifier), 1 snapshot, 2 genesis, 3 earliest (#224) */
     uint64_t syncTo;                 /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;               /* syncat=: ...none written after this time, ms since the epoch (#205); 0: none */
-    uint64_t relayDeposit;           /* relaydeposit=: the relay paid by voucher, the most unspent in its channel (0 = exact, #179) */
     uint64_t spendCap, spendWindow;  /* spendcap=: the most paid in the window (seconds), store and relay together (0 = none, #173) */
     int lowBalanceHours;             /* lowbalance=: warn below this many hours of money at the recent rate (0 = the default, 72; -1 = off) */
     int storeFallback;               /* storefallback=off keeps a batch waiting while the store is down; on (default): the chain carries it */

@@ -149,7 +149,6 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeUrl = node_strdup(config->storeUrl);
     node->config.storeCap = config->storeCap;
     node->config.storePermit = config->storePermit;
-    node->config.relayDeposit = config->relayDeposit;
     node->config.softOff = config->softOff;
     node->syncTo = config->syncTo;
     node->syncAtMs = config->syncAtMs;
@@ -168,19 +167,6 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         if (strncmp(node->config.relayUrl, "http://", 7) != 0 && strncmp(node->config.relayUrl, "https://", 8) != 0) node->relay = NULL;
         else node->relay = hpplite_store_open(node->config.relayUrl, config->hasPrivkey ? config->privkey : NULL, config->relayCap);
         if (node->relay) hpplite_store_set_relay(node->relay);
-        if (node->relay && node->config.relayDeposit) {
-            /* the relay by voucher (#179): one channel for the wallet, not the rollup - the relay is paid
-            ** before the rollup exists (createRollupFor), and every rollup of the wallet goes through it */
-            unsigned char me[20];
-            char *zPath = NULL;
-            if (node->config.dataDir && config->hasPrivkey && eth_address_from_privkey(config->privkey, me) == 0) {
-                char hex[41];
-                hpplite_bytes_to_hex(me, 20, hex);
-                zPath = sqlite3_mprintf("%s/relay-channel-%s.json", node->config.dataDir, hex);
-            }
-            hpplite_store_set_channel(node->relay, node->config.relayDeposit, NULL, zPath);
-            sqlite3_free(zPath);
-        }
         if (!node->relay) {
             fprintf(stderr, "hpplite: relay=%s: not a relay URL (http://host:port of operators/relay or a service like it)\n", node->config.relayUrl);
             return -1;

@@ -335,6 +335,30 @@ static void test_keep_snapshot_cap(void) {
     PASS();
 }
 
+/* #251: the relay's x402 batch-settlement channels are gone - the relay is paid per call (exact); relaydeposit= refuses
+** the open. relay=on with no relaycap= pays up to a default cap: relay=on alone could never pay before (cap 0) */
+#ifndef HPPLITE_DEFAULT_RELAY_CAP
+#define HPPLITE_DEFAULT_RELAY_CAP 1000000
+#endif
+static void test_relay_exact_only(void) {
+    TEST("relaydeposit= refuses the open (channels removed, #251); relay=on gets a default relaycap");
+    HppliteConfig *cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&relay=on&relaydeposit=500000");
+    int refused = !cfg || hpplite_config_error() != NULL;
+    const char *why = hpplite_config_error();
+    if (cfg) hpplite_config_free(cfg);
+    if (!refused || !why || !strstr(why, "relaydeposit")) { printf("  relaydeposit=500000: %s\n", why ? why : "(no error)"); FAIL("relaydeposit= should refuse the open"); }
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&relay=on");
+    int ok = cfg && hpplite_config_resolve_operators(cfg) == 0 && cfg->relayCap == HPPLITE_DEFAULT_RELAY_CAP;
+    if (cfg) printf("  relay=on: relaycap %llu\n", (unsigned long long)cfg->relayCap);
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("relay=on without relaycap= should take the default cap"); }
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-sepolia&relay=on&relaycap=7");
+    ok = cfg && hpplite_config_resolve_operators(cfg) == 0 && cfg->relayCap == 7;
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("relaycap= given keeps its value"); }
+    PASS();
+}
+
 int main(void) {
     printf("test_da_uri: DA URI Scheme Tests\n");
     printf("================================\n\n");
@@ -350,6 +374,7 @@ int main(void) {
     test_alias_interval();
     test_operators_on();
     test_keep_snapshot_cap();
+    test_relay_exact_only();
 
     printf("\n================================\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);

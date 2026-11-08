@@ -250,8 +250,8 @@ Worker, operators#16):
 - the first-signer rule and content-before-name (#199) for names;
 - `batch-settlement` at the store: channels, deposits, vouchers, claims, the
   Ledger and its warnings; the node's `storedeposit=`; undo on a failed
-  settle (#194) becomes "the credit taken back". The relay keeps x402 as it
-  is, channels included;
+  settle (#194) becomes "the credit taken back". The relay dropped its
+  channels in v0.8 too (#251): it is paid per call by `exact`;
 - version negotiation with /1, and migrating per-item history (the Sepolia
   store is reset, operators#12).
 

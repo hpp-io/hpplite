@@ -21,9 +21,9 @@ that dies loses at most what it hadn't flushed: its successor recovers the
 rest from the store.
 
 Stock SQLite, loadable extension, no patches. One sequencer posts. The
-store is paid per put over x402 in USDC.e: one deposit, then a signed
-voucher per put. A wallet with no ETH can run a rollup through a relay that
-sends its transactions, paid the same way.
+store is paid in USDC.e by the rollup's funding wallet, by permit as the
+bytes accrue. A wallet with no ETH can run a rollup through a relay that
+sends its transactions, paid per call over x402.
 
 What HPPLite is **not**:
 - Not a multi-writer database: one sequencer per rollup.
@@ -185,11 +185,10 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `spendcap` | No | The most paid to the store and the relay together over a rolling window, in atomic units: `N/hour` or `N/day` (a bare `N` means per day; #173). It counts what was charged; a channel deposit isn't counted, because it is still the node's money. A put past it is refused before anything is signed, and the batch waits with the reason (`store_state` = `over cap`). The ledger is kept per wallet in the data directory (`spend-<wallet>.json`), so a restart doesn't reset the window. A node opened without its key keeps it in memory. Also `HPPLITE_SPEND_CAP` |
 | `lowbalance` | No | Warn when the money left lasts fewer hours than this at the last day's rate (default 72; 0 turns it off; #173). USDC.e is the wallet's balance plus what is unspent in the store's channel, against the charges. ETH is the wallet's balance, against how fast it fell. The warning prints one line on stderr when it starts and when it clears, and shows in `spend_warning`. Also `HPPLITE_LOW_BALANCE` |
 | `relay` | No | `on` for the network's canonical relay (`l1=hpp-sepolia`: `https://relay.sepolia.hpplite.hpp.io`, #192), or `http://host:port` of a relay ([operators/relay](operators/relay/README.md), #170): every write to the chain goes there as its EIP-712 signed form, paid over x402 like the store: creating the rollup (VERSION 10 factories), the lease, anchors, commitments, checkpoints. A wallet with USDC.e and no ETH runs this way. When the relay fails, the wallet sends the plain transaction itself if it holds ETH; otherwise the write waits and `last_error` says why (#126). The protocol: [doc/relay-protocol.md](doc/relay-protocol.md) (#188). Also `HPPLITE_RELAY` |
-| `relaycap` | No | The most to pay the relay per call, in its asset's atomic units; 0 (default) pays nothing. Also `HPPLITE_RELAY_CAP` |
-| `relaydeposit` | No | Pay the relay by voucher in an x402 `batch-settlement` channel when it offers one (#179). There is one deposit, and each call is charged the gas it actually took, within its quote, with no transfer per call. The value is the most left unspent in the channel, in atomic units. It is one channel per wallet, because the relay is paid before the rollup exists. 0 (default) pays `exact`. Also `HPPLITE_RELAY_DEPOSIT` |
+| `relaycap` | No | The most to pay the relay per call, in its asset's atomic units. With `relay=on` the default is 1000000 (1 USDC.e: a relayed call on HPP costs cents, #251); with a relay URL, 0 (default) pays nothing. Also `HPPLITE_RELAY_CAP` |
 | `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
 | `anchor` | No | With `store=` on a chain that takes ranges (VERSION 9 and later, #164, the `hpp-sepolia` factory): how often the batches the store holds are anchored on the chain in one commitment: `5m`, `30m` (default: HPP's cadence), `1h`; `0` = at close and on `hpplite_anchor()` only. Also `HPPLITE_ANCHOR`. See Stores and commitments |
-| `datadir` | No | Where the two per-wallet files live: the spending ledger `spend-<wallet>.json` (`spendcap=`, #173) and the relay's channel `relay-channel-<wallet>.json` (`relaydeposit=`). They span every database the wallet writes, so they cannot live in the database file, where everything else HPPLite keeps is (`_hpplite_*` tables). Default `/tmp/hpplite`. Also `HPPLITE_DATA_DIR` |
+| `datadir` | No | Where the per-wallet spending ledger `spend-<wallet>.json` lives (`spendcap=`, #173). It spans every database the wallet writes, so it cannot live in the database file, where everything else HPPLite keeps is (`_hpplite_*` tables). Default `/tmp/hpplite`. Also `HPPLITE_DATA_DIR` |
 | `keep` | No | With `snapshot=`: how long the store keeps the history behind a snapshot - `all` (default: every batch, an audit log) or `7d`, `24h`, `30m` (#223). After each anchor the sequencer signs a `Prune` at the newest snapshot made at least that long ago; the store lets go of the batches and older snapshots below it. The snapshots kept are named in each manifest, at most 64 besides the latest, so `keep` divided by the snapshot cadence (the longer of `snapshot=` and `anchor=`: a snapshot is made at an anchor) must not exceed 64 (`snapshot=1h` with `keep=30d` would keep 720: the open refuses it and says so, #231; with anchors by hand, `anchor=0`, the anchor itself makes no snapshot while the list is full). The current state stays provable (that snapshot's root is anchored, then the batches after it); what is lost is replaying how the state got there, and `hpplite-verify --to`/`--at` before it. Also `HPPLITE_KEEP` |
 | `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min for a node without a store, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). With `store=` the chain's cadence goes to `anchor` instead and the interval stays 5 s: the batches reach the store in seconds, the chain gets one commitment per anchor (#164). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
@@ -911,8 +910,6 @@ chain; `--dry-run` prints the two transactions and sends nothing, `--to`
 sends to a node's wallet). Its price is per MiB-month (default $0.03 per GiB-month)
 plus a small fee per put, and the node's `store_price` is exactly what the next
 402 will ask (#172; the costs in [its README](operators/store/README.md)).
-Not here yet: one payment for many puts (#135: HPP's facilitator supports
-x402's `batch-settlement`).
 
 ## Versions
 
@@ -937,7 +934,8 @@ tagged** (2026-11-04). It covers HPP economics:
   and rebuild on a disagreement (#166); recovery of a lost sequencer from the
   store (#167).
 - **Payments:** the store and the relay paid by voucher over x402's
-  batch-settlement (#135, #179); store pricing per MiB-month (#172).
+  batch-settlement (#135, #179; channels removed again in v0.8, #251: the
+  store is paid by permit, the relay per call); store pricing per MiB-month (#172).
 - **A node that holds only USDC.e (#126):** its transactions go through a
   relay (#170) on factory VERSION 10 (#171).
 - **Spending caps and low-balance warnings (#173).**

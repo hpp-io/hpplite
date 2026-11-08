@@ -377,7 +377,6 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_conformance COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/conformance/selftest.sh)
         # ... and leaves nothing running (#196)
         add_test(NAME test_conformance_cleanup COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/conformance/cleanup_check.sh)
-        add_test(NAME test_x402seller COMMAND ${HPPLITE_PYTHON3} -I ${CMAKE_CURRENT_SOURCE_DIR}/operators/x402seller/test_channels.py)
         # The node's store client against it (#11); paid on anvil in scenario 19
         add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
         set_tests_properties(test_store PROPERTIES SKIP_RETURN_CODE 77)

@@ -101,7 +101,7 @@ def start_relay(work, port, keyfile, log, eth_usd="30"):
     url = "http://127.0.0.1:%d" % port
     p = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC,
                           "--key-file", keyfile, "--factory", FACTORY, "--facilitator", os.environ["HPPLITE_ANVIL_FACILITATOR"],
-                          "--asset", USDC, "--eth-usd", eth_usd, "--dir", os.path.join(work, "relay_state")], stdout=log, stderr=log)
+                          "--asset", USDC, "--eth-usd", eth_usd], stdout=log, stderr=log)
     for _ in range(100):
         if p.poll() is not None:
             return p, None

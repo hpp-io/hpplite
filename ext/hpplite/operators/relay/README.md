@@ -5,7 +5,7 @@ gas, charged over x402 in USDC.e. With it, a node whose wallet holds only
 USDC.e can create its rollup, take and renew its lease, and anchor. With the
 pin service beside it ([../store](../store/README.md)), it needs no ETH
 at all. Standard library Python. It shares `../x402seller` with the store:
-`eth.py` (keccak, secp256k1, EIP-712), the x402 seller code and the channels.
+`eth.py` (keccak, secp256k1, EIP-712) and the x402 seller code.
 
 ```sh
 relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file relay.key \
@@ -73,22 +73,12 @@ per 30 minutes. Creating a rollup costs 3.43M gas, a quote of about
 a relay that wants to charge what was used would settle that amount instead
 (#172 is the pricing work).
 
-## Paid by voucher (#179)
+## Paid per call
 
-Each 402 also offers x402's `batch-settlement`, through
-`operators/x402seller/channels.py` (`--no-channels` turns it off). A node with
-`relaydeposit=` deposits once into a channel in x402's escrow and pays each
-call with a signed voucher. The relay charges the gas the call actually took
-(`gasUsed` at its effective price, converted at `--eth-usd` with the margin),
-within the quote the 402 named, and only once the call has landed. That is
-the scheme's usage pricing.
-
-The relay's key is the channel's receiver-authorizer: one `claimWithSignature`
-per `--claim-interval` for all channels, then `settle` to `--pay-to`. The
-book is kept in `--dir`. A wallet with no ETH gets its unspent deposit back
-only by the relay's refund of idle channels (`--refund-idle`). Anvil scenario
-31 runs a zero-ETH wallet through it: one deposit, no transfer per call, and
-`relay_spent` equal to the relay's book.
+Every call is paid by x402's `exact` scheme at the quoted amount. The
+`batch-settlement` channels of #179 (one deposit, a voucher per call, a claim
+cron) were removed in v0.8 (#251): no payer used them, and `exact` at every
+relayed call is the visible x402 use on HPP.
 
 ## Tests
 

@@ -82,52 +82,6 @@
   ],
   "payTo": "0x1111111111111111111111111111111111111111"
  },
- "channels": {
-  "chainId": 181228,
-  "channelId": "0x912b1dfd9d6efea0d0b92b6e9de5fa582d5c402047cd3ce42d51f2cd438a96e1",
-  "claimBatch": {
-   "digest": "0xbb2a8843bb8e70dde6289c16efd05677553c9756022600cd2bca58a88090fbfd",
-   "entries": [
-    [
-     "0x912b1dfd9d6efea0d0b92b6e9de5fa582d5c402047cd3ce42d51f2cd438a96e1",
-     1000,
-     990
-    ],
-    [
-     "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
-     5,
-     5
-    ]
-   ]
-  },
-  "config": {
-   "payer": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
-   "payerAuthorizer": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
-   "receiver": "0x1111111111111111111111111111111111111111",
-   "receiverAuthorizer": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
-   "salt": "0xa05e334153147e75f3f416139b5109d1179cb56fef6a4ecb4c4cbc92a7c37b70",
-   "token": "0x401eCb1D350407f13ba348573E5630B83638E30D",
-   "withdrawDelay": 86400
-  },
-  "escrow": "0x4020074e9dF2ce1deE5A9C1b5c3f541D02a10003",
-  "refund": {
-   "amount": 500,
-   "digest": "0x4b7b1c0c1c155aa19a0fd0a9cff75cc74aa17d9738463eb8966e8f592390625d",
-   "nonce": 3
-  },
-  "vouchers": [
-   {
-    "digest": "0xd48303c00a7d47f926d514df277cba99c77150f17f54ba8232c1273a3e6db348",
-    "maxClaimableAmount": 10,
-    "signature": "0x6d1c0fb7780c49ff98e38088a20cb01f1a0839046776e2dde9817c40068c0981005e412a666e8c5fb0271e852f04e965f4da0481647fcb2a94dba2ce62667e881b"
-   },
-   {
-    "digest": "0xf38b19a2929ba3181c1eecd4cf51f386181cb6d2fb4c17654787386e18f51563",
-    "maxClaimableAmount": 123456789,
-    "signature": "0x8f6951fcab2a19cf5077b388c7833e9a8847465bf43370b01c55d2d0394d044a70c9eff7df76f07fa6886d4615e0b89c8ef89d273e060fb23d746ef33cd4f8a91c"
-   }
-  ]
- },
  "cids": [
   {
    "cid": "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",

@@ -90,7 +90,6 @@ typedef struct HppliteNodeConfig {
     int fromSnapshot;               /* from= (#222): a new replica starts from the latest snapshot (1) or the oldest still kept (2, #224) */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;              /* syncat=: ...none written after this time (ms since the epoch, #205); 0: none */
-    uint64_t relayDeposit;          /* relaydeposit=: the relay paid by voucher (#179); 0 = exact */
     uint64_t spendCap, spendWindow; /* spendcap=: the most paid to the store and the relay in the window (seconds); 0 = none (#173) */
     int lowBalanceHours;            /* lowbalance=: warn below this many hours of money at the recent rate; 0 = 72, -1 = off */
     char *relayUrl;                 /* relay=: the signed forms of the writes go through it (#126); NULL = the wallet sends them */

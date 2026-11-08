@@ -9,7 +9,7 @@ The canonical operators run the same protocol on Cloudflare Workers.
 |-----------|------|
 | [store](store/README.md) | The reference store, `hpplite-store/2` (#213): a bucket per rollup kept while its funding wallet covers it, paid by permit pulls or x402 top-ups; names `<da>-<height>` for the soft tier (#165) |
 | [relay](relay/README.md) | The relay (#170): submits the node's signed contract calls and pays their gas |
-| `x402seller/` | Shared by both: `eth.py` (keccak, secp256k1, EIP-712), `payments.py` (the 402, verify, settle), `channels.py` (batch-settlement, #135; the relay's, #179) |
+| `x402seller/` | Shared by both: `eth.py` (keccak, secp256k1, EIP-712), `payments.py` (the 402, verify, settle) |
 | `conformance/` | `buyer.py`, the buyer's side in Python: what the node does in C, used by the selftests |
 
 The protocols they speak, and what a node expects of any implementation:
