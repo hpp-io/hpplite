@@ -2,10 +2,9 @@
 
 **A crash-safe, encrypted, replayable write log for SQLite, kept at a store in seconds and anchored on a chain.**
 
-HPPLite is a SQLite extension. It captures what each commit wrote: the
-database pages, by default for a new rollup (`capture=pages`), or row
-records or statements. It cuts that into batches and seals them with a key
-derived from your wallet key.
+HPPLite is a SQLite extension. It captures what each commit wrote - the
+database pages, read from the WAL - cuts that into batches and seals them
+with a key derived from your wallet key.
 
 - **Soft tier:** each batch goes to a store within seconds, under its
   height and signed by the sequencer.
@@ -64,7 +63,7 @@ from any language whose SQLite binding can load extensions.
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  your process                                                            │
 │                                                                          │
-│  app ──► SQLite (WAL) ──► the commit's pages (or row records, statements)│
+│  app ──► SQLite (WAL) ──► the commit's pages, read from the WAL file     │
 │                                │                                         │
 │               timer / close    ▼                                         │
 │        batch = page diffs ──► deflate ──► ChaCha20-Poly1305              │
@@ -81,12 +80,12 @@ from any language whose SQLite binding can load extensions.
 
 - **Transparent** - `sqlite3_open_v2()` with URI parameters, or `.load`
 - **Stock SQLite** - no core patches; loadable extension against any SQLite >= 3.24
-- **Nothing to lose** - page capture reads each commit's pages from the WAL
-  before they can be checkpointed away. Row and statement capture write the
-  log row inside your own transaction, so it commits and rolls back with your
-  statement. A crash or a failed submission never loses or duplicates a
-  batch. A statement that *cannot* be logged is refused (`SQLITE_INTERRUPT`)
-  rather than applied unlogged
+- **Nothing to lose** - the capture reads each commit's pages from the WAL
+  before they can be checkpointed away, and the sequencer keeps a read
+  transaction pinned so SQLite never restarts the WAL over a frame it has
+  not read. What the file holds and the chain does not is shipped at the
+  next open. A crash or a failed submission never loses or duplicates a
+  batch
 - **Encrypted by default** - batches are sealed before they leave the
   process, with a key derived from your wallet key; the store and the chain
   see ciphertext. Readers can be granted their own viewing keys (#15)
@@ -96,44 +95,49 @@ from any language whose SQLite binding can load extensions.
   the chain and the store and compares every posted state root along the way;
   `hpplite-verify` does it in a separate process and reports the soft tier too
 
-### Page capture (`capture=pages`, the default for new rollups since v0.4, #146)
+### The capture: pages (#146, the one capture since v0.8, #253)
 
-The capture above records *what* each write changed and replays it. Page
-capture records *which pages* each commit wrote, as Litestream and LiteFS
-do: after each commit the connection's WAL hook has HPPLite read the
-commit's frames from the WAL file and queue the pages (the sequencer also
-reads frames other connections and processes commit, and keeps a read
-transaction pinned so SQLite never restarts the WAL over a frame it has
-not read); a flush turns the queue into a **page batch** - every page the
-batch's commits touched, once, as the whole page the first time a replica
-sees it and as an XOR diff against the last posted image after - and the
-batch's root is a Merkle root over the hashes of every page in the file
-(`root_version` 4). Nothing is logged in the application's file: the
-bookkeeping lives in a sidecar beside it, `<db>-hpplite.db`, and the
-application's connection has no commit or trace hook, only the authorizer
-that keeps the file in WAL mode and refuses `ATTACH`. A replica writes the
-pages into its file under an exclusive lock, in rollback-journal mode so its
-readers see every batch through the change counter, and compares the root.
+HPPLite records *which pages* each commit wrote, as Litestream and LiteFS
+do. After each commit the connection's WAL hook has HPPLite read the
+commit's frames from the WAL file and queue the pages; the sequencer's
+timer also reads the frames other connections and processes commit, and
+keeps a read transaction pinned so SQLite never restarts the WAL over a
+frame it has not read. A flush turns the queue into a **page batch**: every
+page the batch's commits touched, once, as the whole page the first time a
+replica sees it and as an XOR diff against the last posted image after,
+deflated and sealed. The batch's root is a Merkle root over the hashes of
+every page in the file (`root_version` 4), so a replica that applied the
+same pages has the same root. Nothing is logged in the application's file:
+the bookkeeping (height, roots, the batch in flight, the posted copies kept
+for a reorg, the rows waiting for an anchor) lives in a sidecar beside it,
+`<db>-hpplite.db`. The application's connection carries an authorizer that
+keeps the file in WAL mode, keeps `wal_autocheckpoint` HPPLite's, refuses
+`ATTACH` and reserves the `_hpplite_` prefix, and a trace that only tells a
+`VACUUM` apart and polls the WAL at the end of a statement whose commit ran
+without the hook (a `RETURNING` stepped once, a driver's `.get()`). A
+replica writes the pages into its file under an exclusive lock, in
+rollback-journal mode so its readers see every batch through the change
+counter, and compares the root.
 
-What it changes: a transaction costs what SQLite charges for it (the OLTP
-numbers in [doc/performance.md](doc/performance.md): 94% of plain SQLite's
-write rate, p99 0.15 ms against 1.4 ms with row capture), any SQL replicates
-(non-deterministic functions, virtual tables, `VACUUM`), and a batch is a
-few deflated pages rather than a record per row. Several connections and
-processes on one file work as with row capture: the sequencer captures
-what the others commit, a follower that is the last connection out takes
-over and ships what the file holds beyond the chain. A commit that dirties
-more pages than fit under the posting limit is posted as a series of
-pieces, each under the limit, and a replica holds its lock from the first
-piece to the last so its readers never see half a commit (#152; a single
-page is the unit, so the limit must hold at least one deflated page). A
-crash between a submit and its finalize is recovered from the sidecar's
-record of the batch in flight; a sequencer reopened on a file the chain
-does not have whole ships it whole again. `PRAGMA wal_autocheckpoint` is
-refused on a page-mode connection (its WAL hook is the capture's; HPPLite
-checkpoints the file itself). `hpplite_status.capture` says `pages`;
-`hpplite-verify` finds a page history by itself; a named database's first
-batch carries the name.
+What this means for an application: a transaction costs what SQLite
+charges for it plus about 30 µs (the OLTP numbers in
+[doc/performance.md](doc/performance.md): within 1% of plain SQLite's write
+rate, p99 0.16 ms against 0.14), and any SQL replicates - non-deterministic
+functions, the clock, application-registered functions, virtual tables,
+incremental blob writes, `VACUUM` - because the pages are what is shipped,
+not the statements. Several connections and processes on one file work
+alike: the sequencer captures what the others commit, a follower that is
+the last connection out takes over and ships what the file holds beyond the
+chain. A commit that dirties more pages than fit under the posting limit is
+posted as a series of pieces, each under the limit, and a replica holds its
+lock from the first piece to the last so its readers never see half a
+commit (#152; a single page is the unit, so the limit must hold at least
+one deflated page). A crash between a submit and its finalize is recovered
+from the sidecar's record of the batch in flight; a sequencer reopened on a
+file whose root is not the one its sidecar recorded (it died with commits
+unposted, or something wrote the file while it was closed) ships the file
+whole again. `hpplite_status.capture` says `pages`; a named database's
+first batch carries the name.
 
 ## Why one writer?
 
@@ -177,7 +181,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). The only value: any other refuses the open (#248); a sequencer needs no `role=` |
-| `snapshot` | No | With `store=` on a chain with ranges, page capture: how often the sequencer snapshots the database at an anchor - `24h`, `1h`; `0` (default) never (#221). The snapshot is the file at the anchored height, sealed like a batch, at the store in chunks under an index the anchor's manifest names, so a replica can start there instead of at batch 1. Also `HPPLITE_SNAPSHOT`. See Stores and commitments |
+| `snapshot` | No | With `store=` on a chain with ranges: how often the sequencer snapshots the database at an anchor - `24h`, `1h`; `0` (default) never (#221). The snapshot is the file at the anchored height, sealed like a batch, at the store in chunks under an index the anchor's manifest names, so a replica can start there instead of at batch 1. Also `HPPLITE_SNAPSHOT`. See Stores and commitments |
 | `soft` | No | `off`: a `role=verify` connection with `store=` stays at the anchored height instead of following the store's batches past it (#166). Also `HPPLITE_SOFT` |
 | `store` | No | `on` for the network's canonical store (`l1=hpp-sepolia`: `https://store.sepolia.hpplite.hpp.io`; a network without one refuses to open, #192), or `http://host:port` of a store speaking `hpplite-store/2` (`operators/store/hpplite_store.py`, or the canonical one): the rollup's bucket, kept while its funding wallet covers it (#214). The batch bytes go there and the chain holds the commitment - hash, reference, and with each anchor the store's signed bucket statement (#11, #33). A replica needs the same `store=` to rebuild. The protocol: [doc/store-protocol.md](doc/store-protocol.md). Also `HPPLITE_STORE` |
 | `storecap` | No | The most the funding wallet pays the store by x402 at once (a top-up), in its asset's atomic units (USDC.e: 1e-6). A 402 above it is refused before anything is signed and the batch waits; 0 (default) pays nothing by x402. Also `HPPLITE_STORE_CAP` |
@@ -188,18 +192,16 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `relaycap` | No | The most to pay the relay per call, in its asset's atomic units. With `relay=on` the default is 1000000 (1 USDC.e: a relayed call on HPP costs cents, #251); with a relay URL, 0 (default) pays nothing. Also `HPPLITE_RELAY_CAP` |
 | `storefallback` | No | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
 | `anchor` | No | With `store=` on a chain that takes ranges (VERSION 9 and later, #164, the `hpp-sepolia` factory): how often the batches the store holds are anchored on the chain in one commitment: `5m`, `30m` (default: HPP's cadence), `1h`; `0` = at close and on `hpplite_anchor()` only. Also `HPPLITE_ANCHOR`. See Stores and commitments |
-| `datadir` | No | Where the per-wallet spending ledger `spend-<wallet>.json` lives (`spendcap=`, #173). It spans every database the wallet writes, so it cannot live in the database file, where everything else HPPLite keeps is (`_hpplite_*` tables). Default `/tmp/hpplite`. Also `HPPLITE_DATA_DIR` |
+| `datadir` | No | Where the per-wallet spending ledger `spend-<wallet>.json` lives (`spendcap=`, #173). It spans every database the wallet writes, so it cannot live in a database's sidecar, where everything else HPPLite keeps is. Default `/tmp/hpplite`. Also `HPPLITE_DATA_DIR` |
 | `keep` | No | With `snapshot=`: how long the store keeps the history behind a snapshot - `all` (default: every batch, an audit log) or `7d`, `24h`, `30m` (#223). After each anchor the sequencer signs a `Prune` at the newest snapshot made at least that long ago; the store lets go of the batches and older snapshots below it. The snapshots kept are named in each manifest, at most 64 besides the latest, so `keep` divided by the snapshot cadence (the longer of `snapshot=` and `anchor=`: a snapshot is made at an anchor) must not exceed 64 (`snapshot=1h` with `keep=30d` would keep 720: the open refuses it and says so, #231; with anchors by hand, `anchor=0`, the anchor itself makes no snapshot while the list is full). The current state stays provable (that snapshot's root is anchored, then the batches after it); what is lost is replaying how the state got there, and `hpplite-verify --to`/`--at` before it. Also `HPPLITE_KEEP` |
 | `interval` | No | Batch flush interval: `500ms`, `5s`, `1m`, `1h`; `0` = no timer (flush on `hpplite_flush()` or close). The default is 5 s, except that `l1=hpp-sepolia` (and `hpp-mainnet`) makes it 30 min for a node without a store, the chain's own cadence (HPP anchors to L1 every 30 minutes, so a batch posted more often only waits in the queue, and each batch costs its own commitment; see Gas Costs). With `store=` the chain's cadence goes to `anchor` instead and the interval stays 5 s: the batches reach the store in seconds, the chain gets one commitment per anchor (#164). Seconds for development, the chain's cadence in production. The timer also flushes early once the pending log reaches half the DA limit, so a busy writer posts as it goes (#143) |
 | `encrypt` | No | `on` (default when a key is present) or `off` |
-| `from` | No | Where a new replica (an empty file, page capture, `store=`) starts: `snapshot` (the default, except for `role=verify`) - the latest snapshot the anchors name (#222), checked against the root and chain hash the chain anchored at its height, then the batches after it; `earliest` - the oldest one still kept (`keep=`, #224: the most history verified; the latest when it is gone); or `genesis` - every batch from 1. A verifier replays from batch 1 unless given `from=snapshot`; `syncto=`/`syncat=` before the snapshot start from batch 1. Also `HPPLITE_FROM` |
-| `compress` | No | `on` (default): the batch JSON is deflated before it is sealed or posted when that shrinks it, five to twelve times for SQL and row records (#12); `off`: posted as is. Every reader takes both forms, and batches from before stay readable. Also `HPPLITE_COMPRESS` |
+| `from` | No | Where a new replica (an empty file, `store=`) starts: `snapshot` (the default, except for `role=verify`) - the latest snapshot the anchors name (#222), checked against the root and chain hash the chain anchored at its height, then the batches after it; `earliest` - the oldest one still kept (`keep=`, #224: the most history verified; the latest when it is gone); or `genesis` - every batch from 1. A verifier replays from batch 1 unless given `from=snapshot`; `syncto=`/`syncat=` before the snapshot start from batch 1. Also `HPPLITE_FROM` |
+| `compress` | No | `on` (default): the page batch is deflated before it is sealed or posted when that shrinks it (#12); `off`: posted as is. Every reader takes both forms. Also `HPPLITE_COMPRESS` |
 | `checkpoint` | No | Batches per checkpoint, the batch that also carries a state root. Not given: the rollup contract's `checkpointInterval` (100 unless changed). Given: written to the contract by its owner at connect, so the two agree (#44). A history shorter than that has no root on chain to verify against yet (see Verification) |
-| `determinism` | No | `strict` (default): refuse SQL that replay cannot reproduce; `warn`: warn and count |
-| `capture` | No | `auto` (default): `pages` for a new rollup, and for a file or a rollup whose history is already rows or statements, that; `pages`: the database pages each commit wrote (#146, see Page capture); `rows`: log what each write changed (#19, below); `text`: log each write statement, as v0.1. Also `HPPLITE_CAPTURE` |
 | `dbname` | No | Give the database its own rollup among the wallet's, found by this name (#61): several databases on one key. Names are compared exactly and must be unique per wallet: two files with the same name on one key are one database on chain (the second, if empty, rebuilds the first's data into itself). `{file}` = the file's base name without its directory (`a/x.db` and `b/x.db` are both `x.db`; `:memory:` is `memory`), so one `HPPLITE_PARAMS` serves every file `HPPLITE_FILES` names. A name no rollup has yet creates one (~2.5M gas): a misspelt name on a replica is a new, empty database, and the message says which names the wallet has. The name is read from each rollup's first batch (or its snapshot) at the store; while the store does not answer for any of them, a sequencer on a fresh file creates nothing (#229: one of them may be this database) - writes stay local and each flush looks again; a store that answers 404 (the bytes gone) is no reason to wait. Also `HPPLITE_DBNAME` |
 
-*Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`.
+*Either `l1`, or both `rpc` and `factory` (or `rpc` and `contract`). The same settings can come from environment variables — see `.env.example`. `capture=` and `determinism=` (and `HPPLITE_CAPTURE`, `HPPLITE_DETERMINISM`) are gone since v0.8 (#253): a URI or environment that still names one refuses the open and says so.
 
 ## Building
 
@@ -243,7 +245,7 @@ once per process before opening. Checked by `tests/orm/run_orm.sh`:
 | Python `sqlite3`: SQLAlchemy, Alembic, Django | `sqlite3.connect(uri, uri=True)`; Django `NAME` = the URI | works |
 | Node `node:sqlite`: Drizzle (`sqlite-proxy`) | URI, or a plain path with `HPPLITE_FILES` | works |
 | npm `sqlite3`: Knex | `connection: { filename: uri, flags: ['OPEN_URI', 'OPEN_READWRITE', 'OPEN_CREATE'] }` | works |
-| better-sqlite3 (Drizzle's and Knex's default) | a plain path with `HPPLITE_FILES` (`tests/orm/test_better_sqlite3.js`) | works with page capture (the default since v0.4) and with row capture. Its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound strings in `sqlite3_expanded_sql()`: `capture=text` is refused at open, and a statement still logged as text (a schema change, a write reaching a virtual table) is refused when it binds values |
+| better-sqlite3 (Drizzle's and Knex's default) | a plain path with `HPPLITE_FILES` (`tests/orm/test_better_sqlite3.js`) | works. Its bundled SQLite is built with `SQLITE_TRACE_SIZE_LIMIT=32`, which cuts bound values in `sqlite3_expanded_sql()`; pages read no statement text, so it does not matter |
 | Prisma | - | not supported: its engine has its own SQLite and loads no extensions |
 | Ruby `sqlite3` gem: Rails 8 (Solid Queue, Solid Cache) | `extensions: [<module>]` in `database.yml`, `HPPLITE_FILES` for the files and `dbname={file}` in `HPPLITE_PARAMS` (`tests/real_apps/rails`) | works (macOS, forking Puma: `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES`) |
 
@@ -277,36 +279,38 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
 
 - **One connection to a file posts, whatever opens it**: threads with their
   own connections, a pool, several processes (php-fpm, gunicorn workers, a
-  cron job beside the server). The first to open is the *sequencer*; the
-  others capture into the same log in the file and leave posting to it.
-  When the sequencer closes or its process dies, another connection takes
-  over within a second, as the same sequencer to L1 (no lease transaction).
-  `hpplite_status.sequencer` says which one posts.
+  cron job beside the server). The first to open is the *sequencer*; it
+  reads every commit from the file's WAL, whoever made it, and the others
+  leave posting to it. When the sequencer closes or its process dies,
+  another connection takes over within a second, as the same sequencer to
+  L1 (no lease transaction). `hpplite_status.sequencer` says which one
+  posts.
 - **Close flushes** if this connection is the sequencer: it posts what is
   pending and waits for L1. A follower closes at once - unless the
   sequencer is gone, in which case it takes over first (the last connection
   out posts). Bounded: an unreachable RPC costs one timeout (15 s,
-  `HPPLITE_RPC_TIMEOUT`) and the rows stay in the file for the next open.
-  To be sure before exiting, `SELECT hpplite_flush()` and check `pending`
-  is 0.
+  `HPPLITE_RPC_TIMEOUT`) and the commits stay in the file: the next open
+  finds the file past the chain and ships what it holds. To be sure before
+  exiting, `SELECT hpplite_flush()` and check `pending` is 0.
 - **Short-lived connections** (PHP opens one per request, CGI, cron): run
   `hpplite-sequencer <file>` beside the app with the same `HPPLITE_PARAMS`.
   It holds the file as its sequencer, so every request is a follower and
   never waits for the chain (WordPress, 8 PHP workers, 16 concurrent
   clients: ~4% over plain SQLite; `tests/real_apps/wordpress`).
-- **A connection opened without HPPLite writes past the log** (`sqlite3
-  app.db` from a shell, a tool that opens the file plainly). The roots the
-  sequencer posts still match - it hashes the live file - and the difference
-  shows only on a rebuild. It is detected, best effort: when a bookkeeping
-  look finds the file changed while no connection of this process committed
-  and HPPLite's own tables are as they were, `hpplite_status.foreign_writes`
-  goes up and one line says so on stderr (#37). Another HPPLite process's
-  writes leave log rows and are not counted. Open every writer with
-  `hpplite=on`.
-- **Everything that writes is replayed**, DDL included: `CREATE`, `ALTER`,
-  `DROP`, the table rebuilds migration tools do, `PRAGMA user_version` and
-  `application_id`. `changes()`, `last_insert_rowid()` and `RETURNING`
-  report the application's statements as in plain SQLite.
+- **A connection opened without HPPLite** (`sqlite3 app.db` from a shell, a
+  tool that opens the file plainly) is captured all the same while a
+  sequencer is on the file: its commits are frames in the same WAL, read by
+  the sequencer's timer and counted in `pending` at once
+  (`tests/unit/test_pagemode.c`: a thousand commits, a checkpoint and a WAL
+  restart by a plain connection, nothing lost). What such a connection
+  writes while no sequencer runs is shipped at the next open, as the file
+  whole. Open every writer with `hpplite=on` all the same: a plain
+  connection can leave WAL mode or `ATTACH`, which the authorizer refuses
+  on HPPLite's.
+- **Everything that writes is replicated**, DDL included: `CREATE`, `ALTER`,
+  `DROP`, the table rebuilds migration tools do, `VACUUM`, `PRAGMA
+  user_version` and `application_id`. `changes()`, `last_insert_rowid()`
+  and `RETURNING` report the application's statements as in plain SQLite.
 - **One wallet is one database on chain**, plus one per `dbname=`. A new,
   empty file opened with the same key (and the same name) rebuilds that
   database from L1 (that is how you verify, or move to another machine). In the same process as the live writer it says
@@ -321,17 +325,12 @@ file beside the database that also keeps the seed of the sequencer's id
 sequencer to L1; a copy of the file on another machine is not). Every
 connection also holds `<file>-hpplite-users` shared while open, so a closing
 sequencer knows whether someone will take over: it keeps the lease for them,
-or releases it when it is the last. A third, `<file>-hpplite-vacuum`, orders
-VACUUM against everyone else's writes (#75): a VACUUM holds it exclusively
-from before it starts until its marker is in the log, every captured
-statement outside a transaction holds it shared while it runs, so no record
-addressing the rowids a VACUUM renumbered can land ahead of the marker a
-replica must apply first. The files belong with the database (and need a
-local filesystem, as SQLite's WAL does). Followers capture into the
-shared log and post nothing; the sequencer's flush posts everyone's rows in
-commit order, transaction groups intact (`tests/unit/test_concurrency.c`:
-threads and processes writing at once, replica equal). Loading HPPLite twice
-into one connection (static library plus module) is refused.
+or releases it when it is the last. The files belong with the database,
+as the sidecar `<file>-hpplite.db` does (and need a local filesystem, as
+SQLite's WAL does). Followers post nothing; the sequencer's flush posts
+everyone's commits in WAL order (`tests/unit/test_concurrency.c`: threads
+and processes writing at once, replica equal). Loading HPPLite twice into
+one connection (static library plus module) is refused.
 
 **Statically linked** with the SQLite built in this tree (what the tests use):
 
@@ -345,16 +344,24 @@ cmake --build ext/hpplite/build_real
 
 ```bash
 # Unit tests (mock L1, fast, no network)
-ctest                    # 42 tests, ~1 min: core, batch, node, open API, cipher, keys,
-                         # durability, loadable extension, crash harness, row capture,
-                         # Python/CLI smoke, docs check; every suite again with capture=text
+ctest                    # 43 tests, ~1 min: node, durability, page capture (the WAL reader,
+                         # the pin, the page batch, the page mode), concurrency, reorg, blob
+                         # I/O, cipher, envelope, keys, keystore, the store and the
+                         # conformance vectors, the loadable extension, the crash harness
+                         # (mock, store, directory), Python/CLI smoke, docs check.
+                         # One capture, so each suite runs once (the _text/_pages twins
+                         # went with row and statement capture, #253)
 
 # Fault injection (#98): a random workload under injected failures - a post refused,
 # a confirmation lost, a transaction pending past the timeout, a claim that reverts,
 # a bookkeeping commit that fails as SQLITE_FULL, a reorg, the lease expiring - with
-# the chain and a rebuilt replica as the oracle. In ctest with 60 seeds per mode.
+# the chain and a rebuilt replica as the oracle. In ctest with 60 seeds.
 HPPLITE_FAULT_SEEDS=500 build_mock/test_faults          # more seeds
 HPPLITE_FAULT_SEED=17 build_mock/test_faults            # one seed, verbose
+
+# The same suite against SQLite trunk (the advisory sqlite-trunk CI job, #105): what
+# the capture relies on that SQLite does not document is listed in
+# doc/sqlite-dependencies.md
 
 # Real contracts on a local chain (foundry: anvil + forge + cast; no network, no funds).
 # Lease claim/renew/release transactions, a second instance of the same wallet, a
@@ -471,28 +478,26 @@ one block's log by the height topic (the chain's own block number: on an
 Arbitrum-style chain such as HPP the contract asks ArbSys for it, #128),
 which any archive node serves; pruned nodes cannot serve a rebuild.
 Since #12 the batch is deflated before it is sealed (`compress=on`, the
-default), which cuts the bytes five to twelve times again on SQL and row
-records, on the chain and at a store alike; the timer only flushes when
-something is pending, so an idle database costs nothing.
+default), on the chain and at a store alike (the deflated figure above was
+measured on SQL, v0.3; today's batches are pages); the timer only flushes
+when something is pending, so an idle database costs nothing.
 
 ## Components
 
 | File | Description |
 |------|-------------|
-| `hpplite.c` | Lifecycle of a tracked connection, the connection registry, transparent API, extension entry point |
-| `capture.c` | Capture into `_hpplite_pending`: the trace, authorizer, commit and rollback hooks; the text rules; the stale-rerun machinery |
-| `bookkeeping.c` | The bookkeeping transaction and the foreign-write check |
-| `finalize.c` | Batch build, size cut, finalize; the posted batches kept for a reorg |
-| `replay.c` | Applying batches from the chain; adopt, skipped heights, checkpoints |
-| `state_hash.c` | The state root (version 2: schema plus per-table tree roots; version 1 kept for old histories) and the block hash (`sha256.c`) |
-| `smt.c` | The sparse Merkle tree of a table's rows (#9): a store interface, set/clear/root, build from a sorted list |
-| `state_tree.c` | The maintained trees: `_hpplite_tree`, the log taken in by key, the overlay written at the checkpoint (#142), stale trees rebuilt from a scan |
+| `hpplite.c` | Lifecycle of a tracked connection (the sidecar's tables, the WAL hook and the trace of page mode), the connection registry, transparent API, extension entry point |
+| `capture.c` | The authorizer on the application connection (#148): the `_hpplite_` prefix, `ATTACH`, `wal_autocheckpoint`, leaving WAL |
+| `walread.c` | Reads a database's WAL file: a cursor over its frames, each commit's pages validated by salt and checksum and handed to page mode (#155) |
+| `pagemode.c` | Page capture (#146): the queue of commits, the build of a page batch (whole pages, then XOR diffs against the last finalized image), the pieces of a large commit (#152), the file shipped whole |
+| `pages.c` | The page root (a Merkle tree over the file's pages, `root_version` 4) and the page batch format (header, a record per dirty page, trailer with the root and a CRC64) |
+| `bookkeeping.c` | The bookkeeping transaction on the sidecar and the foreign-write check |
+| `finalize.c` | The meta row past a posted page batch, the posted copies kept for a reorg, the rows waiting for an anchor, the chain hash, the verifier's ring of roots, the checkpoint |
+| `state_hash.c` | The content hash of a database (version 1: the schema and every row of every user table): what `hpplite-verify --db` compares and prints as the rebuilt state root; and the block hash (`sha256.c`) |
 | `status.c` | `hpplite_status` table and the close sentinel |
-| `capture_rows.c` | Row capture (#19): the TEMP triggers, the record format, what stays text, `sqlite_sequence`, applying records on a replica |
 | `cipher.c` | Batch encryption: ChaCha20-Poly1305, HKDF-SHA256 key derivation, envelope format, pluggable schemes |
-| `node.c` | Node lifecycle, bookkeeping connection, L1 sync, flush with retry, lease |
+| `node.c` | Node lifecycle, the sidecar connection, the file lock and the follower takeover, L1 sync and the apply of page batches, flush with retry, lease, anchors, snapshots, the soft tier |
 | `batch.c` | Batch creation and serialization |
-| `clock.c` | Pass-through VFS that records and pins SQLite's "now" so clock SQL replays (#56) |
 | `crypto.c` | secp256k1 signing |
 | `config.c` | URI parsing, configuration |
 | `l1.c` | L1 dispatch: every build has every backend, the endpoint picks one (`"mock"` or an RPC URL); `l1_backend.h` is the function table |
@@ -533,28 +538,29 @@ function lastBlock() external view returns (uint256);        // the block of the
 function getDAState() external view returns (uint256 lastBatchHeight, uint256, bytes32 chainHash);
 ```
 
-A rollup created before version 8 keeps its batches in the DA contract's
-storage (`getBatch(height)`); HPPLite reads the coordinator's `VERSION`
-and uses whichever it finds, so older rollups stay readable and verifiable.
+HPPLite reads the coordinator's `VERSION` at connect and refuses one below
+8 (#252): a rollup created before version 8 kept its batches in the DA
+contract's storage, and v0.7 is the last release that reads it.
 
 ## Verification
 
-A replica rebuilt from L1 compares its content hash with the root posted at
-each checkpoint (`roots_compared`, `root_mismatches`). Until the first
-checkpoint (`checkpoint=`, default every 100 batches) there is no posted
-root yet: compare `SELECT state_root FROM hpplite_status` of the writer and
-the rebuilt file yourself, or use a smaller `checkpoint` in development.
+A replica rebuilt from L1 compares the root of its file with the root
+posted at each checkpoint (`roots_compared`, `root_mismatches`). Until the
+first checkpoint (`checkpoint=`, default every 100 batches) there is no
+posted root yet: compare `SELECT state_root FROM hpplite_status` of the
+writer and the rebuilt file yourself, or use a smaller `checkpoint` in
+development.
 
-`hpplite_status` columns: `height` (next batch number), `pending` (log rows -
-records or statements - not yet posted), `state_root`, `prev_block_hash`,
-`last_checkpoint_height`, `lease` (1 = this instance may post), `log_errors`,
-`replay_skipped`, `encryption`, `keyed`, `nondeterministic`, `contract`,
-`root_version` (2: per-table Merkle trees, #9),
-`da_contract`, `last_batch_tx`, `foreign_batches`, `hooks_replaced`,
-`roots_compared`, `root_mismatches`, `txns_dropped`, `last_refusal`,
-`sequencer` (1 = this connection posts the file's batches; 0 = another
-connection, in this process or another, does), `capture` (`rows` or `text`:
-what this connection logs), `foreign_writes` (looks that found the file
+`hpplite_status` columns (43): `height` (next batch number), `pending`
+(commits captured and not yet posted), `state_root` (the page root of the
+file as of the last finalized batch), `prev_block_hash`,
+`last_checkpoint_height`, `lease` (1 = this instance may post),
+`encryption`, `keyed`, `contract`, `root_version` (4: a Merkle root over
+the file's pages, #146), `da_contract`, `last_batch_tx`, `foreign_batches`,
+`roots_compared`, `root_mismatches`, `last_refusal` (the last statement the
+authorizer refused, and why), `sequencer` (1 = this connection posts the
+file's batches; 0 = another connection, in this process or another, does),
+`capture` (`pages`), `foreign_writes` (looks that found the bookkeeping
 changed by something that is not HPPLite, #37), `state` and `last_error`
 (#32), `chain_hash` (the DA contract's rolling hash over every batch as this
 node tracks it, #33; NULL in a file from before it was kept), and, with
@@ -598,33 +604,34 @@ stopped from these two columns alone.
 
 
 The check is **rebuild and compare**: open an empty file with the
-same key and `l1=`/`contract=`; every batch is fetched, opened and replayed,
-and after each batch that carries a state root the content hash of the
-rebuilt database is compared with the posted one (`hpplite: state root
-mismatch after replaying batch N` on stderr when they differ). The live root
-of any database is `SELECT state_root FROM hpplite_status` (or
-`hpplite_db_hash()` from C).
+same key and `l1=`/`contract=`; every batch is fetched, opened and its pages
+applied, and after each batch the root of the rebuilt file is compared with
+the one the batch's trailer carries, and at each checkpoint with the posted
+one (`batch N: the root after applying it differs from the posted one` on
+stderr and in `last_error` when they differ, and the sync stops). The live
+root of any database is `SELECT state_root FROM hpplite_status`.
 
-**What the root is** (version 2, #9): a hash over the schema and, for each
-table, the root of a Merkle tree of its rows (a leaf per row, keyed by its
-rowid or primary key, its value the row's columns as a row record carries
-them). It is a pure function of the file's content, which is why anyone can
-recompute it from a rebuilt file, and the node keeps the trees in
-`_hpplite_tree`, taking each batch's touched rows in from the log, so a
-checkpoint costs what changed and not a scan of the database. The trees are
-written to the file at the checkpoint (or once a large number of touched
-nodes waits in memory), not with every batch; between writes the file says
-they are behind the log (`tree_stale`), and a node that opens such a file,
-after a crash, rebuilds them from a scan (#142). A checkpoint
-batch says which version its root is (`root_v`); histories written before
-carry version 1 roots (one hash over every row) and are compared with
-version 1 still, `hpplite_status.root_version` says what a live node
-computes. The tree is also the structure a row proof needs (#5).
+**What the root is** (version 4, #146): SHA-256 over the page size, the
+page count and the root of a Merkle tree whose leaves are
+`SHA-256("HPP4" || page number || page)` for every page of the file, page
+1 taken without its file-format bytes and change counters (a WAL-mode
+sequencer and a rollback-mode replica hash to one root). The sequencer
+keeps the tree in memory and updates one path per dirty page, so a root
+costs what the batch changed; a node computes it from the file when it
+opens. It is a function of the file's bytes, so two files with the same
+pages have the same root, and a replica that applied the same batches
+has the sequencer's. It is not a function of the content alone: the same
+rows laid out differently (a `VACUUM`, a different page size) give another
+root. The **content hash** (`hpplite_db_hash()` in C, `state_hash.c`, version
+1: the schema and every row of every user table in rowid order) is that
+other function, and `hpplite-verify --db` uses it to compare the live
+database with the rebuilt one, two files whose pages differ while their
+rows must not.
 
 ```bash
 sqlite3> .load ./hpplite
 sqlite3> .open 'file:rebuilt.db?hpplite=on&l1=hpp-sepolia&keyfile=/path/to/key'
-sqlite3> SELECT height, state_root, roots_compared, root_mismatches, replay_skipped FROM hpplite_status;
+sqlite3> SELECT height, state_root, roots_compared, root_mismatches FROM hpplite_status;
 ```
 
 **`hpplite-verify`** (#5) packages this as a command:
@@ -636,10 +643,11 @@ HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" hpplite-verify --db /path/t
 It opens an empty file with `role=verify` and the application's own
 parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`), rebuilds
 from the chain and the store, compares every posted root with the rebuilt
-content, and compares the root the contract anchors at its last checkpoint
-with the rebuilt content at that height. With `--db` it also compares the
-live database (the same content hash as the state root) and, when they
-differ and nothing is pending, names the tables that differ. Exit 0 verified,
+file's page root, and compares the root the contract anchors at its last
+checkpoint with the rebuilt file's root at that height. It prints the
+rebuilt file's content hash too (`rebuilt state root`, version 1): that is
+the hash `--db` compares the live database with, and when they differ and
+nothing is pending, it names the tables that differ. Exit 0 verified,
 1 not (a root mismatch, a sync that stopped short, a live file that
 differs), 2 could not run. On a network with a canonical store (`l1=hpp-sepolia`)
 the tool takes `store=on` itself when the parameters name no store: the bytes,
@@ -794,10 +802,11 @@ If it names another hash, the store served batches the chain didn't commit:
 a sequencer that equivocated, or a store that lost a batch and a successor
 that wrote another at that height. The replica says so and rebuilds itself:
 a second verifier rebuilds it from the chain and the store in
-`<db>-rebuild.db`, and the result is copied into the replica's file.
-Statement and row capture use `sqlite3_backup`, which is atomic for readers
-and leaves other connections open. Page mode copies the pages as they are,
-plus the sidecar. `soft_disagreements` counts these events. `soft=off` keeps
+`<db>-rebuild.db`, and the result is copied into the replica's file: the
+pages as they are (not through `sqlite3_backup`, which would move the
+schema cookie the next diff of page 1 lands on), with page 1's change
+counter moved so the replica's readers notice, and the sidecar by
+`sqlite3_backup`. `soft_disagreements` counts these events. `soft=off` keeps
 a replica at the anchored height.
 
 `hpplite-verify` verifies the hard tier as before. It then reports the soft
@@ -913,16 +922,16 @@ plus a small fee per put, and the node's `store_price` is exactly what the next
 
 ## Versions
 
-Scope is tied to versions. v0.1.1 is the last of the v0.1 line (end of life:
-upgrade to v0.2; `capture=text` keeps v0.1's capture). **v0.2.0 is tagged**
-(2026-11-01): row capture by default, `hpplite verify`, several writers per
-file, the fault harness as the acceptance test, an inventory of the SQLite behaviours
-the capture relies on with a CI build against SQLite trunk. **v0.3.0 is
-tagged** (2026-11-02): batches deflated, the state root kept as per-table
-Merkle trees so a checkpoint costs what changed, the bytes of a batch in a
-store (a pin service paid over x402, a Kubo node, an S3 bucket) with the
-commitment on the chain, the status row saying what the store costs, the
-soak running through a store too. Key roles and viewing keys moved to v0.4.
+Scope is tied to versions. v0.1.1 is the last of the v0.1 line (end of
+life). **v0.2.0 is tagged** (2026-11-01): row capture by default, `hpplite
+verify`, several writers per file, the fault harness as the acceptance
+test, an inventory of the SQLite behaviours the capture relies on with a CI
+build against SQLite trunk. **v0.3.0 is tagged** (2026-11-02): batches
+deflated, the state root kept as per-table Merkle trees so a checkpoint
+costs what changed, the bytes of a batch in a store (a pin service paid
+over x402, a Kubo node, an S3 bucket) with the commitment on the chain, the
+status row saying what the store costs, the soak running through a store
+too. Key roles and viewing keys moved to v0.4.
 **v0.4.0 is tagged** (2026-11-03): key roles and provisioning (#17),
 viewing keys and the public-key envelope (#15), page capture (#146) as the
 default for a new rollup, the application suites (WordPress, Ghost, Rails 8,
@@ -940,6 +949,22 @@ tagged** (2026-11-04). It covers HPP economics:
   relay (#170) on factory VERSION 10 (#171).
 - **Spending caps and low-balance warnings (#173).**
 
+**v0.6** brought the operators (#181: the canonical store and relay, their
+protocols and conformance vectors) and **v0.7** the buckets paid by permit
+(#214) and snapshots with `keep=` (#203). **v0.8 is "One capture"**: the
+persona review of 2026-11-08 took out what no deployment used. Pages are
+the one capture (#253): row and statement capture, `capture=` and
+`determinism=`, the clock VFS, the per-table trees and the in-file log are
+gone, and with them the refusals of non-deterministic SQL; a v0.7 file
+whose history is rows or statements is refused at open, and v0.7 is the
+last release that reads it. Also gone: the `kubo://` and `s3://` store
+kinds (#250), the x402 batch-settlement channels at the relay, which is
+paid per call (#251), the factories before VERSION 8, refused at connect
+(#252), the HPE1 envelope and the `hpplite-store/1` per-item receipt
+(#249); `role=` takes `verify` and nothing else (#248), and
+`hpplite-verify` exits 2 on a rollup whose bytes are at a store the
+parameters do not name (#247).
+
 Paying in the HPP token itself is open (#175).
 
 | Version | Scope | Database size | DA |
@@ -949,155 +974,57 @@ Paying in the HPP token itself is open (#175).
 | v0.3 | Off-chain stores with L1 commitments (#11: pin service over x402, Kubo, S3), incremental (Merkle) state root (#9), batch compression (#12) | GB range | a store + L1 commitments |
 | v0.4 | Key roles and provisioning (#17), viewing keys and the public-key envelope (#15), page capture (#146: the pages each commit wrote, a Merkle root over the file's pages, the default for a new rollup) | same | same |
 | v0.5 | HPP economics: store-based persistence and soft commitment, one chain anchor every 30 minutes (#162, #164-#167); replicas on the soft tier (#166); a node with USDC.e and no ETH through a relay (#126, #170); store and relay paid by voucher (#135, #179), spending caps (#173) | same | a store (soft) + one L1 commitment per 30 min (hard) |
+| v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
+| v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
+| v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
-Why the size bound in v0.1: the state root is a content hash, O(database size) per
-computation (~9 ms/MB), computed once per checkpoint interval (default 100 batches);
-see [doc/architecture.md](doc/architecture.md#state-root).
-Beyond that, shard per tenant (the factory can create several rollups per wallet)
-until v0.3.
+Why the size bound in v0.1: its state root was a content hash, O(database
+size) per computation (~9 ms/MB), computed once per checkpoint interval;
+v0.3's per-table trees and v0.4's page root (one path per dirty page) lifted
+it. See [doc/architecture.md](doc/architecture.md#state-root).
 
-**v0.1.x is end-of-life.** There will be no v0.1.2: everything v0.1 did, v0.2
-does with `capture=text`, and the bugs found in code the two share (`PRAGMA
-count_changes` refusing every write, the rerun of a refused statement, a
-rerun transaction left open after a `CREATE VIRTUAL TABLE`, configuration
-errors ignored at open, among others - #96 lists them) are fixed only on
-v0.2. Upgrading: a v0.2 replica reads v0.1 history, so upgrade the
-replicas first, then the writer. A v0.2 writer logs records by default,
-which v0.1 replicas cannot read; give it `capture=text` until every replica
-is on v0.2. Do not run a v0.1 binary on a file that has records pending
-(#81, below).
+v0.1.x is end-of-life and v0.2-v0.7 with it as far as their histories go:
+a rows or statements history is read by v0.7 and nothing later (#253), so
+a database that must keep one stays on v0.7.
 
 Issues are grouped by [milestone](https://github.com/hpp-io/hpplite/milestones).
 
 ## What is refused
 
-With page capture (the default since v0.4) nothing below applies: the pages
-each commit wrote replicate whatever SQL produced them, and the only
-refusals are `ATTACH` and the `_hpplite_` names. With row capture (below) a replica applies what each write changed,
-so what a statement computed - random values, the clock, application
-functions - does not matter. What is still logged as SQL *text* must produce
-the same rows wherever it runs: schema changes, writes that reach a virtual
-table, and every write with `capture=text` (v0.1's capture). For those, what
-cannot be reproduced is **refused at the write**
-(`SQLITE_INTERRUPT`, a line on stderr, counted in
-`hpplite_status.nondeterministic`) rather than discovered as a root mismatch
-a hundred batches later:
+The pages each commit wrote replicate whatever SQL produced them, so
+nothing is refused for replay's sake: `random()`, the clock and
+`'localtime'`, functions the application registered, `last_insert_rowid()`
+in a write, virtual tables (FTS5, R*Tree), triggers and foreign-key
+cascades, `PRAGMA` connection state, incremental blob writes
+(`sqlite3_blob_write`, Python's `blobopen`), transactions and statements of
+any size, `VACUUM` - all of it lands in the file as pages and ships as
+pages. What the authorizer on the application's connection refuses, with
+`SQLITE_AUTH` (`not authorized` to the driver: in Python an
+`OperationalError`, in Node an `Error` with that text), a line on stderr
+and the reason in `hpplite_status.last_refusal`:
 
 | Refused | Why | Do this instead |
 |---------|-----|-----------------|
-| `random()`, `randomblob()` in a write | different value on replay | generate in the application, bind it; reads (`ORDER BY random()`) are fine |
-| `'localtime'` / `'utc'` modifiers in a write (`datetime('now', 'localtime')`) | the machine's time zone differs between replicas | store UTC, convert when reading (reads may use them) |
-| `last_insert_rowid()`, `changes()`, `total_changes()`, `sqlite_version()`, `sqlite_source_id()`, `sqlite_compileoption_*()`, `load_extension()` in a write | connection or build state | read the value (`SELECT last_insert_rowid()` is fine), then bind it |
-| a write that calls a function the application registered (`sqlite3_create_function`, Python `create_function`; Django's `django_date_extract` behind `filter(due__month=3).update(...)`), directly or through a view, trigger, generated column or expression index | a replica has SQLite's functions only, so the statement could not run there (#53) | compute the value in the application and bind it, or filter with a built-in (`due__year`, a range); reads may call it |
-| `ATTACH` | writes to another file are not captured | one database per file |
-| an incremental blob write (`sqlite3_blob_write`, Python's `blobopen`), with row or statement capture: its transaction is rolled back at the commit | it changes a row without a statement, so no trigger or trace sees it, and the replica would keep the old bytes (#169) | page capture (`capture=pages`), which ships the pages it wrote; or write the blob with SQL (`UPDATE t SET data = ?`) |
-| writes that name `_hpplite_*` tables (`INSERT INTO _hpplite_pending`, a trigger on it, `RENAME TO _hpplite_x`, `INSERT INTO t SELECT ... FROM _hpplite_pending`) | the log and meta are per-replica, not data (#18) | reads are fine (`SELECT`), writes go through HPPLite |
-
-**Incremental blob writes, in detail (#169).** Row and statement capture
-see one through SQLite's pre-update hook. HPPLite's own build has it, and so
-do the SQLite libraries of Homebrew and Debian. Loaded into an application,
-HPPLite looks it up in the SQLite library that loaded it. A commit with one
-in it fails with `SQLITE_CONSTRAINT_COMMITHOOK` (Python: `IntegrityError:
-constraint failed` at the `COMMIT`). An autocommitted one is rolled back when
-the blob is closed, and Python's `Blob.close()` does not report that: the
-write is simply not there, with the reason on stderr and in `last_refusal`.
-Where the application's SQLite has no pre-update hook (conda's, for one),
-HPPLite says so at load. There it still refuses an autocommitted blob write,
-but cannot see one inside a transaction, which would be lost: an application
-that writes blobs that way needs page capture.
-
-**What a refusal looks like.** The driver reports only SQLite's code:
-`interrupted` (`SQLITE_INTERRUPT`) or `not authorized` (`SQLITE_AUTH`) - in
-Python an `OperationalError`, in Node an `Error` with that text - and the
-transaction it was in is rolled back. If a write fails that way, the reason
-and the statement are on stderr (`hpplite: ... statement refused`) and one
-query away:
+| `ATTACH` of a named database | writes to another file are not captured (the unnamed one `VACUUM` attaches to copy through is let past) | one database per file |
+| writes that name `_hpplite_*` tables, or creating one (`CREATE TABLE _hpplite_x`, a trigger on one, `RENAME TO _hpplite_x`) | the prefix is HPPLite's (#18) | any other name |
+| `PRAGMA wal_autocheckpoint` | the connection's WAL hook is the capture's; the pragma would replace it with SQLite's own, and HPPLite checkpoints the file itself (#155) | leave it to HPPLite |
+| `PRAGMA journal_mode` to anything but `wal` | the WAL frames are what is captured | the file stays in WAL |
 
 ```sql
 SELECT last_refusal FROM hpplite_status;
--- non-deterministic function random() in a write; replay cannot reproduce it; ... : INSERT INTO t VALUES(random())
+-- ATTACH: writes to another file are not captured: /tmp/other.db (the driver reports "not authorized")
 ```
 
-`determinism=warn` (URI) or `HPPLITE_DETERMINISM=warn` restores warn-and-count
-for people who know what they are doing (the `_hpplite_*`, size and
-application-function rules stay). Detection is the parser's
-authorizer (each write's functions, through views and triggers, checked
-against what a fresh connection has) plus a scan of the text outside string
-literals. Statements that cannot write (`SELECT`, `WITH ... SELECT`) are
-never refused: they are not logged (#54).
-`tests/unit/test_abuse.c` is the corpus of spellings it must catch and of
-look-alikes it must let through.
-
-**Row capture (the default since v0.2; #19).** Instead of each write's
-text, HPPLite logs what it changed: one record per inserted, updated or
-deleted row, written by TEMP triggers inside the application's transaction.
-A replica applies the records, so `random()`, the clock, `'localtime'`,
-application functions such as WordPress's `REGEXP`, and `CURRENT_TIMESTAMP`
-defaults all replay exactly and are no longer refused. Schema changes, and
-writes that reach a virtual table (FTS5, R*Tree - directly, or through the
-sync triggers of the table written), are still logged as statements, under
-the rules above. Batches with records cannot be read by v0.1: it stops at
-the first with "statement N ran under connection state this version cannot
-apply (mode 4)" - upgrade the replica. A v0.2 replica reads v0.1 history.
-`capture=text` keeps v0.1's capture. Do not run a v0.1 binary on a file
-that has records pending (flush first, or close every connection): v0.1
-would post them as empty statements, and that history cannot be read by
-either version (#81). Design and measurements: `doc/design-row-capture.md`.
-
-**The clock is supported.** `CURRENT_TIMESTAMP`, `datetime('now')`,
-`unixepoch()`, `strftime('%f', 'now')` and columns with `DEFAULT
-CURRENT_TIMESTAMP` - the timestamp defaults every ORM template uses - work in
-writes. SQLite takes "now" from the VFS; HPPLite registers a pass-through VFS
-as the default that records the time each write read and pins that same time
-when the write is replayed, so a replica computes identical values (#56).
-Reads see the real clock. The one condition: the connection must be on that
-VFS, which it is unless the application names another one (`vfs=` in the URI,
-or a VFS registered as default after HPPLite was loaded); there, clock SQL in
-writes is still refused.
-
-**Transactions and statements of any size are supported.** One larger than
-a DA batch (a seed script, `bulk_create` of thousands of rows, a data
-migration, a multi-row `INSERT` an ORM builds from a list - one statement
-can be larger than a batch, #59) is posted across several batches: the batch it starts in is marked open, the ones it
-continues in say so, and a replica applies it only when its last part has
-arrived - a reader never sees part of it. If the writer dies with the rest
-in a log nobody else has, replicas drop the held part whole and count it in
-`hpplite_status.txns_dropped`, as if it had never been posted (#57).
-
-**Foreign keys and recursive triggers are supported.** `PRAGMA foreign_keys`
-and `PRAGMA recursive_triggers` are connection state: they change what a
-statement does to other rows (`ON DELETE CASCADE`, `SET NULL`, `SET DEFAULT`,
-`ON UPDATE CASCADE`, a trigger that fires itself) without showing in its
-text. HPPLite records the state each statement ran under and replays it in
-that state, so an application that turns foreign keys on at connect (as
-Django and Rails do) needs no change for it, and switching the pragmas
-mid-session is fine (#52). The same goes for `legacy_alter_table`,
-`writable_schema`, `ignore_check_constraints` and `case_sensitive_like`
-(#28): each statement and record carries the state they were in, replay
-sets it before applying, and `PRAGMA schema_version = N` (the reload after
-editing `sqlite_schema`) is logged like `user_version`. Set them on the
-connection itself; a pragma set before `hpplite_init()` is read then,
-except `case_sensitive_like`, which SQLite cannot report. One edit under
-`writable_schema` is refused: an `UPDATE` or `DELETE` on `sqlite_schema`
-with no `WHERE`, which would rewrite HPPLite's own schema rows along with
-the application's and leave the file unreadable; name the table (#124).
-
-Not detectable, so not refused - know these:
-
-- **Bound `REAL` values** are expanded with 15 significant digits
-  (`sqlite3_expanded_sql`), so `0.1 + 0.2` replays as `0.3`. Store exact
-  decimals as `INTEGER` or `TEXT`, or write the literal yourself. (Node's
-  `node:sqlite` binds every JS number as `REAL`, so its integers appear as
-  `1.0` in the captured text; the writer stored the same value, so replay
-  agrees - bind `BigInt` if you want integers stored as integers.)
-- **`TEXT` with an embedded NUL** is cut at the NUL in the captured text.
-- **`INSERT ... SELECT` without `ORDER BY`** into a rowid table takes its row
-  order from the query planner.
-
-Row capture (the default since v0.2, #19) lifts all of this for the writes
-it records; it still applies to `capture=text`, and to the statements row
-capture logs as text (schema changes, writes reaching a virtual table).
+Two things are refused at open, with the reason in `sqlite3_errmsg()` and
+on stderr: an in-memory database (`an in-memory database has no WAL to
+capture: HPPLite needs a file`), and a file from v0.7 or earlier that
+carries HPPLite's tables in itself (`this file's history is statements or
+rows (v0.7 and earlier), which this release does not read (#253): v0.7 is
+the last release that does; a page-capture database starts from a fresh
+file`). A replica whose chain holds a batch that is not a page batch stops
+with `batch N is not a page batch`. A URI or environment that still names
+`capture=` or `determinism=` refuses the open as well, saying both are gone.
 
 ## Keys
 
@@ -1182,34 +1109,31 @@ fingerprints.
 
 ## Durability
 
-HPPLite keeps no state outside your database file. Captured records and
-SQL go into `_hpplite_pending` from inside your own transaction (rolled back with it,
-committed with it); height and roots go into `_hpplite_meta` once a batch is
-confirmed on L1. Kill the process at any point and reopen: pending SQL
-flushes, height continues, nothing is replayed twice. A batch that L1 does
-not confirm stays pending and is retried at the same height.
+HPPLite writes nothing into your database file. What it keeps is in a
+sidecar beside it, `<db>-hpplite.db`: the height, the roots, the batch in
+flight (height and root, so a submit the process did not survive is
+recognised at the next open), the posted copies kept for a reorg, the rows
+waiting for an anchor, the readers. The commits themselves are in the
+database and its WAL, where SQLite put them; the capture reads them from
+there and the sequencer's pinned read transaction keeps SQLite from
+checkpointing a frame away before it has been read. Kill the process at
+any point and reopen: the sidecar says where the chain is, the file says
+what it holds, and what the file holds beyond the chain is shipped, whole
+if need be; nothing is posted twice. A batch that L1 does not confirm stays
+pending and is retried at the same height.
 
-File databases are switched to WAL mode on open (bookkeeping runs on a
-second connection) and get a 5 s busy timeout. While the timer runs, the
-WAL's checkpoint is the timer thread's (passive, never waiting for the
-application) and the application's own automatic checkpoint is off: with
-HPPLite's bookkeeping in the WAL it came round several times more often
-than without, each time an fsync on the application's commit, and it was
-the writer's tail latency (#144). `interval=0` keeps SQLite's own. A
-write that cannot take the
-write lock within that timeout (another process holds it) fails with
-`SQLITE_BUSY` after one wait, as it would without HPPLite, and the driver's
-retry runs it again through capture; it is never refused for that. In-memory
-databases work through the C API (`hpplite_node_create` with `:memory:`),
-with bookkeeping on the same connection and no timer: flush explicitly or on
-close.
-
-Three things a statement can be refused for, all with `SQLITE_INTERRUPT`
-and a line on stderr, so the log never silently disagrees with the data:
-its log row could not be written (disk full), its text is longer than one
-DA batch can carry (a 64 KB blob literal is ~128 KB of hex), or its bound
-parameters could not be expanded. Inside an explicit transaction SQLite
-rolls the transaction back, as it would for a disk-full error.
+File databases are switched to WAL mode on open and get a 5 s busy
+timeout; the sidecar is a second connection. The application's WAL hook is
+HPPLite's: it reads the commit's frames, and at 1000 frames - where
+SQLite's own hook would checkpoint - it runs the sequencer's WAL upkeep
+instead (the pin moved on, the WAL polled, a passive checkpoint on a plain
+connection of the node's own, once a second at most), so the application's
+commit never pays for a checkpoint and the pins keep the frames a batch
+still needs; that is why `PRAGMA wal_autocheckpoint` is refused (#144, #155).
+A write that cannot take the write lock within the
+timeout (another process holds it) fails with `SQLITE_BUSY` after one wait,
+as it would without HPPLite. An in-memory database is refused at open:
+it has no WAL to capture.
 
 See [doc/architecture.md](doc/architecture.md#local-durability).
 

@@ -1,5 +1,14 @@
 # Performance
 
+**Read this first.** The sections up to and including "After the fixes of
+2026-11-02" measure statement capture (v0.1-v0.2) and row capture
+(v0.2-v0.7): the log rows in `_hpplite_pending`, the per-table trees, the
+content-hash root. That code was removed in v0.8 (#253); the numbers stay
+as the record of what each version cost and why page capture replaced them.
+Only the last section, "Page capture", describes the current code - and its
+`--uri "&capture=pages"` is no longer needed (or accepted): pages are the
+one capture.
+
 Reference run of `tests/bench/bench_hpplite.c` (mock L1, no network).
 Build with the unit tests and run `make bench`, or
 `./bench_hpplite [--rows N] [--mb 1,10,100] [--json out.json]`.
