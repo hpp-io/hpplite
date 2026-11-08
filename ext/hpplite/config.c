@@ -106,22 +106,6 @@ static int64_t parse_keep_seconds(const char *str) {
     return -1;
 }
 
-HppliteConfigRole hpplite_config_parse_role(const char *str) {
-    if (!str) return HPPLITE_CFG_ROLE_UNKNOWN;
-    if (strcmp(str, "sequencer") == 0) return HPPLITE_CFG_ROLE_SEQUENCER;
-    if (strcmp(str, "observer") == 0) return HPPLITE_CFG_ROLE_OBSERVER;
-    if (strcmp(str, "verify") == 0) return HPPLITE_CFG_ROLE_VERIFY;
-    return HPPLITE_CFG_ROLE_UNKNOWN;
-}
-
-const char *hpplite_config_role_str(HppliteConfigRole role) {
-    switch (role) {
-        case HPPLITE_CFG_ROLE_SEQUENCER: return "sequencer";
-        case HPPLITE_CFG_ROLE_OBSERVER: return "observer";
-        case HPPLITE_CFG_ROLE_VERIFY: return "verify";
-        default: return "unknown";
-    }
-}
 
 static char gConfigError[160];
 const char *hpplite_config_error(void) { return gConfigError[0] ? gConfigError : NULL; }
@@ -136,6 +120,12 @@ static void parse_capture(HppliteConfig *cfg, const char *val, int source) {
     cfg->captureSource = source;
 }
 
+/* role=verify, nothing else (#248): sequencer and observer were parsed and read nowhere - a sequencer needs no role= */
+static void parse_role(HppliteConfig *cfg, const char *val, int source) {
+    if (strcasecmp(val, "verify") == 0) { cfg->roleVerify = 1; cfg->roleSource = source; return; }
+    snprintf(gConfigError, sizeof(gConfigError), "role=%.40s: role= takes verify only (an audit connection); a sequencer needs no role=", val);
+}
+
 HppliteConfig *hpplite_config_create(void) {
     HppliteConfig *cfg = calloc(1, sizeof(HppliteConfig));
     if (!cfg) return NULL;
@@ -145,7 +135,6 @@ HppliteConfig *hpplite_config_create(void) {
     cfg->chainId = HPPLITE_DEFAULT_CHAIN_ID;
     cfg->rpcUrl = strdup(HPPLITE_DEFAULT_RPC_URL);
     cfg->dataDir = strdup(HPPLITE_DEFAULT_DATA_DIR);
-    cfg->role = HPPLITE_CFG_ROLE_OBSERVER;  /* Safe default */
     cfg->batchIntervalMs = 5000;
    /* 5 seconds default */
     cfg->anchorIntervalMs = 30 * 60 * 1000;   /* HPP's cadence (#164); anchor= overrides */
@@ -177,10 +166,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
 
     /* Role */
     val = getenv(HPPLITE_ENV_ROLE);
-    if (val) {
-        cfg->role = hpplite_config_parse_role(val);
-        cfg->roleSource = 1;
-    }
+    if (val) parse_role(cfg, val, 1);
 
     /* Chain ID */
     val = getenv(HPPLITE_ENV_CHAIN_ID);
@@ -246,12 +232,6 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         cfg->dataDir = strdup(val);
     }
 
-    /* Node ID */
-    val = getenv(HPPLITE_ENV_NODE_ID);
-    if (val) {
-        free(cfg->nodeId);
-        cfg->nodeId = strdup(val);
-    }
 
     /* Batch interval */
     val = getenv(HPPLITE_ENV_BATCH_INTERVAL);
@@ -419,10 +399,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     }
 
     /* Role */
-    if (get_uri_param(uri, HPPLITE_URI_ROLE, buf, sizeof(buf))) {
-        cfg->role = hpplite_config_parse_role(buf);
-        cfg->roleSource = 2;
-    }
+    if (get_uri_param(uri, HPPLITE_URI_ROLE, buf, sizeof(buf))) parse_role(cfg, buf, 2);
 
     /* Chain ID (numeric) */
     if (get_uri_param(uri, HPPLITE_URI_CHAIN_ID, buf, sizeof(buf))) {
@@ -513,11 +490,6 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->dataDir = strdup(buf);
     }
 
-    /* Node ID */
-    if (get_uri_param(uri, HPPLITE_URI_NODE_ID, buf, sizeof(buf))) {
-        free(cfg->nodeId);
-        cfg->nodeId = strdup(buf);
-    }
 
     /* Batch interval */
     if (get_uri_param(uri, "interval", buf, sizeof(buf))) {
@@ -608,10 +580,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
 
     /* Role */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_ROLE);
-    if (val) {
-        cfg->role = hpplite_config_parse_role(val);
-        cfg->roleSource = 2;
-    }
+    if (val) parse_role(cfg, val, 2);
 
     /* Chain ID (numeric) */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_CHAIN_ID);
@@ -715,12 +684,6 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
         cfg->dataDir = strdup(val);
     }
 
-    /* Node ID */
-    val = sqlite3_uri_parameter(filename, HPPLITE_URI_NODE_ID);
-    if (val) {
-        free(cfg->nodeId);
-        cfg->nodeId = strdup(val);
-    }
 
     /* Batch interval */
     val = sqlite3_uri_parameter(filename, "interval");
@@ -952,7 +915,7 @@ void hpplite_config_print(const HppliteConfig *cfg) {
 
     printf("HPPLite Configuration:\n");
     printf("  nodeId:     %s\n", cfg->nodeId ? cfg->nodeId : "(auto)");
-    printf("  role:       %s (%s)\n", hpplite_config_role_str(cfg->role), source_str(cfg->roleSource));
+    printf("  role:       %s (%s)\n", cfg->roleVerify ? "verify" : "-", source_str(cfg->roleSource));
     printf("  chainId:    %llu (%s)\n", (unsigned long long)cfg->chainId, source_str(cfg->chainIdSource));
     printf("  rpcUrl:     %s (%s)\n", cfg->rpcUrl, source_str(cfg->rpcUrlSource));
     printf("  contract:   %s", cfg->hasContract ? "0x" : "(not set)");

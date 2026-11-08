@@ -913,7 +913,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->captureSource = cfg->captureSource;
     nc->captureAuto = cfg->captureAuto;
     nc->localOnly = cfg->localOnly;
-    nc->verifyOnly = cfg->role == HPPLITE_CFG_ROLE_VERIFY;
+    nc->verifyOnly = cfg->roleVerify;
     nc->dbName = cfg->dbName;
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;

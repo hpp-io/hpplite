@@ -70,18 +70,29 @@ int main(void) {
 
     /* Test 3: Config loading */
     tests++;
-    TEST("Config loading from URI");
+    TEST("Config loading from URI; role= takes verify only (#248)");
     {
-        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&role=sequencer&chainid=12345&datadir=/tmp/hpplite_test_simple";
+        const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&chainid=12345&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
 
         HppliteConfig *cfg = hpplite_get_config(db);
         if (!cfg) FAIL("hpplite_get_config returned NULL");
 
-        if (cfg->role != HPPLITE_CFG_ROLE_SEQUENCER) FAIL("role not sequencer");
         if (cfg->chainId != 12345) FAIL("chainId not 12345");
+        hpplite_close(db);
 
+        /* role=sequencer and role=observer were parsed and read nowhere; now anything but verify refuses the open */
+        db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&role=observer&chainid=12345&datadir=/tmp/hpplite_test_simple");
+        if (db) { hpplite_close(db); FAIL("role=observer should refuse the open"); }
+        if (!hpplite_config_error() || !strstr(hpplite_config_error(), "role= takes verify only")) FAIL("the refusal should say role= takes verify only");
+        db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&role=verify&chainid=12345&datadir=/tmp/hpplite_test_simple");
+        if (!db) FAIL("role=verify should open");
+        { sqlite3_stmt *st = NULL; int isVerify = 0;
+          if (sqlite3_prepare_v2(db, "SELECT state FROM hpplite_status", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+              isVerify = sqlite3_column_text(st, 0) && strcmp((const char *)sqlite3_column_text(st, 0), "verify") == 0;
+          sqlite3_finalize(st);
+          if (!isVerify) { hpplite_close(db); FAIL("role=verify should open in the verify state"); } }
         hpplite_close(db);
         PASS();
         passed++;
@@ -396,16 +407,16 @@ int main(void) {
         for (size_t i = strlen(longRpc); i < 300; i++) longRpc[i] = 'p';
         unlink("/tmp/test_simple_open.db");
         snprintf(uri, sizeof(uri), "file:/tmp/test_simple_open.db?hpplite=on&l1=local&interval=0&datadir=/tmp/hpplite_test_simple"
-                 "&dbname=%%7Bfile%%7D&nodeid=a%%20node&rpc=%s", longRpc);
+                 "&dbname=%%7Bfile%%7D%%20x&nodeid=a%%20node&rpc=%s", longRpc);
         sqlite3 *db = hpplite_open(uri);
         if (!db) FAIL("hpplite_open failed");
         HppliteConfig *cfg = hpplite_get_config(db);
-        int okName = cfg && cfg->dbName && strcmp(cfg->dbName, "{file}") == 0;
-        int okNode = cfg && cfg->nodeId && strcmp(cfg->nodeId, "a node") == 0;
+        int okName = cfg && cfg->dbName && strcmp(cfg->dbName, "{file} x") == 0;
+        int noNode = cfg && cfg->nodeId == NULL;          /* nodeid= is no parameter (#248): a label the C API may set */
         int okRpc = cfg && cfg->rpcUrl && strcmp(cfg->rpcUrl, longRpc) == 0;
         hpplite_close(db);
-        if (!okName) FAIL("%7Bfile%7D not decoded");
-        if (!okNode) FAIL("%20 not decoded");
+        if (!okName) FAIL("%7Bfile%7D and %20 not decoded");
+        if (!noNode) FAIL("nodeid= should not be read from the URI");
         if (!okRpc) FAIL("a 300-byte value was cut");
         PASS();
         passed++;
@@ -417,10 +428,10 @@ int main(void) {
     {
         unlink("/tmp/test_simple_open.db");
         sqlite3 *db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&l1=local&interval=0&datadir=/tmp/hpplite_test_simple"
-                                   "&nodeid=cut%00here");
+                                   "&dbname=cut%00here");
         if (!db) FAIL("hpplite_open failed");
         HppliteConfig *cfg = hpplite_get_config(db);
-        int cut = cfg && cfg->nodeId && strcmp(cfg->nodeId, "cut") == 0;
+        int cut = cfg && cfg->dbName && strcmp(cfg->dbName, "cut") == 0;
         hpplite_close(db);
         if (cut) FAIL("the value was cut at the %00");
         PASS();

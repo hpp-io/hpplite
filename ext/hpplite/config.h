@@ -5,7 +5,7 @@
 **   URI params > Env vars > Defaults
 **
 ** URI format:
-**   file:state.db?hpplite=on&role=sequencer&l1=hpp-sepolia&contract=0x...
+**   file:state.db?hpplite=on&l1=hpp-sepolia&contract=0x...
 **
 ** Environment variables (same names as .env / run_integration.sh):
 **   HPPLITE_PRIVATE_KEY       - Private key (0x + 64 hex)
@@ -21,8 +21,7 @@
 **   HPPLITE_DETERMINISM       - strict (default: refuse SQL replay cannot reproduce) | warn
 **   HPPLITE_CAPTURE           - auto (default: pages for a new rollup, #146) | pages | rows (#19) | text (v0.1's)
 **   HPPLITE_DBNAME            - a name: the database gets its own rollup among the wallet's (#61); {file} = its file name
-**   HPPLITE_ROLE              - sequencer|observer
-**   HPPLITE_NODE_ID           - Node identifier (status output only)
+**   HPPLITE_ROLE              - verify: an audit connection (rebuild and compare, never post, claim or create, #5)
 */
 
 #ifndef HPPLITE_CONFIG_H
@@ -50,7 +49,6 @@ extern "C" {
 #define HPPLITE_ENV_OWNERKEY      "HPPLITE_OWNER_KEY"
 #define HPPLITE_ENV_KEYSTORE_PASSWORD "HPPLITE_KEYSTORE_PASSWORD"
 #define HPPLITE_ENV_DATA_DIR      "HPPLITE_DATA_DIR"
-#define HPPLITE_ENV_NODE_ID       "HPPLITE_NODE_ID"
 #define HPPLITE_ENV_BATCH_INTERVAL "HPPLITE_BATCH_INTERVAL"
 #define HPPLITE_ENV_ENCRYPT       "HPPLITE_ENCRYPT"
 #define HPPLITE_ENV_COMPRESS      "HPPLITE_COMPRESS"       /* off: the batch JSON as is (#12) */
@@ -93,7 +91,6 @@ extern "C" {
 #define HPPLITE_URI_DBNAME        "dbname"
 #define HPPLITE_URI_MAX_TX        "maxtx"
 #define HPPLITE_URI_MAX_TX_GAS    "maxtxgas"
-#define HPPLITE_URI_NODE_ID       "nodeid"
 #define HPPLITE_URI_FACTORY       "factory"
 #define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
 #define HPPLITE_URI_STORE_CAP     "storecap"    /* the most to pay the store per call, atomic units of its asset */
@@ -121,20 +118,14 @@ extern "C" {
 /*
 ** Role enum
 */
-typedef enum {
-    HPPLITE_CFG_ROLE_UNKNOWN = 0,
-    HPPLITE_CFG_ROLE_SEQUENCER,
-    HPPLITE_CFG_ROLE_OBSERVER,
-    HPPLITE_CFG_ROLE_VERIFY          /* rebuild and compare only: never post, claim or create (#5) */
-} HppliteConfigRole;
 
 /*
 ** Unified configuration struct
 */
 typedef struct HppliteConfig {
     /* Node identity */
-    char *nodeId;                    /* Node identifier */
-    HppliteConfigRole role;          /* sequencer|observer */
+    char *nodeId;                    /* a label for diagnostics, set by the C API (tests); no URI or env form (#248) */
+    int roleVerify;                  /* role=verify: rebuild and compare only, never post, claim or create (#5); the only role */
     unsigned char privkey[32];       /* Node private key */
     int hasPrivkey;                  /* Whether privkey is set */
     unsigned char viewkey[32];       /* A viewing key (#15): reads batches sealed to its public key, signs nothing */
@@ -238,15 +229,6 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename);
 */
 HppliteConfig *hpplite_config_load(const char *uri);
 
-/*
-** Parse role string to enum.
-*/
-HppliteConfigRole hpplite_config_parse_role(const char *str);
-
-/*
-** Get role string from enum.
-*/
-const char *hpplite_config_role_str(HppliteConfigRole role);
 
 /*
 ** Load private key from file.
