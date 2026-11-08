@@ -24,6 +24,7 @@ typedef struct EthL1 {
     uint8_t contract[20];      /* Main HPPLite contract */
     uint8_t da_contract[20];   /* HPPLiteDA contract (for on-chain DA) */
     uint64_t version;          /* Coordinator VERSION, learned from getSystemConfig() */
+    int versionRefused;        /* VERSION < 8 (#252): said once, nothing read */
     int has_da_contract;
     uint8_t privkey[32];
     uint8_t address[20];       /* the wallet: from the key, or the signer's (#17) */
@@ -75,8 +76,6 @@ static uint8_t SEL_GET_SYSTEM_CONFIG[4];
 
 /* Function selectors - HPPLiteDA contract (data availability) */
 static uint8_t SEL_SUBMIT_BATCH[4];
-static uint8_t SEL_GET_BATCH[4];        /* DA v1 (coordinator VERSION < 8): the bytes in storage */
-static uint8_t SEL_GET_BATCH_HASH[4];   /* DA v1 */
 static uint8_t SEL_GET_DA_STATE[4];
 static uint8_t SEL_BLOCK_OF[4];         /* DA v2 (#33): the block whose log carries a height */
 static uint8_t SEL_COMMIT_BATCH[4];     /* DA v2 (#11): commitBatch(bytes32,uint256,bytes32,bytes,bytes) */
@@ -130,8 +129,6 @@ static void init_selectors(void) {
 
     /* HPPLiteDA selectors (data availability) */
     abi_function_selector("submitBatch(bytes32,uint256,bytes)", SEL_SUBMIT_BATCH);
-    abi_function_selector("getBatch(uint256)", SEL_GET_BATCH);
-    abi_function_selector("getBatchHash(uint256)", SEL_GET_BATCH_HASH);
     abi_function_selector("getDAState()", SEL_GET_DA_STATE);
     abi_function_selector("blockOf(uint256)", SEL_BLOCK_OF);
     abi_function_selector("commitBatch(bytes32,uint256,bytes32,bytes,bytes)", SEL_COMMIT_BATCH);
@@ -495,6 +492,11 @@ static int eth_set_signer(HppliteL1 *l1, HppliteSignFn fn, void *arg, const unsi
 
 static HppliteL1State *eth_get_state(HppliteL1 *l1) {
     if (!l1) return NULL;
+    if (self->version == 0) {
+        HppliteSystemConfig *cfg = eth_get_system_config(l1);     /* the VERSION first: contracts before 8 are not read (#252) */
+        if (cfg) hpplite_l1_system_config_free(cfg);
+    }
+    if (self->versionRefused) return NULL;
 
     /* Call getState() on contract */
     uint8_t calldata[4];
@@ -611,6 +613,17 @@ static HppliteSystemConfig *eth_get_system_config(HppliteL1 *l1) {
     /* Parse remaining uint256 values */
     config->version = abi_decode_uint64(result + 64);
     self->version = config->version;
+    if (config->version < 8) {
+        /* the factories before VERSION 8 (DA version 1, the batch bytes in contract storage) are not read since
+        ** v0.8 (#252): no rollup of theirs verifies, and no test ran their paths. v0.7 is the last release that does */
+        if (!self->versionRefused)
+            fprintf(stderr, "hpplite: this rollup's contracts are VERSION %llu, from a factory before 2026-11-01: HPPLite reads VERSION 8 and later (v0.7 is the last release that reads them, #252)\n",
+                    (unsigned long long)config->version);
+        self->versionRefused = 1;
+        hpplite_l1_system_config_free(config);
+        free(result);
+        return NULL;
+    }
     config->chainId = abi_decode_uint64(result + 96);
     /* words 4 and 5: the checkpoint interval (the configuration of record,
     ** #44) and the lease length; older contracts return four words */
@@ -765,9 +778,8 @@ static char *eth_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]
     if (!l1 || !self->has_privkey) return NULL;
     init_selectors();
 
-    /* releaseLease(instanceId): the active instance gives the lease up (VERSION >= 5).
-    ** Rollups created by the older factory only have the owner-only
-    ** forceExpireLease(); the version is read on connect. */
+    /* releaseLease(instanceId): the active instance gives the lease up; without an
+    ** instance, the owner-only forceExpireLease() (a stale lease after a crash, the owner's call) */
     uint8_t *tx_hash;
     if (self->version == 0) {
         /* connected without reading the system config: ask before choosing the call */
@@ -780,7 +792,7 @@ static char *eth_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]
         uint8_t *forData = lease_for(l1, "release", SEL_RELEASE_FOR, instanceId, &n);
         if (relay_first(l1, self->contract, forData, n, "releaseLeaseFor", &zTx)) return zTx;
     }
-    if (self->version >= 5 && instanceId) {
+    if (instanceId) {
         uint8_t calldata[36];
         memcpy(calldata, SEL_RELEASE_LEASE, 4);
         memcpy(calldata + 4, instanceId, 32);
@@ -1488,7 +1500,7 @@ static char *eth_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint6
     uint8_t *calldata, *p, *tx_hash;
     uint64_t gas;
     if (!l1 || !self->has_privkey || !instanceId || !hash || !zRef || !zRef[0]) return NULL;
-    if (!ensure_da_contract(l1) || self->version < 8) return NULL;
+    if (!ensure_da_contract(l1)) return NULL;
     if (self->relay) {
         char *zTx;
         uint8_t *forData = NULL, digest[32], sig[65], wHeight[32];
@@ -1540,7 +1552,7 @@ static int eth_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32], 
     if (pzRef) *pzRef = NULL;
     if (pReceipt) *pReceipt = NULL;
     if (pnReceipt) *pnReceipt = 0;
-    if (!l1 || !ensure_da_contract(l1) || self->version < 8) return -1;
+    if (!l1 || !ensure_da_contract(l1)) return -1;
     raw = eth_height_log(l1, height, TOPIC_BATCH_COMMITTED, &raw_len, h);
     if (!raw) return -1;
     ref = abi_dynamic_bytes(raw, raw_len, 0, &refLen);
@@ -1568,57 +1580,11 @@ static uint8_t *eth_get_batch(
         *data_len_out = 0;
         return NULL;
     }
-    if (self->version >= 8) {
-        uint8_t *data = eth_get_batch_from_log(l1, height, data_len_out, NULL);
+    {
+        uint8_t *data = eth_get_batch_from_log(l1, height, data_len_out, NULL);   /* the bytes in the log (DA version 2 and 3, #33) */
         if (!data) *data_len_out = 0;
         return data;
     }
-
-    /* Build calldata: getBatch(uint256 height) */
-    uint8_t calldata[4 + 32];
-    memcpy(calldata, SEL_GET_BATCH, 4);
-    abi_encode_uint64(height, calldata + 4);
-
-    size_t result_len;
-    uint8_t *result = eth_client_call(self->eth, self->da_contract, calldata, sizeof(calldata), &result_len);
-    if (!result || result_len < 64) {
-        free(result);
-        *data_len_out = 0;
-        return NULL;
-    }
-
-    /* Dynamic bytes: offset (32) + length (32) + data */
-    uint64_t offset = abi_decode_uint64(result);
-    if (offset >= result_len) {
-        free(result);
-        *data_len_out = 0;
-        return NULL;
-    }
-
-    uint64_t len = abi_decode_uint64(result + offset);
-    if (offset + 32 > result_len || offset + 32 < offset) { free(result); return NULL; }   /* length word in bounds */
-    if (len == 0 || len > result_len || offset + 32 + len > result_len) {
-        free(result);
-        *data_len_out = 0;
-        return NULL;
-    }
-
-    /* Copy data, terminated: a plaintext batch is parsed as a C string, and
-    ** one cut short (by the chain, or by whoever posted it) must not run
-    ** the parser past the end (#77) */
-    uint8_t *data = malloc(len + 1);
-    if (!data) {
-        free(result);
-        *data_len_out = 0;
-        return NULL;
-    }
-
-    memcpy(data, result + offset + 32, len);
-    data[len] = 0;
-    *data_len_out = len;
-
-    free(result);
-    return data;
 }
 
 static int eth_get_batch_hash(
@@ -1628,39 +1594,13 @@ static int eth_get_batch_hash(
 ) {
     if (!l1) return -1;
     if (!ensure_da_contract(l1)) return -1;
-    if (self->version >= 8) {
+    {
         size_t n = 0;
         uint8_t *data = eth_get_batch_from_log(l1, height, &n, hash_out);
         if (!data) { memset(hash_out, 0, 32); return 0; }
         free(data);
         return 1;
     }
-
-    /* Build calldata: getBatchHash(uint256 height) */
-    uint8_t calldata[4 + 32];
-    memcpy(calldata, SEL_GET_BATCH_HASH, 4);
-    abi_encode_uint64(height, calldata + 4);
-
-    size_t result_len;
-    uint8_t *result = eth_client_call(self->eth, self->da_contract, calldata, sizeof(calldata), &result_len);
-    if (!result || result_len < 32) {
-        free(result);
-        return -1;
-    }
-
-    memcpy(hash_out, result, 32);
-    free(result);
-
-    /* Check if zero (no batch at this height) */
-    int is_zero = 1;
-    for (int i = 0; i < 32; i++) {
-        if (hash_out[i] != 0) {
-            is_zero = 0;
-            break;
-        }
-    }
-
-    return is_zero ? 0 : 1;  /* 0 = no batch, 1 = has batch */
 }
 
 static int eth_get_da_state(
@@ -1703,7 +1643,7 @@ static int eth_submit_was_oversized(HppliteL1 *l1) {
 /* DA v2: getDAState()'s third word is the rolling hash (#33); v1 kept the latest batch's hash there */
 static int eth_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32]) {
     uint64_t last = 0, total = 0;
-    if (!l1 || !ensure_da_contract(l1) || self->version < 8) return -1;
+    if (!l1 || !ensure_da_contract(l1)) return -1;
     if (eth_get_da_state(l1, &last, &total, out) != 0) return -1;
     if (pHeight) *pHeight = last;
     return 0;

@@ -210,6 +210,8 @@ if(HPPLITE_BUILD_TESTS)
     target_link_libraries(test_l1_dir hpplite_testlib)
 
     add_executable(test_store tests/unit/test_store.c)
+    add_executable(test_l1_version tests/unit/test_l1_version.c)
+    target_link_libraries(test_l1_version hpplite_testlib)
     target_link_libraries(test_store hpplite_testlib)
 
     add_executable(test_simple_open tests/unit/test_simple_open.c)
@@ -379,6 +381,8 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_conformance_cleanup COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/conformance/cleanup_check.sh)
         # The node's store client against it (#11); paid on anvil in scenario 19
         add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
+        # the chain client refuses contracts before VERSION 8 (#252), against a JSON-RPC stand-in
+        add_test(NAME test_l1_version COMMAND test_l1_version ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/rpc_stub.py)
         set_tests_properties(test_store PROPERTIES SKIP_RETURN_CODE 77)
         add_test(NAME test_store_pages COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)   # the page flush through the store (#146)
         set_tests_properties(test_store_pages PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT HPPLITE_CAPTURE=pages RESOURCE_LOCK test_store)

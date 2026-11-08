@@ -1579,26 +1579,15 @@ static int node_ensure_lease(HppliteNode *node) {
     ours = remaining > 0 && memcmp(st->sequencerInstance, node->instanceId, 32) == 0;
     if (st->leaseDuration > 0) node->leaseDuration = st->leaseDuration;
     {
-        /* A stranger's lease on a rollup we own (possible on rollups from the
-        ** pre-VERSION-5 factory): the owner expires it and takes it back. A
-        ** sibling instance of our own wallet is left alone - no takeover. */
+        /* Another wallet's lease: the chain names the sequencer (only that wallet claims, VERSION 5 and later), so
+        ** it is the sequencer the owner set - after a rotation (#208) this node is the old one. Nothing is evicted
+        ** (#252: the pre-VERSION-5 eviction went with those factories); a sibling instance of our own wallet is
+        ** left alone too - no takeover */
         unsigned char me[20];
         int stranger = remaining > 0 && !ours && hpplite_l1_get_my_address(node->l1, me) == 0
                        && memcmp(st->sequencerWallet, me, 20) != 0;
-        int weOwn = stranger && memcmp(st->owner, me, 20) == 0;
         hpplite_l1_state_free(st);
-        if (stranger && weOwn) {
-            char *tx = hpplite_l1_release_lease(node->l1, NULL);   /* forceExpireLease: owner only */
-            hpplite_error(node->ctx, "another wallet holds the lease of our rollup; %s",
-                    tx ? "expiring it as owner" : "could not expire it");
-            if (tx) {
-                hpplite_l1_wait_for_tx(node->l1, tx, 30);
-                sqlite3_free(tx);
-                remaining = 0;                                     /* free now: claim below */
-            }
-        } else if (stranger) {
-            hpplite_error(node->ctx, "another wallet holds the lease and we are not the owner");
-        }
+        if (stranger) hpplite_error(node->ctx, "another wallet holds the lease: the chain names it as the sequencer (a rotation, #208?); not posting");
     }
 
     if (getenv("HPPLITE_TRACE_LEASE"))

@@ -159,7 +159,7 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 
 | Contract | Address | Description |
 |----------|---------|-------------|
-| HPPLiteFactory | `0xbce61e56f84620bc4365e95126f82b51faed7b4e` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 10 with DA version 3 (#171, deployed 2026-11-04: a deadline in lease signatures, `createRollupFor` and `setCheckpointIntervalFor` for a wallet with no ETH, the EIP-712 domain cached; VERSION 9's ranges and anchors as before). Rollups from earlier factories keep working with the rules they were created with - give their factory with `factory=` (`0x7748552e…`: VERSION 9 with DA version 3, #164: range commitments, the anchor as the checkpoint, the lease duration the owner's to set, an hour by default, no storage that grows with the history; `0xa80365fd…`: VERSION 8 with DA version 2, #33: batch bytes in the log, the rolling chain hash, signed forms of every sequencer call, a five-minute lease; `0xac18df18…`: VERSION 8 too, deployed and superseded the same day, 2026-11-01: its DA recorded Ethereum Sepolia's block numbers (HPP is Arbitrum-style, #128), so no replica can fetch its logs; `0xc0fa50eb…`: VERSION 7, batches in contract storage, a checkpoint cannot reach past the DA's height #44; `0xd1aaa8d1…`: VERSION 6, `0x9c6abd03…`: VERSION 5, `0x9cfacba5…`: permissionless claim) |
+| HPPLiteFactory | `0xbce61e56f84620bc4365e95126f82b51faed7b4e` | Creates rollups (one per wallet, plus one per named database); built into the `hpp-sepolia` alias. Contract VERSION 10 with DA version 3 (#171, deployed 2026-11-04: a deadline in lease signatures, `createRollupFor` and `setCheckpointIntervalFor` for a wallet with no ETH, the EIP-712 domain cached; VERSION 9's ranges and anchors as before). Rollups from the two factories before it keep working with the rules they were created with - give their factory with `factory=` (`0x7748552e…`: VERSION 9 with DA version 3, #164: range commitments, the anchor as the checkpoint, the lease duration the owner's to set, an hour by default, no storage that grows with the history; `0xa80365fd…`: VERSION 8 with DA version 2, #33: batch bytes in the log, the rolling chain hash, signed forms of every sequencer call, a five-minute lease; `0xac18df18…`: VERSION 8 too, deployed and superseded the same day, 2026-11-01: its DA recorded Ethereum Sepolia's block numbers (HPP is Arbitrum-style, #128), so no replica can fetch its logs). Factories before VERSION 8 (`0xc0fa50eb…` VERSION 7, `0xd1aaa8d1…` VERSION 6, `0x9c6abd03…` VERSION 5, `0x9cfacba5…` with the permissionless claim; batches in contract storage) are refused at connect since v0.8 (#252): v0.7 is the last release that reads them |
 | HPPLite | *(per rollup)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
 | HPPLiteDA | *(per rollup)* | Your rollup's data-availability contract: batch data |
 
@@ -1223,11 +1223,10 @@ sequencer - there are no funds, bonds or fraud proofs here - it makes the
 divergence detectable, and a lost disk recoverable. The lease keeps two
 copies of your process from posting at once, and only the rollup's
 sequencer wallet (the owner, unless set apart) can take it - a rollup can
-sleep for days and nobody else can claim it. Rollups from the previous
-factory keep the old permissionless claim; there the node evicts a
-stranger's lease as owner, and a batch posted by someone else (it fails our
-authentication, so it is provably not ours) is stepped over by every key
-holder the same way instead of stopping reconstruction.
+sleep for days and nobody else can claim it. A batch posted by someone
+else (it fails our authentication, so it is provably not ours - a rotated
+sequencer's, #208) is stepped over by every key holder the same way instead
+of stopping reconstruction.
 
 **Soft and hard.** A batch at the store carries the sequencer's signature
 over its height and bytes, and the store's signed bucket statement. That is the

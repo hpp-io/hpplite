@@ -1156,9 +1156,10 @@ static void test_foreign_batch_is_skipped(void) {
     PASS();
 }
 
-/* 30. A stranger's lease on our rollup is expired by the owner; a sibling instance is not touched */
+/* 30. Another wallet's lease on our rollup is not evicted (#252: the chain names the sequencer since VERSION 5, so after
+** a rotation, #208, that wallet is the new sequencer and this node the old one); a sibling instance is not touched either */
 static void test_stranger_lease_evicted_sibling_not(void) {
-    TEST("stranger holding our rollup's lease is evicted; a sibling of our wallet is left alone");
+    TEST("another wallet holding our rollup's lease is not evicted - the batch waits and the node says so; a sibling of our wallet is left alone");
     reset_dir();
     HppliteL1 *l1 = hpplite_l1_create_mock();
     HppliteNode *n = open_node(DIR "/ev.db", l1);
@@ -1166,10 +1167,17 @@ static void test_stranger_lease_evicted_sibling_not(void) {
     hpplite_node_exec(n, "CREATE TABLE t(x)", NULL);
     if (hpplite_node_flush_batch(n) != 1) FAIL("batch 1");
     unsigned char other[32]; memset(other, 0xAB, 32);
-    /* a stranger (unknown wallet) grabbed the lease (pre-VERSION-5 contract) */
+    /* another wallet holds the lease: on the chain that is the sequencer the owner set */
     hpplite_l1_mock_claim_foreign(l1, NULL, other, 300);
     hpplite_node_exec(n, "INSERT INTO t VALUES(1)", NULL);
-    if (hpplite_node_flush_batch(n) != 2) FAIL("owner should expire the stranger's lease, reclaim and post");
+    if (hpplite_node_flush_batch(n) != 0) FAIL("the old node must not expire the named sequencer's lease and post (#252)");
+    if (n->hasLease) FAIL("the lease is not ours");
+    if (!strstr(n->ctx->zLastError, "holds the lease")) FAILF("the node should say why: '%s'", n->ctx->zLastError);
+    if (hpplite_node_pending_count(n) != 1) FAIL("kept pending");
+    /* the lease given back (the chain's state after the other instance released it): we post again */
+    hpplite_l1_mock_claim_foreign(l1, NULL, other, 0);
+    n->leaseRecheckAt = 0;
+    if (hpplite_node_flush_batch(n) != 2) FAIL("with the lease free again, the node reclaims and posts");
     if (!n->hasLease) FAIL("lease back with us");
     /* a sibling: our own wallet, another instance - we must not take over */
     unsigned char me[20]; hpplite_l1_get_my_address(l1, me);
