@@ -21,7 +21,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
-#include "state_tree.h"
 
 #include <time.h>
 
@@ -264,174 +263,15 @@ static const char *gInitError;           /* why the last hpplite_init failed, fo
 void hpplite_set_init_error(const char *zWhy) { gInitError = zWhy; }   /* a node's init saying why an open fails (page mode, #146) */
 const char *hpplite_init_error(void) { return gInitError; }
 
-static int expandedSqlIsFaithful(sqlite3 *db) {
-  static const char zLong[] = "hpplite-probe-0123456789abcdefghijklmnopqrstuvwxyz-0123456789abcdefghijklmnopqrstuvwxyz";
-  sqlite3_stmt *st = NULL;
-  char *z;
-  int ok = 0;
-#ifdef HPPLITE_TEST_HOOKS
-  if (getenv("HPPLITE_TEST_TRUNCATING_EXPAND")) return 0;
-#endif
-  /* a prepare that fails says nothing about expansion (a file this SQLite cannot
-  ** read, #139): the schema step reports that; truncation is only what is seen */
-  if (sqlite3_prepare_v2(db, "SELECT ?1", -1, &st, NULL) != SQLITE_OK) return 1;
-  sqlite3_bind_text(st, 1, zLong, -1, SQLITE_STATIC);
-  z = sqlite3_expanded_sql(st);
-  ok = z && strstr(z, zLong) != NULL;
-  sqlite3_free(z);
-  sqlite3_finalize(st);
-  return ok;
-}
-
-int hpplite_init(sqlite3 *db, HppliteCtx **ppCtx) { return hpplite_init_ex(db, ppCtx, 0); }
-
-int hpplite_init_ex(sqlite3 *db, HppliteCtx **ppCtx, int bRowsCapture) {
-  HppliteCtx *pCtx;
-  int rc, bTruncates;
-
-  gInitError = NULL;
-  bTruncates = !expandedSqlIsFaithful(db);
-  if (bTruncates && !bRowsCapture) {
-    gInitError = "this SQLite truncates bound values in sqlite3_expanded_sql() (built with "
-                 "SQLITE_TRACE_SIZE_LIMIT, as better-sqlite3's bundled SQLite is): statement capture "
-                 "would replay cut strings. Use row capture (the default; not capture=text), or a "
-                 "driver on a stock SQLite (Node: node:sqlite or the sqlite3 package; Python: sqlite3)";
-    fprintf(stderr, "hpplite: %s\n", gInitError);
-    return SQLITE_ERROR;
-  }
-
-  pCtx = (HppliteCtx*)sqlite3_malloc(sizeof(HppliteCtx));
-  if (!pCtx) return SQLITE_NOMEM;
-  memset(pCtx, 0, sizeof(HppliteCtx));
-  pCtx->bExpandTruncates = bTruncates;
-  pCtx->seenSchema = -1;
-
-  pCtx->db = db;
-  pCtx->bkDb = db;
-  pCtx->bEnabled = 1;
-
-  /* A file whose bookkeeping exists and is current is opened with reads
-  ** alone (#123): CREATE IF NOT EXISTS of a table that exists reads, but the
-  ** INSERT OR IGNORE of the meta row takes the write lock even when the row
-  ** is there, and a connection opened while another holds a write
-  ** transaction (one connection per request) waited out the busy timeout
-  ** and started without HPPLite. The first open of a file, and an upgrade
-  ** of an older file, still write. */
-  rc = SQLITE_OK;
-  if (!bookkeepingIsCurrent(db)) {
-    rc = hppliteInternalExec(pCtx, db, HPPLITE_SCHEMA);
-    if (rc != SQLITE_OK) {
-      /* a file this SQLite cannot read: not a database, or encrypted at the page
-      ** level (SQLCipher, SEE) and not keyed before HPPLite started (#139) */
-      static char zWhy[300];
-      snprintf(zWhy, sizeof zWhy, "cannot create the bookkeeping tables: %s (the file is not a database, or it is encrypted"
-               " and not yet keyed: see issue #139)", sqlite3_errmsg(db));
-      gInitError = zWhy;
-    }
-    if (rc == SQLITE_OK) {
-      /* files from before #52: the log has no mode column yet (rows already
-      ** in it ran with the default state, which DEFAULT 0 records) */
-      sqlite3_stmt *q = NULL;
-      int has = 0;
-      if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_pending') WHERE name = 'mode'",
-                             -1, &q, NULL) == SQLITE_OK) {
-        has = (sqlite3_step(q) == SQLITE_ROW);
-      }
-      sqlite3_finalize(q);
-      if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_pending ADD COLUMN mode INTEGER NOT NULL DEFAULT 0");
-    }
-    /* files from before #57 (no batch was ever left open) and #56 (no
-    ** statement recorded a time) */
-    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "open_txn");
-    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_pending", "now");
-    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "now");
-    /* #59: statements posted in pieces */
-    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_id");
-    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_meta", "frag_off");
-    if (rc == SQLITE_OK) {
-      /* #33: the rollup's rolling hash; a file from before has none (NULL), which no check reads */
-      sqlite3_stmt *q = NULL;
-      int has = 0;
-      if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_meta') WHERE name = 'chain_hash'", -1, &q, NULL) == SQLITE_OK)
-        has = (sqlite3_step(q) == SQLITE_ROW);
-      sqlite3_finalize(q);
-      if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_meta ADD COLUMN chain_hash BLOB");
-    }
-    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, db, "_hpplite_carry", "frag");
-    if (rc == SQLITE_OK) {
-      /* the rollup the history is on */
-      sqlite3_stmt *q = NULL;
-      int has = 0;
-      if (sqlite3_prepare_v2(db, "SELECT 1 FROM pragma_table_info('_hpplite_meta') WHERE name = 'rollup'", -1, &q, NULL) == SQLITE_OK)
-        has = (sqlite3_step(q) == SQLITE_ROW);
-      sqlite3_finalize(q);
-      if (!has) rc = hppliteInternalExec(pCtx, db, "ALTER TABLE _hpplite_meta ADD COLUMN rollup TEXT NOT NULL DEFAULT ''");
-    }
-    /* #9: the maintained state trees */
-    if (rc == SQLITE_OK) rc = hppliteTreeSchema(pCtx, db);
-  }
-  if (rc != SQLITE_OK) {
-    sqlite3_free(pCtx);
-    return rc;
-  }
-  hppliteLoadMeta(pCtx);
-  pCtx->vacuumFd = -1;
-  {
-    /* the VACUUM barrier (#75): one lock file per database file, by its real path */
-    const char *zFile = sqlite3_db_filename(db, "main");
-    char resolved[PATH_MAX], path[PATH_MAX + 24];
-    if (zFile && zFile[0] && realpath(zFile, resolved)) {
-      snprintf(path, sizeof path, "%s-hpplite-vacuum", resolved);
-      pCtx->vacuumFd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);     /* -1 (a read-only directory): no barrier */
-    }
-  }
-  pCtx->seenSchema = hppliteSchemaVersion(pCtx);
-  pCtx->bClockPin = hpplite_clock_on(db);
-  hpplitePragmaModeRead(pCtx);
-
-  sqlite3_commit_hook(db, hppliteCommitHook, pCtx);
-  sqlite3_rollback_hook(db, hppliteRollbackHook, pCtx);
-  sqlite3_trace_v2(db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, hppliteTraceCallback, pCtx);
-  sqlite3_set_authorizer(db, hppliteAuthorizer, pCtx);
-  hppliteBlobGuardArm(pCtx, 1);
-
-  *ppCtx = pCtx;
-  return SQLITE_OK;
-}
-
 static int pagesTrace(unsigned mask, void *pArg, void *pS, void *pX);
 static int pagesWalHook(void *pArg, sqlite3 *db, const char *zDb, int nFrames);
 static void rearmHooks(HppliteCtx *pCtx, int bClosing) {
-  void *prevCommit, *prevRollback;
-  int lost = 0;
+  (void)bClosing;
   if (!pCtx || pCtx->bDbClosed) return;
-  if (pCtx->bPages) {   /* page mode: the authorizer, the VACUUM marker (#148) and the wal hook (#155) */
-    sqlite3_set_authorizer(pCtx->db, hppliteAuthorizer, pCtx);
-    sqlite3_trace_v2(pCtx->db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, pagesTrace, pCtx);
-    sqlite3_wal_hook(pCtx->db, pagesWalHook, pCtx);
-    return;
-  }
-  /* setting a hook returns the previous argument: not ours means replaced */
-  prevCommit = sqlite3_commit_hook(pCtx->db, hppliteCommitHook, pCtx);
-  prevRollback = sqlite3_rollback_hook(pCtx->db, hppliteRollbackHook, pCtx);
-  if (prevCommit != pCtx || prevRollback != pCtx) lost = 1;
-  /* A driver clearing the connection's callbacks as it closes it (Python's
-  ** sqlite3 does) is not another component taking them over: nothing runs
-  ** after it */
-  if (bClosing && (prevCommit == pCtx || !prevCommit) && (prevRollback == pCtx || !prevRollback)) lost = 0;
-  /* the trace API returns no previous value: re-arm it unconditionally and
-  ** rely on the commit hook as the canary (a library that replaces one
-  ** usually replaces the others; the data_version check in #37 covers the rest) */
-  sqlite3_trace_v2(pCtx->db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, hppliteTraceCallback, pCtx);
+  /* page mode: the authorizer, the VACUUM marker (#148) and the wal hook (#155); a driver that replaced them gets them back */
   sqlite3_set_authorizer(pCtx->db, hppliteAuthorizer, pCtx);
-  hppliteBlobGuardArm(pCtx, 0);
-  if (lost) {
-    pCtx->nHooksReplaced++;
-    if (pCtx->nHooksReplaced == 1) {
-      fprintf(stderr, "hpplite: another component replaced the connection's commit/trace hooks; "
-                      "writes made meanwhile were not captured (re-armed, hooks_replaced counts this)\n");
-    }
-  }
+  sqlite3_trace_v2(pCtx->db, SQLITE_TRACE_STMT | SQLITE_TRACE_PROFILE, pagesTrace, pCtx);
+  sqlite3_wal_hook(pCtx->db, pagesWalHook, pCtx);
 }
 void hpplite_rearm_hooks(HppliteCtx *pCtx) { rearmHooks(pCtx, 0); }
 
@@ -440,57 +280,24 @@ void hpplite_rearm_hooks(HppliteCtx *pCtx) { rearmHooks(pCtx, 0); }
 ** connection. They are re-prepared on demand, so this is safe at any time;
 ** it is needed before a close, which fails while any statement is live.
 */
-static void finalizeOwnStatements(HppliteCtx *pCtx) {
-  if (pCtx->pLogStmt) sqlite3_finalize(pCtx->pLogStmt);
-  if (pCtx->pUnlogStmt) sqlite3_finalize(pCtx->pUnlogStmt);
-  if (pCtx->pRecTrigStmt) sqlite3_finalize(pCtx->pRecTrigStmt);
-  if (pCtx->pSchemaStmt) sqlite3_finalize(pCtx->pSchemaStmt);
-  if (pCtx->pZeroStmt) sqlite3_finalize(pCtx->pZeroStmt);
-  if (pCtx->pSeqStmt) sqlite3_finalize(pCtx->pSeqStmt);
-  if (pCtx->pRowsSchemaStmt) sqlite3_finalize(pCtx->pRowsSchemaStmt);
-  if (pCtx->pRowsTempSchemaStmt) sqlite3_finalize(pCtx->pRowsTempSchemaStmt);
-  if (pCtx->pRowsLockStmt) sqlite3_finalize(pCtx->pRowsLockStmt);
-  if (pCtx->pProbeStmt) sqlite3_finalize(pCtx->pProbeStmt);
-  pCtx->pLogStmt = pCtx->pUnlogStmt = pCtx->pSchemaStmt = pCtx->pRecTrigStmt = pCtx->pZeroStmt = NULL;
-  pCtx->pSeqStmt = pCtx->pRowsSchemaStmt = pCtx->pRowsTempSchemaStmt = pCtx->pRowsLockStmt = pCtx->pProbeStmt = NULL;
-  pCtx->logged.pS = NULL;
-}
 
-/* Statements of the application that are still open (ours do not count).
+/* Statements of the application that are still open (HPPLite keeps none prepared on the application's connection).
 ** Application thread only: it walks the connection. */
 static int applicationStatementsOpen(HppliteCtx *pCtx) {
-  sqlite3_stmt *pStmt = NULL;
-  while ((pStmt = sqlite3_next_stmt(pCtx->db, pStmt)) != NULL) {
-    if (pStmt == pCtx->pLogStmt || pStmt == pCtx->pUnlogStmt || pStmt == pCtx->pSchemaStmt
-        || pStmt == pCtx->pRecTrigStmt || pStmt == pCtx->pZeroStmt || pStmt == pCtx->pSeqStmt
-        || pStmt == pCtx->pRowsSchemaStmt || pStmt == pCtx->pRowsTempSchemaStmt || pStmt == pCtx->pRowsLockStmt
-        || pStmt == pCtx->pProbeStmt) continue;
-    return 1;
-  }
-  return 0;
+  return sqlite3_next_stmt(pCtx->db, NULL) != NULL;
 }
 
 void hpplite_shutdown(HppliteCtx *pCtx) {
   if (!pCtx) return;
 
   if (!pCtx->bDbClosed) {
-    sqlite3_commit_hook(pCtx->db, NULL, NULL);
-    sqlite3_rollback_hook(pCtx->db, NULL, NULL);
     sqlite3_trace_v2(pCtx->db, 0, NULL, NULL);
     sqlite3_set_authorizer(pCtx->db, NULL, NULL);
-    if (pCtx->bPages) sqlite3_wal_hook(pCtx->db, NULL, NULL);
-    hpplite_rows_disable(pCtx);           /* its triggers and functions hold pCtx (#66) */
-    finalizeOwnStatements(pCtx);
+    sqlite3_wal_hook(pCtx->db, NULL, NULL);
   }
   sqlite3_free(pCtx->zWalKey); pCtx->zWalKey = NULL;
-  hppliteFreeFunctionChecks(pCtx);
-  hppliteTreeFree(pCtx);
   if (pCtx->vacuumFd >= 0) close(pCtx->vacuumFd);                         /* its flock goes with it */
-  sqlite3_free(pCtx->aNoClock);
-  sqlite3_free(pCtx->zRowsTextOnly);
-  sqlite3_free(pCtx->zRowsSeq);
   sqlite3_free(pCtx->zDbName);
-  if (pCtx->pNoClockMutex) sqlite3_mutex_free(pCtx->pNoClockMutex);
   sqlite3_free(pCtx);
 }
 
@@ -552,8 +359,7 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
   pCtx->vacuumFd = -1;
   {
     /* a file this SQLite cannot read (not a database; SQLCipher/SEE and not
-    ** keyed, #139): row capture finds out creating its tables in it, page
-    ** mode keeps nothing in the file, so it asks (#149) */
+    ** keyed, #139): HPPLite keeps nothing in the file, so it asks (#149) */
     sqlite3_stmt *q = NULL;
     rc = sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_schema", -1, &q, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_step(q) == SQLITE_ROW ? SQLITE_OK : sqlite3_errcode(db);
@@ -569,7 +375,6 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
   }
   if (!bookkeepingIsCurrent(bkDb)) {
     rc = hppliteInternalExec(pCtx, bkDb, HPPLITE_SCHEMA);
-    if (rc == SQLITE_OK) rc = hppliteTreeSchema(pCtx, bkDb);
     if (rc != SQLITE_OK) { gInitError = "cannot create the bookkeeping tables in the sidecar"; sqlite3_free(pCtx); return rc; }
   }
   {
@@ -606,70 +411,9 @@ int hpplite_set_bookkeeping_db(HppliteCtx *pCtx, sqlite3 *bkDb) {
   return hppliteLoadMeta(pCtx);
 }
 
-void hpplite_enable(HppliteCtx *pCtx, int bEnable) {
-  if (pCtx) pCtx->bEnabled = bEnable;
-}
-
 void hpplite_get_state_root(HppliteCtx *pCtx, unsigned char *pOut) {
   if (!pCtx || !pOut) return;
-  if (pCtx->bPages) { memcpy(pOut, pCtx->stateRoot, HPPLITE_HASH_SIZE); return; }   /* the page root, kept by the node (#146) */
-  if (pCtx->bRootDirty) {
-    /* the trees take the log in; a write transaction keeps what they took,
-    ** a read one computes the root and keeps the work in memory for the
-    ** next flush; on the shared connection inside the application's
-    ** transaction, neither: the statements run as they can */
-    int txn = hppliteBkBegin(pCtx, 1) == SQLITE_OK ? 1 : (hppliteBkBegin(pCtx, 0) == SQLITE_OK ? 0 : -1);
-    int saved = hppliteBkEnter(pCtx);
-    int rc = hppliteTreeRoot(pCtx, pCtx->curRoot);
-    if (rc == SQLITE_OK && txn == 1) rc = hppliteTreeFlush(pCtx);
-    hppliteBkLeave(pCtx, saved);
-    if (txn >= 0) rc = hppliteBkEnd(pCtx, rc);
-    if (rc == SQLITE_OK) pCtx->bRootDirty = 0;
-  }
-  memcpy(pOut, pCtx->curRoot, HPPLITE_HASH_SIZE);
-}
-
-void hpplite_set_callbacks(
-  HppliteCtx *pCtx,
-  void *pArg,
-  void (*xOnCommit)(void*, unsigned char*, int),
-  void (*xOnRollback)(void*)
-) {
-  if (pCtx) {
-    pCtx->pCallbackArg = pArg;
-    pCtx->xOnCommit = xOnCommit;
-    pCtx->xOnRollback = xOnRollback;
-  }
-}
-
-int hpplite_exec(HppliteCtx *pCtx, const char *zSql, char **pzErrMsg) {
-  return hpplite_exec_cb(pCtx, zSql, NULL, NULL, pzErrMsg);
-}
-
-int hpplite_exec_cb(
-  HppliteCtx *pCtx,
-  const char *zSql,
-  int (*xCallback)(void*, int, char**, char**),
-  void *pArg,
-  char **pzErrMsg
-) {
-  if (!pCtx || !zSql) return SQLITE_MISUSE;
-  /* The trace callback logs the statement; nothing else to do here */
-  return sqlite3_exec(pCtx->db, zSql, xCallback, pArg, pzErrMsg);
-}
-
-int hpplite_pending_count(HppliteCtx *pCtx) {
-  sqlite3_stmt *pStmt;
-  int n = 0;
-  if (!pCtx) return 0;
-  int saved = hppliteBkEnter(pCtx);
-  if (sqlite3_prepare_v2(pCtx->bkDb, "SELECT count(*) FROM _hpplite_pending",
-                         -1, &pStmt, NULL) == SQLITE_OK) {
-    if (sqlite3_step(pStmt) == SQLITE_ROW) n = sqlite3_column_int(pStmt, 0);
-    sqlite3_finalize(pStmt);
-  }
-  hppliteBkLeave(pCtx, saved);
-  return n;
+  memcpy(pOut, pCtx->stateRoot, HPPLITE_HASH_SIZE);       /* the page root after the last confirmed batch, kept by the node (#146) */
 }
 
 uint64_t hpplite_get_block_height(HppliteCtx *pCtx) {
@@ -853,7 +597,7 @@ void hppliteOnClose(sqlite3 *db) {
 
     /* Our own prepared statements would make the close fail; the trace
     ** callback re-prepares them if the connection lives on */
-    if (node->ctx) { rearmHooks(node->ctx, 1); finalizeOwnStatements(node->ctx); }
+    if (node->ctx) rearmHooks(node->ctx, 1);
 
     /* SQLite disconnects virtual tables before it checks for unfinalized
     ** statements. If the application still has one, this close is about to
@@ -1380,7 +1124,6 @@ static int hpplite_auto_init(
 */
 __attribute__((constructor))
 static void hpplite_auto_register(void) {
-    hpplite_clock_register();        /* before any connection is opened (#56) */
     sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
 }
 #endif
@@ -1483,9 +1226,6 @@ int sqlite3_hpplite_init(
     }
   }
   hpplite_pin_in_memory();
-  /* connections opened from here on take their time from the clock VFS
-  ** (#56); the module stays loaded, so the VFS outlives every connection */
-  hpplite_clock_register();
   sqlite3_auto_extension((void(*)(void))hpplite_auto_init);
   return hpplite_auto_init(db, pzErrMsg, pApi);
 }

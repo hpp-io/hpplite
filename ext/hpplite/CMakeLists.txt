@@ -59,11 +59,10 @@ target_include_directories(sqlite3 PUBLIC
 target_compile_definitions(sqlite3 PUBLIC
     SQLITE_THREADSAFE=1
     # full-text search and R*Tree, as in the SQLite of Homebrew, macOS, Debian and
-    # Python's builds: what applications use, row capture records (their tables)
+    # Python's builds: what applications use
     SQLITE_ENABLE_FTS5
     SQLITE_ENABLE_RTREE
-    # the pre-update hook, as there too: the only thing that sees an incremental
-    # blob write, which row and statement capture refuse (#169)
+    # the pre-update hook, as there too
     SQLITE_ENABLE_PREUPDATE_HOOK
 )
 target_link_libraries(sqlite3 PUBLIC
@@ -85,9 +84,7 @@ set(HPPLITE_SOURCES
     capture.c
     bookkeeping.c
     finalize.c
-    replay.c
     status.c
-    capture_rows.c
     batch.c
     crypto.c
     node.c
@@ -96,7 +93,6 @@ set(HPPLITE_SOURCES
     cipher.c
     keystore.c
     envelope_pk.c
-    clock.c
     walread.c
     # Web3 integration (eth/ subdirectory)
     eth/cJSON.c
@@ -109,7 +105,7 @@ set(HPPLITE_SOURCES
 # L1 backends: every build has both; the endpoint picks one at run time (#35).
 # HPPLITE_USE_REAL_L1 now only decides whether the tests and examples that
 # need a chain (anvil, HPP Sepolia) are built, and keeps the test hooks out.
-list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c spend.c compress.c smt.c state_tree.c)
+list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c spend.c compress.c)
 if(HPPLITE_USE_REAL_L1)
     message(STATUS "L1 backends: eth + mock; chain tests and examples on")
 else()

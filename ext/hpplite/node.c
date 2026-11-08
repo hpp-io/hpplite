@@ -25,6 +25,7 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch);
 static int node_start_pages(HppliteNode *node, const char *zFile);
 static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch);
 static void node_ck_open(HppliteNode *node);
+static void node_checkpoint_wal(HppliteNode *node, int64_t now);
 static void node_ck_close(HppliteNode *node);
 static void node_pins_close(HppliteNode *node);
 static void node_wal_maintenance(void *pArg);
@@ -37,7 +38,6 @@ static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1);
 static uint8_t *node_store_get_checked(HppliteNode *node, const char *zRef, const unsigned char want[32], size_t *pLen);
 static struct cJSON *node_snapshot_index(HppliteNode *node, const char *zIndex, const unsigned char sha[32]);
 #include "da_uri.h"
-#include "capture_rows.h"
 #include "cJSON.h"
 static void node_cap_batch_limit(HppliteNode *node);
 static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
@@ -2363,7 +2363,7 @@ static int node_anchor_once(HppliteNode *node) {
     sqlite3_finalize(q);
     hppliteBkLeave(ctx, saved);
     if (from == 0) { cJSON_Delete(m); return 0; }
-    if (!hasRoot) hpplite_get_state_root(ctx, root);     /* row capture: the trees give the root after the last finalized batch */
+    if (!hasRoot) hpplite_get_state_root(ctx, root);     /* the root after the last finalized batch */
     cJSON_AddNumberToObject(m, "from", (double)from);
     cJSON_AddNumberToObject(m, "to", (double)to);
     hex32(chainAfter, hx); cJSON_AddStringToObject(m, "chain_after", hx);
@@ -3371,7 +3371,7 @@ static void node_ck_close(HppliteNode *node) {
     sqlite3_close(node->ckDb);
     node->ckDb = NULL;
 }
-static sqlite3 *node_ck_conn(HppliteNode *node) { return node->pm ? node->ckDb : node->bkDb; }
+static sqlite3 *node_ck_conn(HppliteNode *node) { return node->ckDb; }
 
 /* The pins (#155): a read transaction held on one of two plain connections,
 ** moved forward right after each poll: SQLite backfills only up to the
@@ -3408,7 +3408,22 @@ static void node_wal_maintenance(void *pArg) {
     if (node->pinDb[node->pinActive]) sqlite3_exec(node->pinDb[node->pinActive], "COMMIT", NULL, NULL, NULL);
     if (fresh) node->pinActive = !node->pinActive;
     node_ck_open(node);
+    node_checkpoint_wal(node, node_current_time_ms());
     pthread_mutex_unlock((pthread_mutex_t *)node->walMaintMutex);
+}
+
+/* The file's WAL into the database (#144, #155): a passive checkpoint on a plain connection of the node's own, once a
+** second from the WAL upkeep; the application connection's own checkpoint is off (its wal hook is the capture's),
+** so the application never pays for one, and the pins (#155) keep the frames a batch still needs */
+static void node_checkpoint_wal(HppliteNode *node, int64_t now) {
+    int nLog = 0, nCkpt = 0;
+    sqlite3 *ck = node_ck_conn(node);
+    if (!ck) return;
+    if (node->walPages < 1000 && now < node->walCheckAt) return;
+    node->walCheckAt = now + 1000;
+    if (sqlite3_wal_checkpoint_v2(ck, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt) == SQLITE_OK) {
+        node->walPages = nCkpt >= nLog ? 0 : nLog;       /* all of it in the database: the next writer restarts the WAL */
+    }
 }
 
 
@@ -3700,8 +3715,8 @@ void hpplite_node_stop(HppliteNode *node) {
 ** Execute SQL (queued for next batch).
 */
 int hpplite_node_exec(HppliteNode *node, const char *sql, char **errMsg) {
-    if (!node || !sql) return -1;
-    return hpplite_exec(node->ctx, sql, errMsg);
+    if (!node || !sql || !node->ctx) return -1;
+    return sqlite3_exec(node->ctx->db, sql, NULL, NULL, errMsg);     /* the VFS sees the commits: nothing else to do */
 }
 
 /*

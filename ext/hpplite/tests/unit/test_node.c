@@ -418,20 +418,6 @@ static void test_node_lifecycle(void) {
 }
 
 
-/* ---- #141: a flush must not keep the writer waiting ---- */
-
-static int g_syncGate = -1;         /* the gate's state when the trees took in a row */
-static int g_syncBkInTxn = -1;      /* and whether the bookkeeping connection was inside a transaction */
-static int g_syncsUnderGate = 0;    /* syncs that took rows in while the bookkeeping write held the gate */
-static void in_tree_sync(void *arg) {
-    HppliteNode *node = (HppliteNode *)arg;
-    int gate = __atomic_load_n(&node->ctx->txnGate, __ATOMIC_ACQUIRE);
-    if (gate == 2) g_syncsUnderGate++;
-    if (g_syncGate >= 0) return;    /* the first take-in of the flush is the long one */
-    g_syncGate = gate;
-    g_syncBkInTxn = !sqlite3_get_autocommit(node->ctx->bkDb);
-}
-
 static HppliteNode *open_local_node(const char *dir, const char *id) {
     static HppliteNodeConfig config;
     static char dbPath[256];
@@ -467,55 +453,6 @@ static void *writer_main(void *arg) {
     }
     return NULL;
 }
-static void test_flush_gets_the_gate_from_a_busy_writer(void) {
-    HppliteNode *node;
-    Writer w;
-    pthread_t th;
-    char *err = NULL;
-    uint64_t before, after;
-
-    TEST("flush_gets_the_gate_from_a_busy_writer");
-    node = open_local_node("/tmp/hpplite_test_busy", "test-busy");
-    if (!node) { FAIL("create"); return; }
-    hpplite_node_start(node);
-    if (hpplite_node_exec(node, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &err) != 0) { FAIL(err); hpplite_node_destroy(node); return; }
-    if (hpplite_node_flush_batch(node) != 1) { FAIL("first flush"); hpplite_node_destroy(node); return; }   /* the trees built: what follows is the steady state */
-    memset(&w, 0, sizeof(w));
-    w.node = node;
-    pthread_create(&th, NULL, writer_main, &w);
-    usleep(200000);                                   /* a few thousand transactions in */
-    before = hpplite_node_get_height(node);
-#ifdef HPPLITE_TEST_HOOKS
-    g_syncGate = -1; g_syncsUnderGate = 0;
-    hpplite_test_in_tree_sync = in_tree_sync;
-    hpplite_test_in_tree_sync_arg = node;
-#endif
-    after = hpplite_node_flush_batch(node);           /* one try, as the timer would */
-#ifdef HPPLITE_TEST_HOOKS
-    hpplite_test_in_tree_sync = NULL;
-    hpplite_test_in_tree_sync_arg = NULL;
-#endif
-    w.stop = 1;
-    pthread_join(th, NULL);
-    if (after == 0 || hpplite_node_get_height(node) == before) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "the flush could not take the gate from a writer at %d transactions in 0.2 s (height %llu, still)", w.txns, (unsigned long long)before);
-        FAIL(msg);
-    } else if (w.worstMs > 500) {
-        char msg[120];
-        snprintf(msg, sizeof(msg), "the writer waited %.0f ms for the flush", w.worstMs);
-        FAIL(msg);
-    } else if (g_syncsUnderGate > 0) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "the trees took rows in under the gate %d times: rows written during the flush belong to the next batch", g_syncsUnderGate);
-        FAIL(msg);
-    } else {
-        printf("(writer: %d transactions, worst %.1f ms) ", w.txns, w.worstMs);
-        PASS();
-    }
-    hpplite_node_destroy(node);
-    cleanup_test_files("/tmp/hpplite_test_busy");
-}
 
 /* The bookkeeping connection commits without an fsync of its own (#142):
 ** 3 ms per batch under the gate, for commits the chain can replace. */
@@ -540,6 +477,60 @@ static void test_bookkeeping_commits_without_fsync(void) {
 }
 
 
+/* The WAL's checkpoint runs on the timer thread, not at the application's
+** commit (#144): the application connection's automatic checkpoint is off,
+** and the timer moves the WAL into the database on its own. */
+static void test_wal_checkpoint_on_the_timer(void) {
+    HppliteNodeConfig config;
+    HppliteNode *node;
+    sqlite3_stmt *st = NULL;
+    char *err = NULL;
+    int autockpt = -1, i, waited;
+    struct stat stDb;
+
+    TEST("wal_checkpoint_on_the_timer");
+    cleanup_test_files("/tmp/hpplite_test_wal");
+    ensure_test_dir("/tmp/hpplite_test_wal");
+    memset(&config, 0, sizeof(config));
+    config.nodeId = "test-wal";
+    memcpy(config.privkey, SEQ_PRIVKEY, 32);
+    config.hasPrivkey = 1;
+    config.dataDir = "/tmp/hpplite_test_wal";
+    config.dbPath = "/tmp/hpplite_test_wal/test.db";
+    config.localOnly = 1;
+    config.batchIntervalMs = 3600 * 1000;
+    node = hpplite_node_create(&config);
+    if (!node) { FAIL("create"); return; }
+    hpplite_node_start(node);
+    hpplite_node_start_timer(node);
+    if (sqlite3_prepare_v2(node->db, "PRAGMA wal_autocheckpoint", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) autockpt = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (autockpt != 0) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "the application connection still checkpoints itself (wal_autocheckpoint = %d)", autockpt);
+        FAIL(msg); hpplite_node_destroy(node); return;
+    }
+    /* 5 MB of rows in ten transactions: well past a thousand WAL pages */
+    if (hpplite_node_exec(node, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", &err) != 0) { FAIL(err); hpplite_node_destroy(node); return; }
+    for (i = 0; i < 10; i++) {
+        if (hpplite_node_exec(node, "BEGIN; WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 1000)"
+                                    " INSERT INTO t(v) SELECT zeroblob(500) FROM s; COMMIT", &err) != 0) { FAIL(err); hpplite_node_destroy(node); return; }
+    }
+    /* the frames reach the database file only through a checkpoint: the
+    ** file grows past what the schema alone takes */
+    for (waited = 0; waited < 40; waited++) {
+        if (stat("/tmp/hpplite_test_wal/test.db", &stDb) == 0 && stDb.st_size > 4 * 1024 * 1024) break;
+        usleep(100000);
+    }
+    if (stat("/tmp/hpplite_test_wal/test.db", &stDb) != 0 || stDb.st_size <= 4 * 1024 * 1024) {
+        char msg[120];
+        snprintf(msg, sizeof(msg), "no checkpoint in 4 s: the database file is %lld bytes, the rows sit in the WAL", (long long)stDb.st_size);
+        FAIL(msg);
+    } else PASS();
+    hpplite_node_destroy(node);
+    cleanup_test_files("/tmp/hpplite_test_wal");
+}
+
 int main(void) {
     printf("\n=== HPPLite Node Tests (Singleton Sequencer Model) ===\n\n");
 
@@ -548,7 +539,7 @@ int main(void) {
     test_multiple_batches();
     test_checkpoint_tracking();
     test_node_lifecycle();
-    test_flush_gets_the_gate_from_a_busy_writer();
+    test_wal_checkpoint_on_the_timer();
     test_bookkeeping_commits_without_fsync();
 
     printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);

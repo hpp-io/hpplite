@@ -8,13 +8,13 @@
 **
 **   hpplite.c      lifecycle (init, shutdown), the _hpplite_meta mirror, the
 **                  connection registry and the open/close API, extension entry
-**   capture.c      the hooks on the application connection: trace, authorizer,
-**                  commit and rollback; text rules; the stale-rerun machinery
-**   capture_rows.c row capture: the TEMP triggers and their records
+**   capture.c      the authorizer on the application connection (#148)
+**   pagemode.c     page capture (#146): the commits' pages from the WAL, the page batches
+**   pages.c        the page root and the page batch format; walread.c reads the WAL
 **   bookkeeping.c  the bookkeeping transaction and the foreign-write check
-**   finalize.c     batch building, the size cut, finalizing and posted batches
-**   replay.c       applying batches from the chain; adopt, skip, checkpoint
-**   state_hash.c   the content hash (state root) and the block hash
+**   finalize.c     the meta row past a posted page batch, the posted copies, the chain hash,
+**                  the verifier's root ring, a foreign height skipped, the checkpoint
+**   state_hash.c   the content hash of a database (hpplite-verify --db)
 **   status.c       the hpplite_status virtual table and the close sentinel
 **   sha256.c       SHA-256
 */
@@ -23,8 +23,6 @@
 
 #include "hpplite.h"
 #include "sha256.h"
-#include "capture_rows.h"
-#include "clock.h"
 #include "batch.h"
 
 /* mock builds: a test makes the next n bookkeeping COMMITs fail as SQLITE_FULL (a full disk) */
@@ -52,21 +50,13 @@ void hppliteRemoveNode(sqlite3 *db);
 void hppliteOnClose(sqlite3 *db);              /* the connection close, from the status table's xDisconnect */
 
 /* capture.c */
-int hppliteTraceCallback(unsigned mask, void *pArg, void *pStmt, void *pX);  /* the hooks hpplite_init installs */
 int hppliteAuthorizer(void *pArg, int op, const char *z1, const char *z2, const char *z3, const char *z4);  /* ...and re-arms */
-int hppliteCommitHook(void *pArg);
-void hppliteRollbackHook(void *pArg);
-void hppliteBlobGuardArm(HppliteCtx *pCtx, int bInit);  /* the pre-update hook that sees incremental blob writes (#169) */
-int hppliteSchemaVersion(HppliteCtx *pCtx);    /* PRAGMA schema_version (cached statement) */
-void hpplitePragmaModeRead(HppliteCtx *pCtx);  /* the connection pragmas the mode bits mirror (#28) */
-void hppliteFreeFunctionChecks(HppliteCtx *pCtx);  /* the function verdicts and the replica's function list */
 
 /* bookkeeping.c */
 int hppliteBkBegin(HppliteCtx *pCtx, int bWrite);  /* a bookkeeping transaction, read or write... */
 int hppliteBkEnd(HppliteCtx *pCtx, int rc);    /* ...committed or rolled back; a foreign write is noticed here (#37) */
 
 /* finalize.c */
-int hppliteAdvanceMeta(HppliteCtx *pCtx, const HppliteBatch *pBatch, sqlite3_int64 maxId, int bWriter);  /* past a batch: finalize, adopt, replay, skip */
 
 /* status.c */
 void hppliteStatusRegister(sqlite3 *db);       /* the close sentinel and the hpplite_status table on a registered connection */

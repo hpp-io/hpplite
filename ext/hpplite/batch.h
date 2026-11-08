@@ -98,54 +98,18 @@ typedef enum {
   HPPLITE_FINALITY_L1             /* Committed to L1 */
 } HppliteFinalityLevel;
 
-/*
-** Create a new empty batch
-*/
-HppliteBatch *hpplite_batch_new(uint64_t height);
 
-/*
-** The longest prefix of zIn whose JSON-escaped size is at most budget,
-** ending on a UTF-8 character boundary (a statement cut into pieces, #59).
-*/
-size_t hpplite_json_prefix_fit(const char *zIn, size_t budget);
 
 /*
 ** Free a batch and all its transactions
 */
 void hpplite_batch_free(HppliteBatch *pBatch);
 
-/*
-** Add a statement to a batch as its own transaction group
-*/
-int hpplite_batch_add_txn(HppliteBatch *pBatch, const char *zSql, int64_t nRowsAffected);
 
-/*
-** Add a statement to a batch with an explicit transaction group.
-** Statements sharing a group are replayed inside one transaction.
-*/
-int hpplite_batch_add_stmt(HppliteBatch *pBatch, const char *zSql, int64_t nRowsAffected, int64_t txn);
 
-/*
-** Set pre-state root
-*/
-void hpplite_batch_set_pre_state(HppliteBatch *pBatch, const unsigned char *pRoot);
 
-/*
-** Set post-state root
-*/
-void hpplite_batch_set_post_state(HppliteBatch *pBatch, const unsigned char *pRoot);
 
-/*
-** Serialize batch to JSON string
-** Caller must free returned string with sqlite3_free()
-*/
-char *hpplite_batch_to_json(const HppliteBatch *pBatch);
 
-/*
-** Parse batch from JSON string
-** Caller must free returned batch with hpplite_batch_free()
-*/
-HppliteBatch *hpplite_batch_from_json(const char *zJson);
 
 /* === Checkpoint Functions === */
 
@@ -162,38 +126,10 @@ HppliteCheckpoint *hpplite_checkpoint_new(
 */
 void hpplite_checkpoint_free(HppliteCheckpoint *pCheckpoint);
 
-/*
-** Serialize checkpoint to JSON
-** Caller must free returned string with sqlite3_free()
-*/
-char *hpplite_checkpoint_to_json(const HppliteCheckpoint *pCheckpoint);
 
-/*
-** Parse checkpoint from JSON
-** Caller must free returned checkpoint with hpplite_checkpoint_free()
-*/
-HppliteCheckpoint *hpplite_checkpoint_from_json(const char *zJson);
 
-/*
-** Compute hash for checkpoint signing
-** hash = keccak256(fromHeight || toHeight || postStateRoot || batchesHash)
-*/
-void hpplite_checkpoint_hash(
-  const HppliteCheckpoint *pCheckpoint,
-  unsigned char *pHashOut  /* 32 bytes */
-);
 
-/*
-** Number of bytes a statement occupies in the batch JSON (escaped text plus
-** the per-statement framing). Used to cut batches at the DA size limit
-** without serializing.
-*/
-size_t hpplite_batch_stmt_json_size(const char *zSql, int64_t nRowsAffected, int64_t txn);
 
-/*
-** Bytes of batch JSON outside the statements (header, roots, brackets).
-*/
-size_t hpplite_batch_json_overhead(void);
 
 /*
 ** Helper: convert bytes to hex string

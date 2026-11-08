@@ -139,7 +139,7 @@ static void test_timer_vs_open_transaction(void) {
     }
     usleep(300000);
     if (hpplite_get_block_height(ctx) != 3) FAIL("committed transaction should be flushed as one batch");
-    if (hpplite_pending_count(ctx) != 0) FAIL("pending should be empty");
+    if (hpplite_node_pending_count(hpplite_get_node(db)) != 0) FAIL("pending should be empty");
     sqlite3_close(db);
     PASS();
 }

@@ -24,7 +24,6 @@
 #include "hpplite.h"
 #include "node.h"
 #include "batch.h"
-#include "capture_rows.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
