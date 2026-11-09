@@ -76,7 +76,7 @@ int main(void) {
     HppliteConfig *cfg = hpplite_get_config(db);
     if (cfg) {
         printf("\nLoaded Configuration:\n");
-        printf("  Role:     %s\n", hpplite_config_role_str(cfg->role));
+        printf("  Role:     %s\n", cfg->roleVerify ? "verify" : "sequencer");   /* role= takes verify only (#248) */
         printf("  Chain ID: %llu\n", (unsigned long long)cfg->chainId);
         printf("  RPC URL:  %s\n", cfg->rpcUrl);
         printf("  Contract: 0x");
