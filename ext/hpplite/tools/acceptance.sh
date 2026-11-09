@@ -17,8 +17,10 @@
 #   HPPLITE_BUILD_MOCK    default ext/hpplite/build_mock
 #   HPPLITE_BUILD_TRUNK   default ext/hpplite/build_trunk; needs HPPLITE_TRUNK_SQLITE, the directory holding a
 #                         sqlite3.c built from SQLite trunk (make sqlite3.c in a trunk checkout's build dir)
-#   HPPLITE_BUILD_REAL    default ext/hpplite/build_real; configured with -DHPPLITE_USE_REAL_L1=ON and
+#   HPPLITE_BUILD_REAL    default ext/hpplite/build_real; configured with -DHPPLITE_USE_REAL_L1=ON,
 #                         -DHPPLITE_SQLITE_SRC=$HPPLITE_SQLITE_SRC (default <repo>/build, the repo's own amalgamation)
+#                         and -DHPPLITE_BUILD_EXAMPLES=ON: the examples CI compiles (#261); a build found with
+#                         them off is reconfigured with them on before it is built
 # Results: $HPPLITE_ACCEPTANCE_DIR/<run>.result (default ext/hpplite/build_acceptance), with each run's
 # ctest output beside it. Exit 0 only when all four results are passes.
 set -u
@@ -35,7 +37,7 @@ proves() {
     case $1 in
         mock)     echo "every suite on the mock chain: node, durability, page capture, store, keys, crash, docs" ;;
         trunk)    echo "the same suites on SQLite trunk: what the capture relies on in SQLite (doc/sqlite-dependencies.md) still holds upstream" ;;
-        anvil)    echo "the real contracts on a local chain: leases, anchors, stores, relays, snapshots, every scenario" ;;
+        anvil)    echo "the real contracts on a local chain: leases, anchors, stores, relays, snapshots, every scenario; the examples compiled" ;;
         services) echo "the reference store and relay, the x402 conformance vectors and the chain client's encodings, on the real-L1 build" ;;
     esac
 }
@@ -45,7 +47,8 @@ configure() {   # <run> <build dir>: configure a missing build when its inputs a
         mock)  cmake -S "$here" -B "$2" -DCMAKE_BUILD_TYPE=Release >"$dir/$1.configure.log" 2>&1 ;;
         trunk) [ -n "${HPPLITE_TRUNK_SQLITE:-}" ] || { echo "did not run: $2 is not configured and HPPLITE_TRUNK_SQLITE (a trunk sqlite3.c's directory) is not set" >"$dir/$1.result"; return 1; }
                cmake -S "$here" -B "$2" -DCMAKE_BUILD_TYPE=Release -DHPPLITE_SQLITE_SRC="$HPPLITE_TRUNK_SQLITE" >"$dir/$1.configure.log" 2>&1 ;;
-        *)     cmake -S "$here" -B "$2" -DCMAKE_BUILD_TYPE=Release -DHPPLITE_USE_REAL_L1=ON -DHPPLITE_SQLITE_SRC="${HPPLITE_SQLITE_SRC:-$repo/build}" >"$dir/$1.configure.log" 2>&1 ;;
+        *)     cmake -S "$here" -B "$2" -DCMAKE_BUILD_TYPE=Release -DHPPLITE_USE_REAL_L1=ON -DHPPLITE_SQLITE_SRC="${HPPLITE_SQLITE_SRC:-$repo/build}" \
+                     -DHPPLITE_BUILD_EXAMPLES=ON >"$dir/$1.configure.log" 2>&1 ;;
     esac || { echo "did not run: configuring $2 failed (see $dir/$1.configure.log)" >"$dir/$1.result"; return 1; }
 }
 
@@ -53,6 +56,10 @@ run_ctest() {   # <run> <build dir> [ctest args...]: builds, runs, writes the re
     name=$1; bdir=$2; shift 2
     rm -f "$dir/$name.result"
     if [ ! -f "$bdir/CMakeCache.txt" ]; then configure "$name" "$bdir" || return; fi
+    if [ "$bdir" = "$real" ] && grep -q '^HPPLITE_BUILD_EXAMPLES:BOOL=OFF' "$bdir/CMakeCache.txt"; then   # what CI compiles (#261)
+        cmake -S "$here" -B "$bdir" -DHPPLITE_BUILD_EXAMPLES=ON >"$dir/$name.configure.log" 2>&1 \
+            || { echo "did not run: turning the examples on in $bdir failed (see $dir/$name.configure.log)" >"$dir/$name.result"; return; }
+    fi
     if ! cmake --build "$bdir" -j "$jobs" >"$dir/$name.build.log" 2>&1; then
         echo "did not run: the build in $bdir failed (see $dir/$name.build.log)" >"$dir/$name.result"; return
     fi

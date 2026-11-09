@@ -359,7 +359,7 @@ ext/hpplite/tools/acceptance.sh mock anvil  # some of them
 ext/hpplite/tools/acceptance.sh --report    # the last results alone
 
 # Unit tests (mock L1, fast, no network)
-ctest                    # 44 tests, ~3 min: node, durability, page capture (the WAL reader,
+ctest                    # 45 tests, ~3 min: node, durability, page capture (the WAL reader,
                          # the pin, the page batch, the page mode), concurrency, reorg, blob
                          # I/O, cipher, envelope, keys, keystore, the store and the
                          # conformance vectors, the loadable extension, the crash harness
@@ -998,7 +998,8 @@ up to 64 (#257): the sequencer keeps its list in the sidecar, and the #231
 cap on `keep=` with `snapshot=` is gone. Manifests from v0.7 that carry
 `"earlier"` are read for their latest snapshot only. The acceptance run is
 a script, `tools/acceptance.sh` (#258): four runs, each saying what it
-proves, and no pass reported while one is missing.
+proves, and no pass reported while one is missing; its real-L1 build
+compiles the examples CI compiles (#261).
 
 Paying in the HPP token itself is open (#175).
 

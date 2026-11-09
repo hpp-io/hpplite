@@ -378,6 +378,9 @@ if(HPPLITE_BUILD_TESTS)
         # the acceptance run's report refuses a pass while a run is missing, skipped or failed (#258)
         add_test(NAME test_acceptance_report COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/acceptance_report.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/tools/acceptance.sh)
+        # ...and its real-L1 runs build the examples CI compiles (#261)
+        add_test(NAME test_acceptance_builds COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/acceptance_builds.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/acceptance.sh)
     endif()
     if(HPPLITE_BUILD_EXTENSION)
         add_test(NAME test_loadable COMMAND test_loadable)
