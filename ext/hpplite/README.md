@@ -1025,7 +1025,7 @@ Paying in the HPP token itself is open (#175).
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
 | v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#258) | same | same |
-| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267) | same | same |
+| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267), the platform shape end to end on anvil (#268), the first-tick anchor fixed (#270) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database
@@ -1098,7 +1098,16 @@ bounds; an hour by default), and `SELECT hpplite_expire_lease()` ends the
 running lease now, whoever holds it - a dead host's at failover, so a
 successor claims at once instead of waiting it out. Both are the owner's own
 transactions (no signed form in VERSION 10: the owner key holds ETH), so a
-platform runs them from its control plane, not from the apps. The sequencer's key derives a
+platform runs them from its control plane, not from the apps. Anvil scenario
+37 (#268) runs that platform shape end to end: the owner creates the rollup
+and names the app's key with a day's lease; the app writes through a plain
+connection with `hpplite-sequencer` beside it (`contract=`, a store,
+`keeplease=on`, `anchorclose=off`); two sleep/wake cycles send nothing; the
+host is killed, the owner expires the lease, a successor on another path
+rebuilds from the store and claims; the old host, back, keeps its late write
+pending. The app's key sends two transactions in all, one claim per host,
+and the successor reads the predecessor's batches with the same key - no
+batch key is handed over when the owner never wrote one. The sequencer's key derives a
 different batch cipher key, so the owner hands the **batch key** over
 (`SELECT hpplite_batch_key('0x...')` on the sequencer's node, 32 bytes: what
 `hpplite_cipher_derive_key()` gives for the owner's key, or any key chosen

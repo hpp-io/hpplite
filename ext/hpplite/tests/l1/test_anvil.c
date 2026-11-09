@@ -2555,6 +2555,256 @@ static void test_two_rollups_same_range_bounds(void) {
     PASS();
 }
 
+/* 37. The platform shape (hpp-io/hpplite#263, #268): one owner key owns the app's rollup and
+** names the app's own key as its sequencer, a 24 h lease; the app writes through a plain
+** connection with hpplite-sequencer beside it (contract=, a store, keeplease=on,
+** anchorclose=off); it sleeps and wakes and the app's key sends no transaction; the host dies
+** (kill -9), the owner expires the lease, a successor on another path rebuilds from the store,
+** claims and ships; the old host, back, posts nothing over it. The owner never writes a batch,
+** so the app's node seals with its own derived key and the successor reads without a batch key. */
+static const char *sidecar_bin(void) {
+    static char path[600];
+    const char *v = getenv("HPPLITE_VERIFY_BIN");
+    char *slash;
+    if (!v) return NULL;
+    snprintf(path, sizeof path, "%s", v);
+    slash = strrchr(path, '/');
+    snprintf(slash ? slash + 1 : path, sizeof path - (size_t)(slash ? slash + 1 - path : 0), "hpplite-sequencer");
+    return path;
+}
+/* hpplite-sequencer on `file` with HPPLITE_PARAMS `params`, stdout and stderr to files */
+static pid_t spawn_sidecar(const char *bin, const char *file, const char *params, const char *out, const char *err) {
+    pid_t pid;
+    unlink(out); unlink(err);                        /* a previous run's line must not pass for this run's */
+    fflush(stdout); fflush(stderr);
+    pid = fork();
+    if (pid != 0) return pid;
+    {
+        int fo = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644), fe = open(err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fo >= 0) dup2(fo, 1);
+        if (fe >= 0) dup2(fe, 2);
+        setenv("HPPLITE_PARAMS", params, 1);
+        execl(bin, bin, file, (char *)NULL);
+        _exit(127);
+    }
+}
+/* the sidecar's "synced height N" line (#264): N; -1 after `secs`; -2 if it exited first */
+static long wait_synced(const char *out, pid_t pid, double secs) {
+    double t0 = now_s();
+    do {
+        FILE *f = fopen(out, "r");
+        char line[700];
+        if (f) {
+            while (fgets(line, sizeof line, f)) {
+                char *p = strstr(line, "synced height ");
+                if (p) { fclose(f); return atol(p + 14); }
+            }
+            fclose(f);
+        }
+        if (waitpid(pid, NULL, WNOHANG) != 0) return -2;
+        usleep(100000);
+    } while (now_s() - t0 < secs);
+    return -1;
+}
+static int stop_sidecar(pid_t pid, int sig, double secs) {
+    int st = 0;
+    double t0 = now_s();
+    kill(pid, sig);
+    while (waitpid(pid, &st, WNOHANG) == 0) {
+        if (now_s() - t0 > secs) { kill(pid, SIGKILL); waitpid(pid, &st, 0); return -1; }
+        usleep(100000);
+    }
+    return WIFEXITED(st) ? WEXITSTATUS(st) : (WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1);
+}
+/* a plain sqlite3 connection, no HPPLite: what the app does */
+static int plain_exec(const char *file, const char *sql) {
+    sqlite3 *db = NULL;
+    int rc;
+    if (sqlite3_open_v2(file, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK) { sqlite3_close(db); return -1; }
+    sqlite3_busy_timeout(db, 10000);
+    rc = sqlite3_exec(db, sql, NULL, NULL, NULL);
+    sqlite3_close(db);
+    return rc;
+}
+static long long plain_count(const char *file, const char *sql) {
+    sqlite3 *db = NULL;
+    long long n;
+    if (sqlite3_open_v2(file, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) { sqlite3_close(db); return -1; }
+    sqlite3_busy_timeout(db, 10000);
+    n = scalar(db, sql);
+    sqlite3_close(db);
+    return n;
+}
+/* the chain's lease: 1 if `wallet` holds it unexpired; the expiry in *pExpiry */
+static int lease_of_wallet(const char *contract, const unsigned char wallet[20], uint64_t *pExpiry) {
+    HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
+    HppliteL1State *st = NULL;
+    int held = -1;
+    for (int attempt = 0; attempt < 3 && peek && !st; attempt++) {    /* a read the RPC drops is tried again */
+        st = hpplite_l1_get_state(peek);
+        if (!st) sleep(1);
+    }
+    if (st) {
+        held = st->leaseExpiry > st->currentTimestamp && memcmp(st->sequencerWallet, wallet, 20) == 0;
+        if (pExpiry) *pExpiry = st->leaseExpiry;
+    }
+    hpplite_l1_state_free(st);
+    hpplite_l1_disconnect(peek);
+    return held;
+}
+/* DIR/<host>/side.<run>.<ext>: each run of a sidecar keeps its own stdout and stderr */
+static const char *side_path(int host, int run, const char *ext) {
+    static char paths[4][200];
+    static int which;
+    char *p = paths[which++ & 3];
+    snprintf(p, sizeof paths[0], DIR "/host%d/side.%d.%s", host, run, ext);
+    return p;
+}
+/* every transaction `addr` sent, with its selector: a diagnostic for a nonce that moved when it should not have */
+static void dump_txs(const char *addr) {
+    char cmd[1400], out[4000];
+    snprintf(cmd, sizeof cmd,
+             "latest=$(cast block-number --rpc-url %s); for b in $(seq 0 $latest); do cast block $b --full --json --rpc-url %s 2>/dev/null | "
+             "python3 -I -c 'import json,sys\n"
+             "b=json.load(sys.stdin)\n"
+             "for t in b.get(\"transactions\", []):\n"
+             "    if isinstance(t, dict) and t.get(\"from\",\"\").lower()==sys.argv[1].lower(): print(\"block\", int(b[\"number\"],16), \"to\", t.get(\"to\"), \"selector\", (t.get(\"input\") or \"\")[:10])\n' %s; done; "
+             "for f in 'claimSequencer(bytes32)' 'renewLease(bytes32)' 'releaseLease(bytes32)' 'forceExpireLease()' 'submitCheckpoint(bytes32,uint256,uint256,bytes32)' "
+             "'setCheckpointInterval(uint256)' 'submitBatch(bytes32,uint256,bytes)' 'commitBatch(bytes32,uint256,bytes32,bytes,bytes)' 'commitRange(bytes32,uint256,uint256,bytes32,bytes32,bytes32,bytes)'; do printf '%%s %%s\\n' \"$(cast sig \"$f\")\" \"$f\"; done",
+             RPC, RPC, addr);
+    run_cmd(cmd, out, sizeof out);
+    printf("\n    [transactions of %s:\n%s] ", addr, out);
+}
+static void test_platform_sidecar(void) {
+    TEST("the platform shape (#263, #268): the owner creates and names the app's key, 24 h lease; a plain-connection app with hpplite-sequencer beside it; sleep/wake sends nothing; kill -9, the owner expires, a successor rebuilds from the store and ships; the old host posts nothing over it");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char *APPKEY = "0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";   /* the app's key, derived by the platform: no rollup of its own */
+    char appAddr[48], cmd[600], out[400], contract[80], sql[300], params1[700], params2[700], extra[300];
+    unsigned char appWallet[20];
+    uint64_t expiry1 = 0, expiry2 = 0, expiry3 = 0, expiry4 = 0;
+    long long n0, n1, n2, n3, n4;
+    long h;
+    int port;
+    pid_t store, side;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!bin || access(bin, X_OK) != 0) FAIL("hpplite-sequencer not beside hpplite-verify (HPPLITE_VERIFY_BIN)");
+    (void)!system("rm -rf " DIR "/host1 " DIR "/host2 && mkdir -p " DIR "/host1 " DIR "/host2");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", APPKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(appAddr, sizeof appAddr, "%.42s", out);
+    hpplite_hex_to_bytes(appAddr, appWallet, 20);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", appAddr, RPC);   /* the app's key pays its own gas here; on HPP a relay would */
+    if (system(cmd) != 0) FAIL("fund the app's key");
+
+    /* the platform: KEY9 creates the app's rollup, names the app's key, sets a day's lease; it never writes */
+    sqlite3 *owner = open_db("plat_owner.db", KEY9, "&dbname=somaro-app");
+    if (!owner) FAIL("open the owner");
+    snprintf(contract, sizeof contract, "%s", status_text(owner, "contract"));
+    if (!contract[0] || scalar(owner, "SELECT lease FROM hpplite_status") != 1) { sqlite3_close(owner); FAIL("the owner's open creates the rollup and holds its lease"); }
+    snprintf(sql, sizeof sql, "SELECT hpplite_set_sequencer('%s')", appAddr);
+    if (exec_sql(owner, sql) != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(owner)); sqlite3_close(owner); FAIL("the owner names the app's key"); }
+    if (exec_sql(owner, "SELECT hpplite_set_lease_duration(86400)") != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(owner)); sqlite3_close(owner); FAIL("the owner sets a 24 h lease"); }
+    if (scalar(owner, "SELECT lease FROM hpplite_status") != 0) { sqlite3_close(owner); FAIL("the owner's own lease ended with the rotation"); }
+
+    port = test_free_port();
+    store = start_pin_service_free(svc, port);
+    if (store < 0) { sqlite3_close(owner); FAIL("the store did not come up"); }
+#define PLAT_CLEANUP() do { kill(store, SIGTERM); waitpid(store, NULL, 0); sqlite3_close(owner); } while (0)
+    snprintf(params1, sizeof params1, "rpc=%s&contract=%s&chainid=31337&privkey=%s&datadir=" DIR "/host1&interval=300ms&store=http://127.0.0.1:%d&keeplease=on&anchorclose=off&anchor=24h", RPC, contract, APPKEY, port);
+    snprintf(params2, sizeof params2, "rpc=%s&contract=%s&chainid=31337&privkey=%s&datadir=" DIR "/host2&interval=300ms&store=http://127.0.0.1:%d&keeplease=on&anchorclose=off&anchor=24h", RPC, contract, APPKEY, port);
+    snprintf(extra, sizeof extra, "&contract=%s&store=http://127.0.0.1:%d&role=verify", contract, port);
+
+    /* host 1: the sidecar first (an empty volume: wait for its line), then the app's plain writes */
+    n0 = nonce_of(appAddr);
+    side = spawn_sidecar(bin, DIR "/host1/app.db", params1, side_path(1, 1, "out"), side_path(1, 1, "err"));
+    h = wait_synced(side_path(1, 1, "out"), side, 60);
+    if (h < 0) { if (h == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); PLAT_CLEANUP(); FAILF("host 1's sidecar did not say it was synced (%ld)", h); }
+    n1 = nonce_of(appAddr);
+    if (n1 != n0 + 1 || lease_of_wallet(contract, appWallet, &expiry1) != 1) { stop_sidecar(side, SIGKILL, 5); PLAT_CLEANUP(); FAILF("the first open is one claim by the app's key (nonce %lld -> %lld) and the lease is the app's", n0, n1); }
+    if (plain_exec(DIR "/host1/app.db", "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('first wake')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); PLAT_CLEANUP(); FAIL("the app's plain write"); }
+    sleep(3);                                                   /* the timer posts it to the store */
+
+    /* sleep and wake, twice: the sidecar stops (no release, no anchor) and starts (the lease its own, no claim) */
+    for (int cycle = 0; cycle < 2; cycle++) {
+        int rc = stop_sidecar(side, SIGTERM, 60);
+        n2 = nonce_of(appAddr);
+        if (rc != 0 || n2 != n1) { dump_txs(appAddr); PLAT_CLEANUP(); FAILF("sleep %d: the sidecar should exit 0 (%d) and send nothing (nonce %lld -> %lld)", cycle + 1, rc, n1, n2); }
+        side = spawn_sidecar(bin, DIR "/host1/app.db", params1, side_path(1, cycle + 2, "out"), side_path(1, cycle + 2, "err"));
+        h = wait_synced(side_path(1, cycle + 2, "out"), side, 60);
+        n2 = nonce_of(appAddr);
+        {
+            int held = lease_of_wallet(contract, appWallet, &expiry2);
+            if (h < 2 || n2 != n1 || held != 1 || expiry2 != expiry1) {
+                if (h == -1) kill(side, SIGKILL); waitpid(side, NULL, WNOHANG); PLAT_CLEANUP();
+                FAILF("wake %d: synced at %ld, nonce %lld -> %lld, lease held %d, expiry %llu -> %llu: the wake should find the lease its own and send nothing", cycle + 1, h, n1, n2, held, (unsigned long long)expiry1, (unsigned long long)expiry2);
+            }
+        }
+        snprintf(sql, sizeof sql, "INSERT INTO notes(body) VALUES('wake %d')", cycle + 1);
+        if (plain_exec(DIR "/host1/app.db", sql) != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); PLAT_CLEANUP(); FAIL("a write after the wake"); }
+        sleep(3);
+    }
+
+    /* the host dies; the platform knows and ends the lease; a successor on another path takes over */
+    stop_sidecar(side, SIGKILL, 5);
+    n2 = nonce_of(appAddr);
+    if (exec_sql(owner, "SELECT hpplite_expire_lease()") != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(owner)); PLAT_CLEANUP(); FAIL("the owner expires the dead host's lease"); }
+    if (lease_of_wallet(contract, appWallet, &expiry3) != 0) { PLAT_CLEANUP(); FAIL("the lease should be over on the chain"); }
+    side = spawn_sidecar(bin, DIR "/host2/app.db", params2, side_path(2, 1, "out"), side_path(2, 1, "err"));
+    h = wait_synced(side_path(2, 1, "out"), side, 90);
+    n3 = nonce_of(appAddr);
+    if (h < 0 || n3 != n2 + 1 || lease_of_wallet(contract, appWallet, &expiry3) != 1) {
+        if (h == -1) kill(side, SIGKILL); waitpid(side, NULL, WNOHANG); PLAT_CLEANUP();
+        FAILF("the successor should rebuild (synced %ld) and claim once (nonce %lld -> %lld)", h, n2, n3);
+    }
+    {
+        long long rows = plain_count(DIR "/host2/app.db", "SELECT count(*) FROM notes");
+        if (rows != 3) { stop_sidecar(side, SIGKILL, 5); PLAT_CLEANUP(); FAILF("the successor's file should hold the three rows from the store (sealed by the app's own key, no batch key handed over), got %lld", rows); }
+    }
+    if (plain_exec(DIR "/host2/app.db", "INSERT INTO notes(body) VALUES('successor')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); PLAT_CLEANUP(); FAIL("the successor's app writes"); }
+    sleep(3);
+
+    /* the old host comes back and its app writes: nothing of it reaches the chain or the history */
+    {
+        pid_t old = spawn_sidecar(bin, DIR "/host1/app.db", params1, side_path(1, 4, "out"), side_path(1, 4, "err"));
+        long hOld = wait_synced(side_path(1, 4, "out"), old, 60);
+        int rcOld;
+        if (hOld != -2) plain_exec(DIR "/host1/app.db", "INSERT INTO notes(body) VALUES('stale host')");
+        sleep(3);
+        rcOld = hOld == -2 ? 0 : stop_sidecar(old, SIGTERM, 60);
+        n4 = nonce_of(appAddr);
+        {
+            char err[2000] = "";
+            FILE *f = fopen(side_path(1, 4, "err"), "r");
+            if (f) { size_t got = fread(err, 1, sizeof err - 1, f); err[got] = 0; fclose(f); }
+            printf("(old host back: synced %ld, exit %d, stderr: %.300s) ", hOld, rcOld, err);
+        }
+        if (n4 != n3 || lease_of_wallet(contract, appWallet, &expiry4) != 1 || expiry4 != expiry3) { stop_sidecar(side, SIGKILL, 5); PLAT_CLEANUP(); FAILF("the old host must send nothing (nonce %lld -> %lld) and leave the successor's lease (expiry %llu -> %llu)", n3, n4, (unsigned long long)expiry3, (unsigned long long)expiry4); }
+    }
+    {
+        /* the history, from the chain and the store with the app's key: the three rows, the successor's, none of the old host's late one */
+        char vuri[1200];
+        sqlite3 *v = NULL;
+        long long rows = -1, stale = -1;
+        snprintf(vuri, sizeof vuri, "file:" DIR "/plat_verify.db?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=0%s", RPC, APPKEY, extra);
+        if (sqlite3_open_v2(vuri, &v, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+            rows = scalar(v, "SELECT count(*) FROM notes");
+            stale = scalar(v, "SELECT count(*) FROM notes WHERE body = 'stale host'");
+        } else printf("(verifier open: %s) ", sqlite3_errmsg(v));
+        sqlite3_close(v);
+        if (rows != 4 || stale != 0) { stop_sidecar(side, SIGKILL, 5); PLAT_CLEANUP(); FAILF("a verifier should read four rows and no 'stale host' (rows %lld, stale %lld)", rows, stale); }
+    }
+    {
+        int rc = stop_sidecar(side, SIGTERM, 60);
+        n4 = nonce_of(appAddr);
+        PLAT_CLEANUP();
+        if (rc != 0 || n4 != n3) FAILF("the successor's stop should exit 0 (%d) and send nothing (nonce %lld -> %lld)", rc, n3, n4);
+    }
+#undef PLAT_CLEANUP
+    printf("(transactions by the app's key: %lld in all - one claim per host) ", n4 - n0);
+    PASS();
+}
+
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -2602,6 +2852,7 @@ int main(void) {
     if (wanted(34)) test_verify_at();
     if (wanted(35)) test_snapshots_on_chain();
     if (wanted(36)) test_two_rollups_same_range_bounds();
+    if (wanted(37)) test_platform_sidecar();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }
