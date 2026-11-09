@@ -971,7 +971,8 @@ tagged** (2026-11-04). It covers HPP economics:
 
 **v0.6** brought the operators (#181: the canonical store and relay, their
 protocols and conformance vectors) and **v0.7** the buckets paid by permit
-(#214) and snapshots with `keep=` (#203). **v0.8 is "One capture"**: the
+(#214) and snapshots with `keep=` (#203); neither was tagged, and v0.8.0
+carries them. **v0.8.0 is tagged** (2026-11-09), "One capture": the
 persona review of 2026-11-08 took out what no deployment used. Pages are
 the one capture (#253): row and statement capture, `capture=` and
 `determinism=`, the clock VFS, the per-table trees and the in-file log are
