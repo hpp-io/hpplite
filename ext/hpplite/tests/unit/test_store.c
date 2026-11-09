@@ -1086,6 +1086,50 @@ static void test_anchor_timer(const char *url) {
 }
 
 
+/* #270: the timer's first-tick decision ('a previous run left rows: anchor them soon, else the cadence') must
+** not count a batch this run posted in the same tick, and with anchorclose=off the rows the last run left wait
+** for the cadence like everything else; with anchorclose on, a run that died before its close-anchor is still
+** anchored soon */
+static sqlite3_int64 wait_anchored(HppliteNode *w, int tenths) {
+    sqlite3_int64 anchored = 0;
+    for (int i = 0; i < tenths; i++) { usleep(100000); anchored = status_int(w->db, "anchored"); if (anchored > 0) break; }
+    return anchored;
+}
+static void test_first_tick_anchor(const char *url) {
+    TEST("the timer's first tick: a batch written before it is not anchored 'soon' (#270); with anchorclose=off a wake leaves the last run's rows to the cadence; with anchorclose on it anchors them soon");
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "firsttick_w", .intervalMs = 1000, .anchorMs = 60000, .noAnchorAtClose = 1 };
+    HppliteNode *w = test_open_node(tpath("ft_w.db"), l1, &o);
+    sqlite3_int64 anchored, height;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(v); INSERT INTO t VALUES(1)", NULL);         /* before the first tick (1 s) */
+    hpplite_node_start_timer(w);
+    anchored = wait_anchored(w, 40);
+    height = status_int(w->db, "height");
+    if (height != 2) { printf("(height %lld, last_error '%s') ", (long long)height, status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("the first tick posts the batch to the store"); }
+    if (anchored != 0) { hpplite_node_destroy(w); FAILF("a batch posted by the first tick was anchored at once (anchored %lld); the cadence is a minute", (long long)anchored); }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);                                                             /* anchorclose=off: the row stays at the store */
+    w = test_open_node(tpath("ft_w.db"), l1, &o);
+    if (!w) { hpplite_l1_disconnect(l1); FAIL("reopen"); }
+    if (status_int(w->db, "anchored") != 0) { hpplite_node_destroy(w); FAIL("nothing anchored across the close"); }
+    hpplite_node_start_timer(w);
+    anchored = wait_anchored(w, 40);
+    if (anchored != 0) { hpplite_node_destroy(w); FAILF("with anchorclose=off the wake anchored what the last run left (anchored %lld); it should wait for the cadence", (long long)anchored); }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    o.noAnchorAtClose = 0;                                                               /* anchorclose on: a run that never anchored left rows; they are anchored soon */
+    w = test_open_node(tpath("ft_w.db"), l1, &o);
+    if (!w) { hpplite_l1_disconnect(l1); FAIL("reopen with anchorclose on"); }
+    hpplite_node_start_timer(w);
+    anchored = wait_anchored(w, 60);
+    if (anchored != 1) { printf("(anchored %lld after 6 s, last_error '%s') ", (long long)anchored, status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("with anchorclose on, the rows a previous run left should be anchored soon"); }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 /* 9. Named entries (#165): a batch under <da>-<height> with the sequencer's signature; the first
 ** signer holds a rollup's names at the pin service; a reader recovers the signer. */
 static void test_named(const char *url) {
@@ -1378,6 +1422,7 @@ int main(int argc, char **argv) {
     test_manifest_short_hex(url);
     test_snapshot_reused_after_refusal(url);
     test_anchor_timer(url);
+    test_first_tick_anchor(url);
     test_recovery(url);
     test_soft_replica(url);
     test_soft_disagreement(url);

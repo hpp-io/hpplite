@@ -161,6 +161,8 @@ HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpt
     config.storeFallback = !o->storeFallbackOff;
     config.keepLease = o->keepLease;
     config.noAnchorAtClose = o->noAnchorAtClose;
+    config.batchIntervalMs = o->intervalMs;
+    config.anchorIntervalMs = o->anchorMs;
     config.localOnly = o->localOnly > 0 || (o->localOnly == 0 && l1 == NULL);   /* no chain: the local throw-away mode (#38) */
     node = hpplite_node_create(&config);
     if (!node) return NULL;

@@ -3567,6 +3567,12 @@ static void *node_timer_thread_func(void *arg) {
             continue;
         }
         if (now < node->retryAt) continue;           /* backing off after L1 failures */
+        /* the anchor's first deadline, decided before this tick's flush (#270): what a previous run left at the
+        ** store is anchored soon - unless anchorclose=off, where every run leaves rows by design and they wait
+        ** for the cadence like the rest; a batch this tick posts is this run's and waits for the cadence too */
+        if (node->config.anchorIntervalMs > 0 && node->store && node->l1 && node->anchorAt == 0) {
+            node->anchorAt = now + (!node->config.noAnchorAtClose && node_unanchored_above(node, node->anchoredHeight) ? 2000 : node->config.anchorIntervalMs);
+        }
         if (elapsed >= intervalMs || sizeTrigger) {
             pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
             if (mutex) {
@@ -3580,10 +3586,7 @@ static void *node_timer_thread_func(void *arg) {
         /* the anchor, on the chain's cadence (#164); a refused one is tried again within a minute */
         if (node->config.anchorIntervalMs > 0 && node->store && node->l1 && now >= node->anchorAt) {
             pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
-            if (node->anchorAt == 0) {
-                /* decided at the first tick: what a previous run left at the store is anchored soon, the rest on the cadence */
-                node->anchorAt = now + (node_unanchored_above(node, node->anchoredHeight) ? 2000 : node->config.anchorIntervalMs);
-            } else if (mutex) {
+            if (mutex) {
                 int rc = 0;
                 pthread_mutex_lock(mutex);
                 if (node->timerRunning && node_ranges(node)) rc = node_anchor(node);
