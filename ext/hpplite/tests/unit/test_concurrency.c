@@ -363,6 +363,49 @@ static void test_lease_on_close(void) {
     PASS();
 }
 
+/* keeplease (#265): a sidecar sequencer closing alone lets its lease run instead
+** of releasing it, so a wake inside the lease window sends no claim: the instance
+** id is the file's and the host's, a restart is the same instance, and the node
+** sends nothing while the chain's lease is its own with over half its life left */
+static uint64_t lease_expiry(HppliteL1 *l1) {
+    HppliteL1State *st = hpplite_l1_get_state(l1);
+    uint64_t e = st ? st->leaseExpiry : 0;
+    hpplite_l1_state_free(st);
+    return e;
+}
+static void test_keep_lease_on_close(void) {
+    TEST("keeplease: a sequencer closing alone keeps its lease; the reopen finds it its own, same expiry, and sends nothing (#265)");
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR);
+    TestNodeOpts o = NODE;
+    o.keepLease = 1;
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
+    HppliteNode *a = test_open_node(DIR "/keep.db", l1, &o);
+    if (!a) FAIL("open");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k)", NULL);
+    hpplite_node_flush_batch(a);
+    unsigned char before[32], after[32], again[32];
+    int heldBefore = lease_holder(l1, before);
+    uint64_t expiryBefore = lease_expiry(l1);
+    hpplite_node_destroy(a);
+    int heldAfter = lease_holder(l1, after);
+    HppliteNode *b = test_open_node(DIR "/keep.db", l1, &o);
+    sqlite3_int64 lease = b ? status_int(b->db, "lease") : -1;
+    int heldAgain = lease_holder(l1, again);
+    uint64_t expiryAgain = lease_expiry(l1);
+    if (b) hpplite_node_destroy(b);
+    int heldEnd = lease_holder(l1, after);
+    hpplite_l1_disconnect(l1);
+    if (heldBefore != 1) FAIL("the sequencer should hold the lease after its first flush");
+    if (heldAfter != 1 || memcmp(before, after, 32) != 0) FAIL("closing alone with keeplease should leave the lease running, this instance's");
+    if (lease != 1 || heldAgain != 1 || memcmp(before, again, 32) != 0 || expiryAgain != expiryBefore) {
+        printf("(lease %lld, held %d, expiry %llu -> %llu) ", (long long)lease, heldAgain, (unsigned long long)expiryBefore, (unsigned long long)expiryAgain);
+        FAIL("the reopen should find the lease its own and send nothing: same instance, same expiry");
+    }
+    if (heldEnd != 1) FAIL("the second close keeps it too");
+    PASS();
+}
+
 /* Another connection changes the schema; this connection's next statement
 ** finds its schema stale, and SQLite prepares it again and reruns it - the
 ** first run's log row rolled back with it. The rerun must be logged: it was
@@ -467,6 +510,7 @@ int main(int argc, char **argv) {
     test_mixed_threads_and_processes();
     test_sequencer_across_processes();
     test_lease_on_close();
+    test_keep_lease_on_close();
     test_rerun_after_foreign_schema_change();
     test_rerun_in_transaction();
     test_follower_status_follows_the_file();

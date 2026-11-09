@@ -88,6 +88,7 @@ typedef struct TestNodeOpts {
     int snapshotMs;                          /* snapshot= (#221): a snapshot at an anchor when the last is older */
     int fromSnapshot;                        /* a new replica starts from the latest snapshot (#222); the node's own field, not a URI setting (#255) */
     int64_t keepSeconds;                     /* keep= (#223): the history behind a snapshot this old is pruned */
+    int keepLease;                           /* keeplease=on (#265): the lease is left running at a close alone */
 } TestNodeOpts;
 HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpts *o);
 int same_root(HppliteNode *a, HppliteNode *b);

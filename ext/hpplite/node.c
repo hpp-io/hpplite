@@ -154,6 +154,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.lowBalanceHours = config->lowBalanceHours;
     node->config.storeFallback = config->storeFallback;
     node->config.anchorIntervalMs = config->anchorIntervalMs;
+    node->config.keepLease = config->keepLease;
     node->config.snapshotIntervalMs = config->snapshotIntervalMs;
     node->config.fromSnapshot = config->fromSnapshot;
     node->config.keepSeconds = config->keepSeconds;
@@ -921,8 +922,11 @@ void hpplite_node_destroy(HppliteNode *node) {
     /* Let go of the sequencer lease so a restart need not wait it out (a
     ** database rebuilt into a fresh file, another host) - unless another
     ** connection to this file is still open: it takes over as the same
-    ** sequencer (the id is the file's), and a release would only cost it a claim */
-    if (node->l1 && node->hasLease && !(node->lockFd >= 0 && node_others_on_file(node))) {
+    ** sequencer (the id is the file's), and a release would only cost it a
+    ** claim. keeplease=on (#265) keeps it in every case: a sidecar whose app
+    ** sleeps and wakes is the same instance at the next open and finds the
+    ** lease its own, so the cycle sends no claim and no release */
+    if (node->l1 && node->hasLease && !node->config.keepLease && !(node->lockFd >= 0 && node_others_on_file(node))) {
         hpplite_node_release_lease(node);
     }
 

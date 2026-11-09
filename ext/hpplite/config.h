@@ -155,6 +155,7 @@ typedef struct HppliteConfig {
     int snapshotIntervalMs;          /* snapshot=: how often a sequencer at a store snapshots the database at an anchor (#221); 0: never */
     int anchorIntervalMs;            /* anchor=: how often a store node anchors its batches on the chain (#164); default 30 min, the chain's cadence */
     int anchorGiven;
+    int keepLease;                   /* keeplease=on / HPPLITE_KEEP_LEASE: a sequencer closing alone lets its lease run instead of releasing it (#265) */
     int aliasIntervalMs;             /* the cadence of the chain l1= named (0: none) */
     int localOnly;                   /* l1=local: finalize batches locally and keep no history (#38) */
     char *dbName;                    /* Its own rollup among the wallet's, by this name (#61);

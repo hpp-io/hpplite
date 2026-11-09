@@ -58,6 +58,11 @@ static int parse_bool(const char *z) {
     return 1;
 }
 
+/* on/1/true/yes -> 1; anything else -> 0: a switch given in a URI or the environment (#265) */
+static int parse_on(const char *v) {
+    return v && (strcasecmp(v, "on") == 0 || strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0);
+}
+
 static int parse_duration_ms(const char *str) {
     if (!str) return -1;
 
@@ -262,6 +267,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     }
     val = getenv("HPPLITE_KEEP");
     if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) cfg->keepSeconds = k; }
+    val = getenv("HPPLITE_KEEP_LEASE");
+    if (val) cfg->keepLease = parse_on(val);
     val = getenv(HPPLITE_ENV_FROM);
     if (val) refuse_from();
     val = getenv("HPPLITE_SNAPSHOT");
@@ -516,6 +523,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         int ms = parse_duration_ms(buf);
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
+    if (get_uri_param(uri, "keeplease", buf, sizeof(buf))) cfg->keepLease = parse_on(buf);
     if (get_uri_param(uri, HPPLITE_URI_SNAPSHOT, buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
         if (ms >= 0) cfg->snapshotIntervalMs = ms;
@@ -697,6 +705,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
         int ms = parse_duration_ms(val);
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
+    val = sqlite3_uri_parameter(filename, "keeplease");
+    if (val) cfg->keepLease = parse_on(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SNAPSHOT);
     if (val) {
         int ms = parse_duration_ms(val);

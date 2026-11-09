@@ -92,6 +92,7 @@ typedef struct HppliteNodeConfig {
     int storeFallback;              /* HPPLITE_STORE_FALLBACK: a store that does not answer lets the chain carry the bytes (default on) */
     int snapshotIntervalMs;         /* snapshot=: a snapshot at an anchor when the last is older than this (#221); 0: never */
     int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
+    int keepLease;                  /* keeplease=on: a sequencer closing alone lets its lease run instead of releasing it (#265) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;
 
