@@ -682,6 +682,27 @@ static char *mock_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]) {
     return sqlite3_mprintf("0x%08xseq", (unsigned int)self->currentBlock);
 }
 
+/* setLeaseDuration (#267): onlyOwner, a minute to 30 days as the contract requires */
+static char *mock_set_lease_duration(HppliteL1 *l1, uint64_t seconds) {
+    if (!l1 || !self->hasPrivkey) return NULL;
+    if (self->rpcDown) return NULL;
+    if (memcmp(self->owner, self->myAddress, 20) != 0) return NULL;   /* onlyOwner */
+    if (seconds < 60 || seconds > 30 * 86400) return NULL;             /* "Invalid lease duration" */
+    self->leaseDuration = seconds;
+    mockSaveState(l1);
+    return sqlite3_mprintf("0x%08xlease%08x", (unsigned int)self->currentBlock, (unsigned int)seconds);
+}
+
+/* forceExpireLease (#267): onlyOwner; the running lease ends now, whoever holds it */
+static char *mock_force_expire_lease(HppliteL1 *l1) {
+    if (!l1 || !self->hasPrivkey) return NULL;
+    if (self->rpcDown) return NULL;
+    if (memcmp(self->owner, self->myAddress, 20) != 0) return NULL;   /* onlyOwner */
+    self->leaseExpiry = self->currentTimestamp;
+    mockSaveState(l1);
+    return sqlite3_mprintf("0x%08xexpire", (unsigned int)self->currentBlock);
+}
+
 static char *mock_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
     if (!l1 || !self->hasPrivkey || interval == 0) return NULL;
     if (memcmp(self->owner, self->myAddress, 20) != 0) return NULL;   /* onlyOwner */
@@ -1167,6 +1188,8 @@ const HppliteL1Ops hppliteL1MockOps = {
     .set_privkey = mock_set_privkey,
     .set_signer = mock_set_signer,
     .set_sequencer = mock_set_sequencer,
+    .set_lease_duration = mock_set_lease_duration,
+    .force_expire_lease = mock_force_expire_lease,
     .get_state = mock_get_state,
     .claim_sequencer = mock_claim_sequencer,
     .renew_lease = mock_renew_lease,

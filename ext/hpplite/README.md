@@ -1025,7 +1025,7 @@ Paying in the HPP token itself is open (#175).
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
 | v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#258) | same | same |
-| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266) | same | same |
+| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database
@@ -1091,7 +1091,14 @@ roles can be split (#17): the **owner** (cold: `transferOwnership`,
 `SELECT hpplite_set_sequencer('0x...')` on a connection keyed with the owner's
 key; the running lease expires, the owner's own node posts no more, and a
 node keyed with the sequencer's key (`privkey=`, a keystore, or a signer)
-posts on the rollup named with `contract=`. The sequencer's key derives a
+posts on the rollup named with `contract=`. The owner's lease calls have SQL
+forms too (#267): `SELECT hpplite_set_lease_duration(86400)` sets how long a
+claim or a renewal runs on this rollup (a minute to 30 days, the contract's
+bounds; an hour by default), and `SELECT hpplite_expire_lease()` ends the
+running lease now, whoever holds it - a dead host's at failover, so a
+successor claims at once instead of waiting it out. Both are the owner's own
+transactions (no signed form in VERSION 10: the owner key holds ETH), so a
+platform runs them from its control plane, not from the apps. The sequencer's key derives a
 different batch cipher key, so the owner hands the **batch key** over
 (`SELECT hpplite_batch_key('0x...')` on the sequencer's node, 32 bytes: what
 `hpplite_cipher_derive_key()` gives for the owner's key, or any key chosen

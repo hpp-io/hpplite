@@ -524,6 +524,8 @@ static void hpplite_keyfile_func(sqlite3_context *ctx, int argc, sqlite3_value *
 static void hpplite_keystore_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_batch_key_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_set_sequencer_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_set_lease_duration_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_expire_lease_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_grant_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_revoke_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_viewkey_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
@@ -590,6 +592,10 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_batch_key_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_set_sequencer", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
                             hpplite_set_sequencer_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_set_lease_duration", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
+                            hpplite_set_lease_duration_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_expire_lease", 0, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
+                            hpplite_expire_lease_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_grant", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, hpplite_grant_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_revoke", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, hpplite_revoke_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_viewkey", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, hpplite_viewkey_func, NULL, NULL);
@@ -934,6 +940,42 @@ static void hpplite_set_sequencer_func(sqlite3_context *ctx, int argc, sqlite3_v
     if (!tx) { sqlite3_result_error(ctx, "hpplite_set_sequencer: the chain did not take it (only the rollup's owner may; a wallet of zero is refused)", -1); return; }
     hpplite_l1_wait_for_tx(node->l1, tx, 60);                  /* mined before anyone reads the lease again */
     if (node->hasLease) { node->hasLease = 0; node->leaseRecheckAt = 0; }   /* ours expired with the rotation, unless we named ourselves */
+    sqlite3_result_text(ctx, tx, -1, SQLITE_TRANSIENT);
+    sqlite3_free(tx);
+}
+
+/* SELECT hpplite_set_lease_duration(seconds) (#267): the owner sets how long a claim or a renewal
+** runs on this rollup, a minute to 30 days (the contract's bounds); the node reads the duration
+** from the chain at its next lease check. The transaction's hash. Only the owner's goes through. */
+static void hpplite_set_lease_duration_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = hppliteFindNode(db);
+    sqlite3_int64 secs = argc > 0 ? sqlite3_value_int64(argv[0]) : 0;
+    char *tx;
+    if (!node) { sqlite3_result_error(ctx, "hpplite is not on this connection", -1); return; }
+    if (!node->l1) { sqlite3_result_error(ctx, "hpplite_set_lease_duration: no chain on this connection", -1); return; }
+    if (secs < 60 || secs > 30 * 86400) { sqlite3_result_error(ctx, "hpplite_set_lease_duration: seconds must be between 60 (a minute) and 2592000 (30 days), the contract's bounds", -1); return; }
+    tx = hpplite_l1_set_lease_duration(node->l1, (uint64_t)secs);
+    if (!tx) { sqlite3_result_error(ctx, "hpplite_set_lease_duration: the chain did not take it (only the rollup's owner may)", -1); return; }
+    hpplite_l1_wait_for_tx(node->l1, tx, 60);
+    node->leaseRecheckAt = 0;                                   /* the next lease check reads the new duration */
+    sqlite3_result_text(ctx, tx, -1, SQLITE_TRANSIENT);
+    sqlite3_free(tx);
+}
+
+/* SELECT hpplite_expire_lease() (#267): the owner ends the running lease now, whoever holds it -
+** a dead host's at failover, so a successor need not wait it out. The transaction's hash. */
+static void hpplite_expire_lease_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = hppliteFindNode(db);
+    char *tx;
+    (void)argc; (void)argv;
+    if (!node) { sqlite3_result_error(ctx, "hpplite is not on this connection", -1); return; }
+    if (!node->l1) { sqlite3_result_error(ctx, "hpplite_expire_lease: no chain on this connection", -1); return; }
+    tx = hpplite_l1_force_expire_lease(node->l1);
+    if (!tx) { sqlite3_result_error(ctx, "hpplite_expire_lease: the chain did not take it (only the rollup's owner may)", -1); return; }
+    hpplite_l1_wait_for_tx(node->l1, tx, 60);                  /* over before anyone reads the lease again */
+    if (node->hasLease) { node->hasLease = 0; node->leaseRecheckAt = 0; }   /* ours ended with it, if it was ours */
     sqlite3_result_text(ctx, tx, -1, SQLITE_TRANSIENT);
     sqlite3_free(tx);
 }

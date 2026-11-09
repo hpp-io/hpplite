@@ -116,6 +116,12 @@ char *hpplite_l1_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval);
 /* setSequencer(address) (#17): the owner names the wallet that may hold the lease; the running lease expires.
 ** The transaction's hash (sqlite3_free) or NULL (not the owner, no such call on this backend) */
 char *hpplite_l1_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]);
+/* setLeaseDuration(uint256) (#267): the owner sets how long a claim or renewal runs, a minute to 30 days (the
+** contract's bounds). The transaction's hash (sqlite3_free) or NULL (not the owner, out of bounds, no such call) */
+char *hpplite_l1_set_lease_duration(HppliteL1 *l1, uint64_t seconds);
+/* forceExpireLease() (#267): the owner ends the running lease now, whoever holds it - a dead host's, at failover.
+** The transaction's hash (sqlite3_free) or NULL (not the owner, no such call on this backend) */
+char *hpplite_l1_force_expire_lease(HppliteL1 *l1);
 
 /*
 ** Free system config

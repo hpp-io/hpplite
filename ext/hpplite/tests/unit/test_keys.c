@@ -311,6 +311,61 @@ static void test_owner_names_sequencer(void) {
     PASS();
 }
 
+/* The owner's two lease calls (#267), beside hpplite_set_sequencer(): setLeaseDuration (the
+** contract's bounds, a minute to 30 days) and forceExpireLease, each the transaction's hash;
+** a non-owner is refused by the chain. For a platform running many rollups from one owner key:
+** a 24 h lease per rollup, and a dead host's lease ended at once (hpp-io/hpplite#263). */
+static void test_owner_lease_calls(void) {
+    TEST("hpplite_set_lease_duration / hpplite_expire_lease: the owner sets 24 h and the next claim runs 24 h; expire ends the running lease at once; out-of-bounds and a non-owner are refused (#267)");
+    reset_keys();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    sqlite3 *owner = hpplite_open("file:" DIR "/ld.db?hpplite=on&datadir=" DIR "&privkey=" KEY_A);
+    if (!owner) FAIL("open owner");
+    HppliteNode *on = hpplite_get_node(owner);
+    hpplite_node_set_l1(on, l1); hpplite_node_start(on);
+    sqlite3_exec(owner, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL, NULL, NULL);
+    if (hpplite_flush(owner) != 1 || status_int(owner, "lease") != 1) FAIL("the owner posts batch 1 and holds the lease");
+    HppliteL1State *st = hpplite_l1_get_state(l1);
+    unsigned long long dur0 = st ? st->leaseExpiry - hpplite_l1_mock_get_timestamp(l1) : 0, dur = 0, dur1 = 0;
+    hpplite_l1_state_free(st);
+    if (exec_sql(owner, "SELECT hpplite_set_lease_duration(59)") == SQLITE_OK) FAIL("59 s is under the contract's minute: refused");
+    if (exec_sql(owner, "SELECT hpplite_set_lease_duration(2592001)") == SQLITE_OK) FAIL("over 30 days: refused");
+    {
+        char *tx = query_text(owner, "SELECT hpplite_set_lease_duration(86400)");
+        if (!tx || strncmp(tx, "0x", 2) != 0) { printf("(%s) ", sqlite3_errmsg(owner)); sqlite3_free(tx); FAIL("the owner sets the lease duration and gets the transaction's hash"); }
+        sqlite3_free(tx);
+    }
+    st = hpplite_l1_get_state(l1); if (st) dur = st->leaseDuration; hpplite_l1_state_free(st);
+    if (dur != 86400) { printf("(%llu) ", dur); FAIL("the chain's lease duration is 24 h"); }
+    {
+        char *tx = query_text(owner, "SELECT hpplite_expire_lease()");
+        if (!tx || strncmp(tx, "0x", 2) != 0) { printf("(%s) ", sqlite3_errmsg(owner)); sqlite3_free(tx); FAIL("the owner expires the lease and gets the transaction's hash"); }
+        sqlite3_free(tx);
+    }
+    if (hpplite_l1_is_lease_active(l1)) FAIL("the lease should be over on the chain");
+    if (status_int(owner, "lease") != 0) FAIL("the owner's own node knows its lease is gone");
+    sqlite3_exec(owner, "INSERT INTO t VALUES(2)", NULL, NULL, NULL);
+    if (hpplite_flush(owner) != 2 || status_int(owner, "lease") != 1) { printf("(%s) ", status_text(owner, "last_error")); FAIL("the owner's node claims again at its next flush and posts batch 2"); }
+    st = hpplite_l1_get_state(l1); if (st) dur1 = st->leaseExpiry - hpplite_l1_mock_get_timestamp(l1); hpplite_l1_state_free(st);
+    if (dur1 != 86400) { printf("(lease ran %llu before, %llu after) ", dur0, dur1); FAIL("the new lease runs 24 h"); }
+    {
+        sqlite3 *other = hpplite_open("file:" DIR "/ld2.db?hpplite=on&datadir=" DIR "&privkey=" KEY_B);
+        HppliteNode *n2 = other ? hpplite_get_node(other) : NULL;
+        int setOk = -1, expOk = -1;
+        if (n2) {
+            hpplite_node_set_l1(n2, l1); hpplite_node_start(n2);                 /* the mock now signs as KEY_B: not the owner */
+            setOk = exec_sql(other, "SELECT hpplite_set_lease_duration(3600)") == SQLITE_OK;
+            expOk = exec_sql(other, "SELECT hpplite_expire_lease()") == SQLITE_OK;
+            n2->l1 = NULL;
+        }
+        if (other) sqlite3_close(other);
+        if (setOk != 0 || expOk != 0) FAIL("a non-owner setting the duration or expiring the lease should be refused");
+    }
+    on->l1 = NULL; sqlite3_close(owner);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 /* A file this SQLite cannot read - encrypted by SQLCipher or SEE and not yet
 ** keyed, or not a database at all - must fail the open and say so, not open
 ** and fail at the first flush (#17, step 5 deferred). */
@@ -347,6 +402,7 @@ int main(int argc, char **argv) {
     test_keystore();
     test_signer();
     test_owner_names_sequencer();
+    test_owner_lease_calls();
     test_unreadable_file_fails_open();
     remove_dir();
     return test_report();

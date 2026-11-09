@@ -69,6 +69,14 @@ char *hpplite_l1_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]) {
     return (l1 && l1->ops->set_sequencer) ? l1->ops->set_sequencer(l1, wallet) : NULL;
 }
 
+char *hpplite_l1_set_lease_duration(HppliteL1 *l1, uint64_t seconds) {
+    return (l1 && l1->ops->set_lease_duration) ? l1->ops->set_lease_duration(l1, seconds) : NULL;
+}
+
+char *hpplite_l1_force_expire_lease(HppliteL1 *l1) {
+    return (l1 && l1->ops->force_expire_lease) ? l1->ops->force_expire_lease(l1) : NULL;
+}
+
 int hpplite_l1_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
     return l1 ? l1->ops->set_privkey(l1, privkey) : -1;
 }

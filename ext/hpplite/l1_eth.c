@@ -92,6 +92,7 @@ static uint8_t SEL_GET_ROLLUP[4];
 static uint8_t SEL_HAS_ROLLUP[4];
 static uint8_t SEL_FORCE_EXPIRE_LEASE[4];
 static uint8_t SEL_SET_SEQUENCER[4];        /* setSequencer(address): the owner rotates the hot key (#17) */
+static uint8_t SEL_SET_LEASE_DURATION[4];   /* setLeaseDuration(uint256): the owner's, a minute to 30 days (#267) */
 /* The signed forms (#126): the same call with the wallet's EIP-712 signature, anyone's gas */
 static uint8_t SEL_COMMIT_RANGE_FOR[4], SEL_SUBMIT_BATCH_FOR[4], SEL_COMMIT_BATCH_FOR[4];
 static uint8_t SEL_CLAIM_FOR[4], SEL_RENEW_FOR[4], SEL_RELEASE_FOR[4], SEL_CHECKPOINT_FOR[4], SEL_INTERVAL_FOR[4];
@@ -124,6 +125,7 @@ static void init_selectors(void) {
     abi_function_selector("isLeaseActive()", SEL_IS_LEASE_ACTIVE);
     abi_function_selector("forceExpireLease()", SEL_FORCE_EXPIRE_LEASE);
     abi_function_selector("setSequencer(address)", SEL_SET_SEQUENCER);
+    abi_function_selector("setLeaseDuration(uint256)", SEL_SET_LEASE_DURATION);
     abi_function_selector("releaseLease(bytes32)", SEL_RELEASE_LEASE);
     abi_function_selector("getSystemConfig()", SEL_GET_SYSTEM_CONFIG);
 
@@ -473,6 +475,28 @@ static char *eth_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]) {
     tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 80000, 0);
     if (!tx_hash) return NULL;
     return txHashString(tx_hash);
+}
+
+/* setLeaseDuration(uint256) (#267): the owner's transaction, direct (no signed form in VERSION 10:
+** the owner key holds ETH). The contract's bounds are checked here too, so a wrong value costs no gas */
+static char *eth_set_lease_duration(HppliteL1 *l1, uint64_t seconds) {
+    uint8_t calldata[4 + 32];
+    uint8_t *tx_hash;
+    if (!l1 || seconds < 60 || seconds > 30 * 86400) return NULL;
+    init_selectors();
+    memcpy(calldata, SEL_SET_LEASE_DURATION, 4);
+    abi_encode_uint64(seconds, calldata + 4);
+    tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
+    if (!tx_hash) return NULL;
+    self->lastPath = "direct";
+    return txHashString(tx_hash);
+}
+
+static char *eth_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]);
+
+/* forceExpireLease() (#267): the owner ends the running lease now; the release path without an instance */
+static char *eth_force_expire_lease(HppliteL1 *l1) {
+    return eth_release_lease(l1, NULL);
 }
 
 static int eth_set_privkey(HppliteL1 *l1, const uint8_t privkey[32]) {
@@ -1752,6 +1776,8 @@ const HppliteL1Ops hppliteL1EthOps = {
     .set_privkey = eth_set_privkey,
     .set_signer = eth_set_signer,
     .set_sequencer = eth_set_sequencer,
+    .set_lease_duration = eth_set_lease_duration,
+    .force_expire_lease = eth_force_expire_lease,
     .get_state = eth_get_state,
     .claim_sequencer = eth_claim_sequencer,
     .renew_lease = eth_renew_lease,
