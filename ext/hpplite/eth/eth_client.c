@@ -151,6 +151,7 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
     headers = curl_slist_append(headers, "Content-Type: application/json");
     
     curl_easy_setopt(client->curl, CURLOPT_URL, client->rpc_url);
+    if (getenv("HPPLITE_CA_BUNDLE")) curl_easy_setopt(client->curl, CURLOPT_CAINFO, getenv("HPPLITE_CA_BUNDLE"));   /* the certificates to trust: a static binary has no system bundle (#269) */
     curl_easy_setopt(client->curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(client->curl, CURLOPT_POSTFIELDS, request_str);
     curl_easy_setopt(client->curl, CURLOPT_WRITEFUNCTION, write_callback);

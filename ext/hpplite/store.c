@@ -104,6 +104,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
     if (!c) return 0;
     snprintf(url, sizeof url, "%s%s", s->base, path);
     curl_easy_setopt(c, CURLOPT_URL, url);
+    if (getenv("HPPLITE_CA_BUNDLE")) curl_easy_setopt(c, CURLOPT_CAINFO, getenv("HPPLITE_CA_BUNDLE"));   /* the certificates to trust (#269) */
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, bufWrite);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, out);

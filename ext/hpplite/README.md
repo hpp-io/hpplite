@@ -209,6 +209,7 @@ What the node may spend is the deployment's, like its key: it is set in the envi
 | `HPPLITE_LOW_BALANCE` | Warn when the money left lasts fewer hours than this at the last day's rate (default 72; 0 turns it off; #173). USDC.e is the funding wallet's balance against the charges; ETH is the wallet's balance against how fast it fell. The warning prints one line on stderr when it starts and when it clears, and shows in `spend_warning` |
 | `HPPLITE_RELAY_CAP` | The most to pay the relay per call, in its asset's atomic units. With `relay=on` the default is 1000000 (1 USDC.e: a relayed call on HPP costs cents, #251); with a relay URL, 0 (default) pays nothing |
 | `HPPLITE_STORE_FALLBACK` | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
+| `HPPLITE_CA_BUNDLE` | The certificate file (PEM) both HTTPS clients trust - the chain RPC's and the store's (#269). Unset, libcurl's own default applies (the system bundle on a stock build). For the static binary, which has no system bundle unless the image has one where it was compiled to look, and for an image that keeps its own: `HPPLITE_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt`, or a bundle copied in |
 
 ## Building
 
@@ -368,7 +369,7 @@ ext/hpplite/tools/acceptance.sh mock anvil  # some of them
 ext/hpplite/tools/acceptance.sh --report    # the last results alone
 
 # Unit tests (mock L1, fast, no network)
-ctest                    # 47 tests, ~3 min: node, durability, page capture (the WAL reader,
+ctest                    # 49 tests, ~3 min: node, durability, page capture (the WAL reader,
                          # the pin, the page batch, the page mode), concurrency, reorg, blob
                          # I/O, cipher, envelope, keys, keystore, the store and the
                          # conformance vectors, the loadable extension, the crash harness
@@ -398,6 +399,14 @@ cmake -S ext/hpplite -B build_real -DHPPLITE_USE_REAL_L1=ON -DHPPLITE_SQLITE_SRC
 ext/hpplite/tools/linux_test.sh          # Ubuntu 24.04, Release, ctest
 ext/hpplite/tools/linux_test.sh asan     # AddressSanitizer + UBSan
 ext/hpplite/tools/linux_test.sh stress   # + the 100 MB stress test
+
+# A static hpplite-sequencer and hpplite-verify for any Linux image (#269): built on Alpine (musl) in a
+# container, every library linked in (libcurl with OpenSSL, libsecp256k1 from source, zlib), no dynamic
+# dependency, so one binary is copied into Alpine and Debian images alike (a platform's sidecar). The
+# option behind it is -DHPPLITE_STATIC_TOOLS=ON; the image needs no libraries, only a CA bundle for HTTPS
+# (HPPLITE_CA_BUNDLE, or the distribution's at its usual path). ctest test_static_build runs the result in
+# both images; skipped without docker.
+ext/hpplite/tools/linux/static/build.sh [out-dir] [linux/amd64|linux/arm64]   # binaries in out-dir (default ext/hpplite/build_static)
 
 # ORM smoke tests on anvil: SQLAlchemy + Alembic, Django (migrate, ORM), Drizzle, Knex;
 # a replica rebuilt from the chain must match each writer. First run pip/npm installs
@@ -1025,7 +1034,7 @@ Paying in the HPP token itself is open (#175).
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
 | v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#258) | same | same |
-| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267), the platform shape end to end on anvil (#268), the first-tick anchor fixed (#270) | same | same |
+| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267), the platform shape end to end on anvil (#268), the first-tick anchor fixed (#270), the static musl build of the tools and `HPPLITE_CA_BUNDLE` (#269) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database

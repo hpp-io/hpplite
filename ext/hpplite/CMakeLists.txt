@@ -15,6 +15,7 @@ endif()
 option(HPPLITE_BUILD_TESTS "Build test executables" ON)
 option(HPPLITE_USE_REAL_L1 "Use real Ethereum L1 (vs mock)" OFF)
 option(HPPLITE_BUILD_EXTENSION "Build the loadable extension (hpplite.so/.dylib)" ON)
+option(HPPLITE_STATIC_TOOLS "Link hpplite-sequencer and hpplite-verify statically, every library in: one binary for any Linux image (musl, tools/linux/static, #269)" OFF)
 set(HPPLITE_SQLITE_SRC "" CACHE PATH
     "Directory holding a stock SQLite amalgamation (sqlite3.c, sqlite3.h, sqlite3ext.h). Default: ../../build of the parent tree")
 
@@ -25,7 +26,10 @@ pkg_check_modules(SECP256K1 REQUIRED libsecp256k1)
 # libcurl (for Web3 integration)
 pkg_check_modules(CURL REQUIRED libcurl)
 
-# zlib: batch compression (#12)
+# zlib: batch compression (#12); the static archive for the static tools (#269)
+if(HPPLITE_STATIC_TOOLS)
+    set(ZLIB_USE_STATIC_LIBS ON)
+endif()
 find_package(ZLIB REQUIRED)
 
 # Find threads
@@ -174,6 +178,12 @@ add_executable(hpplite-sequencer tools/hpplite_sequencer.c)
 target_link_libraries(hpplite-sequencer hpplite)
 add_executable(hpplite-verify tools/hpplite_verify.c)
 target_link_libraries(hpplite-verify hpplite)
+if(HPPLITE_STATIC_TOOLS)
+    # the static archives pkg-config names for a static link (libcurl's TLS, compression and name libraries among them)
+    target_link_libraries(hpplite PUBLIC ${CURL_STATIC_LIBRARIES} ${SECP256K1_STATIC_LIBRARIES})
+    target_link_options(hpplite-sequencer PRIVATE -static)
+    target_link_options(hpplite-verify PRIVATE -static)
+endif()
 
 if(HPPLITE_BUILD_TESTS)
     # Include tests directory for test_env.h
@@ -206,6 +216,8 @@ if(HPPLITE_BUILD_TESTS)
     add_executable(test_store tests/unit/test_store.c)
     add_executable(test_l1_version tests/unit/test_l1_version.c)
     target_link_libraries(test_l1_version hpplite_testlib)
+    add_executable(test_ca_bundle tests/unit/test_ca_bundle.c)
+    target_link_libraries(test_ca_bundle hpplite_testlib)
     target_link_libraries(test_store hpplite_testlib)
 
     add_executable(test_simple_open tests/unit/test_simple_open.c)
@@ -370,6 +382,11 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
         # the chain client refuses contracts before VERSION 8 (#252), against a JSON-RPC stand-in
         add_test(NAME test_l1_version COMMAND test_l1_version ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/rpc_stub.py)
+        # HPPLITE_CA_BUNDLE names the certificate file both curl clients trust (#269)
+        add_test(NAME test_ca_bundle COMMAND test_ca_bundle ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/tls_stub.py)
+        # the static musl build of the tools runs in Alpine and Debian images (#269); skipped without docker
+        add_test(NAME test_static_build COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/static_build.sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/linux/static/build.sh)
+        set_tests_properties(test_static_build PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
         set_tests_properties(test_store PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(test_store PROPERTIES RESOURCE_LOCK test_store)
         # ...with the ports it used to derive from its pid taken by another program (#177)
