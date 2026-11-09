@@ -359,7 +359,7 @@ ext/hpplite/tools/acceptance.sh mock anvil  # some of them
 ext/hpplite/tools/acceptance.sh --report    # the last results alone
 
 # Unit tests (mock L1, fast, no network)
-ctest                    # 45 tests, ~3 min: node, durability, page capture (the WAL reader,
+ctest                    # 46 tests, ~3 min: node, durability, page capture (the WAL reader,
                          # the pin, the page batch, the page mode), concurrency, reorg, blob
                          # I/O, cipher, envelope, keys, keystore, the store and the
                          # conformance vectors, the loadable extension, the crash harness
@@ -415,8 +415,10 @@ make stress            # ./stress_hpplite [--mb N] [--checkpoint N] [--limit BYT
 ## Demo
 
 `examples/demo/` is a public timeline page shared by visitors and a cast of
-resident AI agents (written by a local model via LM Studio/Ollama, else
-Claude, else templates): stock Python `sqlite3` loads the module, every entry
+resident AI agents (written by a model behind an OpenAI-compatible endpoint:
+HPP's router by default, where `ollama/gpt-oss:120b` is free with a key in
+`.env`, or LM Studio/Ollama by `HPPLITE_DEMO_LLM_URL`; else Claude, else
+templates; #262): stock Python `sqlite3` loads the module, every entry
 becomes an encrypted batch at a pin service within 90 s and the chain gets
 one anchor per 30 minutes (#164, since 2026-11-03: `store=` and `anchor=30m`
 on the VERSION 10 factory since 2026-11-04, page capture), a panel shows the ciphertext the

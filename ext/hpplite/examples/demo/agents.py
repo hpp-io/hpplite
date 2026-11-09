@@ -2,10 +2,14 @@
 
 A small cast of crustacean AI agents posts on its own: reacting to the
 ledger (batches, checkpoints, roots), to each other, and to humans who post.
-Posts are written by a local model when an OpenAI-compatible server answers
-at HPPLITE_DEMO_LLM_URL (default http://localhost:1234/v1 - LM Studio, Ollama,
-llama.cpp; model HPPLITE_DEMO_MODEL, default qwen/qwen3-4b), else by Claude if
-ANTHROPIC_API_KEY is set, else by the offline writer below. Either way the app binds the text as a parameter, so replay sees a
+Posts are written by a model behind an OpenAI-compatible endpoint at
+HPPLITE_DEMO_LLM_URL - default HPP's router, https://router.hpp.io/llm/v1,
+where HPPLITE_DEMO_MODEL's default ollama/gpt-oss:120b is free with a key
+(HPPLITE_DEMO_LLM_KEY, sent as a Bearer token); LM Studio, Ollama and
+llama.cpp speak the same API (http://localhost:1234/v1 and a local model).
+Each setting comes from the environment or else ext/hpplite/.env, where the
+launcher takes HPPLITE_PRIVATE_KEY from (#262). Without an answer: Claude if
+ANTHROPIC_API_KEY is set, else the offline writer below. Either way the app binds the text as a parameter, so replay sees a
 literal and nothing non-deterministic enters the log.
 """
 import json, os, random, urllib.request
@@ -39,8 +43,31 @@ the post, no name prefix, no explaining the technology. Never invent events, nam
 in what you were given. One or two short sentences, at most 160 characters - punchy, like a good tweet."""
 
 import re
-LOCAL_URL = os.environ.get("HPPLITE_DEMO_LLM_URL", "http://localhost:1234/v1")
-LOCAL_MODEL = os.environ.get("HPPLITE_DEMO_MODEL", "qwen/qwen3-coder-30b")
+_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
+_dotenv_cache = None
+def _dotenv():
+    """The KEY=VALUE lines of ext/hpplite/.env (quotes stripped); {} without the file."""
+    global _dotenv_cache
+    if _dotenv_cache is None:
+        _dotenv_cache = {}
+        try:
+            with open(_ENV_FILE) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line: continue
+                    k, v = line.split("=", 1)
+                    _dotenv_cache[k.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return _dotenv_cache
+
+def _setting(name, default=None):
+    """A setting from the environment, else ext/hpplite/.env, else the default."""
+    return os.environ.get(name) or _dotenv().get(name) or default
+
+LOCAL_URL = _setting("HPPLITE_DEMO_LLM_URL", "https://router.hpp.io/llm/v1")
+LOCAL_MODEL = _setting("HPPLITE_DEMO_MODEL", "ollama/gpt-oss:120b")
+LOCAL_KEY = _setting("HPPLITE_DEMO_LLM_KEY")
 _local_down_until = 0.0
 
 TOPICS = ["tide pools", "what humans eat", "the moon", "a dream you had", "your neighbour's shell", "a song stuck in your claw",
@@ -89,16 +116,23 @@ def _clean(text):
     return text.strip() or None
 
 def _rpc_local(agent, status, recent, reply_to):
-    """OpenAI-compatible chat completion on a local server (LM Studio, Ollama, llama.cpp)."""
+    """OpenAI-compatible chat completion (HPP's router, LM Studio, Ollama, llama.cpp).
+
+    A reasoning model's reasoning counts against max_tokens: at 90 gpt-oss:120b finished its thinking and
+    the post was empty, so the budget is 300 with reasoning_effort low (a post is 80-130 tokens); servers
+    that know no such field ignore it. _clean caps the text at 240 characters either way. The User-Agent
+    is the demo's own: Cloudflare in front of the router answers Python's default one 403 (error 1010).
+    """
     import time
     global _local_down_until
     if time.time() < _local_down_until: return None
-    body = json.dumps({"model": LOCAL_MODEL, "max_tokens": 90, "temperature": 1.0,
+    body = json.dumps({"model": LOCAL_MODEL, "max_tokens": 300, "temperature": 1.0, "reasoning_effort": "low",
                        "messages": [{"role": "system", "content": SYSTEM + " /no_think"},
                                     {"role": "user", "content": _task(agent, status, recent, reply_to)}],
                        "chat_template_kwargs": {"enable_thinking": False}}).encode()
-    req = urllib.request.Request(LOCAL_URL.rstrip("/") + "/chat/completions", data=body,
-                                 headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json", "user-agent": "hpplite-demo/1"}
+    if LOCAL_KEY: headers["authorization"] = "Bearer " + LOCAL_KEY
+    req = urllib.request.Request(LOCAL_URL.rstrip("/") + "/chat/completions", data=body, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             out = json.load(r)
@@ -195,7 +229,9 @@ _last_replied = {"id": 0}
 _last_agent = {"name": None}
 def writer_name():
     import time
-    if time.time() >= _local_down_until: return f"local model ({LOCAL_MODEL})"
+    if time.time() >= _local_down_until:
+        from urllib.parse import urlsplit
+        return f"{LOCAL_MODEL} at {urlsplit(LOCAL_URL).hostname}"
     if os.environ.get("ANTHROPIC_API_KEY"): return "Claude"
     return "offline writer"
 
