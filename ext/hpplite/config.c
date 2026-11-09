@@ -62,6 +62,10 @@ static int parse_bool(const char *z) {
 static int parse_on(const char *v) {
     return v && (strcasecmp(v, "on") == 0 || strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0);
 }
+/* off/0/false/no -> 1: a switch that is on unless said otherwise (#266) */
+static int parse_off(const char *v) {
+    return v && (strcasecmp(v, "off") == 0 || strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 || strcasecmp(v, "no") == 0);
+}
 
 static int parse_duration_ms(const char *str) {
     if (!str) return -1;
@@ -160,6 +164,7 @@ HppliteConfig *hpplite_config_create(void) {
     cfg->batchIntervalMs = 5000;
    /* 5 seconds default */
     cfg->anchorIntervalMs = 30 * 60 * 1000;   /* HPP's cadence (#164); anchor= overrides */
+    cfg->anchorClose = 1;                      /* the close anchors; anchorclose=off leaves it to the timer (#266) */
     cfg->encrypt = 1;             /* everything posted is public otherwise */
     cfg->compress = 1;            /* smaller batches everywhere they go (#12) */
     cfg->storeFallback = 1;       /* a store that does not answer never holds a batch back (#11) */
@@ -269,6 +274,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) cfg->keepSeconds = k; }
     val = getenv("HPPLITE_KEEP_LEASE");
     if (val) cfg->keepLease = parse_on(val);
+    val = getenv("HPPLITE_ANCHOR_CLOSE");
+    if (val) cfg->anchorClose = !parse_off(val);
     val = getenv(HPPLITE_ENV_FROM);
     if (val) refuse_from();
     val = getenv("HPPLITE_SNAPSHOT");
@@ -524,6 +531,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
     if (get_uri_param(uri, "keeplease", buf, sizeof(buf))) cfg->keepLease = parse_on(buf);
+    if (get_uri_param(uri, "anchorclose", buf, sizeof(buf))) cfg->anchorClose = !parse_off(buf);
     if (get_uri_param(uri, HPPLITE_URI_SNAPSHOT, buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
         if (ms >= 0) cfg->snapshotIntervalMs = ms;
@@ -707,6 +715,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     }
     val = sqlite3_uri_parameter(filename, "keeplease");
     if (val) cfg->keepLease = parse_on(val);
+    val = sqlite3_uri_parameter(filename, "anchorclose");
+    if (val) cfg->anchorClose = !parse_off(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SNAPSHOT);
     if (val) {
         int ms = parse_duration_ms(val);

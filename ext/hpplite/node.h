@@ -93,6 +93,7 @@ typedef struct HppliteNodeConfig {
     int snapshotIntervalMs;         /* snapshot=: a snapshot at an anchor when the last is older than this (#221); 0: never */
     int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
     int keepLease;                  /* keeplease=on: a sequencer closing alone lets its lease run instead of releasing it (#265) */
+    int noAnchorAtClose;            /* anchorclose=off: the close flushes to the store and leaves the anchor to the timer or hpplite_anchor() (#266) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;
 

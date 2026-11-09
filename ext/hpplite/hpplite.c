@@ -684,6 +684,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->snapshotIntervalMs = cfg->snapshotIntervalMs;   /* snapshots at anchors (#221) */
     nc->anchorIntervalMs = cfg->anchorIntervalMs;   /* the anchor's cadence (#164) */
     nc->keepLease = cfg->keepLease;                  /* the lease left running at a close alone (#265) */
+    nc->noAnchorAtClose = !cfg->anchorClose;         /* the close anchors nothing (#266) */
 
     /* Role removed - always sequencer in simplified model */
 }

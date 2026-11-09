@@ -155,6 +155,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeFallback = config->storeFallback;
     node->config.anchorIntervalMs = config->anchorIntervalMs;
     node->config.keepLease = config->keepLease;
+    node->config.noAnchorAtClose = config->noAnchorAtClose;
     node->config.snapshotIntervalMs = config->snapshotIntervalMs;
     node->config.fromSnapshot = config->fromSnapshot;
     node->config.keepSeconds = config->keepSeconds;
@@ -907,8 +908,11 @@ void hpplite_node_destroy(HppliteNode *node) {
         hpplite_node_stop(node);
     }
 
-    /* the batches the store holds since the last anchor get theirs (#164) */
-    if (node->l1 && node->ctx && !node->ctx->bDbClosed && node->flushMutex && node_ranges(node)) {
+    /* the batches the store holds since the last anchor get theirs (#164) -
+    ** unless anchorclose=off (#266): then the timer anchors on its cadence and
+    ** the close leaves the rows waiting, for an app that sleeps and wakes to
+    ** pay one anchor a day rather than one per cycle */
+    if (node->l1 && node->ctx && !node->ctx->bDbClosed && node->flushMutex && node_ranges(node) && !node->config.noAnchorAtClose) {
         pthread_mutex_lock((pthread_mutex_t *)node->flushMutex);
         node_anchor(node);
         pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);

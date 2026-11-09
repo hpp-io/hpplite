@@ -965,6 +965,44 @@ static void test_snapshot_reused_after_refusal(const char *url) {
     PASS();
 }
 
+/* anchorclose=off (#266): the close flushes what is pending to the store and anchors nothing;
+** the anchor is the timer's (anchor=) or hpplite_anchor()'s. The next run finds the rows waiting */
+static void test_no_anchor_at_close(const char *url) {
+    TEST("anchorclose=off: the close puts the pending batch at the store and anchors nothing; the next run finds both waiting and anchors them on request; its close has nothing left (#266)");
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "noanchor_w", .noAnchorAtClose = 1 };
+    HppliteNode *w = test_open_node(tpath("na_w.db"), l1, &o);
+    uint64_t last = 0, total = 0;
+    unsigned char latest[32];
+    HppliteRange r;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(v)", NULL);
+    hpplite_node_exec(w, "INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("flush 1"); }
+    hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);     /* pending at the close: the close puts it at the store */
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_get_da_state(l1, &last, &total, latest);
+    if (last != 0) { printf("(chain %llu) ", (unsigned long long)last); hpplite_l1_disconnect(l1); FAIL("the close should anchor nothing"); }
+    w = test_open_node(tpath("na_w.db"), l1, &o);
+    if (!w) { hpplite_l1_disconnect(l1); FAIL("reopen"); }
+    {
+        long long rows = scalar(w->ctx->bkDb, "SELECT count(*) FROM _hpplite_unanchored");
+        if (rows != 2 || status_int(w->db, "height") != 3 || status_int(w->db, "anchored") != 0) {   /* height: the next to post */
+            printf("(rows %lld, height %lld, anchored %lld) ", rows, (long long)status_int(w->db, "height"), (long long)status_int(w->db, "anchored"));
+            hpplite_node_destroy(w); FAIL("both batches at the store and waiting for the chain after the restart");
+        }
+    }
+    if (hpplite_node_anchor(w) != 2 || hpplite_l1_get_range(l1, 1, &r) != 0 || r.fromHeight != 1 || r.toHeight != 2) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("hpplite_anchor() anchors them as one range 1-2"); }
+    hpplite_l1_range_clear(&r);
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_get_da_state(l1, &last, &total, latest);
+    hpplite_l1_disconnect(l1);
+    if (last != 2) FAIL("the second close has nothing to anchor and sends nothing");
+    PASS();
+}
+
 static void test_ranges_restart(const char *url) {
     TEST("ranges: a run that dies with batches at the store leaves rows for the chain; the next run anchors them before its own; a manifest with a swapped hash is refused");
     HppliteL1 *l1 = hpplite_l1_create_mock();
@@ -1329,6 +1367,7 @@ int main(int argc, char **argv) {
     test_protocol(dir);
     test_ranges(url);
     test_ranges_restart(url);
+    test_no_anchor_at_close(url);
     test_snapshot_made(url);
     test_snapshot_replica(url);
     test_snapshot_chunks(url);
