@@ -301,7 +301,13 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   `hpplite-sequencer <file>` beside the app with the same `HPPLITE_PARAMS`.
   It holds the file as its sequencer, so every request is a follower and
   never waits for the chain (WordPress, 8 PHP workers, 16 concurrent
-  clients: ~4% over plain SQLite; `tests/real_apps/wordpress`).
+  clients: ~4% over plain SQLite; `tests/real_apps/wordpress`). Its first
+  line on stdout, `hpplite-sequencer: <file> synced height N`, comes when
+  the open has returned - the chain and the store applied to the file, the
+  lease taken (#264): a supervisor that starts an app on an empty volume
+  waits for it before the app opens the file, since pages cannot be applied
+  while another connection holds the file in WAL mode. The rest goes to
+  stderr.
 - **A connection opened without HPPLite** (`sqlite3 app.db` from a shell, a
   tool that opens the file plainly) is captured all the same while a
   sequencer is on the file: its commits are frames in the same WAL, read by
@@ -359,7 +365,7 @@ ext/hpplite/tools/acceptance.sh mock anvil  # some of them
 ext/hpplite/tools/acceptance.sh --report    # the last results alone
 
 # Unit tests (mock L1, fast, no network)
-ctest                    # 46 tests, ~3 min: node, durability, page capture (the WAL reader,
+ctest                    # 47 tests, ~3 min: node, durability, page capture (the WAL reader,
                          # the pin, the page batch, the page mode), concurrency, reorg, blob
                          # I/O, cipher, envelope, keys, keystore, the store and the
                          # conformance vectors, the loadable extension, the crash harness
@@ -1016,6 +1022,7 @@ Paying in the HPP token itself is open (#175).
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
 | v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#258) | same | same |
+| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database

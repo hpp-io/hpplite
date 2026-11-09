@@ -13,6 +13,12 @@
 ** this process posts, on the interval, for all of them. It takes the same
 ** HPPLITE_PARAMS as the application. Stop it with SIGTERM or SIGINT: it posts
 ** what is left, and an application connection takes over if any is open.
+**
+** The first line on stdout, "hpplite-sequencer: <file> synced height N", comes
+** when the open has returned (#264): the chain and the store applied to the
+** file, the lease taken. A supervisor restoring an empty volume waits for it
+** before the application opens the file - pages cannot be applied while
+** another connection holds the file in WAL mode. Everything else goes to stderr.
 */
 
 #include "hpplite.h"
@@ -50,6 +56,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "hpplite-sequencer: cannot open %s with HPPLite (HPPLITE_PARAMS?)\n", argv[1]);
         return 1;
     }
+    printf("hpplite-sequencer: %s synced height %d\n", argv[1], status_int(db, "height"));
+    fflush(stdout);                                /* the line is the signal: out before anything else happens */
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     int role = -1;
