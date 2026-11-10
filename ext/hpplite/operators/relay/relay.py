@@ -222,14 +222,15 @@ class Accounts:
             self._save("s", rollup, s)
             return funder, None
 
-    def refund(self, rollup, funder, amount):
-        """the call did not land: nothing is charged for it, and it does not count in the day"""
+    def refund(self, rollup, funder, amount, uncount=True):
+        """the call did not land: nothing is charged for it, and it does not count in the day. uncount=False: the part
+        of the price a call that landed did not use (#294), the day still counting it"""
         with self.lock:
             a = self.account(funder, create=True)
             a["credit"] += amount
             self._save("a", funder, a)
             s = self._load("s", rollup)
-            if s and same(s.get("funder"), funder) and (s.get("today") or {}).get("calls", 0) > 0:
+            if uncount and s and same(s.get("funder"), funder) and (s.get("today") or {}).get("calls", 0) > 0:
                 s["today"]["calls"] -= 1
                 self._save("s", rollup, s)
 
@@ -626,8 +627,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 r.accounts.refund(rollup, sponsor, amount)
                 tx = rcpt.get("transactionHash") if rcpt else None
                 return self.reply(409 if rcpt else 502, {"error": err or "the transaction reverted", "tx": tx, "call": name, "charged": False})
+            # the account pays what the call used (#294): the quote was taken before, the rest is given back
+            used = min(amount, r.price(int(rcpt["gasUsed"], 16), int(rcpt.get("effectiveGasPrice") or "0x0", 16)))
+            if used < amount:
+                r.accounts.refund(rollup, sponsor, amount - used, uncount=False)
             return self.reply(200, {"tx": rcpt["transactionHash"], "block": int(rcpt["blockNumber"], 16), "gasUsed": int(rcpt["gasUsed"], 16),
-                                    "call": name, "sponsor": sponsor, "charged": amount})
+                                    "call": name, "sponsor": sponsor, "charged": used})
         requirements = None
         if p.enabled:
             requirements = p.requirements(amount, "http://%s/commit" % self.headers.get("Host", "localhost"),

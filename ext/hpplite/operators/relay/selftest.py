@@ -300,6 +300,10 @@ def main():
         st, body = post_raw(url + "/commit", {"to": rollup, "data": encode("renewLeaseFor(bytes32,uint256,uint256,bytes)", instance, 4, deadline, lease("renew", 4))})
         check(st == 200 and body.get("sponsor") == treasury and body.get("charged", 0) > 0,
               "renewLeaseFor on a sponsored rollup, no payment sent: 200, charged to the sponsor (%s %s)" % (st, body))
+        rcpt = chain.call("eth_getTransactionReceipt", body.get("tx"))
+        used = price_units(int(rcpt["gasUsed"], 16), int(rcpt["effectiveGasPrice"], 16), 3000)
+        check(body.get("charged") == used,
+              "the sponsor is charged the gas the call used (#294): %d units for %d gas, not the quote (charged %s)" % (used, int(rcpt["gasUsed"], 16), body.get("charged")))
         check(balance_usdc(wallet) == u0 and t0 - balance_usdc(treasury) >= 1_000_000,
               "the caller paid nothing; the relay pulled at least minPull from the treasury's permit (%d units)" % (t0 - balance_usdc(treasury)))
         st, acct = http_get(url + "/account/" + treasury)

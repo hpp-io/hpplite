@@ -108,7 +108,11 @@ the rollup asked for. `Unsponsor` and `Cap` are the sponsor's alone.
 **Paying.** A sponsored call is charged the price its caller would have
 been quoted, before it is submitted, and given back when the transaction is
 refused, fails to be included or reverts: two calls at once never spend the
-same credit, and nothing is charged for a call that did not land. The price
+same credit, and nothing is charged for a call that did not land. When it
+lands, the account keeps the price of the gas the call used - the same
+formula at the receipt's `gasUsed` and `effectiveGasPrice`, never more than
+the quote - and is given back the rest; `charged` says what was kept (#294).
+A caller paying by x402 pays its quote: `exact` settles the signed amount. The price
 comes from the account's `credit` when that covers it. Otherwise the relay
 first pulls from the funder: when the token's allowance to `spender` is
 short it sends the permit it holds, then `transferFrom` to `payTo`, both by
