@@ -515,6 +515,7 @@ static const char *replica_equals_as(sqlite3 *w, const char *replicaFile, const 
     b = test_dump(r, 0);
     hpplite_state_root(r, rootR);
     sqlite3_close(r);
+    if (!a || !b) { sqlite3_free(a); sqlite3_free(b); return "replica dump: the writer or the replica did not read"; }
     int rows = strcmp(a, b) != 0, root = memcmp(rootW, rootR, 32) != 0;
     if (rows) {
         size_t i = test_dump_diff(a, b);
@@ -1145,6 +1146,13 @@ static const char *soak_settle(sqlite3 *w) {
     }
     return "the owed checkpoint did not land in 10 s";
 }
+/* The replica of the last pass goes with its sidecar: a new file beside the old bookkeeping is refused (#284) */
+static void soak_fresh_replica(void) {
+    static const char *ext[] = { "", "-wal", "-shm", "-hpplite", "-hpplite-users", "-hpplite.db", "-hpplite.db-wal", "-hpplite.db-shm" };
+    char path[300];
+    size_t i;
+    for (i = 0; i < sizeof ext / sizeof ext[0]; i++) { snprintf(path, sizeof path, DIR "/soak_replica.db%s", ext[i]); unlink(path); }
+}
 static pid_t start_pin_service_free(const char *svc, int port);
 static void soak_stop_store(pid_t pid) {
     if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); }
@@ -1196,7 +1204,7 @@ static void test_soak(void) {
             checks++;
             if ((why = soak_settle(w)) != NULL) break;
             t0 = now_s();
-            unlink(DIR "/soak_replica.db"); unlink(DIR "/soak_replica.db-wal"); unlink(DIR "/soak_replica.db-shm");
+            soak_fresh_replica();
             why = replica_equals_as(w, "soak_replica.db", KEY0, replicaExtra);
             tRebuild = now_s() - t0;
             if (why) break;
@@ -1217,7 +1225,7 @@ static void test_soak(void) {
         HppliteNode *n = hpplite_get_node(w);
         why = soak_settle(w);
         if (!why) why = chain_contiguous(n);
-        if (!why) { unlink(DIR "/soak_replica.db"); unlink(DIR "/soak_replica.db-wal"); unlink(DIR "/soak_replica.db-shm"); why = replica_equals_as(w, "soak_replica.db", KEY0, replicaExtra); }
+        if (!why) { soak_fresh_replica(); why = replica_equals_as(w, "soak_replica.db", KEY0, replicaExtra); }
         if (!why && run_verify(verifyCmd, out, sizeof out) != 0) why = out;
     }
     printf("    end: height %lld, %ld statements (%ld failed, none refused), %ld transactions, %ld oracle passes, worst rebuild %.1f s, worst verify %.1f s\n",
