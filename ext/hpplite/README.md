@@ -1026,6 +1026,11 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.9.1** (2026-11-10) fixes `hpplite-verify` on a store-backed rollup
+between anchors, which v0.9.0 called "NOT verified" although the rollup
+was right (#286), and says a bucket's daily cap once, not at every flush
+(#288). No protocol changes.
+
 **v0.9.0 is tagged** (2026-11-10), "A platform's sidecar": what the first
 client needed (#263, a platform that runs one sequencer beside each app's
 database and pays for its apps from one treasury). The node: the
