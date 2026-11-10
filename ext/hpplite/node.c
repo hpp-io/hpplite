@@ -3072,8 +3072,8 @@ static int node_soft_follows(HppliteNode *node) {
     return node && node->config.verifyOnly && !node->syncTo && !node->syncAtMs && node->store && node->l1 && !node->softStopped && hpplite_l1_has_ranges(node->l1);
 }
 
-static int node_soft_push(HppliteNode *node, uint64_t h, const unsigned char after[32]) {
-    if (!node->softFirst) { node->softFirst = h; node->nSoft = 0; }
+static int node_soft_push(HppliteNode *node, uint64_t h, const unsigned char before[32], const unsigned char after[32]) {
+    if (!node->softFirst) { node->softFirst = h; node->nSoft = 0; memcpy(node->softBase, before, 32); }
     if (node->nSoft == node->nSoftAlloc) {
         size_t n = node->nSoftAlloc ? node->nSoftAlloc * 2 : 64;
         unsigned char (*a)[32] = realloc(node->softChain, n * 32);
@@ -3118,7 +3118,7 @@ static int node_range_chain(HppliteNode *node, uint64_t height, unsigned char ou
 /* A soft state from before this process (the file is past the anchored height): its chain hashes again,
 ** from the store's names folded on the chain's hash at the anchored height; they must end at the file's */
 static int node_soft_recount(HppliteNode *node, uint64_t anchored) {
-    unsigned char chain[32], k[32], da[20], inst[32];
+    unsigned char chain[32], after[32], k[32], da[20], inst[32];
     uint8_t sig[65];
     char name[80];
     uint64_t h;
@@ -3130,8 +3130,9 @@ static int node_soft_recount(HppliteNode *node, uint64_t anchored) {
         if (node_store_name(node, h, name, da) != 0 || !(data = hpplite_store_get_named(node->store, name, &n, sig, inst))) return -1;
         hpplite_keccak256(data, n, k);
         free(data);
-        hpplite_chain_hash_next(chain, h, k, chain);
-        if (node_soft_push(node, h, chain) != 0) return -1;
+        hpplite_chain_hash_next(chain, h, k, after);
+        if (node_soft_push(node, h, chain, after) != 0) return -1;
+        memcpy(chain, after, 32);
     }
     return memcmp(chain, node->ctx->chainHash, 32) == 0 ? 0 : -1;
 }
@@ -3224,7 +3225,7 @@ static int node_soft_rebuild(HppliteNode *node) {
                 hppliteLoadMeta(node->ctx);
                 if (node->pm && n2->pm) hpplite_pagemode_take_root(node->pm, n2->pm);   /* the file's page tree is the copy's */
                 node_soft_clear(node);
-                for (size_t k = 0; k < n2->nSoft; k++) node_soft_push(node, n2->softFirst + k, n2->softChain[k]);
+                for (size_t k = 0; k < n2->nSoft; k++) node_soft_push(node, n2->softFirst + k, k ? n2->softChain[k - 1] : n2->softBase, n2->softChain[k]);
                 node->softStopped = 0;
                 node->state = HPPLITE_STATE_RUNNING;
                 hpplite_error_clear(node->ctx);
@@ -3259,6 +3260,7 @@ static int node_soft_settle(HppliteNode *node, uint64_t anchored) {
     if (anchored == end) node_soft_clear(node);
     else {
         size_t drop = (size_t)(anchored - node->softFirst + 1);
+        memcpy(node->softBase, node->softChain[drop - 1], 32);
         memmove(node->softChain, node->softChain + drop, (node->nSoft - drop) * 32);
         node->nSoft -= drop;
         node->softFirst = anchored + 1;
@@ -3269,7 +3271,7 @@ static int node_soft_settle(HppliteNode *node, uint64_t anchored) {
 /* Past the anchored height: the store's next names, checked, applied */
 static int node_soft_follow(HppliteNode *node) {
     HppliteL1State *st;
-    unsigned char seq[20], da[20], who[20], inst[32], k[32], after[32];
+    unsigned char seq[20], da[20], who[20], inst[32], k[32], before[32], after[32];
     uint8_t sig[65];
     char name[80];
     int applied = 0;
@@ -3293,14 +3295,15 @@ static int node_soft_follow(HppliteNode *node) {
         if (!batch) { free(data); break; }
         batch->pPosted = data; batch->nPosted = n; batch->bOwnsPosted = 1;
         hpplite_keccak256(data, n, k);
-        hpplite_chain_hash_next(node->ctx->chainHash, h, k, after);
+        memcpy(before, node->ctx->chainHash, 32);
+        hpplite_chain_hash_next(before, h, k, after);
         rc = node_apply_pages(node, batch);
         hpplite_batch_free(batch);
         if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
             fprintf(stderr, "hpplite: batch %llu at the store does not apply on this history (rc=%d): the soft tier stops before it\n", (unsigned long long)h, rc);
             break;
         }
-        if (node_soft_push(node, h, after) != 0) break;
+        if (node_soft_push(node, h, before, after) != 0) break;
         applied++;
     }
     return applied;

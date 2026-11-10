@@ -150,6 +150,7 @@ typedef struct HppliteNode {
     /* the soft tier (#166): what a verifier applied from the store past the anchored height */
     uint64_t softFirst;             /* the first soft height; 0: nothing soft */
     unsigned char (*softChain)[32]; /* the chain hash after each soft height, from softFirst */
+    unsigned char softBase[32];     /* the chain hash before softFirst: at the anchored height, the contract's (#286) */
     size_t nSoft, nSoftAlloc;
     int softStopped;                /* the soft tier disagreed with the chain: not followed (#166) */
     int softDisagreements;          /* ...times it did, each followed by a rebuild (status soft_disagreements) */

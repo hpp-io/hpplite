@@ -222,8 +222,10 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_CHAIN_HASH: {            /* the DA contract's rolling hash as this node tracks it (#33); NULL until known */
             static const unsigned char zero[32];
-            if (memcmp(node->ctx->chainHash, zero, 32) == 0) sqlite3_result_null(ctx);
-            else statusResultHex(ctx, node->ctx->chainHash);
+            /* at the hard height, as height is: past it a verifier's soft tier has not reached the contract (#286) */
+            const unsigned char *chain = node->softFirst ? node->softBase : node->ctx->chainHash;
+            if (memcmp(chain, zero, 32) == 0) sqlite3_result_null(ctx);
+            else statusResultHex(ctx, chain);
             break;
         }
         case STATUS_COL_LAST_CHECKPOINT:

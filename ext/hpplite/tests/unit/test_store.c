@@ -1536,6 +1536,25 @@ static void test_soft_replica(const char *url) {
     printf("(after the anchor: height %lld, soft_height %lld, state %s) ", hard, soft, status_text(r->db, "state"));
     int same = same_root(w, r);
     if (hard != 4 || soft != 4 || !same || r->state == HPPLITE_STATE_ERROR) { SOFT_DONE(); FAIL("the anchor names what was applied: all hard, the same root"); }
+    /* a batch past the anchor: chain_hash stays the hash at the anchored height, as height does - the one the
+    ** contract holds and hpplite-verify compares it with (#286) */
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('past the anchor')", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { SOFT_DONE(); FAIL("the fourth flush"); }
+    hpplite_node_sync_from_l1(r, 1);
+    {
+        HppliteRange r3;
+        char want[67] = "0x";
+        memset(&r3, 0, sizeof r3);
+        if (hpplite_l1_get_range(l1, 3, &r3) != 0 || r3.toHeight != 3) { SOFT_DONE(); FAIL("the range the anchor wrote, 1-3"); }
+        hpplite_to_hex(r3.chainHashAfter, 32, want + 2);
+        hpplite_l1_range_clear(&r3);
+        hard = status_int(r->db, "height"); soft = status_int(r->db, "soft_height");
+        if (hard != 4 || soft != 5 || strcasecmp(status_text(r->db, "chain_hash"), want) != 0) {
+            printf("(height %lld, soft_height %lld, chain_hash %s, the anchor's %s) ", hard, soft, status_text(r->db, "chain_hash"), want);
+            SOFT_DONE();
+            FAIL("with a batch past the anchor, chain_hash is the hash at the anchored height, the contract's (#286)");
+        }
+    }
     SOFT_DONE();
 #undef SOFT_DONE
     PASS();

@@ -1579,6 +1579,19 @@ static void test_store_commit(void) {
     /* the close anchors what the store holds since */
     sqlite3_exec(w, "INSERT INTO s(v) VALUES('four')", NULL, NULL, NULL);
     if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("batch 4 through the store"); }
+    {
+        /* between anchors: batch 4 is at the store, the chain anchors 3. hpplite-verify compares the contract's rolling
+        ** hash with the rebuild's at the anchored height and says verified, the batch past the anchor reported (#286) */
+        char params[300];
+        snprintf(params, sizeof params, "rpc=%s&factory=%s&chainid=31337&privkey=%s&dbname=stored&store=http://127.0.0.1:%d", RPC, FACTORY, KEY2, port);
+        int rc = run_verify_with(params, NULL, out, sizeof out);
+        if (rc != 0 || !strstr(out, "chain hash over 3 batches: matches the contract's") || !strstr(out, "1 batches at the store past the anchor")
+            || !strstr(out, "\nverified")) {
+            printf("(hpplite-verify with a batch past the anchor rc %d: %.700s) ", rc, out);
+            sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+            FAIL("hpplite-verify between anchors should say verified: the chain hash compared at the anchored height (#286)");
+        }
+    }
     sqlite3_close(w);
     {
         HppliteL1 *peek = hpplite_l1_connect(RPC, contract);

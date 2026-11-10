@@ -363,7 +363,9 @@ int main(int argc, char **argv) {
             char want[65];
             hex(chain, want);
             if (mine[0] == '0' && (mine[1] == 'x' || mine[1] == 'X')) mine += 2;
-            if (rebuilt < h) {
+            if (h == 0) {
+                printf("chain hash: no batch on chain yet, nothing to compare\n");
+            } else if (rebuilt < h) {
                 printf("chain hash: the contract's covers %llu batches, the rebuild %llu: not compared\n", (unsigned long long)h, (unsigned long long)rebuilt);
             } else if (strcasecmp(mine, want) == 0) {
                 printf("chain hash over %llu batches: matches the contract's\n", (unsigned long long)h);

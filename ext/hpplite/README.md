@@ -601,7 +601,9 @@ file's batches; 0 = another connection, in this process or another, does),
 `capture` (`pages`), `foreign_writes` (looks that found the bookkeeping
 changed by something that is not HPPLite, #37), `state` and `last_error`
 (#32), `chain_hash` (the DA contract's rolling hash over every batch as this
-node tracks it, #33; NULL in a file from before it was kept), and, with
+node tracks it, #33; NULL in a file from before it was kept; on a verifier
+with batches past the anchor, the hash at the anchored height, as `height`
+is, #286), and, with
 `store=` (#11): `store` (its URL), `store_state` (`ok`, `unreachable`, `over
 cap`, `error`: the last put's outcome, so a waiting batch says
 why), `store_spent` and `store_calls` (paid by x402 by this process in the asset's
