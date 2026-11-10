@@ -48,7 +48,10 @@ fee: `max(ceil(gas × fee × (1 + margin) × ethUsd × 10^6 / 10^18), minFee)`
 in IEEE doubles in that order (cases in `operators/conformance/vectors.json`).
 `gas` is the estimate itself; the headroom a transaction needs (the
 estimate × 1.25 + 10,000 in both relays) is its gas limit, not charged
-(#293). The offer is x402's `exact` (the
+(#293). `ethUsd` is the operator's current price of ETH in USD, as
+`/status` reports it: a fixed setting, or a feed the operator reads (the
+canonical relay reads Chainlink's ETH/USD on Ethereum mainnet, #295), so it
+may differ from one quote to the next. The offer is x402's `exact` (the
 `batch-settlement` channels of v0.5-v0.7 were removed in v0.8, #251).
 
 Every offer's `extra.quote` is `{gas, until, mac}`: the gas limit the

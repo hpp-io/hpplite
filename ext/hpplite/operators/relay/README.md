@@ -67,12 +67,12 @@ a transaction that might never land.
 ## Cost
 
 On HPP Sepolia (0.01 gwei), an anchor costs about 73.5k gas, or $0.0022
-of ETH at $3,000. The relay quotes the estimate with its headroom and
-margin, about 0.0037 USDC.e per anchor, or about $5 a month at one anchor
-per 30 minutes. Creating a rollup costs 3.43M gas, a quote of about
-0.15 USDC.e. The headroom is charged even when the transaction uses less;
-a relay that wants to charge what was used would settle that amount instead
-(#172 is the pricing work).
+of ETH at $3,000. The relay quotes the estimate with its margin, about
+0.0027 USDC.e per anchor. Creating a rollup costs 3.43M gas, a quote of
+about 0.12 USDC.e. A caller paying by x402 pays its quote (`exact` settles
+the signed amount); a sponsor's account pays what the call used (#294).
+The canonical relay charges no margin and converts at Chainlink's ETH/USD
+(#295).
 
 ## Paid per call
 
