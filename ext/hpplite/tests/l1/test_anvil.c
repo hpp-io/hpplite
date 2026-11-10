@@ -3052,6 +3052,11 @@ static void test_fleet_sequencer(void) {
     int stopRc = stop_sidecar(pid, SIGTERM, 90);
     printf("\n    %d databases (+1 added, 1 removed): rollups created in %.1f s, all synced %.1f s after the start; fleet process: %ld threads (%.1f per db), %ld open files (%.1f per db); idle RPC %ld requests in 30 s (%.1f per db per minute); SIGTERM exit %d ",
            n, tCreate, tSynced, thr, (double)thr / n, fds, (double)fds / n, idle, idle * 2.0 / n, stopRc);
+    if (!why && idle > n) {                                  /* an idle database costs no RPC (#292): under one request each in 30 s */
+        static char b[160];
+        snprintf(b, sizeof b, "idle databases asked the chain %ld times in 30 s (%.1f per database a minute): an idle database should ask nothing (#292)", idle, idle * 2.0 / n);
+        why = b;
+    }
     if (!why && stopRc != 0) why = "SIGTERM should close every database and exit 0";
     if (!why && fleet_lines(out, ": closed") != n + 1) why = "every database says closed at SIGTERM";
     kill_proxy();

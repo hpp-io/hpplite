@@ -113,6 +113,7 @@ typedef struct HppliteNode {
     unsigned char instanceId[32];
     int hasLease;                   /* We claimed the lease and have not released it */
     int64_t leaseRecheckAt;         /* Next time to read the lease from L1 (ms, monotonic) */
+    int64_t idleSyncAt;             /* An idle lease holder asks the chain again at this time, not at every tick (#292) */
     uint64_t leaseDuration;         /* Seconds, learned from the contract (default 300) */
     int warnedForeignLease;         /* "someone else holds the lease" said once */
     int leaseHeldElsewhere;         /* The last look found another instance's lease (hpplite_status.state = waiting) */

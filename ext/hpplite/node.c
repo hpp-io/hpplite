@@ -1577,6 +1577,7 @@ static void test_crash_point(const char *zName) {
 /* Raw page records deflate about this many times as diffs: the build's budget
 ** of raw bytes for a posted limit, corrected when a batch comes out over it */
 #define HPPLITE_PAGE_DEFLATE_GUESS 8
+#define HPPLITE_IDLE_SYNC_MS (10 * 60 * 1000)   /* an idle writer holding the lease looks at the chain this often (#292) */
 
 /* A replica takes a page batch into its file (#146): the records applied at
 ** their offsets (a diff XORed onto the page as it is), the file cut to the
@@ -3586,12 +3587,20 @@ static void *node_timer_thread_func(void *arg) {
         if (node->config.anchorIntervalMs > 0 && node->store && node->l1 && node->anchorAt == 0) {
             node->anchorAt = now + (!node->config.noAnchorAtClose && node_unanchored_above(node, node->anchoredHeight) ? 2000 : node->config.anchorIntervalMs);
         }
-        if (elapsed >= intervalMs || sizeTrigger) {
+        /* An idle writer holding the lease asks the chain nothing at its tick (#292): nobody else posts while the
+        ** lease holds, and a lease lost meanwhile (expired, the owner's forceExpire) is met at the next post, which
+        ** reads the lease and adopts or refuses. It still looks every HPPLITE_IDLE_SYNC_MS; a waiting writer, a
+        ** follower and a verifier keep looking at every tick, and hpplite_flush() always does */
+        if ((elapsed >= intervalMs || sizeTrigger) && !sizeTrigger && node->state == HPPLITE_STATE_RUNNING && node->hasLease
+            && !node->leaseHeldElsewhere && !node->config.verifyOnly && now < node->idleSyncAt && hpplite_node_pending_count(node) == 0) {
+            node->lastFlushTime = now;
+        } else if (elapsed >= intervalMs || sizeTrigger) {
             pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
             if (mutex) {
                 pthread_mutex_lock(mutex);
                 if (node->timerRunning) {
                     node_flush_unlocked(node);
+                    node->idleSyncAt = now + HPPLITE_IDLE_SYNC_MS;
                 }
                 pthread_mutex_unlock(mutex);
             }
