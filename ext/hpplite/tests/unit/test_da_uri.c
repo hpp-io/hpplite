@@ -351,6 +351,44 @@ static void test_relay_exact_only(void) {
     PASS();
 }
 
+/* #316 (a): fleet= names a database by owner= and dbname= alone; what names a rollup (contract=, factory=) and what a
+** fleet's anchor does for it (anchor=, checkpoint=, keep=) refuse the open, one line each naming it */
+static void test_fleet_params(void) {
+    TEST("fleet=: owner= and dbname= are required; contract=, factory=, anchor=, checkpoint=, keep= refuse the open with fleet= (#316)");
+    static const char *base = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
+    static const char *cases[][2] = {
+        { "&dbname=notes", "owner=" }, { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1", "dbname=" },
+        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&contract=0x2222222222222222222222222222222222222222", "contract=" },
+        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&factory=0x2222222222222222222222222222222222222222", "factory=" },
+        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&anchor=24h", "anchor=" },
+        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&checkpoint=7", "checkpoint=" },
+        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&keep=7d", "keep=" },
+    };
+    char uri[600];
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        snprintf(uri, sizeof uri, "%s%s", base, cases[i][0]);
+        HppliteConfig *cfg = hpplite_config_load(uri);
+        const char *why = hpplite_config_error();
+        int refused = !cfg || why != NULL;
+        printf("  %s: %s\n", cases[i][1], why ? why : "(no error)");
+        if (cfg) hpplite_config_free(cfg);
+        if (!refused || !why || !strstr(why, cases[i][1])) { FAIL("fleet= with this should refuse the open, naming it"); }
+    }
+    /* the vectors' first database: "notes" of key 0x01..01's address, dbId as operators/conformance/vectors.json (fleet) */
+    snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&admit=1800000000:0x%s", base,
+             "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222" "1b");
+    HppliteConfig *cfg = hpplite_config_load(uri);
+    static const unsigned char want[32] = { 0x0d,0x00,0x46,0xe2,0x14,0xcb,0x02,0x16,0x94,0x1a,0x01,0x56,0x73,0xfa,0x82,0x8c,
+                                            0x60,0xa4,0x2d,0x13,0x9b,0x75,0xe4,0xad,0x10,0x8a,0xe5,0xd5,0xa3,0x48,0x03,0x0e };
+    int ok = cfg && !hpplite_config_error() && cfg->hasFleet && memcmp(cfg->dbId, want, 32) == 0 && cfg->hasAdmit && cfg->admitIssuedAt == 1800000000;
+    printf("  owner, dbname and admit: %s\n", ok ? "parsed, the vectors' dbId" : (hpplite_config_error() ? hpplite_config_error() : "the dbId differs"));
+    int stops = cfg && hpplite_config_resolve_operators(cfg) != 0 && hpplite_config_error() && strstr(hpplite_config_error(), "not served yet");
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("fleet=, owner= and dbname= should give the vectors' dbId, admit= its issuedAt"); }
+    if (!stops) { FAIL("until the fleet mode is built, the open stops saying so"); }
+    PASS();
+}
+
 /* #254: the money knobs are the deployment's, not the connection string's. Each in a URI refuses the open naming
 ** its environment variable; the variable is honoured; storefallback gets the twin it never had */
 static void test_money_knobs_env_only(void) {
@@ -431,6 +469,7 @@ int main(void) {
     test_operators_on();
     test_keep_not_capped();
     test_relay_exact_only();
+    test_fleet_params();
     test_money_knobs_env_only();
     test_from_soft_gone();
 

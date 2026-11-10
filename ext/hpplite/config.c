@@ -12,6 +12,7 @@
 #include <errno.h>
 #include "da_uri.h"
 #include "hpplite_sqlite.h"
+#include "crypto.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -147,6 +148,43 @@ static void refuse_soft(void) {
 }
 
 /* role=verify, nothing else (#248): sequencer and observer were parsed and read nowhere - a sequencer needs no role= */
+/* fleet= (#316): a database in a shared rollup is named by owner= and dbname= alone; admit= carries the fleet's Admit */
+static void fleet_param(HppliteConfig *cfg, const char *name, const char *val) {
+    if (!val) return;
+    if (strcmp(name, "fleet") == 0) { if (hex_to_bytes(val, cfg->fleet, 20) == 0) cfg->hasFleet = 1;
+                                      else snprintf(gConfigError, sizeof(gConfigError), "fleet=%.48s: not an address", val); }
+    else if (strcmp(name, "owner") == 0) { if (hex_to_bytes(val, cfg->fleetOwner, 20) == 0) cfg->hasFleetOwner = 1;
+                                           else snprintf(gConfigError, sizeof(gConfigError), "owner=%.48s: not an address", val); }
+    else if (strcmp(name, "admit") == 0) {
+        const char *colon = strchr(val, ':');
+        cfg->admitIssuedAt = strtoull(val, NULL, 10);
+        if (!colon || !cfg->admitIssuedAt || hex_to_bytes(colon + 1, cfg->admitSig, 65) != 0)
+            snprintf(gConfigError, sizeof(gConfigError), "admit=: <issuedAt>:0x<65-byte signature>, the fleet's Admit");
+        else cfg->hasAdmit = 1;
+    }
+}
+
+/* with fleet=: owner= and dbname= required; what names a rollup or is a fleet anchor's job refuses the open; the dbId */
+static void fleet_check(HppliteConfig *cfg, int contract, int factory, int anchor, int checkpoint, int keep) {
+    unsigned char word[64];
+    if (!cfg->hasFleet || gConfigError[0]) return;
+    if (!cfg->hasFleetOwner) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: owner= is required (with dbname= it names the database)"); return; }
+    if (!cfg->dbName || !cfg->dbName[0]) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: dbname= is required (with owner= it names the database)"); return; }
+    if (contract || factory) {
+        snprintf(gConfigError, sizeof(gConfigError), "%s= with fleet=: a database in a fleet is named by fleet=, owner= and dbname= alone", contract ? "contract" : "factory");
+        return;
+    }
+    if (anchor || checkpoint || keep) {
+        snprintf(gConfigError, sizeof(gConfigError), "%s= with fleet=: the fleet's anchor anchors its databases%s", anchor ? "anchor" : checkpoint ? "checkpoint" : "keep",
+                 keep ? " (snapshots and pruning in a fleet: #314)" : "");
+        return;
+    }
+    memset(word, 0, 12);
+    memcpy(word + 12, cfg->fleetOwner, 20);
+    hpplite_keccak256((const unsigned char *)cfg->dbName, strlen(cfg->dbName), word + 32);
+    hpplite_keccak256(word, 64, cfg->dbId);
+}
+
 static void parse_role(HppliteConfig *cfg, const char *val, int source) {
     if (strcasecmp(val, "verify") == 0) { cfg->roleVerify = 1; cfg->roleSource = source; return; }
     snprintf(gConfigError, sizeof(gConfigError), "role=%.40s: role= takes verify only (an audit connection); a sequencer needs no role=", val);
@@ -582,6 +620,14 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->checkpointInterval = atoi(buf);
     }
 
+    {   /* fleet= (#316): params only */
+        static const char *names[] = { "fleet", "owner", "admit" };
+        for (int i = 0; i < 3; i++) if (get_uri_param(uri, names[i], buf, sizeof(buf))) fleet_param(cfg, names[i], buf);
+        fleet_check(cfg, get_uri_param(uri, HPPLITE_URI_CONTRACT, buf, sizeof(buf)) != NULL, get_uri_param(uri, HPPLITE_URI_FACTORY, buf, sizeof(buf)) != NULL,
+                    get_uri_param(uri, "anchor", buf, sizeof(buf)) != NULL, get_uri_param(uri, HPPLITE_URI_CHECKPOINT, buf, sizeof(buf)) != NULL,
+                    get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf)) != NULL);
+    }
+
     /* the chain's cadence applies to whatever goes to the chain (#162, #164): the batches
     ** of a node without a store, the anchors of a node with one */
     if (cfg->aliasIntervalMs && cfg->storeUrl) { if (!cfg->anchorGiven) cfg->anchorIntervalMs = cfg->aliasIntervalMs; }
@@ -770,6 +816,13 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     ** of a node without a store, the anchors of a node with one */
     if (cfg->aliasIntervalMs && cfg->storeUrl) { if (!cfg->anchorGiven) cfg->anchorIntervalMs = cfg->aliasIntervalMs; }
     else if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;
+    {   /* fleet= (#316): params only */
+        static const char *names[] = { "fleet", "owner", "admit" };
+        for (int i = 0; i < 3; i++) fleet_param(cfg, names[i], sqlite3_uri_parameter(filename, names[i]));
+        fleet_check(cfg, sqlite3_uri_parameter(filename, HPPLITE_URI_CONTRACT) != NULL, sqlite3_uri_parameter(filename, HPPLITE_URI_FACTORY) != NULL,
+                    sqlite3_uri_parameter(filename, "anchor") != NULL, sqlite3_uri_parameter(filename, HPPLITE_URI_CHECKPOINT) != NULL,
+                    sqlite3_uri_parameter(filename, HPPLITE_URI_KEEP) != NULL);
+    }
     return 0;
 }
 
@@ -870,6 +923,16 @@ int hpplite_config_resolve_operators(HppliteConfig *cfg) {
         free(*k[i].pz);
         *k[i].pz = strdup(url);
         if (i == 1 && cfg->relayCap == 0) cfg->relayCap = HPPLITE_DEFAULT_RELAY_CAP;   /* relay=on pays: a cap of 0 could pay nothing (#251) */
+    }
+    if (cfg->hasFleet && !gConfigError[0]) {
+        /* the dbId said at once, so a wrong owner= or dbname= is seen (#316) */
+        char id[65], fl[41], ow[41];
+        for (i = 0; i < 32; i++) snprintf(id + 2 * i, 3, "%02x", cfg->dbId[i]);
+        for (i = 0; i < 20; i++) { snprintf(fl + 2 * i, 3, "%02x", cfg->fleet[i]); snprintf(ow + 2 * i, 3, "%02x", cfg->fleetOwner[i]); }
+        fprintf(stderr, "hpplite: fleet 0x%s: database \"%s\" of 0x%s, dbId 0x%s\n", fl, cfg->dbName, ow, id);
+        /* until the node's fleet mode is built (#316 b-e), a database in a fleet does not open as anything else */
+        snprintf(gConfigError, sizeof(gConfigError), "fleet=: the node's fleet mode is not served yet (#316); this database does not open as a rollup instead");
+        return -1;
     }
     return 0;
 }

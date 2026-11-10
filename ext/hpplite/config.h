@@ -171,6 +171,14 @@ typedef struct HppliteConfig {
     uint64_t storeCap;               /* HPPLITE_STORE_CAP: the most to pay the store per call (0 = pay nothing) */
     uint64_t storePermit;            /* HPPLITE_STORE_PERMIT: what the permit lets the store pull, atomic units (#214) */
     int storePermitSet;              /* ...given (0 is a value: no permit, the 402s paid) */
+    unsigned char fleet[20];         /* fleet= (#316): the shared rollup (hpplite-fleet/1) this database lives in */
+    int hasFleet;
+    unsigned char fleetOwner[20];    /* owner=: the database's owner; with dbname= it makes the dbId */
+    int hasFleetOwner;
+    unsigned char dbId[32];          /* keccak256(abi.encode(owner, keccak256(dbname))), derived when fleet= is given */
+    uint64_t admitIssuedAt;          /* admit=<issuedAt>:0x<signature>: the fleet's Admit, for a database with no live record */
+    unsigned char admitSig[65];
+    int hasAdmit;
     unsigned char funder[20];        /* funder= (#272): the external funding wallet the bucket must be bound to */
     int hasFunder;
     int64_t keepSeconds;             /* keep= (#223): how long the store keeps the history behind the latest snapshot; 0: all of it */
