@@ -148,12 +148,13 @@ contract HPPLiteFleet {
         emit Admitted(dbId, dbOwner, sequencer, migratedFrom);
     }
 
-    /// Admitted and claimed in one call (one relay call per new database): the Admit and the sequencer's first Claim
+    /// Admitted and claimed in one call (one relay call per new database): the Admit and the sequencer's first Claim.
+    /// `nonce` is the record's claimNonce (0 for a dbId the fleet never had; a re-admitted one keeps its count)
     function joinFor(bytes32 dbId, address dbOwner, address sequencer, uint256 issuedAt, bytes calldata admitSig,
-                     bytes32 instanceId, uint256 deadline, bytes calldata claimSig) external {
+                     bytes32 instanceId, uint256 nonce, uint256 deadline, bytes calldata claimSig) external {
         _admit(dbId, dbOwner, sequencer, issuedAt, admitSig);
         emit Admitted(dbId, dbOwner, sequencer, address(0));
-        _claim(dbId, instanceId, 0, deadline, claimSig);
+        _claim(dbId, instanceId, nonce, deadline, claimSig);
     }
 
     function _admit(bytes32 dbId, address dbOwner, address sequencer, uint256 issuedAt, bytes calldata admitSig) internal returns (Db storage d) {

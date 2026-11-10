@@ -148,7 +148,7 @@ contract HPPLiteFleetTest is Test {
         uint256 deadline = block.timestamp + 60;
         bytes memory a = sig(ADMITTER_PK, f.admitDigest(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1));
         bytes memory c = sig(SEQ_PK, f.claimDigest(DB, bytes32("host-a"), 0, deadline));
-        f.joinFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a, bytes32("host-a"), deadline, c);
+        f.joinFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a, bytes32("host-a"), 0, deadline, c);
         HPPLiteFleet.Db memory d = f.db(DB);
         assertEq(d.instance, bytes32("host-a"));
         assertEq(d.epoch, 1);
@@ -156,7 +156,22 @@ contract HPPLiteFleetTest is Test {
         bytes memory c2 = sig(SEQ_PK, f.claimDigest(keccak256("another"), bytes32("host-a"), 0, deadline));
         bytes memory a2 = sig(STRANGER_PK, f.admitDigest(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1));
         vm.expectRevert(bytes("Not admitted by the fleet"));
-        f.joinFor(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a2, bytes32("host-a"), deadline, c2);
+        f.joinFor(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a2, bytes32("host-a"), 0, deadline, c2);
+    }
+
+    /// A retired database admitted again joins in one call too: its claim nonce carried on, so the Claim names it.
+    /// Red before: joinFor claimed with nonce 0 and a re-admitted database's was 1 ('Bad nonce')
+    function test_RejoinAfterRetirement() public {
+        admit(ADMITTER_PK, 1);
+        claim(bytes32("host-a"));
+        f.retireFor(DB, 2, sig(DBOWNER_PK, f.retireDigest(DB, 2)));
+        uint256 nonce = f.db(DB).claimNonce;
+        uint256 deadline = block.timestamp + 60;
+        bytes memory a = sig(ADMITTER_PK, f.admitDigest(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 3));
+        bytes memory c = sig(SEQ_PK, f.claimDigest(DB, bytes32("host-b"), nonce, deadline));
+        f.joinFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 3, a, bytes32("host-b"), nonce, deadline, c);
+        assertEq(f.db(DB).instance, bytes32("host-b"));
+        assertFalse(f.db(DB).retired);
     }
 
     /// VERSION 11's factory: a fleet created by its owner, or for it by a relay with the owner's CreateFleet
