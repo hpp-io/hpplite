@@ -49,7 +49,10 @@ def generate():
             ("Release", hpplite_store.RELEASE_TYPE, [da2, funder, 1800000001], 2),
             ("Content", hpplite_store.CONTENT_TYPE, [da2, 7, eth.keccak256(b"first batch")], 1),
             ("Prune", hpplite_store.PRUNE_TYPE, [da2, 5, 1800000002], 1),
-            ("BucketStatement", hpplite_store.STATEMENT_TYPE, [da2, 9, 5, hpplite_store.FOREVER, 1800000003], 0)]
+            ("BucketStatement", hpplite_store.STATEMENT_TYPE, [da2, 9, 5, hpplite_store.FOREVER, 1800000003], 0),
+            # the funder's own words (#274, #275): its daily cap on the bucket, and a release that deletes it now
+            ("Cap", hpplite_store.CAP_TYPE, [da2, 100, 1048576, 1800000004], 2),
+            ("Delete", hpplite_store.DELETE_TYPE, [da2, funder, 1800000005], 2)]
     v["bucketMessages"] = {"chainId": 181228, "payTo": pay_to, "messages": [
         {"type": t, "typeString": ts, "fields": [("0x" + f.hex()) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
          "digest": "0x" + eth.typed_digest(sdom, ts, *fields).hex(),
@@ -112,6 +115,14 @@ def main():
     if bad:
         print("vectors.py: the reference no longer computes vectors.json for: %s" % ", ".join(bad))
         print("  (a protocol change? regenerate with --write and say so in the commit; a bug? fix the reference)")
+        return 1
+    # every message the reference operators sign or verify in their own domains has a vector (#279); Batch is in the
+    # DA's domain (names) and Permit in the asset's
+    missing = [ts for mod, sect in ((hpplite_store, "bucketMessages"), (relay, "relayMessages"))
+               for name, ts in sorted(vars(mod).items())
+               if name.endswith("_TYPE") and name not in ("BATCH_TYPE", "PERMIT_TYPE") and ts not in [m["typeString"] for m in v[sect]["messages"]]]
+    if missing:
+        print("vectors.py: no vector for: %s" % "; ".join(missing))
         return 1
     n = sum(len(x) if isinstance(x, list) else 1 for x in v.values())
     print("vectors.py: the reference computes vectors.json (%d sections, %d groups)" % (len(v), n))

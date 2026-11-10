@@ -78,6 +78,31 @@
     "signature": "0x2d7d051d8488355ceebc7c626b7b40e9dc34d663cbdefb8dd15469f91c97bfe82cab0e6c1f248a77857763217e927f6f90093ddedf4bb51745031bfab3db5fbf1b",
     "type": "BucketStatement",
     "typeString": "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
+   },
+   {
+    "digest": "0xe6c7e055c77186e5d8a1caf8e79709fee55b6930ffa4fabe6d39143308863f34",
+    "fields": [
+     "0xabababababababababababababababababababab",
+     100,
+     1048576,
+     1800000004
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x92cf71d43abbfd088105fecbafcd08c1de142c71eb17f4ac422e08e22303df617c2ea040bb0fdb7ea58c3dcacedd71b61ffe4fe5799de7629461fa3cb61ac7dd1c",
+    "type": "Cap",
+    "typeString": "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x58524954e747966c1b85d480c61c5e7d0978368a8da9d8f276eebbdbdd734dd9",
+    "fields": [
+     "0xabababababababababababababababababababab",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000005
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x4fe4e531a59abd2cba15e2af44c0ce3f32c28aee60264b891c21a4958e662b6203752daffe22cb9455946c65f2ecab5786f35b5dcb119342d9537416dc7f1f161c",
+    "type": "Delete",
+    "typeString": "Delete(address da,address funder,uint256 issuedAt)"
    }
   ],
   "payTo": "0x1111111111111111111111111111111111111111"
