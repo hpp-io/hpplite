@@ -84,10 +84,30 @@ carries no database's content and names only as hashes.
   released bucket's do today; a verifier of past roots still finds the heads
   in their manifests.
 
+## The store (step 3, draft for decision)
+
+A fleet's databases write to a store that speaks `hpplite-store/2` plus the
+calls below. `<fleet>` is the shared rollup's address, `<db>` a `dbId` (hex).
+
+| Call | By | What |
+|------|----|------|
+| `POST /fleet/<fleet>/name/<db>-<height>`, the body the batch's bytes, the instance (32 bytes) and the `Head` signature (65 bytes); header `X-HPPLite-Head` the head's fields as JSON | the database's sequencer | the batch and its head in one write (#296). The store checks: the head's `dbId` and `toHeight` are this name's; its signature recovers to the database's `sequencer` on chain; its `instanceId` and `epoch` are the lease's on chain (the epoch is the fence: an older one is `409`); the bytes' keccak is the batch's. It keeps the bytes under their CID, the name, and the database's latest head |
+| `GET /fleet/<fleet>/name/<db>-<height>` | - | the bytes, as a name today |
+| `GET /fleet/<fleet>/heads?since=<seq>` | the anchor | the latest head of every database whose head moved after root `seq`: what the next root is built from |
+| `POST /fleet/<fleet>/root`, body `{seq, root, manifestDigest}` | the anchor, after `postRootFor` | the store fetches nothing it was not given: it reads `rootIs(seq, root, manifestDigest)` on chain, takes the manifest (already put as content under its CID), checks it hashes to the digest and its leaves to the root, and records, per `dbId` in it, `latestRoot = seq` |
+| `GET /fleet/<fleet>/db/<db>` | - | `{dbId, epoch, sequencer, latestHead, latestRoot, retired}`: the latest head held, and the latest root that holds one of its heads (a hint: the path proves it) |
+
+Funding and caps (D): a bucket per `(fleet, dbId)`, bound and funded like a
+bucket today (the fleet's treasury as funder, one Bind per database, a cap
+per database); the name write is charged to that bucket. Open: whether the
+fleet may bind all its databases with one signature instead of one Bind each.
+
+Names (E, retirement): a retired database's names stay until its bucket is
+released, as a released bucket's do today.
+
 ## Not decided here
 
-The contract's storage layout and gas, the store's endpoints for heads and
-the index, the name format under a shared rollup
-(`<shared da>-<dbId>-<height>` is the proposal), and the anchor's schedule are
-the next steps' to fix: contract v11 on anvil, the reference store, the node
-(`fleet=`), the anchor tool, then verify.
+The contract is built (`contracts/src/HPPLiteFleet.sol`, `HPPLiteFleetFactory.sol`,
+#300-#303; not deployed). The store's calls above are a draft; the relay's
+acceptance of the v11 factory's and fleets' calls, the node (`fleet=`), the
+anchor tool and verify follow.
