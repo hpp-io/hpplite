@@ -106,9 +106,19 @@ def generate():
     rmsgs = [("Sponsor", relay.SPONSOR_TYPE, [rollup, funder, 1800000000], 2),
              ("Sponsor", relay.SPONSOR_TYPE, [rollup, funder, 1800000000], 1),
              ("Unsponsor", relay.UNSPONSOR_TYPE, [rollup, funder, 1800000001], 2),
-             ("Cap", relay.CAP_TYPE, [rollup, 3, 1800000002], 2)]
+             ("Cap", relay.CAP_TYPE, [rollup, 3, 1800000002], 2),
+             # a fleet database (#312): SponsorDb by the funder and by the database's side (its owner or sequencer);
+             # UnsponsorDb and CapDb by the sponsor; the fleet's roots: Sponsor and Cap with the fleet in place of the rollup,
+             # Sponsor's other side the fleet's owner
+             ("SponsorDb", relay.SPONSORDB_TYPE, [fleet_addr, fleet_db, funder, 1800000003], 2),
+             ("SponsorDb", relay.SPONSORDB_TYPE, [fleet_addr, fleet_db, funder, 1800000003], 1),
+             ("UnsponsorDb", relay.UNSPONSORDB_TYPE, [fleet_addr, fleet_db, funder, 1800000004], 2),
+             ("CapDb", relay.CAPDB_TYPE, [fleet_addr, fleet_db, 24, 1800000005], 2),
+             ("Sponsor", relay.SPONSOR_TYPE, [fleet_addr, funder, 1800000006], 2),
+             ("Cap", relay.CAP_TYPE, [fleet_addr, 48, 1800000007], 2)]
     v["relayMessages"] = {"chainId": 181228, "payTo": pay_to, "messages": [
-        {"type": t, "typeString": ts, "fields": fields, "key": KEYS[k], "digest": "0x" + eth.typed_digest(rdom, ts, *fields).hex(),
+        {"type": t, "typeString": ts, "fields": [("0x" + f.hex()) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
+         "digest": "0x" + eth.typed_digest(rdom, ts, *fields).hex(),
          "signature": "0x" + eth.sign(key(k), eth.typed_digest(rdom, ts, *fields)).hex()}
         for t, ts, fields, k in rmsgs]}
     v["fleet"] = fleet_vectors()

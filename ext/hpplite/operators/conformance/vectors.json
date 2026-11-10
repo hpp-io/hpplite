@@ -652,6 +652,82 @@
     "signature": "0xf6bb552202449cff56a58a1e9a1c7f00ca03f3dc14a68ca34e96b7410d148ebf5a6f7b5017eb13308abadb7b785c7e2f87af6ab14227acdcb28ef49ed6aa5b8a1c",
     "type": "Cap",
     "typeString": "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x4b1a84f2098742f05509408611b24b4e904927d59f412df2642b16717af0b022",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000003
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x1b4d4599137d76a085005e269b54a9311ff42d415828f46ccbc7501fe8421e6f724f4b66bb679d5a1e41e3bb4344d5fb6e69e2a70d40cd8852fc92c1bde92f371c",
+    "type": "SponsorDb",
+    "typeString": "SponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x4b1a84f2098742f05509408611b24b4e904927d59f412df2642b16717af0b022",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000003
+    ],
+    "key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+    "signature": "0x49d97e3de1ddec34f61aa4a050b7fd1bea4758ebcd187b4855272aded5a5534f16563bab47352b4c9477316ba8868d45b63e1e556f1ffa31959b0e1c6d81633a1b",
+    "type": "SponsorDb",
+    "typeString": "SponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0xa4f416cbca59d0b581e232bc57da4a0f0c50a55cb8838175f315125817a68922",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000004
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0xc9076ea190eb39b89d450bb1e333d5e9c489c4c0e7dc5ec500b5a395927221302fe9e9a7d2d7e6dcd048118c7ceb0ebacd24ef33bec98d32db8e97a0a1f022531c",
+    "type": "UnsponsorDb",
+    "typeString": "UnsponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x43a64fecc80bcce67ad05ccc6f1852beedba4dff44faa6b08b2ab748ed803d8b",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     24,
+     1800000005
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x44cf7a5569e4da1a24b9a6ab20612654592d91050ce62f733daed9f577734ace4a250e568419490e7ab5c6c3173b2cf76f37fc7477332c898966f179c81efa281c",
+    "type": "CapDb",
+    "typeString": "CapDb(address fleet,bytes32 dbId,uint256 callsPerDay,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x12aaac0d299e1162ac4c21a38e254bc255ecf20c237d21b66e03e633fe9a0211",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000006
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x75768d490229963099b055d95f19f157d9ef4d74ea9a8410be24fe46f415519d579e449f41fe19e6568f1d09a634e8de999d48abf3caaec5610ed25d9b5e56041c",
+    "type": "Sponsor",
+    "typeString": "Sponsor(address rollup,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x64874166745ad736f519ab617c74ec4efce4dd5c3bb3fc55edf8baf7b4a63162",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     48,
+     1800000007
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x549d4186e4ee393b1c41056aba70f519c555e08512821654ae6d1dba966c166a428ce34d9e11d93c53245d8469d6f124baf3032170596d09f825311e0e4a4f521c",
+    "type": "Cap",
+    "typeString": "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)"
    }
   ],
   "payTo": "0x1111111111111111111111111111111111111111"

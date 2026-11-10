@@ -197,6 +197,24 @@ per fleet.
 **Retirement.** A retired database's names stay until its bucket is
 released, as a released bucket's do today.
 
+## The relay (sponsorship of a fleet's calls; vectors first, #312)
+
+In the relay's domain `("HPPLiteRelay", "1", chainId, payTo)`, today's three
+messages over `(fleet, dbId)` (vectors in `relayMessages`):
+
+| Type | Signed by |
+|------|-----------|
+| `SponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the funder, and the database's side: its owner or its sequencer on the fleet's record |
+| `UnsponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the sponsor |
+| `CapDb(address fleet,bytes32 dbId,uint256 callsPerDay,uint256 issuedAt)` | the sponsor: a database's joins and claims a day |
+
+A fleet's roots are sponsored with today's `Sponsor` and `Cap`, the fleet in
+place of the rollup and the fleet's owner as the other side: roots are counted
+per fleet. An unsponsored call is answered as an unsponsored rollup's is today
+(the `402`). The relay takes the v11 factory's `createFleetFor` and a fleet's
+`joinFor`, `claimFor`, `postRootFor`, `retireFor` (the calls built on these
+vectors after somaro's second reading).
+
 ## Not decided here
 
 The contract is built (`contracts/src/HPPLiteFleet.sol`, `HPPLiteFleetFactory.sol`,

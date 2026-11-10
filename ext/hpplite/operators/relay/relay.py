@@ -75,6 +75,11 @@ PROTOCOL = "hpplite-relay/1"        # the version of doc/relay-protocol.md this 
 SPONSOR_TYPE = "Sponsor(address rollup,address funder,uint256 issuedAt)"
 UNSPONSOR_TYPE = "Unsponsor(address rollup,address funder,uint256 issuedAt)"
 CAP_TYPE = "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)"
+# a fleet database's sponsorship (hpplite-fleet/1, #297, #312): today's three over (fleet, dbId); a fleet's roots are
+# sponsored with Sponsor and Cap themselves, the fleet in place of the rollup
+SPONSORDB_TYPE = "SponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+UNSPONSORDB_TYPE = "UnsponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+CAPDB_TYPE = "CapDb(address fleet,bytes32 dbId,uint256 callsPerDay,uint256 issuedAt)"
 PERMIT_TYPE = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 DAY = 86400
