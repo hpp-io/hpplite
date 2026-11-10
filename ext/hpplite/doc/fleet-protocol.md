@@ -47,7 +47,13 @@ fleet's). `vectors.py` refuses a `*_TYPEHASH` in either contract without a
 vector.
 
 `dbId = keccak256(abi.encode(owner, keccak256(name)))`: a database is its
-owner and its name in the fleet; `dbname=` computes it, no scan.
+owner and its name in the fleet; `dbname=` computes it, no scan. `admitFor`
+and `joinFor` take `nameHash` and refuse a `dbId` that is not
+`keccak256(abi.encode(owner, nameHash))`; the Admit signs `dbId` and `owner`,
+which with that check fix the name (#307). The record keeps `nameHash` and
+`Admitted` carries it, so a leaf's owner and name come from the chain. A
+database's owner never changes inside a fleet: a new owner is a new `dbId`
+(retire, admit again under the new owner; the data moves by a restore).
 
 ## The leaf and the tree
 
@@ -137,8 +143,11 @@ The reference store serves the calls above (`operators/store/fleet_store.py`,
 ctest `test_store_fleet` on anvil). A head's chain hash must follow from the
 previous head and the bytes (`keccak256(abi.encode(prev, height,
 keccak256(bytes)))`, zero before height 1), which ties the signed head to the
-bytes it is written with. Until the money below is built, a store that
-charges answers fleet writes `501`.
+bytes it is written with. A write past a gap, or above height 1 for a database
+whose earlier heads the store never held (a migration, a second store), is
+`409` with the height it expects; above height 1 the way in is the genesis
+fields of `admitFor`. Until the money below is built, a store that charges
+answers fleet writes `501`.
 
 **Funding and caps.** One bucket per `(fleet, dbId)`, bound by one Bind per
 database as today, the fleet's treasury (or a database's own funder in a

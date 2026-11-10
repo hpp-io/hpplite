@@ -27,8 +27,9 @@ contract HPPLiteFleet {
     bytes32 public constant CLAIM_TYPEHASH = keccak256("Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)");
 
     struct Db {
-        address owner;
+        address owner;          // never changes inside a fleet: a new owner is a new dbId
         address sequencer;
+        bytes32 nameHash;       // keccak256(name): dbId = keccak256(abi.encode(owner, nameHash))
         bytes32 instance;       // the lease's holder
         uint64 until;           // the lease's end
         uint64 epoch;           // moves at every new holder, forceExpire and rotation: the store refuses older names
@@ -52,7 +53,7 @@ contract HPPLiteFleet {
     mapping(uint256 => bytes32) public rootHash;
     mapping(bytes32 => Db) private _dbs;
 
-    event Admitted(bytes32 indexed dbId, address indexed owner, address sequencer, address migratedFrom);
+    event Admitted(bytes32 indexed dbId, address indexed owner, address sequencer, bytes32 nameHash, address migratedFrom);
     event Claimed(bytes32 indexed dbId, bytes32 instance, uint64 until);
     event EpochMoved(bytes32 indexed dbId, uint64 epoch, uint64 sinceSeq);
     event RootPosted(uint256 indexed seq, bytes32 root, bytes32 manifestDigest);
@@ -138,28 +139,32 @@ contract HPPLiteFleet {
 
     /// The first claim of a dbId: the fleet's owner or admitter admits it (owner, sequencer); the sequencer claims.
     /// `migratedFrom` and the genesis fields name the dedicated rollup a database's history began on (0: none)
-    function admitFor(bytes32 dbId, address dbOwner, address sequencer, uint256 issuedAt, bytes calldata admitSig,
+    function admitFor(bytes32 dbId, address dbOwner, address sequencer, bytes32 nameHash, uint256 issuedAt, bytes calldata admitSig,
                       address migratedFrom, uint256 genesisHeight, bytes32 genesisChain, bytes32 genesisRoot) external {
-        Db storage d = _admit(dbId, dbOwner, sequencer, issuedAt, admitSig);
+        Db storage d = _admit(dbId, dbOwner, sequencer, nameHash, issuedAt, admitSig);
         d.migratedFrom = migratedFrom;
         d.genesisHeight = genesisHeight;
         d.genesisChain = genesisChain;
         d.genesisRoot = genesisRoot;
-        emit Admitted(dbId, dbOwner, sequencer, migratedFrom);
+        emit Admitted(dbId, dbOwner, sequencer, nameHash, migratedFrom);
     }
 
     /// Admitted and claimed in one call (one relay call per new database): the Admit and the sequencer's first Claim.
     /// `nonce` is the record's claimNonce (0 for a dbId the fleet never had; a re-admitted one keeps its count)
-    function joinFor(bytes32 dbId, address dbOwner, address sequencer, uint256 issuedAt, bytes calldata admitSig,
+    function joinFor(bytes32 dbId, address dbOwner, address sequencer, bytes32 nameHash, uint256 issuedAt, bytes calldata admitSig,
                      bytes32 instanceId, uint256 nonce, uint256 deadline, bytes calldata claimSig) external {
-        _admit(dbId, dbOwner, sequencer, issuedAt, admitSig);
-        emit Admitted(dbId, dbOwner, sequencer, address(0));
+        _admit(dbId, dbOwner, sequencer, nameHash, issuedAt, admitSig);
+        emit Admitted(dbId, dbOwner, sequencer, nameHash, address(0));
         _claim(dbId, instanceId, nonce, deadline, claimSig);
     }
 
-    function _admit(bytes32 dbId, address dbOwner, address sequencer, uint256 issuedAt, bytes calldata admitSig) internal returns (Db storage d) {
+    function _admit(bytes32 dbId, address dbOwner, address sequencer, bytes32 nameHash, uint256 issuedAt, bytes calldata admitSig)
+        internal returns (Db storage d)
+    {
         address a = admitDigest(dbId, dbOwner, sequencer, issuedAt).recover(admitSig);
         require(a != address(0) && (a == owner || a == admitter), "Not admitted by the fleet");
+        // the Admit signs dbId and owner; with this check they fix the name too (#307)
+        require(dbId == keccak256(abi.encode(dbOwner, nameHash)), "dbId is not the owner's name");
         require(dbOwner != address(0) && sequencer != address(0), "No owner or sequencer");
         d = _dbs[dbId];
         require(d.owner == address(0) || d.retired, "Already in the fleet");
@@ -169,6 +174,7 @@ contract HPPLiteFleet {
         delete _dbs[dbId];
         d.owner = dbOwner;
         d.sequencer = sequencer;
+        d.nameHash = nameHash;
         d.admittedAt = uint64(issuedAt);
         d.epoch = epoch;                              // a re-admitted dbId never reuses an epoch
         d.claimNonce = nonce;                         // nor a claim signature

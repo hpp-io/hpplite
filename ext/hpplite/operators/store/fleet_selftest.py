@@ -117,8 +117,8 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     inst_a = eth.keccak256(b"host-a")
     admit = eth.sign(kb(KEY0), eth.typed_digest(dom, F.ADMIT_TYPE, db, dbowner, seq, issued))
     claim = eth.sign(kb(KEY3), eth.typed_digest(dom, F.CLAIM_TYPE, db, inst_a, 0, deadline))
-    cast("send", "--private-key", KEY2, fl, "joinFor(bytes32,address,address,uint256,bytes,bytes32,uint256,uint256,bytes)",
-         dbx, dbowner, seq, str(issued), hx(admit), hx(inst_a), "0", str(deadline), hx(claim))
+    cast("send", "--private-key", KEY2, fl, "joinFor(bytes32,address,address,bytes32,uint256,bytes,bytes32,uint256,uint256,bytes)",
+         dbx, dbowner, seq, hx(F.name_hash(name)), str(issued), hx(admit), hx(inst_a), "0", str(deadline), hx(claim))
     st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))
     check(st == 200 and view.get("epoch") == 1 and view.get("instance") == hx(inst_a) and view.get("sequencer") == seq,
           "joined: the store's view from the fleet's events, epoch 1, the lease's instance (%s %s)" % (st, view))
@@ -147,6 +147,8 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     check(st == 200, "batch 2: taken (%s %s)" % (st, body))
     st, data = http("GET", url + "/fleet/%s/name/%s-2" % (fl, dbx))
     check(st == 200 and data[:-97] == b"batch two", "batch 2 read back by its name")
+    st, body = write(5, b"past a gap", inst_a, 1)
+    check(st == 409 and body.get("expected") == 3, "a write past a gap: 409 with the height expected (%s %s)" % (st, body))
 
     # the fence: the owner expires the lease; the old holder's next write is refused once the store has heard
     cast("send", "--private-key", KEY1, fl, "forceExpire(bytes32)", dbx)
@@ -157,7 +159,7 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     check(st == 409, "the old holder's write after the takeover: 409, the fence (%s %s)" % (st, body.get("error")))
     # a new holder claims; its first write comes before the store polled: read on chain at once, taken
     inst_b = eth.keccak256(b"host-b")
-    nonce = int(cast("call", fl, "db(bytes32)(address,address,bytes32,uint64,uint64,uint64,uint64,bool,uint256,address,uint256,bytes32,bytes32,address)", dbx).split("\n")[8].split()[0])
+    nonce = int(cast("call", fl, "db(bytes32)(address,address,bytes32,bytes32,uint64,uint64,uint64,uint64,bool,uint256,address,uint256,bytes32,bytes32,address)", dbx).split("\n")[9].split()[0])
     claim = eth.sign(kb(KEY3), eth.typed_digest(dom, F.CLAIM_TYPE, db, inst_b, nonce, deadline))
     cast("send", "--private-key", KEY2, fl, "claimFor(bytes32,bytes32,uint256,uint256,bytes)", dbx, hx(inst_b), str(nonce), str(deadline), hx(claim))
     st, body = write(3, b"batch three", inst_b, 3)

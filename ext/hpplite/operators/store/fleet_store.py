@@ -19,7 +19,7 @@ from x402seller.token import ChainUnreadable  # noqa: E402
 import fleet as F  # noqa: E402
 
 EVENTS = {eth.keccak256(s.encode()).hex(): s.split("(")[0] for s in (
-    "Admitted(bytes32,address,address,address)", "Claimed(bytes32,bytes32,uint64)", "EpochMoved(bytes32,uint64,uint64)",
+    "Admitted(bytes32,address,address,bytes32,address)", "Claimed(bytes32,bytes32,uint64)", "EpochMoved(bytes32,uint64,uint64)",
     "RootPosted(uint256,bytes32,bytes32)", "Retired(bytes32)", "Promoted(bytes32,address)", "SequencerSet(bytes32,address)")}
 HEAD_FIELDS = ("dbId", "instanceId", "fromHeight", "toHeight", "chainHashAfter", "stateRoot", "manifestDigest", "epoch")
 ZERO = bytes(32)
@@ -82,8 +82,8 @@ class FleetBook:
         db = log["topics"][1].lower()
         d = st["dbs"].setdefault(db, {"epoch": 0})
         if name == "Admitted":
-            d.update({"owner": "0x" + log["topics"][2][-40:], "sequencer": "0x" + _w(data, 0)[-40:], "instance": "0x" + "00" * 32,
-                      "retired": False})
+            d.update({"owner": "0x" + log["topics"][2][-40:], "sequencer": "0x" + _w(data, 0)[-40:], "nameHash": "0x" + _w(data, 1),
+                      "instance": "0x" + "00" * 32, "retired": False})
         elif name == "Claimed":
             d["instance"] = "0x" + _w(data, 0)
         elif name == "EpochMoved":
@@ -100,10 +100,11 @@ class FleetBook:
         except (RpcError, OSError, ValueError) as e:
             raise ChainUnreadable(str(e)[:200])
         r = r[2:]
-        if len(r) < 64 * 14 or int(_w(r, 0), 16) == 0:
+        if len(r) < 64 * 15 or int(_w(r, 0), 16) == 0:
             return None
-        return {"owner": "0x" + _w(r, 0)[-40:], "sequencer": "0x" + _w(r, 1)[-40:], "instance": "0x" + _w(r, 2),
-                "epoch": int(_w(r, 4), 16), "epochSince": int(_w(r, 5), 16), "retired": int(_w(r, 7), 16) != 0}
+        # Db: owner, sequencer, nameHash, instance, until, epoch, epochSince, admittedAt, retired, claimNonce, ...
+        return {"owner": "0x" + _w(r, 0)[-40:], "sequencer": "0x" + _w(r, 1)[-40:], "nameHash": "0x" + _w(r, 2), "instance": "0x" + _w(r, 3),
+                "epoch": int(_w(r, 5), 16), "epochSince": int(_w(r, 6), 16), "retired": int(_w(r, 8), 16) != 0}
 
     def _check_roots(self, fleet, st):
         for seq in sorted((s for s, r in st["roots"].items() if r["state"] != "ok"), key=int):
@@ -279,12 +280,13 @@ def _post_name(h, fleet, name, body):
             return h.reply(409, {"error": "the database's head is already past this height", "head": prev["head"]["toHeight"]})
         if prev:
             if int(prev["head"]["toHeight"]) != height - 1:
-                return h.reply(409, {"error": "a height is missing before this one", "head": prev["head"]["toHeight"]})
+                return h.reply(409, {"error": "a height is missing before this one", "expected": int(prev["head"]["toHeight"]) + 1})
             before = bytes.fromhex(prev["head"]["chainHashAfter"][2:])
         elif height == 1:
             before = ZERO                              # a database that began in the fleet
         else:
-            return h.reply(409, {"error": "a height is missing before this one (a migrated database's genesis is not read here yet)"})
+            return h.reply(409, {"error": "this store holds no head of the database before this height (a migrated database's genesis is not read here yet)",
+                                 "expected": 1})
         if chain_hash_next(before, height, eth.keccak256(data)) != hb["chainHashAfter"]:
             return h.reply(400, {"error": "the head's chain hash does not follow from the previous head and these bytes"})
         import hashlib

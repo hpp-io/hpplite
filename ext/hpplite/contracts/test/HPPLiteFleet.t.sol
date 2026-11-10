@@ -16,9 +16,11 @@ contract HPPLiteFleetTest is Test {
     uint256 constant DBOWNER_PK = 0xD0;
     uint256 constant STRANGER_PK = 0xBAD;
     HPPLiteFleet f;
-    bytes32 constant DB = keccak256("a database");
+    bytes32 constant NAME = keccak256("a database");
+    bytes32 DB;                                              // keccak256(abi.encode(the database's owner, NAME))
 
     function setUp() public {
+        DB = keccak256(abi.encode(vm.addr(DBOWNER_PK), NAME));
         f = new HPPLiteFleet(vm.addr(OWNER_PK), vm.addr(ANCHOR_PK), 7 days);
         vm.prank(vm.addr(OWNER_PK));
         f.setRoles(vm.addr(ADMITTER_PK), vm.addr(ANCHOR_PK), 7 days);
@@ -34,7 +36,7 @@ contract HPPLiteFleetTest is Test {
     function admit(uint256 pk, uint256 issuedAt, bytes memory reverts) internal {
         bytes memory s = sig(pk, f.admitDigest(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), issuedAt));
         if (reverts.length > 0) vm.expectRevert(reverts);
-        f.admitFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), issuedAt, s, address(0), 0, bytes32(0), bytes32(0));
+        f.admitFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), NAME, issuedAt, s, address(0), 0, bytes32(0), bytes32(0));
     }
 
     function claim(bytes32 instance) internal { claim(instance, ""); }
@@ -151,7 +153,7 @@ contract HPPLiteFleetTest is Test {
         uint256 deadline = block.timestamp + 60;
         bytes memory a = sig(ADMITTER_PK, f.admitDigest(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1));
         bytes memory c = sig(SEQ_PK, f.claimDigest(DB, bytes32("host-a"), 0, deadline));
-        f.joinFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a, bytes32("host-a"), 0, deadline, c);
+        f.joinFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), NAME, 1, a, bytes32("host-a"), 0, deadline, c);
         HPPLiteFleet.Db memory d = f.db(DB);
         assertEq(d.instance, bytes32("host-a"));
         assertEq(d.epoch, 1);
@@ -159,7 +161,7 @@ contract HPPLiteFleetTest is Test {
         bytes memory c2 = sig(SEQ_PK, f.claimDigest(keccak256("another"), bytes32("host-a"), 0, deadline));
         bytes memory a2 = sig(STRANGER_PK, f.admitDigest(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1));
         vm.expectRevert(bytes("Not admitted by the fleet"));
-        f.joinFor(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a2, bytes32("host-a"), 0, deadline, c2);
+        f.joinFor(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), NAME, 1, a2, bytes32("host-a"), 0, deadline, c2);
     }
 
     /// A retired database admitted again joins in one call too: its claim nonce carried on, so the Claim names it.
@@ -172,9 +174,19 @@ contract HPPLiteFleetTest is Test {
         uint256 deadline = block.timestamp + 60;
         bytes memory a = sig(ADMITTER_PK, f.admitDigest(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 3));
         bytes memory c = sig(SEQ_PK, f.claimDigest(DB, bytes32("host-b"), nonce, deadline));
-        f.joinFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 3, a, bytes32("host-b"), nonce, deadline, c);
+        f.joinFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), NAME, 3, a, bytes32("host-b"), nonce, deadline, c);
         assertEq(f.db(DB).instance, bytes32("host-b"));
         assertFalse(f.db(DB).retired);
+    }
+
+    /// A dbId is its owner and its name: an Admit for a dbId that is not keccak256(abi.encode(owner, nameHash)) is
+    /// refused by admitFor and joinFor alike, so a database's owner never changes inside a fleet (somaro, #307).
+    /// Red before: any dbId was admitted under any owner
+    function test_DbIdIsItsOwnerAndName() public {
+        bytes32 other = keccak256(abi.encode(vm.addr(STRANGER_PK), keccak256("notes")));     // the stranger's "notes"
+        bytes memory a = sig(ADMITTER_PK, f.admitDigest(other, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1));
+        vm.expectRevert(bytes("dbId is not the owner's name"));
+        f.admitFor(other, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), keccak256("notes"), 1, a, address(0), 0, bytes32(0), bytes32(0));
     }
 
     /// VERSION 11's factory: a fleet created by its owner, or for it by a relay with the owner's CreateFleet
@@ -216,7 +228,7 @@ contract HPPLiteFleetTest is Test {
     }
 
     function test_MigratedFromAndPromoted() public {
-        f.admitFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, sig(ADMITTER_PK, f.admitDigest(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1)),
+        f.admitFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), NAME, 1, sig(ADMITTER_PK, f.admitDigest(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1)),
                    address(0xDED1), 42, keccak256("chain at 42"), keccak256("root at 42"));
         HPPLiteFleet.Db memory d = f.db(DB);
         assertEq(d.migratedFrom, address(0xDED1));
