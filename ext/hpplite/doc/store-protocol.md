@@ -142,6 +142,13 @@ sent again later. JSON bodies with `error`; for `402` also
   with its next pull (permit, then `transferFrom`) or when the chain's
   allowance falls short, so a permit costs nothing until money moves. A
   newer permit replaces an older one (the asset's nonce).
+- The asset keeps one permit nonce per wallet, whoever the spender is. A
+  wallet's permit held here and not yet sent, and another held by a second
+  operator (a relay with accounts, another store), carry the same nonce:
+  the first sent voids the other, and that operator's pull then fails and
+  leaves the account uncovered. A funder that pays two operators from one
+  wallet gives its permit to one and tops the other up over x402 (`/pay`),
+  or signs the second permit once the first is on chain (`sent`) (#281).
 - The permit's `spender` is `/status`'s `buckets.spender` (the store's
   puller, which holds a little ETH for gas); `transferFrom` pays `payTo`.
 

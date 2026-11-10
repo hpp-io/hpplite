@@ -115,7 +115,11 @@ at least `minPull` and the rest stays as credit for the next calls. A pull
 the chain refuses (no permit, a spent or expired one, no balance) leaves
 the account `state: uncovered` with `why`, and the rollup's calls get their
 `402` until a new permit or a top-up; the relay never fronts a call for an
-uncovered account. A call past the rollup's cap gets the `402` with
+uncovered account. The token keeps one permit nonce per wallet, whoever the
+spender is: a funder whose wallet has a permit at a store that is not yet
+sent cannot hold one here too - the first sent voids the other - so it
+tops this account up (`/pay`) or gives the permit once the store's is on
+chain (#281). A call past the rollup's cap gets the `402` with
 `sponsor.why` saying so. `today` counts sponsored calls that landed, in a
 rolling day from the first.
 
