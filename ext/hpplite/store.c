@@ -82,6 +82,14 @@ static int ensureBucket(HppliteStore *s);
 static void storeDigest(HppliteStore *s, const char *zType, const unsigned char *words, size_t nWords, unsigned char out[32]);
 static int signWith(HppliteStore *s, HppliteKeypair *kp, const unsigned char digest[32], unsigned char sig[65]);
 static void lowerHex(const unsigned char *b, size_t n, char *out);
+/* 429 bucket_capped (#274): the funder bounded the bucket's day; the write waits for the window, nothing was charged */
+static void storeCapped(HppliteStore *s, const char *zBody) {
+    cJSON *r = zBody ? cJSON_Parse(zBody) : NULL;
+    cJSON *d = r ? cJSON_GetObjectItem(r, "detail") : NULL;
+    snprintf(s->error, sizeof s->error, "the bucket's daily cap is reached, set by its funder; the write waits for the next window (%.160s)",
+             d && cJSON_IsString(d) ? d->valuestring : "429 bucket_capped");
+    cJSON_Delete(r);
+}
 
 static size_t bufWrite(void *data, size_t size, size_t nmemb, void *arg) {
     Buf *b = (Buf *)arg;
@@ -836,6 +844,18 @@ int hpplite_store_bind_digest(HppliteStore *s, const unsigned char funder[20], u
     storeDigest(s, "Bind(address da,address funder,uint256 issuedAt)", words, 3, digest);
     return 0;
 }
+int hpplite_store_cap_digest(HppliteStore *s, uint64_t writesPerDay, uint64_t bytesPerDay, uint64_t issuedAt, unsigned char digest[32]) {
+    unsigned char words[128];
+    if (!s || !digest || !s->hasBucket) return -1;
+    if (!s->hasSigner && hpplite_store_take_status(s) != 200) return -1;
+    memset(words, 0, 128);
+    memcpy(words + 12, s->bucketDa, 20);
+    wordInt(writesPerDay, words + 32);
+    wordInt(bytesPerDay, words + 64);
+    wordInt(issuedAt, words + 96);
+    storeDigest(s, "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)", words, 4, digest);
+    return 0;
+}
 int hpplite_store_sign_bind(HppliteStore *s, const unsigned char funder[20], uint64_t issuedAt, unsigned char sig[65]) {
     unsigned char digest[32];
     if (!s || !s->hasKey || hpplite_store_bind_digest(s, funder, issuedAt, digest) != 0) return -1;
@@ -1079,6 +1099,7 @@ char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data
         free(out.p);
         return NULL;
     }
+    if (status == 429) storeCapped(s, out.p);                                  /* the funder's daily cap (#274) */
     if (status != 200) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to put: %.120s", status, out.p ? out.p : "");
         s->lastFailure = status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;
@@ -1184,6 +1205,7 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
         else status = s->v2 ? paidPost(s, path, body, len + 97, NULL, &out) : storeRequest(s, "POST", path, body, len + 97, NULL, &out, NULL, NULL);
         if (status == 200) rc = 0;
         else if (status == -1) { /* the reason is in s->error */ }
+        else if (status == 429) storeCapped(s, out.p);
         else if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s: %.120s", status, zName, out.p ? out.p : "");
     }
     free(body);

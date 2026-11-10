@@ -968,6 +968,80 @@ static int da_of(HppliteL1 *l1, unsigned char da[20], char daHex[43]) {
     return hpplite_hex_to_bytes(daHex + 2, da, 20) == 20 ? 0 : -1;
 }
 
+/* the platform's console bounds the bucket's day (#274): Cap(da, writes, bytes, now) signed by the treasury, posted to the store */
+static int console_cap(const char *url, HppliteCrypto *cr, const HppliteKeypair *treasury, const unsigned char da[20],
+                       uint64_t writes, uint64_t nbytes, int later, char *out, size_t n) {
+    HppliteStore *con = hpplite_store_open(url, NULL, 0);
+    HppliteSignature hs;
+    unsigned char digest[32], sig[65], v;
+    char tre[43], sigHex[133], daHex[43], cmd[800], json[400];
+    uint64_t issued = (uint64_t)time(NULL) + (uint64_t)later;        /* a newer cap than the last, within the same second */
+    FILE *f;
+    if (!con) return -1;
+    hpplite_store_set_bucket(con, da, 0);
+    if (hpplite_store_cap_digest(con, writes, nbytes, issued, digest) != 0) { hpplite_store_close(con); return -1; }
+    hpplite_store_close(con);
+    if (hpplite_crypto_sign(cr, treasury, digest, &hs) != 0) return -1;
+    hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);
+    sig[64] = v;
+    hex0x(treasury->address, 20, tre); hex0x(sig, 65, sigHex); hex0x(da, 20, daHex);
+    snprintf(json, sizeof json, "{\"funder\":\"%s\",\"writesPerDay\":%llu,\"bytesPerDay\":%llu,\"issuedAt\":%llu,\"signature\":\"%s\"}",
+             tre, (unsigned long long)writes, (unsigned long long)nbytes, (unsigned long long)issued, sigHex);
+    f = fopen(tpath("console_cap.json"), "w");
+    if (!f) return -1;
+    fputs(json, f); fclose(f);
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data-binary @%s %s/bucket/%s/cap", tpath("console_cap.json"), url, daHex);
+    return sh_out(cmd, out, n) == 0 && strstr(out, "\"cap\"") ? 0 : -1;
+}
+/* the bucket's writes today (GET /bucket/<da> today.writes), -1 unknown */
+static long long bucket_writes_today(const char *url, const char *daHex) {
+    char cmd[300], out[3000];
+    const char *p;
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/bucket/%s", url, daHex);
+    if (sh_out(cmd, out, sizeof out) != 0 || !(p = strstr(out, "\"writes\":"))) return -1;
+    return atoll(p + 9);
+}
+
+/* 6k. The funder's daily cap (#274): a write past it is 429 at the store; the node keeps the batch pending and says so;
+** lifted, the next flush goes through. Red before: the node said 'store answered 429 to the name ...'. */
+static void test_bucket_cap(const char *url) {
+    TEST("the funder's daily cap (#274): past it the store answers 429, the node keeps the batch pending and says why; lifted, the flush goes through");
+    static const unsigned char kseq[32] = { [31] = 0x74 }, ktre[32] = { [31] = 0x75 };
+    HppliteCrypto *cr = hpplite_crypto_init();
+    HppliteKeypair treasury;
+    unsigned char da[20];
+    char daHex[43], out[4000];
+    const char *why = NULL;
+    long long writes;
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    if (!cr || hpplite_crypto_keypair_from_privkey(cr, &treasury, ktre) != 0) FAIL("the treasury's key");
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "cap_w", .privkey = kseq, .funder = treasury.address };
+    HppliteNode *w = test_open_node(tpath("cap_w.db"), l1, &o);
+    if (!w) FAIL("open with funder=");
+    if (da_of(l1, da, daHex) != 0 || console_bind(url, cr, &treasury, kseq, da, out, sizeof out) != 0) { printf("(%s) ", out); hpplite_node_destroy(w); FAIL("the platform binds the bucket"); }
+    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the first flush"; }
+    if (!why && (writes = bucket_writes_today(url, daHex)) < 1) why = "the store should count the day's writes";
+    /* a batch is two writes at the store, its bytes and its name: room for one more batch */
+    if (!why && console_cap(url, cr, &treasury, da, (uint64_t)writes + 2, 0, 0, out, sizeof out) != 0) { printf("(%s) ", out); why = "the funder's cap"; }
+    if (!why) {
+        hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the flush within the cap"; }
+    }
+    if (!why) {
+        hpplite_node_exec(w, "INSERT INTO t VALUES(3)", NULL);
+        if (hpplite_node_flush_batch(w) >= 1) why = "a flush past the cap should keep the batch pending";
+        else if (!strstr(status_text(w->db, "last_error"), "daily cap")) { printf("(%s) ", status_text(w->db, "last_error")); why = "the node should say the bucket's daily cap is reached"; }
+    }
+    if (!why && console_cap(url, cr, &treasury, da, 0, 0, 1, out, sizeof out) != 0) { printf("(%s) ", out); why = "lifting the cap"; }
+    if (!why && hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the flush once the cap is lifted"; }
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    hpplite_crypto_free(cr);
+    if (why) FAIL(why);
+    PASS();
+}
+
 /* 6j. funder= (#272): the bucket's account is a platform's treasury, bound and permitted from its control plane; the node
 ** derives no funding key, binds nothing, gives no permit, takes the bucket as the platform left it, and a 402 is
 ** "waiting for the funder", not a cap refusal. Red before: the node bound the bucket to its own derived wallet. */
@@ -1561,6 +1635,7 @@ int main(int argc, char **argv) {
     test_ranges_restart(url);
     test_no_anchor_at_close(url);
     test_external_funder(url, dir);
+    test_bucket_cap(url);
     test_snapshot_made(url);
     test_snapshot_replica(url);
     test_snapshot_chunks(url);

@@ -51,6 +51,8 @@ BIND_TYPE = "Bind(address da,address funder,uint256 issuedAt)"
 RELEASE_TYPE = "Release(address da,address funder,uint256 issuedAt)"
 CONTENT_TYPE = "Content(address da,uint256 height,bytes32 hash)"
 PRUNE_TYPE = "Prune(address da,uint256 height,uint256 issuedAt)"
+CAP_TYPE = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"   # the funder's daily bound (#274)
+DAY = 86400
 STATEMENT_TYPE = "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
 BATCH_TYPE = "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)"
 PERMIT_TYPE = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
@@ -293,6 +295,39 @@ class Ledger:
             if b and same(b.get("funder"), funder) and b["state"] != "deleted":
                 out.append(b)
         return out
+
+    # --- the funder's daily cap (#274): every new write counted in a rolling day, bounded when a cap is set ---
+    def today(self, b, now=None):
+        """the bucket's window: {writes, bytes, since}, reset once a day has passed since its first write"""
+        now = now or int(time.time())
+        t = b.get("today") or {"writes": 0, "bytes": 0, "since": now}
+        if now - int(t.get("since", now)) >= DAY:
+            t = {"writes": 0, "bytes": 0, "since": now}
+        return t
+
+    def capped(self, b, nbytes, now=None):
+        """the 429 body when a write of nbytes would pass the bucket's cap, else None"""
+        cap = b.get("cap")
+        if not cap:
+            return None
+        now = now or int(time.time())
+        t = self.today(b, now)
+        w, by = int(cap.get("writesPerDay", 0)), int(cap.get("bytesPerDay", 0))
+        if (w and t["writes"] + 1 > w) or (by and t["bytes"] + nbytes > by):
+            left = int(t["since"]) + DAY - now
+            return {"error": "bucket_capped", "cap": cap, "today": t, "retryAfter": max(left, 1),
+                    "detail": "the bucket's daily cap is reached: %d of %s writes, %d of %s bytes today; the window opens again in %d s"
+                              % (t["writes"], w or "-", t["bytes"], by or "-", max(left, 1))}
+        return None
+
+    def count_write(self, da, nbytes, now=None):
+        now = now or int(time.time())
+        b = self.bucket(da)
+        t = self.today(b, now)
+        t["writes"] += 1
+        t["bytes"] += nbytes
+        b["today"] = t
+        self.save_bucket(b)
 
     @property
     def free(self):
@@ -653,11 +688,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fee = self.service.args.price_per_write
         with self.L.lock:
             b = self.L.bucket(b["da"])
+            capped = self.L.capped(b, nbytes)
+            if capped:
+                return self.reply(429, capped, {"Retry-After": str(capped["retryAfter"])})
             a = self.L.account(b["funder"], create=True)
             if b["state"] == "covered" and self.L.can_pay(a, fee):
                 if fee:
                     self.L.charge(b["funder"], fee)
                 status, obj = work()
+                if status == 200 and not obj.get("held"):
+                    self.L.count_write(b["da"], nbytes)
                 return self.reply(status, obj)
         why = "bucket_parked" if b["state"] == "parked" else "account_uncovered"
         if not self.service.payments.enabled:
@@ -668,7 +708,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         def paid():
             with self.L.lock:
                 self.L.charge(b["funder"], fee)
-                return work()
+                status, obj = work()
+                if status == 200 and not obj.get("held"):
+                    self.L.count_write(b["da"], nbytes)
+                return status, obj
         return self.x402(b["funder"], self.L.top_up(a, fee), "top up %s's account" % b["funder"], paid)
 
     # --- GET ---
@@ -686,6 +729,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out = {k: b.get(k) for k in ("da", "funder", "state", "bytes", "objects", "height", "pruneHeight", "parkedAt")}
             out["coveredUntil"] = self.L.covered_until(a) if a and b["state"] == "covered" else 0
             out["statement"] = self.L.statement(b) if b["state"] != "deleted" else None
+            out["cap"], out["today"] = b.get("cap"), self.L.today(b)
             return self.reply(200, out)
         if path.startswith("/account/"):
             funder = path[9:].lower()
@@ -749,13 +793,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.post_name(path[6:], body)
             if path == "/put":
                 return self.post_put(query, body)
-            m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})(/release|/prune)?$", path)
+            m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})(/release|/prune|/cap)?$", path)
             if m:
                 da = m.group(1).lower()
                 if m.group(2) == "/release":
                     return self.post_release(da, body)
                 if m.group(2) == "/prune":
                     return self.post_prune(da, body)
+                if m.group(2) == "/cap":
+                    return self.post_cap(da, body)
                 return self.post_bind(da, body)
             m = re.match(r"^/account/(0x[0-9a-fA-F]{40})/(permit|pay)$", path)
             if m:
@@ -801,6 +847,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                      "created": now, "accruedAt": now, "pruneAt": 0}
             else:
                 self.L.accrue(b, now)                   # what accrued so far stays with the old funder
+            if b.get("funder") and not same(b.get("funder"), funder):
+                b["cap"], b["capAt"] = None, 0                 # the cap goes with the funder (#274)
             b.update({"funder": funder, "sequencer": signer.lower(), "boundAt": issued, "state": "covered", "parkedAt": None})
             self.L.save_bucket(b)
             a = self.L.account(funder, create=True)
@@ -809,6 +857,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 b["state"], b["parkedAt"] = "parked", now
                 self.L.save_bucket(b)
             return self.reply(200, {"da": da, "funder": funder, "state": b["state"]})
+
+    def post_cap(self, da, body):
+        req = self.body_json(body)
+        try:
+            writes, nbytes, issued = int(req["writesPerDay"]), int(req["bytesPerDay"]), int(req["issuedAt"])
+            funder = str(req["funder"]).lower()
+        except (KeyError, TypeError, ValueError):
+            return self.reply(400, {"error": "a cap is {funder, writesPerDay, bytesPerDay, issuedAt, signature}"})
+        if writes < 0 or nbytes < 0 or not ADDR_RE.match(funder):
+            return self.reply(400, {"error": "a cap is {funder, writesPerDay, bytesPerDay, issuedAt, signature}"})
+        with self.L.lock:
+            b = self.L.bucket(da)
+            if not b or b["state"] == "deleted" or not b.get("funder"):
+                return self.reply(404, {"error": "no bound bucket", "da": da})
+            digest = eth.typed_digest(self.L.domain, CAP_TYPE, da, writes, nbytes, issued)
+            sig = sig_bytes(req.get("signature"))
+            if not sig or not same(funder, b["funder"]) or not same(eth.recover(digest, sig), b["funder"]):
+                return self.reply(401, {"error": "not signed by the bucket's funder"})
+            if not self.fresh(issued, b.get("capAt")):
+                return self.reply(409, {"error": "a cap no newer than the last taken", "last": b.get("capAt")})
+            b["cap"] = {"writesPerDay": writes, "bytesPerDay": nbytes} if (writes or nbytes) else None
+            b["capAt"] = issued
+            self.L.save_bucket(b)
+            return self.reply(200, {"da": da, "cap": b["cap"], "today": self.L.today(b)})
 
     def post_release(self, da, body):
         req = self.body_json(body)

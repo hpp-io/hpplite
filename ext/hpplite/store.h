@@ -71,6 +71,8 @@ int hpplite_store_waiting_on_funder(HppliteStore *store);     /* 1 while the las
 ** what a platform binding an app's bucket to its treasury needs from the app (SELECT hpplite_bind_signature(funder, issuedAt)). 0, or -1 */
 int hpplite_store_bind_digest(HppliteStore *store, const unsigned char funder[20], uint64_t issuedAt, unsigned char digest[32]);
 int hpplite_store_sign_bind(HppliteStore *store, const unsigned char funder[20], uint64_t issuedAt, unsigned char sig[65]);
+/* The Cap(da, writesPerDay, bytesPerDay, issuedAt) digest in this store's domain (#274): the funder signs it to bound the bucket's day */
+int hpplite_store_cap_digest(HppliteStore *store, uint64_t writesPerDay, uint64_t bytesPerDay, uint64_t issuedAt, unsigned char digest[32]);
 int64_t hpplite_store_covered_until(HppliteStore *store);
 const char *hpplite_store_bucket_state(HppliteStore *store);
 int hpplite_store_statement(HppliteStore *store, uint8_t out[HPPLITE_STATEMENT_SIZE]);

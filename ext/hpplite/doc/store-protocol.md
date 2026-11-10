@@ -54,6 +54,7 @@ gives it:
 | `Release(address da,address funder,uint256 issuedAt)` | the funder | stop paying for a bucket |
 | `Content(address da,uint256 height,bytes32 hash)` | the sequencer | put bytes into the bucket (`hash` the keccak-256 of the bytes; `height` the batch they belong to, for pruning) |
 | `Prune(address da,uint256 height,uint256 issuedAt)` | the sequencer | let go of the bucket's history before `height` |
+| `Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)` | the funder | bound what the bucket may take in a day (#274); 0 = no bound on that axis |
 | `BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)` | the store's `signer` | what the store holds (below) |
 
 `issuedAt` (seconds) orders a bucket's bindings and prunes: the store takes
@@ -72,7 +73,8 @@ supports it: version 2).
 | `POST /bucket/<da>`, body `{funder, issuedAt, sequencerSignature, funderSignature}` | the sequencer and the funder | `200` the bucket |
 | `POST /bucket/<da>/release`, body `{funder, issuedAt, signature}` | the funder | `200` the bucket |
 | `POST /bucket/<da>/prune`, body `{height, issuedAt, signature}` | the sequencer | `200` the bucket |
-| `GET /bucket/<da>` | - | `200 {da, funder, state, bytes, objects, height, pruneHeight, coveredUntil, statement}` |
+| `POST /bucket/<da>/cap`, body `{funder, writesPerDay, bytesPerDay, issuedAt, signature}` | the funder | `200 {da, cap, today}` |
+| `GET /bucket/<da>` | - | `200 {da, funder, state, bytes, objects, height, pruneHeight, coveredUntil, statement, cap, today}` |
 | `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | the sequencer; `402` if not covered | `200 {name, bytes, signer}`: the name is the write - its bytes are held in the bucket |
 | `POST /put?bucket=<da>&height=<n>`, the body the bytes, `X-HPPLite-Signature` the `Content` signature | the sequencer; `402` if not covered | `200 {cid, bytes}` |
 | `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names); a name's batch bytes are also read by their CID |
@@ -93,7 +95,9 @@ sequencer (or the funder); `402` a write its account cannot cover, or an
 unpaid `/pay` (x402 requirements, below); `403`/`409`/`503` as above; `404`
 not held, or no such bucket; `409` a binding or prune older than the last
 taken; `410` a read of a parked bucket (the body says what restores it);
-`413` over the size limit. JSON bodies with `error`; for `402` also
+`413` over the size limit; `429 bucket_capped` a write past the bucket's
+daily cap (below), nothing charged, `Retry-After` and `retryAfter` the
+seconds to the next window. JSON bodies with `error`; for `402` also
 `bucket_unbound`, `bucket_parked` or `account_uncovered`.
 
 ### Binding
@@ -111,6 +115,23 @@ taken; `410` a read of a parked bucket (the body says what restores it);
   platform that owns its apps' rollups pays for their buckets from one
   treasury without holding the apps' keys; the node runs with `funder=`
   (hpplite #272) and binds nothing itself.
+
+### The daily cap
+
+- The funder may bound a bucket (#274): `Cap(da, writesPerDay, bytesPerDay,
+  issuedAt)`, 0 on an axis meaning no bound there, a newer `issuedAt`
+  replacing the last; the cap goes with the funder (a binding to another
+  funder drops it). A platform paying for many apps from one account bounds
+  what an app's key - which sits in the app's process - can cost it.
+- The store counts every new name and content put (bytes held already count
+  nothing; a node's batch is two writes, its bytes and its name) in a rolling
+  window of 86400 s from the first write in it:
+  `today {writes, bytes, since}` on `GET /bucket/<da>`, kept whether or not
+  there is a cap. A write that would pass the cap answers `429
+  bucket_capped` with `cap`, `today`, `retryAfter` (seconds to the window's
+  end) and a `Retry-After` header; nothing is charged and the bucket's state
+  does not change. A node keeps the batch pending and tries again at its
+  next flush, saying why.
 
 ### The permit
 

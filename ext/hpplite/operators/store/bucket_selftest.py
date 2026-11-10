@@ -36,6 +36,7 @@ fails = 0
 BIND = "Bind(address da,address funder,uint256 issuedAt)"
 RELEASE = "Release(address da,address funder,uint256 issuedAt)"
 CONTENT = "Content(address da,uint256 height,bytes32 hash)"
+CAP = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"
 PRUNE = "Prune(address da,uint256 height,uint256 issuedAt)"
 STATEMENT = "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
 PERMIT = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
@@ -125,6 +126,14 @@ class Store:
         issued = issued or int(time.time())
         d = self.digest(BIND, da, funder, issued)
         return jpost(self.url + "/bucket/" + da, {"funder": funder, "issuedAt": issued, "funderSignature": "0x" + eth.sign(funder_key, d).hex()})
+
+    def cap(self, da, funder_key, writes, nbytes, issued=None):
+        """the funder bounds the bucket's day (#274)"""
+        funder = eth.address(funder_key).lower()
+        issued = issued or int(time.time())
+        d = self.digest(CAP, da, writes, nbytes, issued)
+        return jpost(self.url + "/bucket/%s/cap" % da, {"funder": funder, "writesPerDay": writes, "bytesPerDay": nbytes, "issuedAt": issued,
+                                                       "signature": "0x" + eth.sign(funder_key, d).hex()})
 
     def permit(self, funder_key, value, deadline):
         funder = eth.address(funder_key)
@@ -240,6 +249,33 @@ def main():
         code, out, _ = http("POST", "%s/put?bucket=%s&height=4" % (url, da), same_bytes, {"X-HPPLite-Signature": "0x" + sig.hex()})
         check(code == 200 and out.get("held") and http("GET", url + "/bucket/" + da)[1]["bytes"] == before_bytes,
               "a content put of a name's bytes: held already, counted once")
+        # --- the funder's daily cap (#274): counted always, bound when set; content puts, so the height stays 4 ---
+        bk = http("GET", url + "/bucket/" + da)[1]
+        today = bk.get("today") or {}
+        check(isinstance(today.get("writes"), int) and today["writes"] >= 5 and bk.get("cap") is None,
+              "the bucket counts its day's writes without a cap (%s)" % today)
+        code, out, _ = S.cap(da, G, 1, 0)
+        check(code == 401, "a cap signed by a wallet that is not the bucket's funder: 401 (%s)" % code)
+        code, out, _ = S.cap(da, F, today.get("writes", 0) + 2, 0)
+        check(code == 200 and out.get("cap", {}).get("writesPerDay") == today.get("writes", 0) + 2, "the funder caps the bucket at two more writes today (%s %s)" % (code, out))
+
+        def put(blob):
+            sg = eth.sign(k1, S.digest(CONTENT, da, 4, eth.keccak256(blob)))
+            return http("POST", "%s/put?bucket=%s&height=4" % (url, da), blob, {"X-HPPLite-Signature": "0x" + sg.hex()})
+        for i in (1, 2):
+            code, out, _ = put(b"capped put %d" % i)
+            check(code == 200, "a put within the cap: 200 (%s)" % code)
+        code, out, hdr = put(b"capped put 3")
+        check(code == 429 and out.get("error") == "bucket_capped" and "RETRY-AFTER" in {k.upper() for k in hdr} and out.get("retryAfter", 0) > 0,
+              "a put past the cap: 429 bucket_capped with Retry-After, nothing charged (%s %s)" % (code, out))
+        code, out, _ = put(b"capped put 2")
+        check(code == 200 and out.get("held"), "the same bytes again under the cap: held, counted nothing (%s)" % code)
+        code, out, _ = S.cap(da, F, 0, 0, issued=int(time.time()) - 1)
+        check(code == 409, "an older cap: 409 (%s)" % code)
+        code, out, _ = S.cap(da, F, 0, 0, issued=int(time.time()) + 1)
+        check(code == 200 and out.get("cap") is None, "the funder lifts the cap (%s %s)" % (code, out))
+        code, out, _ = put(b"capped put 3")
+        check(code == 200, "the put goes through once the cap is lifted (%s)" % code)
         acct = http("GET", url + "/account/" + fa)[1]
         check(acct.get("permitNonce") == 0 and st["buckets"].get("assetDomain", {}).get("name") == "Bridged USDC",
               "the account view gives the permit nonce; /status the token's domain")
