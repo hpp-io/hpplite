@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "forge-std/Test.sol";
 import "../src/HPPLiteFleet.sol";
+import "../src/HPPLiteFleetFactory.sol";
 
 /// The shared rollup (#297, doc/fleet-protocol.md): digests and the tree against operators/conformance/vectors.json
 /// (section fleet), admission, leases and epochs, roots, retirement
@@ -156,6 +157,24 @@ contract HPPLiteFleetTest is Test {
         bytes memory a2 = sig(STRANGER_PK, f.admitDigest(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1));
         vm.expectRevert(bytes("Not admitted by the fleet"));
         f.joinFor(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a2, bytes32("host-a"), deadline, c2);
+    }
+
+    /// VERSION 11's factory: a fleet created by its owner, or for it by a relay with the owner's CreateFleet
+    function test_FactoryCreatesFleets() public {
+        HPPLiteFleetFactory fac = new HPPLiteFleetFactory();
+        assertEq(fac.VERSION(), 11);
+        vm.prank(vm.addr(OWNER_PK));
+        address a = fac.createFleet(vm.addr(ANCHOR_PK), 0);
+        assertTrue(fac.isFleet(a));
+        assertEq(HPPLiteFleet(a).owner(), vm.addr(OWNER_PK));
+        assertEq(HPPLiteFleet(a).leaseDuration(), 7 days);
+        uint256 deadline = block.timestamp + 60;
+        bytes memory s = sig(DBOWNER_PK, fac.createDigest(vm.addr(DBOWNER_PK), vm.addr(ANCHOR_PK), 1 days, 0, deadline));
+        address b = fac.createFleetFor(vm.addr(DBOWNER_PK), vm.addr(ANCHOR_PK), 1 days, 0, deadline, s);
+        assertEq(HPPLiteFleet(b).owner(), vm.addr(DBOWNER_PK));
+        assertEq(fac.fleetCount(vm.addr(DBOWNER_PK)), 1);
+        vm.expectRevert(bytes("Bad nonce"));
+        fac.createFleetFor(vm.addr(DBOWNER_PK), vm.addr(ANCHOR_PK), 1 days, 0, deadline, s);   // a signature creates one fleet
     }
 
     function test_RetiredIsGoneUntilAdmittedAgain() public {
