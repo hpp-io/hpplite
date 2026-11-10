@@ -195,6 +195,7 @@ batches; `workflow_dispatch` takes a duration.
 - **v0.6 — Operators** (not tagged; in v0.8.0): #181 the canonical store and relay on Cloudflare (hpp-io/hpplite-operators), `store=on` / `relay=on`, the protocols hpplite-store/2 and hpplite-relay/1 with their conformance vectors.
 - **v0.7 — Data availability** (not tagged; in v0.8.0): #214 buckets paid by the funding wallet's permit, #203 snapshots and `keep=`, point-in-time `hpplite-verify --to/--at` (#205, #206).
 - **v0.8 — One capture** (v0.8.0 tagged 2026-11-09): the persona review of 2026-11-08 - pages the one capture (#253), the store kinds, channels, old factories, the /1 receipt and the HPE1 envelope gone (#247-#252), the budgets in the environment alone (#254), `from=`/`soft=` gone (#255), `checkpoint=` under a store (#256), the manifest's `earliest` (#257), the acceptance script (#258, #261).
+- **v0.9 — A platform's sidecar** (v0.9.0 tagged 2026-11-10): #263 the first client's needs - the sequencer as an app's sidecar (#264-#271), a bucket paid by a platform's treasury (`funder=` #272, owner-only Bind #273, daily cap #274, deleting release #275), relay accounts and sponsorship (#276), the store's rate limit told apart from a cap (#280). Waiting for real use: #283 (a relay's 429 and Retry-After).
 - **v1.0 — Stable formats**: frozen batch JSON / `_hpplite_meta` / `hppda://`, bindings.
 
 ---

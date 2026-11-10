@@ -1024,6 +1024,16 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.9.0 is tagged** (2026-11-10), "A platform's sidecar": what the first
+client needed (#263, a platform that runs one sequencer beside each app's
+database and pays for its apps from one treasury). The node: the
+sequencer's "synced" line (#264), `keeplease=on` (#265), `anchorclose=off`
+(#266), the owner's lease calls (#267), a static build of the tools (#269),
+`funder=` (#272). The store protocol: a Bind by the rollup's owner alone
+(#273), the funder's daily cap (#274), a release that deletes (#275). The
+relay protocol: accounts and sponsorship (#276). The canonical operators
+carry all of it from `sepolia-v0.4.0`.
+
 Paying in the HPP token itself is open (#175).
 
 | Version | Scope | Database size | DA |
