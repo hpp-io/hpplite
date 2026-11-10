@@ -3635,8 +3635,11 @@ static void *node_timer_thread_func(void *arg) {
                 pthread_mutex_unlock(mutex);
             }
         }
-        /* the anchor, on the chain's cadence (#164); a refused one is tried again within a minute */
-        if (node->config.anchorIntervalMs > 0 && node->store && node->l1 && now >= node->anchorAt) {
+        /* the anchor, on the chain's cadence (#164); a refused one is tried again within a minute. Nothing at the store
+        ** above the anchored height: no attempt and no chain read, and the deadline stays armed - the next batch is
+        ** anchored at the next tick, not a whole anchor= later (#308) */
+        if (node->config.anchorIntervalMs > 0 && node->store && node->l1 && now >= node->anchorAt
+            && node_unanchored_above(node, node->anchoredHeight) > 0) {
             pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
             if (mutex) {
                 int rc = 0;

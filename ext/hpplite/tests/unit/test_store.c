@@ -1470,6 +1470,44 @@ static void test_anchor_deadline_across_runs(const char *url) {
     PASS();
 }
 
+/* 8c. ... and idle: at a deadline with nothing new nothing is sent, however long (an idle app costs no relay call a
+** day), and the deadline stays armed, so the next batch is anchored at once, not a whole anchor= after the idle
+** deadline (somaro on #308). Red before: an empty deadline set the next one anchor= later */
+static double mono_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+static void test_anchor_idle_deadline(const char *url) {
+    TEST("an idle deadline sends nothing and stays armed: the next batch is anchored at the next tick, not anchor= later");
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "idle_anchor_w", .intervalMs = 300, .anchorMs = 6000, .noAnchorAtClose = 1 };
+    HppliteNode *w = test_open_node(tpath("ia_w.db"), l1, &o);
+    char tx1[80], tx2[80];
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(v); INSERT INTO t VALUES(1)", NULL);
+    hpplite_node_start_timer(w);
+    sqlite3_int64 anchored = wait_anchored(w, 120);              /* the first deadline: anchor= from the rollup's start */
+    snprintf(tx1, sizeof tx1, "%s", status_text(w->db, "last_anchor_tx"));
+    if (anchored < 1) { hpplite_node_destroy(w); FAIL("the first anchor"); }
+    usleep(13 * 1000 * 1000);                                      /* two idle deadlines, nothing written */
+    snprintf(tx2, sizeof tx2, "%s", status_text(w->db, "last_anchor_tx"));
+    int idleSent = strcmp(tx1, tx2) != 0;
+    hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);
+    sqlite3_int64 h0 = status_int(w->db, "anchored");
+    double t0 = mono_s();
+    sqlite3_int64 a = h0;
+    for (int i = 0; i < 50 && a <= h0; i++) { usleep(100000); a = status_int(w->db, "anchored"); }
+    double took = mono_s() - t0;
+    printf("(idle deadlines sent %s; the next batch anchored in %.1f s, anchored %lld -> %lld) ", idleSent ? "an anchor" : "nothing", took, (long long)h0, (long long)a);
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    if (idleSent) FAIL("an idle deadline should send nothing");
+    if (a <= h0 || took > 3.0) FAIL("the next batch after an idle deadline should be anchored at once (within 3 s), not anchor= later");
+    PASS();
+}
+
 /* 9. Named entries (#165): a batch under <da>-<height> with the sequencer's signature; the first
 ** signer holds a rollup's names at the pin service; a reader recovers the signer. */
 static void test_named(const char *url) {
@@ -1787,6 +1825,7 @@ int main(int argc, char **argv) {
     test_anchor_timer(url);
     test_first_tick_anchor(url);
     test_anchor_deadline_across_runs(url);
+    test_anchor_idle_deadline(url);
     test_recovery(url);
     test_soft_replica(url);
     test_soft_disagreement(url);
