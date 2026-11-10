@@ -3,7 +3,8 @@ the name write that carries a database's signed head (checked against the databa
 the epoch is the fence), the heads an anchor builds the next root from, and the latest root per database from
 RootPosted with the manifest checked against digest and root.
 
-Money for fleet databases (BindDb and its siblings) is not here yet: a store that charges answers fleet writes 501.
+A fleet database's bucket (#310, #311) is a bucket of the store's ledger under bucket_key(fleet, dbId), bound with
+BindDb and released, deleted and capped with its siblings; its name writes are charged to it as a rollup's are.
 """
 import json
 import os
@@ -77,7 +78,8 @@ class FleetBook:
             return
         if name == "RootPosted":
             seq = str(int(log["topics"][1], 16))
-            st["roots"][seq] = {"root": "0x" + _w(data, 0), "manifest": "0x" + _w(data, 1), "state": "manifest missing"}
+            st["roots"][seq] = {"root": "0x" + _w(data, 0), "manifest": "0x" + _w(data, 1), "state": "manifest missing",
+                                "block": log.get("blockNumber")}
             return
         db = log["topics"][1].lower()
         d = st["dbs"].setdefault(db, {"epoch": 0})
@@ -118,10 +120,16 @@ class FleetBook:
                 r["state"] = "bad manifest: " + why
                 continue
             r["state"] = "ok"
+            try:
+                blk = self.chain.call("eth_getBlockByNumber", r.get("block") or "latest", False) or {}
+                when = int(blk.get("timestamp", "0x0"), 16)
+            except (RpcError, OSError, ValueError):
+                when = None
             for leaf in json.loads(data)["leaves"]:
                 d = st["dbs"].setdefault(leaf["dbId"].lower(), {"epoch": 0})
                 d["latestRoot"] = int(seq)
                 d["rootHead"] = _head_digest_hex(fleet, self.chain_id, leaf["head"])
+                d["anchored"] = {"seq": int(seq), "toHeight": int(leaf["head"]["toHeight"]), "time": when}
 
 
 def _cid(digest):
@@ -170,8 +178,21 @@ def fleet_get(h, path, query):
         if not d:
             return h.reply(404, {"error": "no such database in the fleet", "dbId": db})
         head = h.service.disk.json("f/%s/%s/head.json" % (fleet, db))
-        return h.reply(200, {"dbId": db, "epoch": d.get("epoch", 0), "sequencer": d.get("sequencer"), "instance": d.get("instance"),
-                             "retired": d.get("retired", False), "latestHead": head, "latestRoot": d.get("latestRoot")})
+        out = {"dbId": db, "epoch": d.get("epoch", 0), "sequencer": d.get("sequencer"), "instance": d.get("instance"),
+               "retired": d.get("retired", False), "latestHead": head, "latestRoot": d.get("latestRoot")}
+        if d.get("anchored"):
+            out["anchored"] = d["anchored"]             # absent before the first indexed root that holds it
+        return h.reply(200, out)
+    if len(parts) == 6 and parts[3] == "db" and parts[5] == "bucket":
+        b = h.L.bucket(bucket_key(fleet, parts[4].lower()))
+        if not b:
+            return h.reply(404, {"error": "no such bucket", "fleet": fleet, "dbId": parts[4].lower()})
+        a = h.L.account(b["funder"]) if b.get("funder") else None
+        out = {"fleet": fleet, "dbId": parts[4].lower()}
+        out.update({k: b.get(k) for k in ("funder", "state", "bytes", "objects", "height", "pruneHeight", "parkedAt")})
+        out["coveredUntil"] = h.L.covered_until(a) if a and b["state"] == "covered" else 0
+        out["cap"], out["today"] = b.get("cap"), h.L.today(b)
+        return h.reply(200, out)
     if len(parts) == 4 and parts[3] == "heads":
         after = (query.get("after") or ["0x" + "00" * 32])[0].lower()
         limit = min(int((query.get("limit") or ["1000"])[0]), 1000)
@@ -199,8 +220,16 @@ def fleet_post(h, path, body):
     parts = path.split("/")
     fleet = parts[2].lower()
     book = h.service.fleets
-    if h.service.args.price_per_write or h.service.args.price_per_mib_month:
-        return h.reply(501, {"error": "fleet writes on a store that charges need BindDb (not yet in this store)"})
+    if len(parts) >= 6 and parts[3] == "db" and parts[5] == "bucket":
+        db = parts[4].lower()
+        if not re_hex32(db):
+            return h.reply(400, {"error": "a dbId is 32 bytes of hex"})
+        if len(parts) == 6:
+            return _post_binddb(h, fleet, db, body)
+        if len(parts) == 7 and parts[6] == "cap":
+            return _post_capdb(h, fleet, db, body)
+        if len(parts) == 7 and parts[6] == "release":
+            return _post_releasedb(h, fleet, db, body)
     if len(parts) == 4 and parts[3] == "root":
         st = book.follow(fleet)                    # a hint to look now; the body is trusted for nothing
         return h.reply(200, {"fleet": fleet, "roots": st["roots"]})
@@ -291,14 +320,154 @@ def _post_name(h, fleet, name, body):
             return h.reply(400, {"error": "the head's chain hash does not follow from the previous head and these bytes"})
         import hashlib
         cid = _cid(hashlib.sha256(data).digest())
-        h.service.disk.write("c/%s" % cid, data)
-        refs = h.service.disk.json("c/%s.refs" % cid) or {}
-        refs["%s:%s" % (fleet, db)] = height
-        h.service.disk.set_json("c/%s.refs" % cid, refs)
-        h.service.disk.write("f/%s/%s/n/%d" % (fleet, db, height), body[-97:] + cid.encode())
-        h.service.disk.set_json("f/%s/%s/head.json" % (fleet, db), {"head": head, "signature": "0x" + sig.hex()})
-    return h.reply(200, {"name": name, "bytes": len(data), "cid": cid})
+        key = bucket_key(fleet, db)
+
+        def work():
+            h.service.disk.write("c/%s" % cid, data)
+            refs = h.service.disk.json("c/%s.refs" % cid) or {}
+            refs[key] = height
+            h.service.disk.set_json("c/%s.refs" % cid, refs)
+            b = h.L.bucket(key)
+            if b:
+                b.setdefault("content", {})[cid] = {"height": height, "bytes": len(data)}
+                b["bytes"] += len(data) + 97
+                b["objects"] += 1
+                b["height"] = max(b.get("height", 0), height)
+                h.L.save_bucket(b)
+            h.service.disk.write("f/%s/%s/n/%d" % (fleet, db, height), body[-97:] + cid.encode())
+            h.service.disk.set_json("f/%s/%s/head.json" % (fleet, db), {"head": head, "signature": "0x" + sig.hex()})
+            return 200, {"name": name, "bytes": len(data), "cid": cid}
+        if h.L.free:
+            status, obj = work()
+            return h.reply(status, obj)
+    # a store that charges: the database's bucket pays, as a rollup's does (unbound: the same 402)
+    return h.write(h.L.bucket(key), len(data) + 97, lambda: _locked(book, work))
+
+
+def _locked(book, work):
+    with book.lock:
+        return work()
 
 
 def eth_same(a, b):
     return a.lower() == b.lower()
+
+
+# ============ money: a fleet database's bucket (#310, #311) ============
+
+
+def bucket_key(fleet, db):
+    """the ledger's key for a fleet database's bucket: apart from every rollup's DA"""
+    return "fd-%s-%s" % (fleet[2:].lower(), db[2:].lower())
+
+
+def _db_bucket(h, fleet, db):
+    b = h.L.bucket(bucket_key(fleet, db))
+    return b if b and b["state"] != "deleted" and b.get("funder") else None
+
+
+def _post_binddb(h, fleet, db, body):
+    """BindDb(fleet, dbId, funder, issuedAt): the funder, and the database's side - with a record its sequencer or its
+    owner alone; before the record its owner alone, the request naming owner and nameHash (the derivation checked)"""
+    import time
+    import hpplite_store as S
+    req = h.body_json(body)
+    if not req or not S.ADDR_RE.match(str(req.get("funder", ""))) or not isinstance(req.get("issuedAt"), int):
+        return h.reply(400, {"error": "a binding is {funder, issuedAt, funderSignature, dbSignature[, owner, nameHash]}"})
+    funder, issued = req["funder"].lower(), req["issuedAt"]
+    digest = eth.typed_digest(h.L.domain, S.BINDDB_TYPE, fleet, bytes.fromhex(db[2:]), funder, issued)
+    f_sig, d_sig = S.sig_bytes(req.get("funderSignature")), S.sig_bytes(req.get("dbSignature"))
+    if not f_sig or not eth_same(eth.recover(digest, f_sig), funder):
+        return h.reply(401, {"error": "the funder's signature does not recover to the funder"})
+    signer = eth.recover(digest, d_sig) if d_sig else ""
+    st = h.service.fleets.follow(fleet)
+    d = st["dbs"].get(db)
+    if d and d.get("owner"):
+        allowed = [d["owner"]] + ([d["sequencer"]] if d.get("sequencer") else [])
+        if not signer or not any(eth_same(signer, x) for x in allowed):
+            return h.reply(401, {"error": "the database's side: its sequencer or its owner must sign", "signer": signer})
+    else:
+        owner, nh = str(req.get("owner", "")).lower(), str(req.get("nameHash", ""))
+        if not S.ADDR_RE.match(owner) or not re_hex32(nh):
+            return h.reply(400, {"error": "a database the fleet has no record of yet: name owner and nameHash beside the owner's signature"})
+        if "0x" + eth.keccak256(eth.word(owner) + eth.word(bytes.fromhex(nh[2:]))).hex() != db:
+            return h.reply(400, {"error": "dbId is not keccak256(abi.encode(owner, nameHash))"})
+        if not signer or not eth_same(signer, owner):
+            return h.reply(401, {"error": "before its record, the database's owner alone binds it", "signer": signer})
+    key = bucket_key(fleet, db)
+    with h.L.lock:
+        b = h.L.bucket(key)
+        if b and b["state"] != "deleted" and not h.fresh(issued, b.get("boundAt")):
+            return h.reply(409, {"error": "a binding no newer than the last taken", "last": b.get("boundAt")})
+        now = int(time.time())
+        if not b or b["state"] == "deleted":
+            b = {"da": key, "fleet": fleet, "dbId": db, "bytes": 0, "objects": 0, "height": 0, "pruneHeight": 0, "content": {},
+                 "names": {}, "created": now, "accruedAt": now, "pruneAt": 0}
+        else:
+            h.L.accrue(b, now)
+        if b.get("funder") and not eth_same(b.get("funder"), funder):
+            b["cap"], b["capAt"] = None, 0                 # the cap goes with the funder (#274)
+        b.update({"funder": funder, "binder": signer.lower(), "boundAt": issued, "state": "covered", "parkedAt": None})
+        h.L.save_bucket(b)
+        a = h.L.account(funder, create=True)
+        h.L.save_account(a)
+        if a.get("uncovered") or (not h.L.free and a["credit"] < 0 and not a.get("permit")):
+            b["state"], b["parkedAt"] = "parked", now
+            h.L.save_bucket(b)
+        return h.reply(200, {"fleet": fleet, "dbId": db, "funder": funder, "state": b["state"]})
+
+
+def _post_capdb(h, fleet, db, body):
+    import hpplite_store as S
+    req = h.body_json(body)
+    try:
+        writes, nbytes, issued = int(req["writesPerDay"]), int(req["bytesPerDay"]), int(req["issuedAt"])
+        funder = str(req["funder"]).lower()
+    except (KeyError, TypeError, ValueError):
+        return h.reply(400, {"error": "a cap is {funder, writesPerDay, bytesPerDay, issuedAt, signature}"})
+    with h.L.lock:
+        b = _db_bucket(h, fleet, db)
+        if not b:
+            return h.reply(404, {"error": "no bound bucket", "fleet": fleet, "dbId": db})
+        digest = eth.typed_digest(h.L.domain, S.CAPDB_TYPE, fleet, bytes.fromhex(db[2:]), writes, nbytes, issued)
+        sig = S.sig_bytes(req.get("signature"))
+        if not sig or not eth_same(funder, b["funder"]) or not eth_same(eth.recover(digest, sig), b["funder"]):
+            return h.reply(401, {"error": "not signed by the bucket's funder"})
+        if not h.fresh(issued, b.get("capAt")):
+            return h.reply(409, {"error": "a cap no newer than the last taken", "last": b.get("capAt")})
+        b["cap"] = {"writesPerDay": writes, "bytesPerDay": nbytes} if (writes or nbytes) else None
+        b["capAt"] = issued
+        h.L.save_bucket(b)
+        return h.reply(200, {"fleet": fleet, "dbId": db, "cap": b["cap"], "today": h.L.today(b)})
+
+
+def _post_releasedb(h, fleet, db, body):
+    import time
+    import hpplite_store as S
+    req = h.body_json(body)
+    if not req or not isinstance(req.get("issuedAt"), int):
+        return h.reply(400, {"error": "a release is {funder, issuedAt, signature[, delete]}"})
+    with h.L.lock:
+        b = _db_bucket(h, fleet, db)
+        if not b:
+            return h.reply(404, {"error": "no bound bucket", "fleet": fleet, "dbId": db})
+        delete = req.get("delete") is True
+        digest = eth.typed_digest(h.L.domain, S.DELETEDB_TYPE if delete else S.RELEASEDB_TYPE, fleet, bytes.fromhex(db[2:]),
+                                  b["funder"], req["issuedAt"])
+        sig = S.sig_bytes(req.get("signature"))
+        if not sig or not eth_same(eth.recover(digest, sig), b["funder"]) or not eth_same(str(req.get("funder", "")), b["funder"]):
+            return h.reply(401, {"error": "not signed by the bucket's funder"})
+        if not h.fresh(req["issuedAt"], b.get("boundAt")):
+            return h.reply(409, {"error": "a release no newer than the binding"})
+        now = int(time.time())
+        h.L.accrue(b, now)
+        b.update({"funder": None, "boundAt": req["issuedAt"], "state": "parked", "parkedAt": now})
+        h.L.save_bucket(b)
+        if delete:
+            h.L.delete_bucket(b)
+            return h.reply(200, {"fleet": fleet, "dbId": db, "funder": None, "state": "deleted"})
+        return h.reply(200, {"fleet": fleet, "dbId": db, "funder": None, "state": "parked"})
+
+
+def re_hex32(x):
+    return isinstance(x, str) and len(x) == 66 and x.startswith("0x") and all(c in "0123456789abcdefABCDEF" for c in x[2:])

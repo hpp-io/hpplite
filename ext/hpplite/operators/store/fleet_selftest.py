@@ -24,6 +24,8 @@ import fleet as F  # noqa: E402
 import fleet_store  # noqa: E402
 
 RPC = os.environ["HPPLITE_ANVIL_RPC"]
+USDC = os.environ.get("HPPLITE_ANVIL_USDC")
+FACILITATOR = os.environ.get("HPPLITE_ANVIL_FACILITATOR")
 KEY0, KEY1, KEY2, KEY3 = (os.environ["HPPLITE_ANVIL_KEY%d" % i] for i in range(4))
 CONTRACTS = os.path.join(here, "..", "..", "contracts")
 fails = 0
@@ -100,7 +102,108 @@ def main():
                     break
             except OSError:
                 time.sleep(0.1)
-        return run(chain_id, fl, url, owner, dbowner, seq)
+        rc = run(chain_id, fl, url, owner, dbowner, seq)
+    finally:
+        store.terminate()
+        store.wait()
+    if USDC and FACILITATOR:
+        rc = paid(chain_id, fl, work) or rc
+    else:
+        print("  (no MockUSDC or facilitator: the charging store's checks skipped)")
+    return rc
+
+
+def paid(chain_id, fl, work):
+    """a store that charges (#311): a fleet database's bucket bound by BindDb (before its record, by the owner alone),
+    its writes charged, capped by CapDb and released by ReleaseDb; an unbound database's write refused as a rollup's is"""
+    import secrets
+    pay_to = eth.address(secrets.token_bytes(32)).lower()
+    with open(os.path.join(work, "signer2.key"), "w") as f:
+        f.write(KEY2)
+    port = free_port()
+    url = "http://127.0.0.1:%d" % port
+    log = open(os.path.join(work, "store2.log"), "w")
+    store = subprocess.Popen([sys.executable, "-I", os.path.join(here, "hpplite_store.py"), "--port", str(port), "--dir", os.path.join(work, "s2"),
+                              "--signer-key", os.path.join(work, "signer2.key"), "--pay-to", pay_to, "--rpc", RPC, "--facilitator", FACILITATOR,
+                              "--network", "eip155:%d" % chain_id, "--asset", USDC, "--price-per-write", "10", "--price-per-mib-month", "0",
+                              "--pull-threshold", "2000", "--tick-interval", "3600"], stdout=log, stderr=log)
+    try:
+        for _ in range(100):
+            try:
+                if http("GET", url + "/status")[0] == 200:
+                    break
+            except OSError:
+                time.sleep(0.1)
+        sdom = eth.domain_separator("HPPLiteStore", "2", chain_id, pay_to)
+        dom = F.domain(chain_id, fl)
+        fk = secrets.token_bytes(32)                       # the funding wallet: USDC.e, no ETH
+        funder = eth.address(fk).lower()
+        cast("send", "--private-key", KEY0, USDC, "transfer(address,uint256)", funder, "5000000")
+        dbowner, seq = eth.address(kb(KEY1)).lower(), eth.address(kb(KEY3)).lower()
+        name = "orders"
+        db = F.db_id(dbowner, name)
+        dbx, nh = hx(db), hx(F.name_hash(name))
+        issued = int(time.time())
+
+        def binddb(db_key, owner=dbowner, name_hash=nh, issued_at=issued):
+            d = eth.typed_digest(sdom, "BindDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)", fl, db, funder, issued_at)
+            return http("POST", url + "/fleet/%s/db/%s/bucket" % (fl, dbx), json.dumps({
+                "funder": funder, "issuedAt": issued_at, "owner": owner, "nameHash": name_hash,
+                "funderSignature": hx(eth.sign(fk, d)), "dbSignature": hx(eth.sign(kb(db_key), d))}).encode(), {"Content-Type": "application/json"})
+        st, body = binddb(KEY2)
+        check(st == 401, "BindDb before the record, signed by someone other than the owner: 401 (%s)" % st)
+        st, body = binddb(KEY1, name_hash=hx(F.name_hash("another name")))
+        check(st == 400, "BindDb before the record with a nameHash that does not make the dbId: 400 (%s)" % st)
+        st, body = binddb(KEY1)
+        check(st == 200 and body.get("state") in ("covered", "parked"), "BindDb before the record, by the owner alone with owner and nameHash: %s" % body)
+
+        # join it; an unbound database (a second one) gets the rollup's refusal
+        deadline = int(time.time()) + 600
+        inst = eth.keccak256(b"host-orders")
+        admit = eth.sign(kb(KEY0), eth.typed_digest(dom, F.ADMIT_TYPE, db, dbowner, seq, issued))
+        claim = eth.sign(kb(KEY3), eth.typed_digest(dom, F.CLAIM_TYPE, db, inst, 0, deadline))
+        cast("send", "--private-key", KEY2, fl, "joinFor(bytes32,address,address,bytes32,uint256,bytes,bytes32,uint256,uint256,bytes)",
+             dbx, dbowner, seq, nh, str(issued), hx(admit), hx(inst), "0", str(deadline), hx(claim))
+
+        def write(height, data, chain):
+            after = fleet_store.chain_hash_next(chain, height, eth.keccak256(data))
+            head = {"dbId": db, "instanceId": inst, "fromHeight": height, "toHeight": height, "chainHashAfter": after,
+                    "stateRoot": bytes(32), "manifestDigest": bytes(32), "epoch": 1}
+            sig = eth.sign(kb(KEY3), F.head_digest(dom, head))
+            hj = json.dumps({k: (hx(v) if isinstance(v, bytes) else v) for k, v in head.items()})
+            st, body = http("POST", url + "/fleet/%s/name/%s-%d" % (fl, dbx, height), data + inst + sig, {"X-HPPLite-Head": hj})
+            return st, body, after
+
+        # the funder's permit: the account can pay
+        nonce = int(cast("call", USDC, "nonces(address)(uint256)", funder).split()[0])
+        spender = http("GET", url + "/status")[1]["buckets"]["spender"]
+        pd = eth.typed_digest(eth.domain_separator("Bridged USDC", "2", chain_id, USDC),
+                              "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)", funder, spender, 1000000, nonce, deadline + 86400)
+        st, body = http("POST", url + "/account/%s/permit" % funder, json.dumps({"value": 1000000, "deadline": deadline + 86400,
+                                                                                "signature": hx(eth.sign(fk, pd))}).encode(), {"Content-Type": "application/json"})
+        check(st == 200, "the funder's permit taken (%s)" % st)
+        st, body, chain = write(1, b"order one", bytes(32))
+        check(st == 200, "a write into the bound database: taken, charged to its bucket (%s %s)" % (st, body))
+        st, bview = http("GET", url + "/fleet/%s/db/%s/bucket" % (fl, dbx))
+        check(st == 200 and bview.get("funder") == funder and bview.get("today", {}).get("writes") == 1 and bview.get("height") == 1,
+              "GET the database's bucket: its funder, one write today, height 1 (%s)" % bview)
+        st, acct = http("GET", url + "/account/" + funder)
+        check({"fleet": fl, "dbId": dbx} in acct.get("databases", []) and acct.get("buckets") == [],
+              "the account lists the database apart, buckets staying addresses (%s, %s)" % (acct.get("databases"), acct.get("buckets")))
+        cap = eth.typed_digest(sdom, "CapDb(address fleet,bytes32 dbId,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)", fl, db, 1, 0, issued + 1)
+        st, body = http("POST", url + "/fleet/%s/db/%s/bucket/cap" % (fl, dbx), json.dumps({"funder": funder, "writesPerDay": 1, "bytesPerDay": 0,
+                        "issuedAt": issued + 1, "signature": hx(eth.sign(fk, cap))}).encode(), {"Content-Type": "application/json"})
+        check(st == 200, "CapDb by the funder: one write a day (%s %s)" % (st, body))
+        st, body, _ = write(2, b"order two", chain)
+        check(st == 429 and body.get("error") == "bucket_capped", "the second write past the cap: 429 bucket_capped (%s %s)" % (st, body.get("error")))
+        rel = eth.typed_digest(sdom, "ReleaseDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)", fl, db, funder, issued + 2)
+        st, body = http("POST", url + "/fleet/%s/db/%s/bucket/release" % (fl, dbx), json.dumps({"funder": funder, "issuedAt": issued + 2,
+                        "signature": hx(eth.sign(fk, rel))}).encode(), {"Content-Type": "application/json"})
+        check(st == 200 and body.get("state") == "parked", "ReleaseDb by the funder: the bucket parked (%s)" % body)
+        st, body, _ = write(2, b"order two", chain)
+        check(st == 402 and body.get("error") == "bucket_unbound", "a write after the release: 402 bucket_unbound, as an unbound rollup's (%s %s)" % (st, body.get("error")))
+        print("fleet store selftest (charging store): %s" % ("ok" if not fails else "%d FAIL so far" % fails))
+        return 1 if fails else 0
     finally:
         store.terminate()
         store.wait()
@@ -166,6 +269,7 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     check(st == 200, "the new holder's first write, before the store polled the claim: read on chain, taken (%s %s)" % (st, body))
 
     # the anchor: the heads that moved, a manifest put first, the root posted; the store indexes it from RootPosted
+    check("anchored" not in http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))[1], "before any root: no anchored in the view (absent, not zeros)")
     st, heads = http("GET", url + "/fleet/%s/heads" % fl)
     check(st == 200 and len(heads.get("heads", [])) == 1 and heads["heads"][0]["head"]["toHeight"] == 3,
           "GET heads: the database, at its head 3 (%s)" % [h["head"]["toHeight"] for h in heads.get("heads", [])])
@@ -184,6 +288,9 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     cast("send", "--private-key", KEY0, fl, "postRootFor(uint256,bytes32,bytes32,uint256,bytes)", "1", hx(root), hx(mdigest), str(deadline), hx(rsig))
     st, roots = http("POST", url + "/fleet/%s/root" % fl, b"")
     st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))
+    anch = view.get("anchored") or {}
+    check(anch.get("seq") == 1 and anch.get("toHeight") == 3 and isinstance(anch.get("time"), int) and anch["time"] > 0,
+          "the database's view carries anchored {seq 1, toHeight 3, RootPosted's block time} (%s)" % anch)
     check(roots.get("roots", {}).get("1", {}).get("state") == "ok" and view.get("latestRoot") == 1,
           "root 1 indexed from RootPosted, its manifest checked; the database's latestRoot 1 (%s, %s)" % (roots.get("roots"), view.get("latestRoot")))
     st, heads = http("GET", url + "/fleet/%s/heads" % fl)

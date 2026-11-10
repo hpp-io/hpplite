@@ -146,8 +146,10 @@ keccak256(bytes)))`, zero before height 1), which ties the signed head to the
 bytes it is written with. A write past a gap, or above height 1 for a database
 whose earlier heads the store never held (a migration, a second store), is
 `409` with the height it expects; above height 1 the way in is the genesis
-fields of `admitFor`. Until the money below is built, a store that charges
-answers fleet writes `501`.
+fields of `admitFor` (not read by the reference store yet: the migration
+step). A store that charges takes a fleet write only into a bound database's
+bucket, charged and capped as a rollup's; an unbound database's write gets the
+same `402 bucket_unbound` an unbound rollup's does.
 
 **Funding and caps.** One bucket per `(fleet, dbId)`. Its messages, in the
 store's domain `("HPPLiteStore", "2", chainId, payTo)`, are today's four over
@@ -159,6 +161,14 @@ store's domain `("HPPLiteStore", "2", chainId, payTo)`, are today's four over
 | `ReleaseDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the funder |
 | `DeleteDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the funder |
 | `CapDb(address fleet,bytes32 dbId,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)` | the funder |
+
+Calls: `POST /fleet/<fleet>/db/<dbId>/bucket` `{funder, issuedAt,
+funderSignature, dbSignature[, owner, nameHash]}` (BindDb; a newer one from
+another funder rebinds, as Bind does, and the cap goes with the old funder);
+`.../bucket/cap` `{funder, writesPerDay, bytesPerDay, issuedAt, signature}`;
+`.../bucket/release` `{funder, issuedAt, signature[, delete: true]}`
+(ReleaseDb, or DeleteDb with `delete`). The reference store serves them
+(#311).
 
 A bucket bound before the record costs its funder nothing until bytes come,
 and bytes come only with a head the fleet's record accepts; the record's owner

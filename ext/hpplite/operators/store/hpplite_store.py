@@ -715,7 +715,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "permit": {"value": p["value"], "deadline": p["deadline"], "sent": a.get("permitSent", False)} if p else None,
                 "permitNonce": nonce,
                 "dailyCost": int(L.rate(a["funder"]) * 86400 + 0.999999), "coveredUntil": L.covered_until(a),
-                "buckets": [b["da"] for b in L.buckets_of(a["funder"])],
+                "buckets": [b["da"] for b in L.buckets_of(a["funder"]) if ADDR_RE.match(b["da"])],
+                "databases": [{"fleet": b["fleet"], "dbId": b["dbId"]} for b in L.buckets_of(a["funder"]) if b.get("fleet")],
                 "state": "uncovered" if a.get("uncovered") else "covered", "why": a.get("why", "")}
 
     # --- POST ---
