@@ -450,6 +450,7 @@ void hpplite_get_prev_block_hash(HppliteCtx *pCtx, unsigned char *pOut) {
 #include "batch.h"
 #include "l1_interface.h"
 #include "node.h"
+#include "store.h"
 
 /*
 ** Global registry mapping sqlite3* -> HppliteNode
@@ -526,6 +527,7 @@ static void hpplite_batch_key_func(sqlite3_context *ctx, int argc, sqlite3_value
 static void hpplite_set_sequencer_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_set_lease_duration_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_expire_lease_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
+static void hpplite_bind_signature_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_grant_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_revoke_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
 static void hpplite_viewkey_func(sqlite3_context *ctx, int argc, sqlite3_value **argv);
@@ -590,6 +592,8 @@ void hpplite_register_node(sqlite3 *db, HppliteNode *node) {
                             hpplite_keystore_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_batch_key", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
                             hpplite_batch_key_func, NULL, NULL);
+    sqlite3_create_function(db, "hpplite_bind_signature", 2, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
+                            hpplite_bind_signature_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_set_sequencer", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
                             hpplite_set_sequencer_func, NULL, NULL);
     sqlite3_create_function(db, "hpplite_set_lease_duration", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL,
@@ -677,6 +681,8 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->storeUrl = cfg->storeUrl;
     nc->storeCap = cfg->storeCap;
     nc->storePermit = cfg->storePermitSet ? cfg->storePermit : 20000000;   /* 20 USDC.e by default (#214) */
+    memcpy(nc->funder, cfg->funder, 20);
+    nc->hasFunder = cfg->hasFunder;
     nc->syncTo = nc->verifyOnly ? cfg->syncTo : 0;      /* a stop for a verifier only: a sequencer must replay all (#206) */
     nc->keepSeconds = cfg->keepSeconds;                /* pruning behind a snapshot (#223) */
     nc->fromSnapshot = !nc->verifyOnly;                /* a new replica starts from the latest snapshot (#222); a verifier from batch 1, else the oldest kept (#224, #255) */
@@ -942,6 +948,27 @@ static void hpplite_set_sequencer_func(sqlite3_context *ctx, int argc, sqlite3_v
     if (node->hasLease) { node->hasLease = 0; node->leaseRecheckAt = 0; }   /* ours expired with the rotation, unless we named ourselves */
     sqlite3_result_text(ctx, tx, -1, SQLITE_TRANSIENT);
     sqlite3_free(tx);
+}
+
+/* SELECT hpplite_bind_signature('0x<funder>', issuedAt) (#272): the sequencer's half of Bind(da, funder, issuedAt) in the
+** store's domain, signed with this node's key, as 0x-hex (65 bytes): what a platform binding this app's bucket to its
+** treasury needs from the app; the treasury's half and the permit are the platform's. Needs store= and the rollup known. */
+static void hpplite_bind_signature_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
+    HppliteNode *node = hppliteFindNode(db);
+    const char *z = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : NULL;
+    sqlite3_int64 issued = argc > 1 ? sqlite3_value_int64(argv[1]) : 0;
+    unsigned char funder[20], sig[65];
+    char hex[133];
+    if (!node) { sqlite3_result_error(ctx, "hpplite is not on this connection", -1); return; }
+    if (!node->store || !hpplite_store_is_bucket(node->store)) { sqlite3_result_error(ctx, "hpplite_bind_signature: no hpplite-store/2 store on this connection (store=)", -1); return; }
+    if (!z || hpplite_hex_to_bytes(z, funder, 20) != 20) { sqlite3_result_error(ctx, "hpplite_bind_signature: not a 20-byte hex address", -1); return; }
+    if (issued <= 0) { sqlite3_result_error(ctx, "hpplite_bind_signature: issuedAt must be a time in seconds", -1); return; }
+    if (hpplite_store_sign_bind(node->store, funder, (uint64_t)issued, sig) != 0) { sqlite3_result_error(ctx, "hpplite_bind_signature: cannot sign (no key, or the rollup's address is not known yet: write once first)", -1); return; }
+    hex[0] = '0'; hex[1] = 'x';
+    hpplite_bytes_to_hex(sig, 65, hex + 2);
+    for (int i = 2; i < 132; i++) if (hex[i] >= 'A' && hex[i] <= 'F') hex[i] += 32;
+    sqlite3_result_text(ctx, hex, 132, SQLITE_TRANSIENT);
 }
 
 /* SELECT hpplite_set_lease_duration(seconds) (#267): the owner sets how long a claim or a renewal

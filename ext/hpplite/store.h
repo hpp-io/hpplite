@@ -63,6 +63,14 @@ void hpplite_store_set_bucket(HppliteStore *store, const unsigned char da[20], u
 int hpplite_store_prune(HppliteStore *store, uint64_t height);
 int hpplite_store_is_bucket(HppliteStore *store);
 int hpplite_store_funder(HppliteStore *store, unsigned char out[20]);
+/* funder= (#272): the bucket's funding wallet is another's (a platform's treasury, bound and permitted from its control plane): the
+** node derives no funding key, binds nothing, gives no permit; a bucket bound elsewhere or a 402 is "waiting for the funder". */
+void hpplite_store_set_funder(HppliteStore *store, const unsigned char funder[20]);
+int hpplite_store_waiting_on_funder(HppliteStore *store);     /* 1 while the last refusal was the external funder's to lift */
+/* The Bind(da, funder, issuedAt) digest in this store's domain, and the sequencer's half of it signed with the node's key (65 bytes):
+** what a platform binding an app's bucket to its treasury needs from the app (SELECT hpplite_bind_signature(funder, issuedAt)). 0, or -1 */
+int hpplite_store_bind_digest(HppliteStore *store, const unsigned char funder[20], uint64_t issuedAt, unsigned char digest[32]);
+int hpplite_store_sign_bind(HppliteStore *store, const unsigned char funder[20], uint64_t issuedAt, unsigned char sig[65]);
 int64_t hpplite_store_covered_until(HppliteStore *store);
 const char *hpplite_store_bucket_state(HppliteStore *store);
 int hpplite_store_statement(HppliteStore *store, uint8_t out[HPPLITE_STATEMENT_SIZE]);

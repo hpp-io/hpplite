@@ -60,6 +60,8 @@ struct HppliteStore {
     int bound;                      /* the store has the bucket bound to this node's funding wallet */
     time_t boundChecked;            /* when that was last asked */
     int hasFund;                    /* the funding key: derived from the node's key */
+    int external;                   /* funder= (#272): fundAddr is another's wallet; no key, no binding, no permit from here */
+    int funderWait;                 /* the last refusal is the external funder's to lift */
     HppliteKeypair fundKp;
     unsigned char fundAddr[20];
     uint64_t permitCap;             /* HPPLITE_STORE_PERMIT: what the permit lets the store pull (0: none, the 402s are paid) */
@@ -272,6 +274,17 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
     cJSON_ArrayForEach(it, accepts) {
         cJSON *scheme = cJSON_GetObjectItem(it, "scheme");
         if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "exact") == 0 && !acc) acc = it;
+    }
+    if (acc && s->external) {
+        /* funder= (#272): the account is the platform's; a 402 means it is not covered, and this node pays nothing */
+        char fund[43];
+        const char *za = jstr(acc, "amount");
+        lowerHex(s->fundAddr, 20, fund);
+        snprintf(s->error, sizeof s->error, "waiting for the funder %s to cover the bucket: the %s asks %s (the node pays nothing with funder=)", fund,
+                 s->isRelay ? "relay" : "store", za ? za : "a top-up");
+        s->funderWait = 1;
+        cJSON_Delete(req);
+        return NULL;
     }
     if (acc && s->spend) {
         /* HPPLITE_SPEND_CAP (#173): over the window's cap, nothing is signed; the batch waits as over HPPLITE_STORE_CAP */
@@ -627,7 +640,7 @@ static void ensurePermit(HppliteStore *s) {
     unsigned char w[32 * 5], domain[32], c[32], h[32], digest[32], sig[65];
     static const char zPermit[] = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)";
     Buf out = {0};
-    if (!s->permitCap || !s->hasFund || (s->pricePerWrite == 0 && s->pricePerMiBMonth == 0)) return;
+    if (s->external || !s->permitCap || !s->hasFund || (s->pricePerWrite == 0 && s->pricePerMiBMonth == 0)) return;
     if (s->permitChecked && now - (uint64_t)s->permitChecked < 3600) return;
     s->permitChecked = (time_t)now;
     lowerHex(s->fundAddr, 20, fund);
@@ -684,7 +697,7 @@ static int ensureBucket(HppliteStore *s) {
     Buf out = {0};
     long status;
     if (!s->v2) return 0;
-    if (!s->hasBucket || !s->hasKey || !s->hasFund) {
+    if (!s->hasBucket || !s->hasKey || !(s->hasFund || s->external)) {
         snprintf(s->error, sizeof s->error, "the store keeps buckets (hpplite-store/2): %s",
                  !s->hasKey ? "this node has no key to sign for its bucket" : "the rollup's address is not known yet");
         return -1;
@@ -702,10 +715,22 @@ static int ensureBucket(HppliteStore *s) {
             s->coveredUntil = (int64_t)(cu > (uint64_t)INT64_MAX ? (uint64_t)INT64_MAX : cu);
         }
         s->bound = f && strcasecmp(f, fund) == 0 && st && strcmp(st, "deleted") != 0;
+        if (!s->bound && s->external) {
+            /* funder= (#272): the platform binds; this node never does. Said as the funder's to lift */
+            snprintf(s->error, sizeof s->error, "waiting for the funder %s: the bucket is %s%s (the node binds nothing with funder=)", fund,
+                     st && strcmp(st, "deleted") == 0 ? "deleted" : f ? "bound to " : "not bound to it", st && strcmp(st, "deleted") != 0 && f ? f : "");
+        }
     } else {
         s->bound = 0;
+        if (s->external) snprintf(s->error, sizeof s->error, "waiting for the funder %s: the bucket is not bound%s (the node binds nothing with funder=)", fund, status == 0 ? "; the store does not answer" : "");
     }
     cJSON_Delete(b);
+    if (!s->bound && s->external) {
+        s->funderWait = 1;
+        s->lastFailure = status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;
+        return -1;
+    }
+    s->funderWait = 0;
     if (!s->bound) {
         unsigned char words[96], digest[32], sig[65];
         uint64_t issued = (uint64_t)now;
@@ -785,12 +810,37 @@ void hpplite_store_set_bucket(HppliteStore *s, const unsigned char da[20], uint6
 int hpplite_store_is_bucket(HppliteStore *s) { return s && s->v2; }
 
 int hpplite_store_funder(HppliteStore *s, unsigned char out[20]) {
-    if (!s || !s->v2 || !s->hasFund) return -1;
+    if (!s || !s->v2 || !(s->hasFund || s->external)) return -1;
     memcpy(out, s->fundAddr, 20);
     return 0;
 }
 
 int64_t hpplite_store_covered_until(HppliteStore *s) { return s && s->v2 ? s->coveredUntil : -1; }
+void hpplite_store_set_funder(HppliteStore *s, const unsigned char funder[20]) {
+    if (!s || !funder) return;
+    memcpy(s->fundAddr, funder, 20);
+    memset(&s->fundKp, 0, sizeof s->fundKp);
+    s->hasFund = 0;                     /* no funding key here: the platform's signer binds and permits */
+    s->external = 1;
+    s->bound = 0;
+}
+int hpplite_store_waiting_on_funder(HppliteStore *s) { return s && s->funderWait; }
+int hpplite_store_bind_digest(HppliteStore *s, const unsigned char funder[20], uint64_t issuedAt, unsigned char digest[32]) {
+    unsigned char words[96];
+    if (!s || !funder || !digest || !s->hasBucket) return -1;
+    if (!s->hasSigner && hpplite_store_take_status(s) != 200) return -1;
+    memset(words, 0, 96);
+    memcpy(words + 12, s->bucketDa, 20);
+    memcpy(words + 44, funder, 20);
+    wordInt(issuedAt, words + 64);
+    storeDigest(s, "Bind(address da,address funder,uint256 issuedAt)", words, 3, digest);
+    return 0;
+}
+int hpplite_store_sign_bind(HppliteStore *s, const unsigned char funder[20], uint64_t issuedAt, unsigned char sig[65]) {
+    unsigned char digest[32];
+    if (!s || !s->hasKey || hpplite_store_bind_digest(s, funder, issuedAt, digest) != 0) return -1;
+    return signWith(s, &s->kp, digest, sig);
+}
 const char *hpplite_store_bucket_state(HppliteStore *s) { return s && s->v2 && s->bucketState[0] ? s->bucketState : NULL; }
 
 /* The bucket statement in its compact form (HPPLITE_STATEMENT_SIZE), checked against the store's signer */
@@ -877,7 +927,7 @@ int hpplite_store_set_key(HppliteStore *s, const uint8_t privkey[32]) {
     if (hpplite_crypto_keypair_from_privkey(s->crypto, &s->kp, privkey) != 0) return -1;
     memcpy(s->address, s->kp.address, 20);
     s->hasKey = 1;
-    deriveFund(s, privkey);
+    if (!s->external) deriveFund(s, privkey);
     s->bound = 0;
     return 0;
 }
@@ -956,6 +1006,7 @@ static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, siz
             sqlite3_free(zRequired);
             zRequired = zAgain;
             if (status == 200) {
+                s->funderWait = 0;
                 s->spent += amount;
                 s->calls++;
                 hpplite_spend_add(s->spend, amount);

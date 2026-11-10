@@ -60,6 +60,7 @@ extern "C" {
 #define HPPLITE_ENV_STORE         "HPPLITE_STORE"          /* where batch bytes live instead of the chain (#11) */
 #define HPPLITE_ENV_STORE_CAP     "HPPLITE_STORE_CAP"
 #define HPPLITE_ENV_STORE_PERMIT "HPPLITE_STORE_PERMIT"
+#define HPPLITE_ENV_FUNDER        "HPPLITE_FUNDER"     /* funder=: the store account is another wallet's (#272) */
 #define HPPLITE_ENV_SPEND_CAP     "HPPLITE_SPEND_CAP"
 #define HPPLITE_ENV_SOFT          "HPPLITE_SOFT"          /* gone (#255): refused */
 #define HPPLITE_ENV_FROM          "HPPLITE_FROM"          /* gone (#255): refused */
@@ -94,6 +95,7 @@ extern "C" {
 #define HPPLITE_URI_FACTORY       "factory"
 #define HPPLITE_URI_STORE         "store"       /* store=http://host:port: a pin service holds the bytes, the chain the commitment (#11) */
 #define HPPLITE_URI_STORE_CAP     "storecap"   /* refused in a URI (#254): the setting is HPPLITE_STORE_CAP */
+#define HPPLITE_URI_FUNDER        "funder"      /* funder=0x...: the bucket's funding wallet is external (a platform's treasury): the node binds nothing, gives no permit (#272) */
 #define HPPLITE_URI_STORE_PERMIT "storepermit"   /* refused in a URI (#254): the setting is HPPLITE_STORE_PERMIT */
 #define HPPLITE_URI_KEEP         "keep"        /* how long the store keeps the history behind a snapshot (#223) */
 #define HPPLITE_URI_SNAPSHOT     "snapshot"    /* how often a sequencer at a store snapshots the database at an anchor (#221) */
@@ -169,6 +171,8 @@ typedef struct HppliteConfig {
     uint64_t storeCap;               /* HPPLITE_STORE_CAP: the most to pay the store per call (0 = pay nothing) */
     uint64_t storePermit;            /* HPPLITE_STORE_PERMIT: what the permit lets the store pull, atomic units (#214) */
     int storePermitSet;              /* ...given (0 is a value: no permit, the 402s paid) */
+    unsigned char funder[20];        /* funder= (#272): the external funding wallet the bucket must be bound to */
+    int hasFunder;
     int64_t keepSeconds;             /* keep= (#223): how long the store keeps the history behind the latest snapshot; 0: all of it */
     uint64_t syncTo;                 /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;               /* syncat=: ...none written after this time, ms since the epoch (#205); 0: none */

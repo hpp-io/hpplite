@@ -76,7 +76,7 @@ supports it: version 2).
 | `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | the sequencer; `402` if not covered | `200 {name, bytes, signer}`: the name is the write - its bytes are held in the bucket |
 | `POST /put?bucket=<da>&height=<n>`, the body the bytes, `X-HPPLite-Signature` the `Content` signature | the sequencer; `402` if not covered | `200 {cid, bytes}` |
 | `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names); a name's batch bytes are also read by their CID |
-| `POST /account/<funder>/permit`, body `{value, deadline, v, r, s}` | the funder (the permit) | `200` the account |
+| `POST /account/<funder>/permit`, body `{value, deadline, signature}` (65 bytes hex; `{v, r, s}` taken too) | the funder (the permit) | `200` the account |
 | `POST /account/<funder>/pay?amount=<units>` | x402 `exact` | `200` the account: `credit` raised by the amount |
 | `GET /account/<funder>` | - | `200 {funder, credit, balance, allowance, deadline, dailyCost, coveredUntil, buckets, state}` |
 | `GET /status` | - | below |

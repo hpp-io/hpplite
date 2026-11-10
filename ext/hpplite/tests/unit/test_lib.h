@@ -92,6 +92,7 @@ typedef struct TestNodeOpts {
     int noAnchorAtClose;                     /* anchorclose=off (#266): the close anchors nothing */
     int intervalMs;                          /* interval=: the timer (0: none, flush by hand) */
     int anchorMs;                            /* anchor=: the timer's anchor cadence (0: at close and by hand) */
+    const unsigned char *funder;             /* funder= (#272): the external funding wallet; NULL: the node's own derived one */
 } TestNodeOpts;
 HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpts *o);
 int same_root(HppliteNode *a, HppliteNode *b);

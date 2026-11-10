@@ -302,6 +302,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val && atoll(val) > 0) cfg->storeCap = (uint64_t)atoll(val);
     val = getenv(HPPLITE_ENV_STORE_PERMIT);
     if (val && val[0] >= '0' && val[0] <= '9') { cfg->storePermit = (uint64_t)atoll(val); cfg->storePermitSet = 1; }
+    val = getenv(HPPLITE_ENV_FUNDER);
+    if (val && hex_to_bytes(val, cfg->funder, 20) == 0) cfg->hasFunder = 1;
     val = getenv(HPPLITE_ENV_SOFT);
     if (val) refuse_soft();
     val = getenv(HPPLITE_ENV_SPEND_CAP);
@@ -557,6 +559,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         free(cfg->storeUrl);
         cfg->storeUrl = strdup(buf);
     }
+    if (get_uri_param(uri, HPPLITE_URI_FUNDER, buf, sizeof(buf)) && hex_to_bytes(buf, cfg->funder, 20) == 0) cfg->hasFunder = 1;
     for (int i = 0; i < N_MONEY_KNOBS; i++)
         if (get_uri_param(uri, gMoneyKnobs[i].uri, buf, sizeof(buf))) refuse_money_knob(i);
     if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)))
@@ -738,6 +741,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && atol(val) > 0) cfg->maxTxBytes = (size_t)atol(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_STORE);
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_FUNDER);
+    if (val && hex_to_bytes(val, cfg->funder, 20) == 0) cfg->hasFunder = 1;
     for (int i = 0; i < N_MONEY_KNOBS; i++)
         if (sqlite3_uri_parameter(filename, gMoneyKnobs[i].uri)) refuse_money_knob(i);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SOFT);

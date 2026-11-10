@@ -80,6 +80,8 @@ typedef struct HppliteNodeConfig {
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* HPPLITE_STORE_CAP: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storePermit;           /* HPPLITE_STORE_PERMIT: what the funding wallet's permit lets the store pull (0: none, #214) */
+    unsigned char funder[20];       /* funder= (#272): the bucket's funding wallet is external; the node binds nothing, gives no permit */
+    int hasFunder;
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
     int fromSnapshot;               /* a new replica (no role=verify, an empty file) starts from the latest snapshot (#222); a verifier
                                     ** reads batch 1 and, when the store has pruned it, starts from the oldest snapshot kept (#224, #255) */
@@ -142,6 +144,7 @@ typedef struct HppliteNode {
     struct HppliteStore *store;     /* the batch bytes' store when store= is given (#11); the chain commits hash, ref, receipt */
     struct HppliteStore *relay;     /* relay= (#126): the signed forms of the writes go through it, paid like the store */
     int warnedStoreDown;            /* said once per outage that batches go on the chain meanwhile */
+    int warnedFunder;               /* funder= (#272): the wait on the external funder is said once per episode */
     int warnedNames;                /* said once that the store takes no names (#165) */
     int softWalked;                 /* the store's names past the chain were read once (#167) */
     /* the soft tier (#166): what a verifier applied from the store past the anchored height */

@@ -147,6 +147,8 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeUrl = node_strdup(config->storeUrl);
     node->config.storeCap = config->storeCap;
     node->config.storePermit = config->storePermit;
+    memcpy(node->config.funder, config->funder, 20);
+    node->config.hasFunder = config->hasFunder;
     node->syncTo = config->syncTo;
     node->syncAtMs = config->syncAtMs;
     node->config.spendCap = config->spendCap;
@@ -174,6 +176,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     if (node->config.storeUrl) {
         /* the batch bytes' store (#11): the chain will hold commitments only */
         node->store = hpplite_store_open(node->config.storeUrl, config->hasPrivkey ? config->privkey : NULL, config->storeCap);
+        if (node->store && config->hasFunder) hpplite_store_set_funder(node->store, config->funder);   /* an external account (#272) */
         if (!node->store) {
             fprintf(stderr, "hpplite: store=%s: not a store HPPLite knows: store=on for the network's canonical store, or http(s)://host[:port] of an hpplite-store/2 store (operators/store/hpplite_store.py in front of your own disk; kubo:// and s3:// were removed in v0.8, #250)\n", node->config.storeUrl);
             return -1;
@@ -2742,6 +2745,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
             } else {
                 unsigned char h[32];
                 node->warnedStoreDown = 0;
+                node->warnedFunder = 0;
                 hpplite_keccak256(payload, payloadLen, h);
                 if (node_ranges(node)) {
                     node_anchor_row(node, h, zRef, NULL, 0);   /* the chain's commitment comes with the anchor (#164); the store's word is its bucket statement there */
@@ -2773,8 +2777,12 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         if (adopted == 1) { sqlite3_free(bytes); free(packed); free(sealed); free(framed); return height; }
         if (node->failStreak < 6) node->failStreak++;
         node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 0 ? node->config.batchIntervalMs : 5000);
-        if (zStoreWhy[0]) hpplite_error(ctx, "page batch %llu kept pending: %s", (unsigned long long)height, zStoreWhy);
-        else hpplite_error(ctx, "page batch %llu not confirmed on L1, kept pending", (unsigned long long)height);
+        if (zStoreWhy[0]) {
+            /* an external funder's refusal (#272) is theirs to lift: said once per episode, not at every flush */
+            int funder = node->store && hpplite_store_waiting_on_funder(node->store);
+            if (!(funder && node->warnedFunder)) hpplite_error(ctx, "page batch %llu kept pending: %s", (unsigned long long)height, zStoreWhy);
+            node->warnedFunder = funder;
+        } else hpplite_error(ctx, "page batch %llu not confirmed on L1, kept pending", (unsigned long long)height);
         sqlite3_free(bytes); free(packed); free(sealed); free(framed);
         *pMore = 0;
         return 0;

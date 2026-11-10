@@ -11,6 +11,7 @@
 #include "cJSON.h"
 #include "crypto.h"
 #include "eth_client.h"
+#include <time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -918,6 +919,153 @@ static void test_manifest_short_hex(const char *url) {
 }
 
 
+/* a shell command's stdout (curl), its exit status */
+static int sh_out(const char *cmd, char *out, size_t n) {
+    FILE *f = popen(cmd, "r");
+    size_t k;
+    if (!f) return -1;
+    k = fread(out, 1, n - 1, f);
+    out[k] = 0;
+    return pclose(f);
+}
+static void hex0x(const unsigned char *b, size_t n, char *out) {
+    out[0] = '0'; out[1] = 'x';
+    for (size_t i = 0; i < n; i++) snprintf(out + 2 + 2 * i, 3, "%02x", b[i]);
+}
+/* the platform's control plane: Bind(da, treasury, now) with the app's half (the node's key, as hpplite_bind_signature gives it)
+** and the treasury's half, posted to the store. 0 when the store took it */
+static int console_bind(const char *url, HppliteCrypto *cr, const HppliteKeypair *treasury, const unsigned char seqKey[32],
+                        const unsigned char da[20], char *out, size_t n) {
+    HppliteStore *con = hpplite_store_open(url, seqKey, 0);
+    HppliteSignature hs;
+    unsigned char seqSig[65], funSig[65], digest[32], v;
+    char tre[43], seqHex[133], funHex[133], cmd[1200], json[600];
+    uint64_t issued = (uint64_t)time(NULL);
+    FILE *f;
+    if (!con) return -1;
+    hpplite_store_set_bucket(con, da, 0);
+    if (hpplite_store_sign_bind(con, treasury->address, issued, seqSig) != 0 || hpplite_store_bind_digest(con, treasury->address, issued, digest) != 0) { hpplite_store_close(con); return -1; }
+    hpplite_store_close(con);
+    if (hpplite_crypto_sign(cr, treasury, digest, &hs) != 0) return -1;
+    hpplite_sig_to_eth_format(&hs, &v, funSig, funSig + 32);
+    funSig[64] = v;
+    hex0x(treasury->address, 20, tre); hex0x(seqSig, 65, seqHex); hex0x(funSig, 65, funHex);
+    snprintf(json, sizeof json, "{\"funder\":\"%s\",\"issuedAt\":%llu,\"sequencerSignature\":\"%s\",\"funderSignature\":\"%s\"}", tre, (unsigned long long)issued, seqHex, funHex);
+    f = fopen(tpath("console_bind.json"), "w");
+    if (!f) return -1;
+    fputs(json, f); fclose(f);
+    {
+        char daHex[43];
+        hex0x(da, 20, daHex);
+        snprintf(cmd, sizeof cmd, "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data-binary @%s %s/bucket/%s", tpath("console_bind.json"), url, daHex);
+    }
+    return sh_out(cmd, out, n) == 0 && strstr(out, "\"covered\"") ? 0 : -1;
+}
+static int da_of(HppliteL1 *l1, unsigned char da[20], char daHex[43]) {
+    char c[43], d[43];
+    if (hpplite_l1_get_addresses(l1, c, d) != 0) return -1;
+    snprintf(daHex, 43, "%s", d[0] ? d : c);
+    return hpplite_hex_to_bytes(daHex + 2, da, 20) == 20 ? 0 : -1;
+}
+
+/* 6j. funder= (#272): the bucket's account is a platform's treasury, bound and permitted from its control plane; the node
+** derives no funding key, binds nothing, gives no permit, takes the bucket as the platform left it, and a 402 is
+** "waiting for the funder", not a cap refusal. Red before: the node bound the bucket to its own derived wallet. */
+static void test_external_funder(const char *url, const char *dir) {
+    TEST("funder= (#272): the node binds nothing and gives no permit; the platform's binding to its treasury is taken as found; a 402 waits on the funder, pays nothing");
+    static const unsigned char kseq[32] = { [31] = 0x72 }, ktre[32] = { [31] = 0x73 };
+    HppliteCrypto *cr = hpplite_crypto_init();
+    HppliteKeypair treasury;
+    unsigned char da[20], got[20], derived[20];
+    char daHex[43], tre[43], derivedHex[43], cmd[600], out[4000];
+    const char *why = NULL;
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    if (!cr || hpplite_crypto_keypair_from_privkey(cr, &treasury, ktre) != 0) FAIL("the treasury's key");
+    hex0x(treasury.address, 20, tre);
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "ext_w", .privkey = kseq, .funder = treasury.address };
+    HppliteNode *w = test_open_node(tpath("ext_w.db"), l1, &o);
+    if (!w) FAIL("open with funder=");
+    if (da_of(l1, da, daHex) != 0) { hpplite_node_destroy(w); FAIL("the rollup's address"); }
+    {   /* the node's own derived wallet: it must never appear at the store */
+        HppliteStore *own = hpplite_store_open(url, kseq, 0);
+        if (!own || hpplite_store_funder(own, derived) != 0) { if (own) hpplite_store_close(own); hpplite_node_destroy(w); FAIL("the derived wallet"); }
+        hpplite_store_close(own);
+        hex0x(derived, 20, derivedHex);
+    }
+    /* 1. unbound: the node writes nothing and binds nothing; it waits for the funder */
+    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) >= 1) why = "the node should bind nothing and keep the batch pending";
+    if (!why) {
+        snprintf(cmd, sizeof cmd, "curl -s -m 5 -o /dev/null -w '%%{http_code}' %s/bucket/%s", url, daHex);
+        sh_out(cmd, out, sizeof out);
+        if (strcmp(out, "404") != 0) { printf("(bucket %s) ", out); why = "no bucket should exist before the platform binds it"; }
+    }
+    if (!why && !strstr(status_text(w->db, "last_error"), "waiting for the funder")) { printf("(%s) ", status_text(w->db, "last_error")); why = "the node should say it waits for the funder"; }
+    if (!why && hpplite_store_funder(w->store, got) == 0 && memcmp(got, treasury.address, 20) != 0) why = "store_funder should be the external funder";
+    /* 2. the platform binds the bucket to its treasury; the node's next flush goes through, the binding untouched */
+    if (!why && console_bind(url, cr, &treasury, kseq, da, out, sizeof out) != 0) { printf("(%s) ", out); why = "the console's binding"; }
+    if (!why && hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the flush after the platform's binding"; }
+    if (!why) {
+        snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/bucket/%s", url, daHex);
+        sh_out(cmd, out, sizeof out);
+        if (!strstr(out, tre)) { printf("(%s) ", out); why = "the bucket should stay bound to the treasury (red: rebound to the node's derived wallet)"; }
+    }
+    if (!why) {
+        snprintf(cmd, sizeof cmd, "curl -s -m 5 -o /dev/null -w '%%{http_code}' %s/account/%s", url, derivedHex);
+        sh_out(cmd, out, sizeof out);
+        if (strcmp(out, "200") == 0) why = "the node's derived wallet should have no account at the store (no binding, no permit from it)";
+    }
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    if (why) FAIL(why);
+
+    /* 3. a priced store (no chain, nothing can pull): the 402 is the funder's to lift; the node pays nothing and says so */
+    {
+        int port = test_free_port(), up = 0;
+        char portStr[16], script[600], url2[64], keyPath[600];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
+        snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
+        pid_t pid = fork();
+        if (pid == 0) {
+            int fd = open("/dev/null", O_WRONLY);
+            if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+            execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", tpath("ext_paid_pins"), "--signer-key", keyPath,
+                   "--pay-to", "0x1111111111111111111111111111111111111111", "--facilitator", "http://127.0.0.1:1",
+                   "--price-per-mib-month", "30", "--price-per-write", "10", (char *)NULL);
+            _exit(127);
+        }
+        for (int i = 0; i < 50 && !up; i++) {
+            if (!test_child_alive(pid)) break;
+            snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status 2>/dev/null | grep -q pricePerWrite", port);
+            up = system(cmd) == 0;
+            if (!up) usleep(200 * 1000);
+        }
+        if (!up) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); FAIL("the paid store did not start"); }
+        snprintf(url2, sizeof url2, "http://127.0.0.1:%d", port);
+        HppliteL1 *l1b = hpplite_l1_create_mock();
+        TestNodeOpts o2 = { .storeUrl = url2, .nodeId = "ext_w2", .privkey = kseq, .funder = treasury.address };
+        HppliteNode *w2 = test_open_node(tpath("ext_w2.db"), l1b, &o2);
+        if (!w2) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open on the paid store"); }
+        if (da_of(l1b, da, daHex) != 0 || console_bind(url2, cr, &treasury, kseq, da, out, sizeof out) != 0) { printf("(%s) ", out); why = "the console's binding at the paid store"; }
+        if (!why) {
+            hpplite_node_exec(w2, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+            if (hpplite_node_flush_batch(w2) >= 1) why = "an uncovered account should keep the batch pending";
+        }
+        if (!why) {
+            const char *e = status_text(w2->db, "last_error");
+            if (!strstr(e, "waiting for the funder") || strstr(e, "HPPLITE_STORE_CAP")) { printf("(%s) ", e); why = "the 402 should read as waiting for the funder, not a cap refusal"; }
+        }
+        if (!why && hpplite_store_spent(w2->store, NULL) != 0) why = "the node should pay nothing";
+        hpplite_node_destroy(w2);
+        hpplite_l1_disconnect(l1b);
+        kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        if (why) FAIL(why);
+    }
+    hpplite_crypto_free(cr);
+    PASS();
+}
+
 /* the objects the store holds in the rollup's bucket (GET /bucket/<da>), -1 unknown */
 static long long bucket_objects(const char *url, HppliteL1 *l1) {
     char c[43], d[43], cmd[300], out[2000] = "";
@@ -1412,6 +1560,7 @@ int main(int argc, char **argv) {
     test_ranges(url);
     test_ranges_restart(url);
     test_no_anchor_at_close(url);
+    test_external_funder(url, dir);
     test_snapshot_made(url);
     test_snapshot_replica(url);
     test_snapshot_chunks(url);
