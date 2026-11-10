@@ -225,6 +225,23 @@
     "signature": "0x6f798888d6c7baced5cb2e900850e426a8763ec1599550867be881cff92274b017224db4e6df293ac1e85f247f1605d5a2c92c8cd43766cd5a539931bd891fec1b"
    }
   ],
+  "factory": "0xfafafafafafafafafafafafafafafafafafafafa",
+  "factoryMessages": [
+   {
+    "digest": "0x1d06d9b1718113556856c6c1086ca64b5b6193a479106264023ceb52c1b3de49",
+    "fields": [
+     "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     604800,
+     0,
+     1800000004
+    ],
+    "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+    "signature": "0x84b02c94c50408f73e0abbca35f61a6e84f9a6cbfb4c30f3dc9e8e9639207260419e1259b31fa806f20bdac1a165e538735789d7a09ddd91ce3533584958120f1c",
+    "type": "CreateFleet",
+    "typeString": "CreateFleet(address owner,address anchor,uint64 leaseDuration,uint256 nonce,uint256 deadline)"
+   }
+  ],
   "manifest": {
    "bytes": "{\"chainId\":181228,\"leaves\":[{\"dbId\":\"0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e\",\"head\":{\"chainHashAfter\":\"0x825589fb316a16dbe3adb78311e2eb817072ef52dabd4c6f15065d41e2c75e7f\",\"dbId\":\"0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e\",\"epoch\":1,\"fromHeight\":1,\"instanceId\":\"0x1fe7fbe32f2e527c0da96fe3212cc3bae9ca124c8c3acc793733702b09564abd\",\"manifestDigest\":\"0x6aa1c15c2a69ce65c84ab680d41a88ca34647fa3b8bd3f7297142e7bc007a2b7\",\"stateRoot\":\"0x892d5bd6622e103a7459e820912fd29738eb7197c33683b94695d3591a1e2672\",\"toHeight\":5},\"nameHash\":\"0x55fd8d795c5b9d2a906e1540ade043a6fb75de555aeb3800c4dd8cf3079b5dda\",\"owner\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"signature\":\"0x50b4767c2738f91ff455990f92bcea8c7ee2413e7e28f7fe86f2a299da7595fd4b42bfee0926113acb5039b268bea53b616f8dbaec90256284c7f08e34cf16e41c\"},{\"dbId\":\"0xdc4fb9e0ec665f4dfce66a84073b1f0514c146d33659b188f0b1dadbce45995d\",\"head\":{\"chainHashAfter\":\"0xe065a3a797f141309d89de1097f5abd95c1523e4987369d85102ddcfb5ae1a2f\",\"dbId\":\"0xdc4fb9e0ec665f4dfce66a84073b1f0514c146d33659b188f0b1dadbce45995d\",\"epoch\":2,\"fromHeight\":11,\"instanceId\":\"0xc4ffbf774524910ef5e2ee9d1705125def00907a350481ed80b84c7ff3976670\",\"manifestDigest\":\"0x34e6fab6310ced66d43caf3c08a2590d01e2e9cecd57d35a5592c757079ffb00\",\"stateRoot\":\"0x105ed2c9ece133136a7f6ae0d3c5e4bb2713b40115e9f0830b8b4dfa1d3e1a43\",\"toHeight\":15},\"nameHash\":\"0x2b8865017b926aa111ff95603d978bc3d6c54e205a95149c92c5653a0ad96578\",\"owner\":\"0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c\",\"signature\":\"0x1d9379393155b64a33f37fe1cc63117316cdffb94872e9718d5283b586348e97226e60461dd5648a6095645553060212288291dd15281470a43225d8ff2b8e421c\"},{\"dbId\":\"0xfed783cfce1c83b4f7a3e5540a2dd20f63fccf0bf702d6cad784fe004f5bb95f\",\"head\":{\"chainHashAfter\":\"0x9584ae49fbd8ddd8901271397d1ea0de5cee21ecbe7bd87395693d8660e26a2d\",\"dbId\":\"0xfed783cfce1c83b4f7a3e5540a2dd20f63fccf0bf702d6cad784fe004f5bb95f\",\"epoch\":3,\"fromHeight\":21,\"instanceId\":\"0xa79677cc9a5b9b148f56984a61b1e27aed01e3062b1c719c1649aaa63972c3a1\",\"manifestDigest\":\"0x12a573d50788f2f639379534f6612cf6868a52b4f9ae0472df8a6be7537e2e94\",\"stateRoot\":\"0x4b8c1356232b43b1f6bbd36a34c7d91454d2c1fec3de07920699ec735aa3ebf1\",\"toHeight\":25},\"nameHash\":\"0x3ac225168df54212a25c1c01fd35bebfea408fdac2e31ddd6f80a4bbf9a5f1cb\",\"owner\":\"0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025\",\"signature\":\"0x3708b2f91d62d6a4e64e966081ed8f31345330cd449e9c331e86215b74f7fd1f28e86a1ae89042375f7d2e1e4731c05af45233cf03f0da06332f5c81582699141b\"}],\"protocol\":\"hpplite-fleet/1\",\"rollup\":\"0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1\",\"seq\":7}",
    "leaves": 3,
@@ -285,6 +302,19 @@
     "signature": "0x8d37bcc518b9419fb3edcbae4543eff50996c1fbf56b070f3264c1a7a8014aa954c430d18ebe542d1c55c739017be262b0b182a7ba97e778f2fd6c8a737520311b",
     "type": "Root",
     "typeString": "Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)"
+   },
+   {
+    "digest": "0x6ea6d51ed3e465f53232df0d0a13d2fc7094b27284b3c1330d9ae53f3f961da8",
+    "fields": [
+     "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e",
+     "0x1fe7fbe32f2e527c0da96fe3212cc3bae9ca124c8c3acc793733702b09564abd",
+     0,
+     1800000003
+    ],
+    "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+    "signature": "0xa05047c042bf9cb3859dd3e4b48db5aa04ddf69895b47a6fafbd7561e6bc0f480f6cb35bd9d971f56c5d55fbe5c043f17f955056e5c5f1a0180cd9fa4e56480b1c",
+    "type": "Claim",
+    "typeString": "Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)"
    }
   ],
   "protocol": "hpplite-fleet/1",

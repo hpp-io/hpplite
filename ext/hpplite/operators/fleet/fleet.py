@@ -23,6 +23,13 @@ HEAD_TYPE = ("Head(bytes32 dbId,bytes32 instanceId,uint256 fromHeight,uint256 to
 ADMIT_TYPE = "Admit(bytes32 dbId,address owner,address sequencer,uint256 issuedAt)"     # the fleet's owner, or its admitter
 RETIRE_TYPE = "Retire(bytes32 dbId,uint256 issuedAt)"                                   # the database's owner
 ROOT_TYPE = "Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)"     # the fleet's anchor key
+CLAIM_TYPE = "Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)"     # the database's sequencer; nonce: the record's claimNonce
+# in the factory's domain ("HPPLiteFleetFactory", "11", chainId, <the factory>): the fleet's owner; nonce: the factory's createNonce(owner)
+CREATE_FLEET_TYPE = "CreateFleet(address owner,address anchor,uint64 leaseDuration,uint256 nonce,uint256 deadline)"
+
+
+def factory_domain(chain_id, factory):
+    return eth.domain_separator("HPPLiteFleetFactory", "11", chain_id, factory)
 
 
 def domain(chain_id, rollup):

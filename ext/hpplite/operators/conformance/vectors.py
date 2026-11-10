@@ -142,7 +142,11 @@ def fleet_vectors():
     rootmsg = [7, fleet.root([(d["dbId"], d["leaf"]) for d in dbs[:3]]), mdigest, 1800000002]
     msgs = [("Head", fleet.HEAD_TYPE, [dbs[0]["head"][k] for k in ("dbId", "instanceId", "fromHeight", "toHeight", "chainHashAfter",
                                                                      "stateRoot", "manifestDigest", "epoch")], 0),
-            ("Admit", fleet.ADMIT_TYPE, admit, 2), ("Retire", fleet.RETIRE_TYPE, retire, 1), ("Root", fleet.ROOT_TYPE, rootmsg, 2)]
+            ("Admit", fleet.ADMIT_TYPE, admit, 2), ("Retire", fleet.RETIRE_TYPE, retire, 1), ("Root", fleet.ROOT_TYPE, rootmsg, 2),
+            ("Claim", fleet.CLAIM_TYPE, [dbs[0]["dbId"], dbs[0]["head"]["instanceId"], 0, 1800000003], 0)]
+    factory = "0x" + "fa" * 20
+    fdom = fleet.factory_domain(chain_id, factory)
+    create = [owners[0], eth.address(key(2)).lower(), 604800, 0, 1800000004]
     return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup,
             "databases": [{"name": d["name"], "owner": d["owner"], "dbId": hx(d["dbId"]), "nameHash": hx(fleet.name_hash(d["name"])),
                            "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in d["head"].items()},
@@ -152,7 +156,11 @@ def fleet_vectors():
             "manifest": {"seq": 7, "leaves": 3, "bytes": mdata.decode(), "sha256": hx(mdigest)},
             "messages": [{"type": t, "typeString": ts, "fields": [hx(f) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
                           "digest": hx(eth.typed_digest(dom, ts, *fields)), "signature": hx(eth.sign(key(k), eth.typed_digest(dom, ts, *fields)))}
-                         for t, ts, fields, k in msgs]}
+                         for t, ts, fields, k in msgs],
+            "factory": factory,
+            "factoryMessages": [{"type": "CreateFleet", "typeString": fleet.CREATE_FLEET_TYPE, "fields": create, "key": KEYS[0],
+                                 "digest": hx(eth.typed_digest(fdom, fleet.CREATE_FLEET_TYPE, *create)),
+                                 "signature": hx(eth.sign(key(0), eth.typed_digest(fdom, fleet.CREATE_FLEET_TYPE, *create)))}]}
 
 
 def main():
@@ -174,7 +182,16 @@ def main():
     # DA's domain (names) and Permit in the asset's
     missing = [ts for mod, sect in ((hpplite_store, "bucketMessages"), (relay, "relayMessages"), (fleet, "fleet"))
                for name, ts in sorted(vars(mod).items())
-               if name.endswith("_TYPE") and name not in ("BATCH_TYPE", "PERMIT_TYPE") and ts not in [m["typeString"] for m in v[sect]["messages"]]]
+               if name.endswith("_TYPE") and name not in ("BATCH_TYPE", "PERMIT_TYPE")
+               and ts not in [m["typeString"] for m in v[sect]["messages"] + v[sect].get("factoryMessages", [])]]
+    import re
+    fleet_types = [m["typeString"] for m in v["fleet"]["messages"] + v["fleet"]["factoryMessages"]]
+    sol = os.path.join(here, "..", "..", "contracts", "src")
+    for f in ("HPPLiteFleet.sol", "HPPLiteFleetFactory.sol"):
+        text = open(os.path.join(sol, f)).read()
+        for name, ts in re.findall(r'(\w+_TYPEHASH)\s*=\s*keccak256\(\s*"([^"]+)"\s*\)', text):
+            if ts not in fleet_types:
+                missing.append("%s %s (%s)" % (f, name, ts))
     if missing:
         print("vectors.py: no vector for: %s" % "; ".join(missing))
         return 1

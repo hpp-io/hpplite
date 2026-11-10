@@ -33,6 +33,18 @@ EIP-712 in the domain `("HPPLiteFleet", "1", chainId, <shared rollup>)`:
 | `Admit(bytes32 dbId,address owner,address sequencer,uint256 issuedAt)` | the fleet's owner or its admitter: the first claim of a `dbId` in the fleet needs it, so nobody rides a fleet's roots and sponsorship uninvited |
 | `Retire(bytes32 dbId,uint256 issuedAt)` | the database's owner: the record goes, at `rm` |
 | `Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)` | the fleet's anchor key (the owner may change it); sponsored at the relay |
+| `Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)` | the database's sequencer, to take or renew its lease (`claimFor`, or with the Admit in `joinFor`); `nonce` is the record's `claimNonce` - 0 for a dbId the fleet never had, carried on when a retired one is admitted again |
+
+In the factory's domain `("HPPLiteFleetFactory", "11", chainId, <the factory>)`:
+
+| Type | Signed by |
+|------|-----------|
+| `CreateFleet(address owner,address anchor,uint64 leaseDuration,uint256 nonce,uint256 deadline)` | the fleet's owner, for `createFleetFor`; `nonce` is the factory's `createNonce(owner)` |
+
+Every other change is a call by its role (`forceExpire`, `setSequencer`,
+`promote` by the database's owner; `setRoles`, `transferOwnership` by the
+fleet's). `vectors.py` refuses a `*_TYPEHASH` in either contract without a
+vector.
 
 `dbId = keccak256(abi.encode(owner, keccak256(name)))`: a database is its
 owner and its name in the fleet; `dbname=` computes it, no scan.
