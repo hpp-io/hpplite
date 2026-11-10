@@ -1442,6 +1442,34 @@ static void test_first_tick_anchor(const char *url) {
     PASS();
 }
 
+/* 8b. The anchor's deadline counts from the last anchor on chain, across runs (somaro#31, #84): a sequencer
+** restarted more often than its anchor= (a deploy, a reboot, a new build) must not reset the clock and never
+** anchor. Red before: every run started a fresh anchor= from its own start, so the second run below waited
+** another 200 s although the last anchor was 210 s ago. */
+static void test_anchor_deadline_across_runs(const char *url) {
+    TEST("the anchor's deadline counts from the last anchor on chain, not from the run's start: a run restarted past it anchors soon after open");
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "deadline_w", .intervalMs = 1000, .anchorMs = 200000, .noAnchorAtClose = 1 };
+    HppliteNode *w = test_open_node(tpath("dl_w.db"), l1, &o);
+    sqlite3_int64 anchored;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(v); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("the batch to the store"); }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);                                    /* anchorclose=off: the row waits for the cadence */
+    hpplite_l1_mock_advance_time(l1, 210);                      /* the chain's last anchor (the rollup's start) is 210 s back */
+    w = test_open_node(tpath("dl_w.db"), l1, &o);
+    if (!w) { hpplite_l1_disconnect(l1); FAIL("reopen"); }
+    hpplite_node_start_timer(w);
+    anchored = wait_anchored(w, 80);
+    printf("(a run opened 210 s after the last anchor, anchor=200s: anchored %lld within 8 s) ", (long long)anchored);
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    if (anchored != 1) FAIL("the deadline was past at open: the run should anchor soon, not 200 s after its own start");
+    PASS();
+}
+
 /* 9. Named entries (#165): a batch under <da>-<height> with the sequencer's signature; the first
 ** signer holds a rollup's names at the pin service; a reader recovers the signer. */
 static void test_named(const char *url) {
@@ -1758,6 +1786,7 @@ int main(int argc, char **argv) {
     test_snapshot_reused_after_refusal(url);
     test_anchor_timer(url);
     test_first_tick_anchor(url);
+    test_anchor_deadline_across_runs(url);
     test_recovery(url);
     test_soft_replica(url);
     test_soft_disagreement(url);

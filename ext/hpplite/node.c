@@ -3533,6 +3533,23 @@ static void node_checkpoint_wal(HppliteNode *node, int64_t now) {
 }
 
 
+/* The first anchor of a run (#308): anchor= after the last anchor on chain (its lastCheckpointTime), not after this
+** run's start - a sequencer restarted more often than anchor= (a deploy, a reboot, a new build) must still anchor.
+** Past it already: soon, after a jitter of up to a hundredth of anchor= (at most 30 s) drawn from the instance, so a
+** host's sequencers restarted together do not anchor in the same second. One read of the chain */
+static int64_t node_anchor_deadline(HppliteNode *node, int64_t now) {
+    int64_t interval = node->config.anchorIntervalMs, due, jitter;
+    HppliteL1State *st = hpplite_l1_get_state(node->l1);
+    if (!st) return now + interval;
+    if (!st->lastCheckpointTime) { hpplite_l1_state_free(st); return now + interval; }
+    due = ((int64_t)st->lastCheckpointTime - (int64_t)st->currentTimestamp) * 1000 + interval;   /* in the chain's clock */
+    hpplite_l1_state_free(st);
+    if (due > interval) due = interval;
+    if (due > 0) return now + due;
+    jitter = interval / 100 < 28000 ? interval / 100 : 28000;
+    return now + 2000 + (jitter > 0 ? (int64_t)(((uint64_t)node->instanceId[0] << 8 | node->instanceId[1]) % (uint64_t)jitter) : 0);
+}
+
 /*
 ** Timer thread function - auto-flush batches on interval.
 */
@@ -3598,7 +3615,7 @@ static void *node_timer_thread_func(void *arg) {
         ** store is anchored soon - unless anchorclose=off, where every run leaves rows by design and they wait
         ** for the cadence like the rest; a batch this tick posts is this run's and waits for the cadence too */
         if (node->config.anchorIntervalMs > 0 && node->store && node->l1 && node->anchorAt == 0) {
-            node->anchorAt = now + (!node->config.noAnchorAtClose && node_unanchored_above(node, node->anchoredHeight) ? 2000 : node->config.anchorIntervalMs);
+            node->anchorAt = !node->config.noAnchorAtClose && node_unanchored_above(node, node->anchoredHeight) ? now + 2000 : node_anchor_deadline(node, now);
         }
         /* An idle writer holding the lease asks the chain nothing at its tick (#292): nobody else posts while the
         ** lease holds, and a lease lost meanwhile (expired, the owner's forceExpire) is met at the next post, which
