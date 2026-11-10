@@ -18,7 +18,9 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 sys.path.insert(0, os.path.join(here, "..", "store"))
 sys.path.insert(0, os.path.join(here, "..", "relay"))
+sys.path.insert(0, os.path.join(here, "..", "fleet"))
 from x402seller import eth  # noqa: E402
+import fleet  # noqa: E402
 import hpplite_store  # noqa: E402
 import relay  # noqa: E402
 
@@ -96,9 +98,61 @@ def generate():
         {"type": t, "typeString": ts, "fields": fields, "key": KEYS[k], "digest": "0x" + eth.typed_digest(rdom, ts, *fields).hex(),
          "signature": "0x" + eth.sign(key(k), eth.typed_digest(rdom, ts, *fields)).hex()}
         for t, ts, fields, k in rmsgs]}
+    v["fleet"] = fleet_vectors()
     v["relayCalls"] = {"factoryVersion": 10, "selectors": {name: "0x" + sel for sel, name in sorted(
         list(relay.FACTORY_CALLS.items()) + list(relay.ROLLUP_CALLS.items()) + list(relay.DA_CALLS.items()), key=lambda x: x[1])}}
     return v
+
+
+def fleet_vectors():
+    """hpplite-fleet/1 (#297, doc/fleet-protocol.md): dbIds, the signed messages, leaves, roots of 1, 2, 3 and 5
+    leaves (the odd node moving up), every leaf's Merkle path, and a manifest's digest"""
+    rollup, chain_id = "0x" + "f1" * 20, 181228
+    dom = fleet.domain(chain_id, rollup)
+    hx = lambda b: "0x" + b.hex()
+    owners = [eth.address(key(i)).lower() for i in range(3)]
+    dbs = []
+    for i, name in enumerate(["notes", "orders.db", "a", "somaro-app-7", "x" * 64]):
+        owner = owners[i % 3]
+        db = fleet.db_id(owner, name)
+        head = {"dbId": db, "instanceId": eth.keccak256(b"instance-%d" % i), "fromHeight": 1 + 10 * i, "toHeight": 5 + 10 * i,
+                "chainHashAfter": eth.keccak256(b"chain-%d" % i), "stateRoot": eth.keccak256(b"root-%d" % i),
+                "manifestDigest": eth.keccak256(b"manifest-%d" % i), "epoch": i + 1}
+        hd = fleet.head_digest(dom, head)
+        sig = eth.sign(key(i % 3), hd)
+        lf = fleet.leaf(db, owner, fleet.name_hash(name), hd)
+        dbs.append({"name": name, "owner": owner, "dbId": db, "head": head, "headDigest": hd, "signature": sig, "leaf": lf,
+                    "key": KEYS[i % 3]})
+    roots = []
+    for n in (1, 2, 3, 5):
+        entries = [(d["dbId"], d["leaf"]) for d in dbs[:n]]
+        r = fleet.root(entries)
+        paths = {}
+        for d in dbs[:n]:
+            path = fleet.proof(entries, d["dbId"])
+            assert fleet.verify(d["leaf"], path, r), "a path that does not reach its root"
+            paths[hx(d["dbId"])] = [{"hash": hx(h), "left": left} for h, left in path]
+        roots.append({"leaves": [hx(d["dbId"]) for d in dbs[:n]], "root": hx(r), "paths": paths})
+    items = [{"dbId": hx(d["dbId"]), "owner": d["owner"], "nameHash": hx(fleet.name_hash(d["name"])),
+              "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in d["head"].items()}, "signature": hx(d["signature"])}
+             for d in dbs[:3]]
+    mdata, mdigest = fleet.manifest(chain_id, rollup, 7, items)
+    admit = [dbs[0]["dbId"], dbs[0]["owner"], eth.address(key(1)).lower(), 1800000000]
+    retire = [dbs[1]["dbId"], 1800000001]
+    rootmsg = [7, fleet.root([(d["dbId"], d["leaf"]) for d in dbs[:3]]), mdigest, 1800000002]
+    msgs = [("Head", fleet.HEAD_TYPE, [dbs[0]["head"][k] for k in ("dbId", "instanceId", "fromHeight", "toHeight", "chainHashAfter",
+                                                                     "stateRoot", "manifestDigest", "epoch")], 0),
+            ("Admit", fleet.ADMIT_TYPE, admit, 2), ("Retire", fleet.RETIRE_TYPE, retire, 1), ("Root", fleet.ROOT_TYPE, rootmsg, 2)]
+    return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup,
+            "databases": [{"name": d["name"], "owner": d["owner"], "dbId": hx(d["dbId"]), "nameHash": hx(fleet.name_hash(d["name"])),
+                           "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in d["head"].items()},
+                           "headDigest": hx(d["headDigest"]), "key": d["key"], "signature": hx(d["signature"]), "leaf": hx(d["leaf"])}
+                          for d in dbs],
+            "roots": roots,
+            "manifest": {"seq": 7, "leaves": 3, "bytes": mdata.decode(), "sha256": hx(mdigest)},
+            "messages": [{"type": t, "typeString": ts, "fields": [hx(f) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
+                          "digest": hx(eth.typed_digest(dom, ts, *fields)), "signature": hx(eth.sign(key(k), eth.typed_digest(dom, ts, *fields)))}
+                         for t, ts, fields, k in msgs]}
 
 
 def main():
@@ -118,7 +172,7 @@ def main():
         return 1
     # every message the reference operators sign or verify in their own domains has a vector (#279); Batch is in the
     # DA's domain (names) and Permit in the asset's
-    missing = [ts for mod, sect in ((hpplite_store, "bucketMessages"), (relay, "relayMessages"))
+    missing = [ts for mod, sect in ((hpplite_store, "bucketMessages"), (relay, "relayMessages"), (fleet, "fleet"))
                for name, ts in sorted(vars(mod).items())
                if name.endswith("_TYPE") and name not in ("BATCH_TYPE", "PERMIT_TYPE") and ts not in [m["typeString"] for m in v[sect]["messages"]]]
     if missing:

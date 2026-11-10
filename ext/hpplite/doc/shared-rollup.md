@@ -1,5 +1,13 @@
 # The shared rollup (draft for decision, not built)
 
+Changed after somaro's reading (decision 0016): the anchor reads no database
+file and holds no database key - each database's sequencer signs its head at
+flush, the head rides with the batch's name write, and an anchor operator
+builds the root from the heads at the store. Leases on chain per database,
+admission by the fleet's owner, retirement, and how a database's latest root
+and its epoch there are found are added. The protocol is fixed in
+[fleet-protocol.md](fleet-protocol.md); where this draft differs, that one holds.
+
 Status: a draft (#297), 2026-11-10, written for the maintainer's morning decision at
 somaro's request (somaro decision 0016, docs/FLEET.md). Nothing here is built
 or deployed. It answers: per-database leases with epoch fencing, the epoch
