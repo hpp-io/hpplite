@@ -861,7 +861,12 @@ static void test_rpc_faults(void) {
     if (!w) { kill_proxy(); unsetenv("HPPLITE_RPC_TIMEOUT"); FAIL("open through the proxy"); }
     HppliteNode *nw = hpplite_get_node(w);
     sqlite3_exec(w, "CREATE TABLE f(id INTEGER PRIMARY KEY, phase TEXT)", NULL, NULL, NULL);
-    if (scalar(w, "SELECT hpplite_flush()") <= 0) { sqlite3_close(w); kill_proxy(); unsetenv("HPPLITE_RPC_TIMEOUT"); FAIL("schema batch through the healthy proxy"); }
+    /* the schema batch on chain, by this flush or by the 300 ms timer before it: a flush finding nothing pending
+    ** answers 0, and on a slow runner the timer can be first (#289) */
+    for (int k = 0; k < 10 && scalar(w, "SELECT height FROM hpplite_status") < 2; k++) { scalar(w, "SELECT hpplite_flush()"); usleep(200000); }
+    if (scalar(w, "SELECT height FROM hpplite_status") < 2) {
+        printf("(height %lld, pending %lld, last_error '%s') ", (long long)scalar(w, "SELECT height FROM hpplite_status"),
+               (long long)scalar(w, "SELECT pending FROM hpplite_status"), status_text(w, "last_error")); sqlite3_close(w); kill_proxy(); unsetenv("HPPLITE_RPC_TIMEOUT"); FAIL("schema batch through the healthy proxy"); }
     int written = 0;
     double slowest = 0, t0 = now_s();
     for (size_t p = 0; p < sizeof phase / sizeof phase[0]; p++) {
