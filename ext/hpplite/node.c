@@ -631,7 +631,9 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
     if (!config->hasContract && !config->hasFactory) return;
     node->wantsL1 = 1;
 
-    if (config->hasFactory && config->hasPrivkey) {
+    /* contract= names the rollup and wins over any factory beside it - the alias's (l1=hpp-sepolia), HPPLITE_FACTORY,
+    ** factory= (#271): the factory only finds or creates a rollup when none is named */
+    if (config->hasFactory && config->hasPrivkey && !config->hasContract) {
         /* Use factory to find/create rollup */
         char factoryHex[43];
         snprintf(factoryHex, sizeof(factoryHex), "0x");
@@ -701,7 +703,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                 config->rpcUrl, factoryHex, config->privkey);
             node->ownsL1 = (node->l1 != NULL);
         }
-    } else if (config->hasFactory && node->hasSigner) {
+    } else if (config->hasFactory && node->hasSigner && !config->hasContract) {
         /* a signer's wallet: its rollup on the factory, found by address; a signer creates none (#17) */
         char factoryHex[43], rollupHex[43];
         unsigned char rollup[20];

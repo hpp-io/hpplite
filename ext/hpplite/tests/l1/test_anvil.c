@@ -2675,6 +2675,45 @@ static void dump_txs(const char *addr) {
     run_cmd(cmd, out, sizeof out);
     printf("\n    [transactions of %s:\n%s] ", addr, out);
 }
+/* #271: contract= names the rollup whatever factory is set beside it (the alias's on HPP, HPPLITE_FACTORY, factory=): the
+** harness's open passes factory= always, so here it stands for the alias's. Before the fix the factory branch ran first,
+** found no rollup of the app's key and created one, and the named rollup sat unused */
+static void test_contract_beats_factory(void) {
+    TEST("contract= beside a factory (#271): the app's key sequences the rollup named and creates none of its own");
+    static const char *APPKEY = "0x5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b";
+    char appAddr[48], cmd[600], out[400], contract[80], on[80], sql[300], extra[200];
+    unsigned char appWallet[20];
+    int own, held;
+    (void)!system("rm -f " DIR "/cbf_owner.db* " DIR "/cbf_app.db*");          /* a previous run's files were another chain's */
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", APPKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(appAddr, sizeof appAddr, "%.42s", out);
+    hpplite_hex_to_bytes(appAddr, appWallet, 20);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", appAddr, RPC);
+    if (system(cmd) != 0) FAIL("fund the app's key");
+
+    sqlite3 *owner = open_db("cbf_owner.db", KEY9, "&dbname=contract-beats-factory");
+    if (!owner) FAIL("open the owner");
+    snprintf(contract, sizeof contract, "%s", status_text(owner, "contract"));
+    if (!contract[0]) { sqlite3_close(owner); FAIL("the owner's open creates the rollup"); }
+    snprintf(sql, sizeof sql, "SELECT hpplite_set_sequencer('%s')", appAddr);
+    if (exec_sql(owner, sql) != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(owner)); sqlite3_close(owner); FAIL("the owner names the app's key"); }
+
+    snprintf(extra, sizeof extra, "&contract=%s", contract);
+    sqlite3 *app = open_db("cbf_app.db", APPKEY, extra);
+    if (!app) { sqlite3_close(owner); FAIL("open with contract= beside factory="); }
+    snprintf(on, sizeof on, "%s", status_text(app, "contract"));
+    own = hpplite_l1_factory_has_rollup(RPC, FACTORY, appWallet);
+    held = lease_of_wallet(contract, appWallet, NULL);
+    sqlite3_close(app);
+    sqlite3_close(owner);
+    if (strcmp(on, contract) != 0 || own != 0 || held != 1) {
+        printf("(on %s, named %s; a rollup of the app's own on the factory: %d; the named rollup's lease held: %d) ", on, contract, own, held);
+        FAIL("contract= should win over the factory");
+    }
+    PASS();
+}
+
 static void test_platform_sidecar(void) {
     TEST("the platform shape (#263, #268): the owner creates and names the app's key, 24 h lease; a plain-connection app with hpplite-sequencer beside it; sleep/wake sends nothing; kill -9, the owner expires, a successor rebuilds from the store and ships; the old host posts nothing over it");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
@@ -2853,6 +2892,7 @@ int main(void) {
     if (wanted(35)) test_snapshots_on_chain();
     if (wanted(36)) test_two_rollups_same_range_bounds();
     if (wanted(37)) test_platform_sidecar();
+    if (wanted(38)) test_contract_beats_factory();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

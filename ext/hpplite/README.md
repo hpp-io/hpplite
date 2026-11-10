@@ -177,7 +177,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `l1` | Yes* | Network alias (`hpp-sepolia`): sets `rpc` and `factory`. `file:///path`: a directory instead of a chain - lease, checkpoints and batches as files, no wallet needed (#35, see Stores and commitments). `local`: no chain, batches are finalized in the file and the history is kept nowhere (#38) |
 | `rpc` | Yes* | L1 RPC URL (if no `l1`) |
 | `factory` | Yes* | Factory contract address (if no `l1`) |
-| `contract` | No | Connect to an existing rollup instead of using the factory |
+| `contract` | No | The rollup to post on or read, by address: a rollup this key does not own (the sequencer the owner named, a verifier), or any rollup when the by-name lookup is not wanted. Wins over any factory set beside it - the alias's (`l1=hpp-sepolia`), `HPPLITE_FACTORY`, `factory=` (#271) - so an app on a platform's rollup never gets a rollup of its own |
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
 | `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). The only value: any other refuses the open (#248); a sequencer needs no `role=` |
@@ -1034,7 +1034,7 @@ Paying in the HPP token itself is open (#175).
 | v0.6 | Operators (#181): the canonical store and relay, `store=on` / `relay=on`, the protocols and their conformance vectors | same | same |
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
 | v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#258) | same | same |
-| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267), the platform shape end to end on anvil (#268), the first-tick anchor fixed (#270), the static musl build of the tools and `HPPLITE_CA_BUNDLE` (#269) | same | same |
+| v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267), the platform shape end to end on anvil (#268), the first-tick anchor fixed (#270), the static musl build of the tools and `HPPLITE_CA_BUNDLE` (#269), `contract=` wins over a factory set beside it (#271) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database
