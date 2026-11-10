@@ -204,16 +204,32 @@ messages over `(fleet, dbId)` (vectors in `relayMessages`):
 
 | Type | Signed by |
 |------|-----------|
-| `SponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the funder, and the database's side: its owner or its sequencer on the fleet's record |
+| `SponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the funder, and the database's side: with a record its owner or its sequencer; before the record (a join is the first call) its owner alone, the request carrying `owner` and `nameHash`, the relay checking the derivation without a chain read |
 | `UnsponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the sponsor |
 | `CapDb(address fleet,bytes32 dbId,uint256 callsPerDay,uint256 issuedAt)` | the sponsor: a database's joins and claims a day |
 
 A fleet's roots are sponsored with today's `Sponsor` and `Cap`, the fleet in
-place of the rollup and the fleet's owner as the other side: roots are counted
-per fleet. An unsponsored call is answered as an unsponsored rollup's is today
-(the `402`). The relay takes the v11 factory's `createFleetFor` and a fleet's
-`joinFor`, `claimFor`, `postRootFor`, `retireFor` (the calls built on these
-vectors after somaro's second reading).
+place of the rollup and the fleet's owner as the other side (not the anchor):
+roots are counted per fleet. A database's sponsor pays its `joinFor`,
+`claimFor` and `retireFor`; CapDb counts joins and claims, and `retireFor` is
+charged but never refused by the cap nor counted (it is the owner's, once per
+record; somaro's order at `rm` is retire, UnsponsorDb, DeleteDb). No fallback
+between the two: a database with no SponsorDb is not covered by the fleet's
+Sponsor, and the fleet's Sponsor pays `postRootFor` only. `createFleetFor` has
+no sponsor (no fleet yet): its caller pays over x402, as for `createRollupFor`.
+An unsponsored, capped or unfunded call keeps today's `402` (with `sponsor:
+{funder, why}` when there is a sponsor), so the caller may still pay itself. The
+relay tells a fleet from a rollup by the v11 factory's own record
+(`isFleet`), never by probing; a `to` that is neither is refused as today.
+
+Calls, mirroring the store's: `POST /fleet/<fleet>/db/<dbId>/sponsor`
+`{funder, issuedAt, funderSignature, dbSignature[, owner, nameHash]}` (a newer
+SponsorDb from another funder re-sponsors, the cap going with the old funder);
+`.../sponsor/cap` `{funder, callsPerDay, issuedAt, signature}`;
+`.../sponsor/release` `{funder, issuedAt, signature}`; `GET
+/fleet/<fleet>/db/<dbId>/sponsor`; `GET /account/<funder>` lists `databases:
+[{fleet, dbId}]` apart from `rollups`. The reference relay serves them with
+`--fleet-factory` (#313; ctest `test_relay_fleet` on anvil).
 
 ## Not decided here
 
