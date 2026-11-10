@@ -48,8 +48,8 @@ contract HPPLiteFleet {
     address public anchor;
     uint64 public leaseDuration;
     uint256 public rootSeq;
-    mapping(uint256 => bytes32) public roots;
-    mapping(uint256 => bytes32) public manifests;
+    /// keccak256(abi.encode(root, manifestDigest)) per sequence: one slot a root; both are in RootPosted in full
+    mapping(uint256 => bytes32) public rootHash;
     mapping(bytes32 => Db) private _dbs;
 
     event Admitted(bytes32 indexed dbId, address indexed owner, address sequencer, address migratedFrom);
@@ -116,10 +116,16 @@ contract HPPLiteFleet {
         return keccak256(abi.encode(dbId, dbOwner, nameHash, hd));
     }
 
+    /// Root `seq` is (root, manifestDigest), as RootPosted or the store's index gave them
+    function rootIs(uint256 seq, bytes32 root, bytes32 manifestDigest) public view returns (bool) {
+        return root != bytes32(0) && rootHash[seq] == keccak256(abi.encode(root, manifestDigest));
+    }
+
     /// A leaf and its path against root `seq`: siblings bottom up, `left[i]` when sibling i is on the left
-    function verifyLeaf(uint256 seq, bytes32 leaf, bytes32[] calldata path, bool[] calldata left) external view returns (bool) {
-        bytes32 r = roots[seq];
-        return r != bytes32(0) && foldPath(leaf, path, left) == r;
+    function verifyLeaf(uint256 seq, bytes32 root, bytes32 manifestDigest, bytes32 leaf, bytes32[] calldata path, bool[] calldata left)
+        external view returns (bool)
+    {
+        return rootIs(seq, root, manifestDigest) && foldPath(leaf, path, left) == root;
     }
 
     function foldPath(bytes32 leaf, bytes32[] calldata path, bool[] calldata left) public pure returns (bytes32 h) {
@@ -235,8 +241,7 @@ contract HPPLiteFleet {
         require(root != bytes32(0) && manifestDigest != bytes32(0), "Empty root");
         require(rootDigest(seq, root, manifestDigest, deadline).recover(sig) == anchor, "Not the fleet's anchor");
         rootSeq = seq;
-        roots[seq] = root;
-        manifests[seq] = manifestDigest;
+        rootHash[seq] = keccak256(abi.encode(root, manifestDigest));
         emit RootPosted(seq, root, manifestDigest);
     }
 

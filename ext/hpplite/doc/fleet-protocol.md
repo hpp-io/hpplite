@@ -13,7 +13,9 @@ somaro's decisions on it (decision 0016) are folded in below.
   keeps, per database: `dbId`, `owner`, `sequencer`, the lease
   `{instance, until, epoch}`, `epochSince` (the root sequence at which the
   current epoch began), and `retired`. It keeps the fleet's `owner`, its
-  `admitter` and its `anchor` key, and the roots by sequence.
+  `admitter` and its `anchor` key, and per root sequence one slot,
+  `keccak256(abi.encode(root, manifestDigest))`; `RootPosted(seq, root,
+  manifestDigest)` carries both in full and `rootSeq` is the latest (#301).
 - Each **database's sequencer** (its own process and key, one per app: the
   single-file `hpplite-sequencer`) signs its head at every flush; the head
   rides with the batch's name write - one store write per batch (#296).

@@ -122,8 +122,24 @@ contract HPPLiteFleetTest is Test {
         bad = sig(ANCHOR_PK, f.rootDigest(2, r, m, deadline));     // (reused: the stack is short)
         f.postRootFor(2, r, m, deadline, bad);
         assertEq(f.rootSeq(), 2);
-        assertEq(f.roots(2), r);
-        assertEq(f.manifests(2), m);
+        assertTrue(f.rootIs(2, r, m));
+    }
+
+    /// A root is one fresh slot, keccak256(root, manifestDigest); the event carries both in full (somaro: roots are
+    /// the fleet's one recurring cost). Red before: 53549 execution gas, two fresh slots
+    function test_ARootCostsOneSlot() public {
+        root(1);
+        uint256 deadline = block.timestamp + 60;
+        bytes32 r = keccak256("r2");
+        bytes32 m = keccak256("m2");
+        bytes memory s = sig(ANCHOR_PK, f.rootDigest(2, r, m, deadline));
+        uint256 g = gasleft();
+        f.postRootFor(2, r, m, deadline, s);
+        g -= gasleft();
+        emit log_named_uint("postRootFor gas", g);
+        assertLt(g, 40_000, "a root should cost one fresh slot (execution gas; the transaction adds 21k and calldata)");
+        assertTrue(f.rootIs(2, r, m));
+        assertFalse(f.rootIs(2, r, keccak256("another manifest")));
     }
 
     function test_RetiredIsGoneUntilAdmittedAgain() public {
