@@ -248,6 +248,9 @@ bytes above a prune point, is caught by its own signature on chain.
 
 `payment` is `null` for a store without x402 (permit pulls only). A free
 store (development) has `buckets` with zero prices and charges nothing.
+Amounts are whole numbers of the asset's atomic units, but
+`pricePerMiBMonth` is a number that may carry a fraction: `30` and `30.0`
+are the same quote, and a client reads it as a decimal (#282).
 
 ## Payment (x402 v2, `exact` only)
 
