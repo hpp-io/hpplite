@@ -28,6 +28,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include "store.h"
 #include "crypto.h"
 #include "config.h"
@@ -2908,6 +2909,167 @@ static void test_sponsored_relay(void) {
     PASS();
 }
 
+/* 41. A fleet in one process (somaro decision 0016): hpplite-sequencer --dir holds N databases, each its own
+** rollup (opened by contract=) and its own <name>.conf (mode 0600, the key in it), written by N app threads
+** with plain connections. While they write, a database is added and one removed (SIGHUP), untouched by the
+** rest; a file readable by others and one naming no contract= are refused with a line each and stop nothing.
+** SIGTERM closes all within the bound. Every database rebuilt from the chain equals what its app wrote.
+** Measured on the fleet process: threads and fds per database, idle RPC per database per minute (through
+** the proxy). HPPLITE_FLEET_N databases (default 10). */
+typedef struct { const char *file; int rows; int rc; } FleetApp;
+static void *fleet_app(void *arg) {
+    FleetApp *f = (FleetApp *)arg;
+    char sql[160];
+    for (int i = 0; i < f->rows && f->rc == SQLITE_OK; i++) {
+        snprintf(sql, sizeof sql, "INSERT INTO t(v) VALUES('row %d of a fleet database')", i);
+        f->rc = plain_exec(f->file, sql);
+        usleep(30000);
+    }
+    return NULL;
+}
+static int fleet_lines(const char *out, const char *what) {
+    char line[800];
+    int n = 0;
+    FILE *f = fopen(out, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) if (strstr(line, what)) n++;
+    fclose(f);
+    return n;
+}
+static int fleet_wait(const char *out, const char *what, int want, double secs) {
+    double t0 = now_s();
+    while (fleet_lines(out, what) < want) { if (now_s() - t0 > secs) return 0; usleep(200000); }
+    return 1;
+}
+static int fleet_conf(int i, const char *rpc, const char *contract, int mode) {
+    char path[200], body[900];
+    snprintf(path, sizeof path, DIR "/fleet/fleet-%03d.conf", i);
+    snprintf(body, sizeof body, "# fleet database %d\ndb=" DIR "/fleet_db/%03d.db\nparams=rpc=%s&contract=%s&chainid=31337&datadir=" DIR "/fleet_db&interval=1s\nprivkey=%s\n",
+             i, i, rpc, contract, KEY4);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return -1;
+    int ok = write(fd, body, strlen(body)) == (ssize_t)strlen(body);
+    close(fd);
+    chmod(path, (mode_t)mode);
+    return ok ? 0 : -1;
+}
+static long fleet_count(pid_t pid, const char *what) {
+    char cmd[160], out[64];
+    if (!strcmp(what, "threads")) snprintf(cmd, sizeof cmd, "(ps -M -p %d 2>/dev/null | tail -n +2 | grep -c . ) || ls /proc/%d/task | wc -l", (int)pid, (int)pid);
+    else snprintf(cmd, sizeof cmd, "lsof -p %d 2>/dev/null | tail -n +2 | wc -l", (int)pid);
+    return run_cmd(cmd, out, sizeof out) == 0 ? atol(out) : -1;
+}
+static void test_fleet_sequencer(void) {
+    TEST("a fleet in one process (somaro decision 0016): hpplite-sequencer --dir, one conf per database; add and remove on SIGHUP while the others write; refused files stop nothing; SIGTERM closes all; every replica equals its app");
+    static const char *modeFile = DIR "/fleet_proxy.mode";
+    const char *bin = sidecar_bin();
+    int n = (int)soak_env("HPPLITE_FLEET_N", 10), i, port = test_free_port();
+    char rpc[64], contract[201][48], out[] = DIR "/fleet/out.log", err[] = DIR "/fleet/err.log", what[64];
+    const char *why = NULL;
+    if (n < 2) n = 2;
+    if (n > 200) n = 200;
+    if (!bin || access(bin, X_OK) != 0) FAIL("hpplite-sequencer not beside hpplite-verify (HPPLITE_VERIFY_BIN)");
+    (void)!system("rm -rf " DIR "/fleet " DIR "/fleet_db && mkdir -p " DIR "/fleet " DIR "/fleet_db");
+    snprintf(rpc, sizeof rpc, "http://127.0.0.1:%d", port);
+    set_proxy_mode(modeFile, "");
+    if (start_proxy(port, modeFile) != 0) { printf("SKIP (no RPC proxy) "); PASS(); return; }
+    /* the platform creates each database's rollup (by name, once) and from then on knows it by address */
+    double t0 = now_s();
+    for (i = 0; i <= n && !why; i++) {
+        char file[64], extra[64];
+        snprintf(file, sizeof file, "fleet_owner_%03d.db", i);
+        snprintf(extra, sizeof extra, "&dbname=fleet-%03d", i);
+        sqlite3 *o = open_db(file, KEY4, extra);
+        snprintf(contract[i], sizeof contract[i], "%s", o ? status_text(o, "contract") : "");
+        if (o) sqlite3_close(o);
+        if (!contract[i][0]) why = "the platform creates a fleet database's rollup";
+    }
+    double tCreate = now_s() - t0;
+    for (i = 0; i < n && !why; i++) if (fleet_conf(i, rpc, contract[i], 0600) != 0) why = "write a conf file";
+    if (!why) {                                              /* two refused: readable by others, and no contract= */
+        int fd = open(DIR "/fleet/nocontract.conf", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        char body[400];
+        snprintf(body, sizeof body, "db=" DIR "/fleet_db/nc.db\nparams=rpc=%s&factory=%s&chainid=31337&dbname=fleet-nc\nprivkey=%s\n", rpc, FACTORY, KEY4);
+        if (fd >= 0) { (void)!write(fd, body, strlen(body)); close(fd); }
+    }
+    if (!why) {
+        int fd = open(DIR "/fleet/leaky.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        char body[400];
+        snprintf(body, sizeof body, "db=" DIR "/fleet_db/leaky.db\nparams=rpc=%s&contract=%s&chainid=31337\nprivkey=%s\n", rpc, contract[0], KEY4);
+        if (fd >= 0) { (void)!write(fd, body, strlen(body)); close(fd); }
+        chmod(DIR "/fleet/leaky.conf", 0644);
+    }
+    if (why) { kill_proxy(); FAIL(why); }
+    /* the fleet process */
+    unlink(out); unlink(err);
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int fo = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644), fe = open(err, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fo >= 0) dup2(fo, 1);
+        if (fe >= 0) dup2(fe, 2);
+        unsetenv("HPPLITE_PARAMS");
+        execl(bin, bin, "--dir", DIR "/fleet", (char *)NULL);
+        _exit(127);
+    }
+    t0 = now_s();
+    if (!fleet_wait(out, ": synced height", n, 120)) why = "every fleet database says it is synced";
+    double tSynced = now_s() - t0;
+    if (!why && (fleet_lines(out, "leaky: error:") != 1 || fleet_lines(out, "readable by others") != 1)) why = "a conf readable by others is refused with one line";
+    if (!why && fleet_lines(out, "nocontract: error:") != 1) why = "a conf naming no contract= is refused with one line";
+    /* the apps: plain connections, as an app's own process; database 0 writes 10 rows and is then removed */
+    pthread_t th[201];
+    FleetApp app[201];
+    char files[201][80];
+    for (i = 0; i < n && !why; i++) {
+        snprintf(files[i], sizeof files[i], DIR "/fleet_db/%03d.db", i);
+        if (plain_exec(files[i], "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v TEXT)") != SQLITE_OK) why = "an app creates its table";
+    }
+    for (i = 0; i < n && !why; i++) { app[i].file = files[i]; app[i].rows = i == 0 ? 10 : 30; app[i].rc = SQLITE_OK; pthread_create(&th[i], NULL, fleet_app, &app[i]); }
+    if (!why) {
+        pthread_join(th[0], NULL);
+        sleep(3);                                            /* database 0's rows posted on its interval */
+        unlink(DIR "/fleet/fleet-000.conf");                 /* removed while the others write */
+        if (fleet_conf(n, rpc, contract[n], 0600) != 0) why = "write the added database's conf";
+        kill(pid, SIGHUP);
+        if (!why && !fleet_wait(out, "fleet-000: closed", 1, 60)) why = "the removed database closes on SIGHUP";
+        snprintf(what, sizeof what, "fleet-%03d: synced height", n);
+        if (!why && !fleet_wait(out, what, 1, 60)) why = "the added database opens on SIGHUP";
+        for (i = 1; i < n; i++) { pthread_join(th[i], NULL); if (app[i].rc != SQLITE_OK && !why) why = "an app's write failed"; }
+    }
+    if (!why) {
+        snprintf(files[n], sizeof files[n], DIR "/fleet_db/%03d.db", n);
+        if (plain_exec(files[n], "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v TEXT)") != SQLITE_OK) why = "the added app creates its table";
+        app[n].file = files[n]; app[n].rows = 30; app[n].rc = SQLITE_OK;
+        if (!why) { fleet_app(&app[n]); if (app[n].rc != SQLITE_OK) why = "the added app's writes"; }
+    }
+    if (!why && fleet_lines(out, ": closed") != 1) why = "only the removed database closed: the SIGHUP disturbed the others";
+    sleep(3);                                                /* the last interval posts */
+    long thr = fleet_count(pid, "threads"), fds = fleet_count(pid, "fds");
+    long req0 = proxy_stat(modeFile, "requests");
+    sleep(30);
+    long idle = proxy_stat(modeFile, "requests") - req0;
+    int stopRc = stop_sidecar(pid, SIGTERM, 90);
+    printf("\n    %d databases (+1 added, 1 removed): rollups created in %.1f s, all synced %.1f s after the start; fleet process: %ld threads (%.1f per db), %ld open files (%.1f per db); idle RPC %ld requests in 30 s (%.1f per db per minute); SIGTERM exit %d ",
+           n, tCreate, tSynced, thr, (double)thr / n, fds, (double)fds / n, idle, idle * 2.0 / n, stopRc);
+    if (!why && stopRc != 0) why = "SIGTERM should close every database and exit 0";
+    if (!why && fleet_lines(out, ": closed") != n + 1) why = "every database says closed at SIGTERM";
+    kill_proxy();
+    /* each database rebuilt from the chain alone equals what its app wrote */
+    for (i = 0; i <= n && !why; i++) {
+        char file[64], extra[96];
+        snprintf(file, sizeof file, "fleet_replica_%03d.db", i);
+        snprintf(extra, sizeof extra, "&contract=%s&role=verify", contract[i]);
+        sqlite3 *r = open_db(file, KEY4, extra);
+        long long rows = r ? scalar(r, "SELECT count(*) FROM t") : -1, want = i == 0 ? 10 : 30;
+        if (r) sqlite3_close(r);
+        if (rows != want) { static char b[160]; snprintf(b, sizeof b, "database %d: its replica holds %lld rows of %lld", i, rows, want); why = b; }
+    }
+    if (why || getenv("HPPLITE_FLEET_SHOW")) { char c[300]; snprintf(c, sizeof c, "tail -40 %s; tail -8 %s", out, err); printf("\n"); (void)!system(c); }
+    if (why) FAIL(why);
+    PASS();
+}
+
 static void test_platform_sidecar(void) {
     TEST("the platform shape (#263, #268): the owner creates and names the app's key, 24 h lease; a plain-connection app with hpplite-sequencer beside it; sleep/wake sends nothing; kill -9, the owner expires, a successor rebuilds from the store and ships; the old host posts nothing over it");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
@@ -3089,6 +3251,7 @@ int main(void) {
     if (wanted(38)) test_contract_beats_factory();
     if (wanted(39)) test_owner_binds_alone();
     if (wanted(40)) test_sponsored_relay();
+    if (wanted(41)) test_fleet_sequencer();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

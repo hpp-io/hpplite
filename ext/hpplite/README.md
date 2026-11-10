@@ -313,6 +313,20 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   waits for it before the app opens the file, since pages cannot be applied
   while another connection holds the file in WAL mode. The rest goes to
   stderr.
+- **A fleet on one host** (a platform with many apps' databases):
+  `hpplite-sequencer --dir <directory>` holds every database named by a
+  `<name>.conf` there - `db=<path>`, `params=<HPPLITE_PARAMS with
+  contract=>`, `privkey=0x...`, mode 0600, so keys are never on a command
+  line nor in one shared environment - each its own connection, key and
+  rollup, in one process. SIGHUP reads the directory again: a new file
+  opens, a removed one closes (posting what is pending), a changed one is
+  reopened, the others are not disturbed. One line per database on stdout:
+  `<name>: synced height N`, `<name>: closed`, `<name>: error: ...`. One
+  failing does not stop the rest; SIGTERM closes all within
+  `HPPLITE_STOP_SECONDS` (30). Measured (anvil scenario 41): about 2 threads
+  and 21 open files per database - raise the file limit past ~45 databases
+  (systemd `LimitNOFILE`) - and, at `interval=1s`, about 170 RPC requests per
+  idle database a minute, scaling with 1/interval.
 - **A connection opened without HPPLite** (`sqlite3 app.db` from a shell, a
   tool that opens the file plainly) is captured all the same while a
   sequencer is on the file: its commits are frames in the same WAL, read by
