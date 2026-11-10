@@ -323,7 +323,12 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   reopened, the others are not disturbed. One line per database on stdout:
   `<name>: synced height N`, `<name>: closed`, `<name>: error: ...`. One
   failing does not stop the rest; SIGTERM closes all within
-  `HPPLITE_STOP_SECONDS` (30). Measured (anvil scenario 41): about 2 threads
+  `HPPLITE_STOP_SECONDS` (30). One trust domain only: the process follows
+  each `db=` (links included) with the keys its files give it, so over
+  several tenants' volumes in one mount namespace a tenant's link could make
+  it ship another's database under the tenant's key. For tenants, run one
+  single-file sequencer per app, each in its own container with only that
+  app's volume (somaro's choice, #298). Measured (anvil scenario 41): about 2 threads
   and 21 open files per database - raise the file limit past ~45 databases
   (systemd `LimitNOFILE`) - and, at `interval=1s`, about 170 RPC requests per
   idle database a minute, scaling with 1/interval.
