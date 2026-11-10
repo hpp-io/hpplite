@@ -1035,6 +1035,13 @@ static void test_bucket_cap(const char *url) {
         if (hpplite_node_flush_batch(w) >= 1) why = "a flush past the cap should keep the batch pending";
         else if (!strstr(status_text(w->db, "last_error"), "daily cap")) { printf("(%s) ", status_text(w->db, "last_error")); why = "the node should say the bucket's daily cap is reached"; }
     }
+    if (!why) {
+        /* said once per episode, as the wait on a funder is (#272): not again at every flush while the cap holds (#288) */
+        hpplite_error_clear(w->ctx);
+        if (hpplite_node_flush_batch(w) >= 1) why = "the batch should still be pending at the cap";
+        else if (status_text(w->db, "last_error")[0]) { printf("(said again: %.120s) ", status_text(w->db, "last_error")); why = "the cap's refusal should be said once, not at every flush (#288)"; }
+        else if (status_int(w->db, "pending") < 1) why = "the batch is pending while nothing is said";
+    }
     if (!why && console_cap(url, cr, &treasury, da, 0, 0, 1, out, sizeof out) != 0) { printf("(%s) ", out); why = "lifting the cap"; }
     if (!why && hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the flush once the cap is lifted"; }
     hpplite_node_destroy(w);

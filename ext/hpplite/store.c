@@ -61,7 +61,7 @@ struct HppliteStore {
     time_t boundChecked;            /* when that was last asked */
     int hasFund;                    /* the funding key: derived from the node's key */
     int external;                   /* funder= (#272): fundAddr is another's wallet; no key, no binding, no permit from here */
-    int funderWait;                 /* the last refusal is the external funder's to lift */
+    int funderWait;                 /* the last refusal is the funder's to lift: not bound, not covered (#272), its daily cap (#288) */
     HppliteKeypair fundKp;
     unsigned char fundAddr[20];
     uint64_t permitCap;             /* HPPLITE_STORE_PERMIT: what the permit lets the store pull (0: none, the 402s are paid) */
@@ -88,10 +88,11 @@ static void storeBusy(HppliteStore *s, const char *zBody) {
     cJSON *r = zBody ? cJSON_Parse(zBody) : NULL;
     cJSON *e = r ? cJSON_GetObjectItem(r, "error") : NULL;
     cJSON *d = r ? cJSON_GetObjectItem(r, "detail") : NULL;
-    if (e && cJSON_IsString(e) && strcmp(e->valuestring, "bucket_capped") == 0)
+    if (e && cJSON_IsString(e) && strcmp(e->valuestring, "bucket_capped") == 0) {
         snprintf(s->error, sizeof s->error, "the bucket's daily cap is reached, set by its funder; the write waits for the next window (%.160s)",
                  d && cJSON_IsString(d) ? d->valuestring : "429 bucket_capped");
-    else
+        s->funderWait = 1;              /* the funder's to lift, or the window's: said once per episode (#288) */
+    } else
         snprintf(s->error, sizeof s->error, "the store's rate limit is reached; the write waits for the next flush (%.160s)",
                  e && cJSON_IsString(e) ? e->valuestring : "429");
     cJSON_Delete(r);
@@ -1078,6 +1079,7 @@ char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data
     long status;
     if (!s || !data || !len) return NULL;
     s->error[0] = 0;
+    s->funderWait = 0;                  /* this write's own refusal sets it again */
     s->lastFailure = HPPLITE_STORE_FAIL_NONE;
     if (protocolOk(s) != 0) return NULL;
     s->lastBytes = len;
@@ -1198,6 +1200,7 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
     int rc = -1;
     if (!s || !nameOk(zName) || !instance || !data || !len || !sig) return -1;
     s->error[0] = 0;
+    s->funderWait = 0;
     if (protocolOk(s) != 0) return -1;
     body = malloc(len + 97);
     if (!body) return -1;

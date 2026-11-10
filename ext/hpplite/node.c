@@ -2778,7 +2778,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         if (node->failStreak < 6) node->failStreak++;
         node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 0 ? node->config.batchIntervalMs : 5000);
         if (zStoreWhy[0]) {
-            /* an external funder's refusal (#272) is theirs to lift: said once per episode, not at every flush */
+            /* an external funder's refusal (#272) and a bucket's daily cap (#288) are the funder's to lift: said once per episode, not at every flush */
             int funder = node->store && hpplite_store_waiting_on_funder(node->store);
             if (!(funder && node->warnedFunder)) hpplite_error(ctx, "page batch %llu kept pending: %s", (unsigned long long)height, zStoreWhy);
             node->warnedFunder = funder;

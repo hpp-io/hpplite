@@ -134,7 +134,7 @@ sent again later. JSON bodies with `error`; for `402` also
   bucket_capped` with `cap`, `today`, `retryAfter` (seconds to the window's
   end) and a `Retry-After` header; nothing is charged and the bucket's state
   does not change. A node keeps the batch pending and tries again at its
-  next flush, saying why.
+  next flush, saying why once (#288).
 
 ### The permit
 
