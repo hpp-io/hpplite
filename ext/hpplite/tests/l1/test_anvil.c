@@ -1667,7 +1667,7 @@ static void test_store_paid(void) {
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/paid_pins", "--signer-key", DIR "/paid_signer.key",
                "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc, "--network", "eip155:31337",
                "--price-per-write", "1000", "--price-per-mib-month", "0", "--min-pay", "3000",
-               "--pull-threshold", "2500", "--tick-interval", "0.5", (char *)NULL);
+               "--pull-threshold", "1500", "--tick-interval", "0.5", (char *)NULL);   /* two batches: two writes since #296 */
         _exit(127);
     }
     int up = 0;
@@ -1705,7 +1705,7 @@ static void test_store_paid(void) {
     long long fundBal = anvil_usdc_of(usdc, funder);
     printf("(permit: the store pulled %lld units; funder %s holds %lld USDC.e, %ld wei; store_balance %lld, store_spent %lld, bucket %s) ",
            gained, funder, fundBal, first_number(ethOut), balance, spent, status_text(w, "store_bucket"));
-    int okPermit = gained >= 2500 && first_number(ethOut) == 0 && balance == fundBal && spent == 0
+    int okPermit = gained >= 1500 && first_number(ethOut) == 0 && balance == fundBal && spent == 0
                    && strcmp(status_text(w, "store_bucket"), "covered") == 0 && strcmp(status_text(w, "store_state"), "ok") == 0;
     sqlite3_close(w);
     if (!okPermit) PD_FAIL("the store should pull the writes' cost from the funding wallet, which holds no ETH; nothing paid by x402");
@@ -2219,8 +2219,8 @@ static void test_spend_cap(void) {
     setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
     setenv("HPPLITE_SPEND_CHECK_SECONDS", "1", 1);          /* the warning's rate from a second of history, not five minutes */
 #define SP_FAIL(why) do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); unsetenv("HPPLITE_SPEND_CHECK_SECONDS"); FAIL(why); } while (0)
-    /* HPPLITE_STORE_PERMIT=0: every write's 402 is a top-up of 1000 paid by x402 from the funding wallet, two per batch (its bytes, its name) */
-    money_env("5000", "0", "4500/hour", "1000", NULL, NULL);
+    /* HPPLITE_STORE_PERMIT=0: every write's 402 is a top-up of 1000 paid by x402 from the funding wallet, one per batch (its name, #296) */
+    money_env("5000", "0", "2500/hour", "1000", NULL, NULL);
     snprintf(extra, sizeof extra, "&dbname=spendcap&store=http://127.0.0.1:%d", port);
     sqlite3 *w = open_db("spend_writer.db", SKEY, extra);
     if (!w) SP_FAIL("open writer");
@@ -2237,7 +2237,7 @@ static void test_spend_cap(void) {
     snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
     int refused = h == 0 && strstr(err, "SPEND_CAP") && scalar(w, "SELECT pending FROM hpplite_status") > 0 && strcmp(status_text(w, "store_state"), "over cap") == 0;
     printf("(spent %lld, window %lld; third put: flush %lld, '%.80s') ", spent, window, h, err);
-    if (spent != 4000 || window != spent || !refused) { sqlite3_close(w); SP_FAIL("the third batch should wait over spendcap, the window holding the two"); }
+    if (spent != 2000 || window != spent || !refused) { sqlite3_close(w); SP_FAIL("the third batch should wait over spendcap, the window holding the two"); }
     usleep(1500 * 1000);
     char warn[300];
     snprintf(warn, sizeof warn, "%s", status_text(w, "spend_warning"));

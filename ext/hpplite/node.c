@@ -1809,24 +1809,22 @@ static void node_store_bucket(HppliteNode *node) {
 /* The batch under its rollup's name at the store (#165): the bytes with the sequencer's
 ** signature, so a reader finds it by height before the anchor. Best effort: a store that
 ** takes no names, or refuses, is said once; the hard tier does not depend on it. */
-static void node_name_batch(HppliteNode *node, uint64_t height, const uint8_t *payload, size_t payloadLen) {
+/* The batch under its name: 1 written, 0 not attempted (no addresses, no key to sign with), -1 the store refused it */
+static int node_name_batch(HppliteNode *node, uint64_t height, const uint8_t *payload, size_t payloadLen) {
     char c[43], d[43], name[80];
     unsigned char da[20];
     uint8_t sig[65];
     const char *zDa;
     uint64_t chainId;
-    if (!node->store || !node->l1 || hpplite_l1_get_addresses(node->l1, c, d) != 0) return;
+    if (!node->store || !node->l1 || hpplite_l1_get_addresses(node->l1, c, d) != 0) return 0;
     zDa = d[0] ? d : c;
-    if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return;
+    if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return 0;
     chainId = hpplite_l1_chain_id(node->l1);
     if (!chainId) chainId = hpplite_l1_default_chain_id();          /* a backend on no chain (the mock): the signing domain still needs one */
-    if (hpplite_store_sign_batch(node->store, da, chainId, node->instanceId, height, payload, payloadLen, sig) != 0) return;   /* no raw key here: the content put stands alone */
+    if (hpplite_store_sign_batch(node->store, da, chainId, node->instanceId, height, payload, payloadLen, sig) != 0) return 0;   /* no raw key here: the content put stands alone */
     snprintf(name, sizeof name, "%.40s-%llu", zDa + 2, (unsigned long long)height);
     { char *p; for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a'); }
-    if (hpplite_store_put_named(node->store, name, node->instanceId, payload, payloadLen, sig) != 0 && !node->warnedNames) {
-        fprintf(stderr, "hpplite: the store did not take batch %llu under its name (%s): readers find it only through the anchor\n", (unsigned long long)height, hpplite_store_error(node->store));
-        node->warnedNames = 1;
-    }
+    return hpplite_store_put_named(node->store, name, node->instanceId, payload, payloadLen, sig) == 0 ? 1 : -1;
 }
 
 /* how many batches above the chain's height the store holds (rows of _hpplite_unanchored) */
@@ -2726,9 +2724,20 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         if (hppliteMarkInflightPages(ctx, height, root) != SQLITE_OK) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); free(sealed); free(framed); *pMore = 0; return 0; }
         if (node->store) {
             /* the bytes to the store, the commitment to the chain (#11), as the row flush does */
-            char *zRef;
+            char *zRef = NULL;
+            int named = 0;
             node_store_bucket(node);
-            zRef = hpplite_store_put_at(node->store, height, payload, payloadLen);
+            /* one write per batch (#296): a bucket store under ranges takes the batch by its name, which carries the
+            ** bytes, and holds them under their CID - the ref, computed here. Without a key to sign the name, the
+            ** content put and a name after it, as before */
+            if (node_ranges(node) && hpplite_store_is_bucket(node->store)) named = node_name_batch(node, height, payload, payloadLen);
+            if (named == 1) {
+                uint8_t sha[32];
+                char cid[64];
+                hpplite_store_sha256(payload, payloadLen, sha);
+                hpplite_store_cid_from_sha256(sha, cid);
+                zRef = sqlite3_mprintf("%s", cid);
+            } else if (named == 0) zRef = hpplite_store_put_at(node->store, height, payload, payloadLen);
             node->storeBalanceOk = 0;
             if (!zRef) {
                 if (node->config.storeFallback && hpplite_store_last_failure(node->store) == HPPLITE_STORE_FAIL_UNREACHABLE
@@ -2750,7 +2759,11 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
                 hpplite_keccak256(payload, payloadLen, h);
                 if (node_ranges(node)) {
                     node_anchor_row(node, h, zRef, NULL, 0);   /* the chain's commitment comes with the anchor (#164); the store's word is its bucket statement there */
-                    node_name_batch(node, height, payload, payloadLen);
+                    if (named == 0 && node_name_batch(node, height, payload, payloadLen) < 0 && !node->warnedNames) {
+                        fprintf(stderr, "hpplite: the store did not take batch %llu under its name (%s): readers find it only through the anchor\n",
+                                (unsigned long long)height, hpplite_store_error(node->store));
+                        node->warnedNames = 1;
+                    }
                     txHash = NULL;
                     storedOnly = 1;
                 } else {

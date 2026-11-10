@@ -1201,6 +1201,8 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
     if (!s || !nameOk(zName) || !instance || !data || !len || !sig) return -1;
     s->error[0] = 0;
     s->funderWait = 0;
+    s->lastFailure = HPPLITE_STORE_FAIL_NONE;           /* a batch's one write (#296): what failed decides fallback and waiting */
+    s->lastBytes = len;
     if (protocolOk(s) != 0) return -1;
     body = malloc(len + 97);
     if (!body) return -1;
@@ -1212,10 +1214,13 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
         snprintf(path, sizeof path, "/name/%s", zName);
         if (s->v2 && ensureBucket(s) != 0) status = -1;                 /* /2: a write into the bucket, paid as a put (#214) */
         else status = s->v2 ? paidPost(s, path, body, len + 97, NULL, &out) : storeRequest(s, "POST", path, body, len + 97, NULL, &out, NULL, NULL);
-        if (status == 200) rc = 0;
+        if (status == 200) { rc = 0; s->nOk++; }                          /* a batch's write, counted as its put was (#296) */
         else if (status == -1) { /* the reason is in s->error */ }
         else if (status == 429) storeBusy(s, out.p);
         else if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s: %.120s", status, zName, out.p ? out.p : "");
+        if (rc != 0 && s->lastFailure == HPPLITE_STORE_FAIL_NONE)
+            s->lastFailure = status == 402 && (strstr(s->error, "HPPLITE_STORE_CAP") || strstr(s->error, "HPPLITE_SPEND_CAP")) ? HPPLITE_STORE_FAIL_CAP
+                           : status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;
     }
     free(body);
     free(out.p);

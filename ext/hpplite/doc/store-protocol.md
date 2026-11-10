@@ -127,7 +127,8 @@ sent again later. JSON bodies with `error`; for `402` also
   funder drops it). A platform paying for many apps from one account bounds
   what an app's key - which sits in the app's process - can cost it.
 - The store counts every new name and content put (bytes held already count
-  nothing; a node's batch is two writes, its bytes and its name) in a rolling
+  nothing; a node's batch is one write, its name - two, its bytes then its
+  name, from a node before #296) in a rolling
   window of 86400 s from the first write in it:
   `today {writes, bytes, since}` on `GET /bucket/<da>`, kept whether or not
   there is a cap. A write that would pass the cap answers `429
@@ -276,8 +277,11 @@ charged to the account as owed).
 - **Through the console**: given `funder=<address>`, the node signs only
   its half of the binding; the console's signer signs the rest and the
   permit.
-- It writes names (the bytes once) and other content (manifests, snapshots)
-  as signed bucket puts, commits the bucket statement with each anchor, and
+- It writes each batch once, by its name (#296): the name write carries the
+  bytes and the store holds them under their CID, which the node computes
+  and puts in the anchor's manifest. A store takes a content put before the
+  name as well (nodes before #296, and a node with no key to sign the name).
+  Other content (manifests, snapshots) goes as signed bucket puts. It commits the bucket statement with each anchor, and
   reports `covered_until` and the bucket's state in `hpplite_status`.
 - `kubo://` and `s3://` stores: removed in v0.8 (#250); a store speaks this protocol.
 

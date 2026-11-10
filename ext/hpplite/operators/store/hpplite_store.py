@@ -478,7 +478,7 @@ class Ledger:
 class Service:
     def __init__(self, args):
         self.args = args
-        self.puts = 0                     # content puts seen (the --fail-put and --busy-put test hooks)
+        self.puts = 0                     # content puts and batch names seen (the --fail-put and --busy-put test hooks)
         self.disk = Disk(args.dir)
         with open(args.signer_key) as f:
             key = bytes.fromhex(f.read().strip().replace("0x", ""))
@@ -837,6 +837,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not m or len(body) <= 97 or len(body) > self.service.args.max_bytes + 97:
             return self.reply(400, {"error": "a name is <da>-<height>, the body the bytes, a 32-byte instance and a 65-byte signature"})
         da, height = "0x" + m.group(1), int(m.group(2))
+        # a batch is its name since #296: the test hooks count it as they counted its content put
+        self.service.puts += 1
+        if self.service.args.fail_put and self.service.puts == self.service.args.fail_put:
+            return self.reply(503, {"error": "test hook: this put is refused (--fail-put)"})
+        if self.service.args.busy_put and self.service.puts == self.service.args.busy_put:
+            return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": "60"})
         instance, data = "0x" + body[-97:-65].hex(), body[:-97]
         signer = eth.recover(batch_digest(self.service.chain_id, da, instance, height, data), body[-65:])
         if not signer:
@@ -1041,7 +1047,7 @@ def main():
     ap.add_argument("--sweep-age", type=int, default=3600, help="bytes in no bucket older than this are swept")
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)
-    ap.add_argument("--fail-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th content put answers 503
+    ap.add_argument("--fail-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th content put or batch name answers 503
     ap.add_argument("--busy-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th answers 429 as an operator's rate limit does
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()

@@ -851,7 +851,7 @@ static void test_snapshot_name_refused(const char *dir) {
     int got;
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/nr_pins", test_dir());
-    pid = start_store_at(dir, port, storeDir, 5, 0);              /* content puts: batches 1-3, then the chunk (4), the name (5), the index */
+    pid = start_store_at(dir, port, storeDir, 5, 0);              /* puts (a batch's name counts as one, #296): batches 1-3, then the chunk (4), the name (5), the index */
     if (pid < 0) FAIL("the test's store did not start");
     memset(&o, 0, sizeof o);
     o.storeUrl = url; o.nodeId = "nr_w"; o.privkey = kseq; o.snapshotMs = 1; o.keepSeconds = 3600; o.dbName = "named";
@@ -1024,8 +1024,8 @@ static void test_bucket_cap(const char *url) {
     hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
     if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the first flush"; }
     if (!why && (writes = bucket_writes_today(url, daHex)) < 1) why = "the store should count the day's writes";
-    /* a batch is two writes at the store, its bytes and its name: room for one more batch */
-    if (!why && console_cap(url, cr, &treasury, da, (uint64_t)writes + 2, 0, 0, out, sizeof out) != 0) { printf("(%s) ", out); why = "the funder's cap"; }
+    /* a batch is one write at the store, its name (#296): room for one more batch */
+    if (!why && console_cap(url, cr, &treasury, da, (uint64_t)writes + 1, 0, 0, out, sizeof out) != 0) { printf("(%s) ", out); why = "the funder's cap"; }
     if (!why) {
         hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);
         if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the flush within the cap"; }
@@ -1047,6 +1047,47 @@ static void test_bucket_cap(const char *url) {
     hpplite_node_destroy(w);
     hpplite_l1_disconnect(l1);
     hpplite_crypto_free(cr);
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* 6k2. One write per batch (#296): with a bucket store and names, a batch goes to the store once - its name, which
+** carries the bytes - not as a content put and then a name. Red before: two writes a batch at the store. */
+static void test_one_write_per_batch(const char *url) {
+    TEST("one store write per batch (#296): a batch is its name write, which carries the bytes; the anchor's ref is their CID, read back by it");
+    static const unsigned char kseq[32] = { [31] = 0x96 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "once_w", .privkey = kseq };
+    HppliteNode *w = test_open_node(tpath("once_w.db"), l1, &o);
+    unsigned char da[20];
+    char daHex[43];
+    const char *why = NULL;
+    long long w1 = -1, w2 = -1;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the first flush"; }
+    if (!why && (da_of(l1, da, daHex) != 0 || (w1 = bucket_writes_today(url, daHex)) < 1)) why = "the store counts the bucket's writes";
+    if (!why) {
+        hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the second flush"; }
+    }
+    if (!why) {
+        w2 = bucket_writes_today(url, daHex);
+        printf("(writes at the store for one batch: %lld) ", w2 - w1);
+        if (w2 - w1 != 1) why = "a batch should be one write at the store, its name (#296)";
+    }
+    if (!why && hpplite_node_anchor(w) != 2) { printf("(%s) ", status_text(w->db, "last_error")); why = "the anchor of the two batches, by their CIDs"; }
+    if (!why) {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "once_r", .privkey = kseq };
+        HppliteNode *r = test_open_node(tpath("once_r.db"), l1, &ro);
+        int rows = r ? count_rows(r->db, "t") : -1, same = r ? same_root(w, r) : 0;
+        printf("(a verifier: rows %d, same root %d) ", rows, same);
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); }
+        if (rows != 2 || !same) why = "a verifier rebuilds both batches from the store";
+    }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
     if (why) FAIL(why);
     PASS();
 }
@@ -1704,6 +1745,7 @@ int main(int argc, char **argv) {
     test_no_anchor_at_close(url);
     test_external_funder(url, dir);
     test_bucket_cap(url);
+    test_one_write_per_batch(url);
     test_store_rate_limited(dir);
     test_snapshot_made(url);
     test_snapshot_replica(url);
