@@ -214,6 +214,8 @@ if(HPPLITE_BUILD_TESTS)
     target_link_libraries(test_l1_dir hpplite_testlib)
 
     add_executable(test_store tests/unit/test_store.c)
+    add_executable(test_l1_threads tests/unit/test_l1_threads.c)
+    target_link_libraries(test_l1_threads hpplite_testlib)
     add_executable(test_l1_version tests/unit/test_l1_version.c)
     target_link_libraries(test_l1_version hpplite_testlib)
     add_executable(test_ca_bundle tests/unit/test_ca_bundle.c)
@@ -381,6 +383,7 @@ if(HPPLITE_BUILD_TESTS)
         # The node's store client against it (#11); paid on anvil in scenario 19
         add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
         # the chain client refuses contracts before VERSION 8 (#252), against a JSON-RPC stand-in
+        add_test(NAME test_l1_threads COMMAND test_l1_threads)
         add_test(NAME test_l1_version COMMAND test_l1_version ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/rpc_stub.py)
         # HPPLITE_CA_BUNDLE names the certificate file both curl clients trust (#269)
         add_test(NAME test_ca_bundle COMMAND test_ca_bundle ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/tls_stub.py)

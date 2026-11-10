@@ -14,6 +14,7 @@
 #include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>
@@ -103,7 +104,7 @@ static uint8_t SEL_GET_ROLLUPS_BY_OWNER[4];
 static uint8_t SEL_CREATE_ROLLUP[4];
 static uint8_t SEL_CREATE_SIMPLE_ROLLUP[4];
 
-static int selectors_initialized = 0;
+static pthread_once_t selectors_once = PTHREAD_ONCE_INIT;   /* a fleet's timer threads connect at once (test_l1_threads) */
 static int eth_get_da_state(HppliteL1 *l1, uint64_t *last_batch_height, uint64_t *total_batches, uint8_t latest_batch_hash[32]);
 
 /* Default factory address on HPP Sepolia (update after deployment) */
@@ -113,8 +114,7 @@ static const char *DEFAULT_FACTORY_ADDRESS = "0x00000000000000000000000000000000
 ** chainid= never reached the client and no other chain (anvil, 31337)
 ** could be used. Found by the anvil harness (#47). */
 
-static void init_selectors(void) {
-    if (selectors_initialized) return;
+static void init_selectors_once(void) {
 
     /* HPPLite selectors (coordination) */
     abi_function_selector("getState()", SEL_GET_STATE);
@@ -173,8 +173,8 @@ static void init_selectors(void) {
     abi_function_selector("ownerNonce()", SEL_OWNER_NONCE);
     abi_function_selector("createNonce(address)", SEL_CREATE_NONCE);
 
-    selectors_initialized = 1;
 }
+static void init_selectors(void) { pthread_once(&selectors_once, init_selectors_once); }
 
 static HppliteL1 *eth_connect(const char *endpoint, const char *contractAddress) {
     if (!endpoint || !contractAddress) return NULL;
