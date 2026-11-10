@@ -47,6 +47,8 @@ def generate():
     pay_to = "0x" + "11" * 20
     sdom = eth.domain_separator("HPPLiteStore", "2", 181228, pay_to)
     da2, funder = "0x" + "ab" * 20, eth.address(key(2)).lower()
+    fleet_addr = "0x" + "f1" * 20
+    fleet_db = fleet.db_id(eth.address(key(1)).lower(), "notes")
     msgs = [("Bind", hpplite_store.BIND_TYPE, [da2, funder, 1800000000], 1),
             ("Release", hpplite_store.RELEASE_TYPE, [da2, funder, 1800000001], 2),
             ("Content", hpplite_store.CONTENT_TYPE, [da2, 7, eth.keccak256(b"first batch")], 1),
@@ -54,7 +56,18 @@ def generate():
             ("BucketStatement", hpplite_store.STATEMENT_TYPE, [da2, 9, 5, hpplite_store.FOREVER, 1800000003], 0),
             # the funder's own words (#274, #275): its daily cap on the bucket, and a release that deletes it now
             ("Cap", hpplite_store.CAP_TYPE, [da2, 100, 1048576, 1800000004], 2),
-            ("Delete", hpplite_store.DELETE_TYPE, [da2, funder, 1800000005], 2)]
+            ("Delete", hpplite_store.DELETE_TYPE, [da2, funder, 1800000005], 2),
+            # a fleet database's bucket (#310): BindDb signed by the funder and by the database's side (its sequencer, or
+            # its owner alone - also before its record exists, with owner and nameHash beside it); the rest by the funder
+            ("BindDb", hpplite_store.BINDDB_TYPE, [fleet_addr, fleet_db, funder, 1800000006], 2),
+            ("BindDb", hpplite_store.BINDDB_TYPE, [fleet_addr, fleet_db, funder, 1800000006], 1),
+            ("ReleaseDb", hpplite_store.RELEASEDB_TYPE, [fleet_addr, fleet_db, funder, 1800000007], 2),
+            ("DeleteDb", hpplite_store.DELETEDB_TYPE, [fleet_addr, fleet_db, funder, 1800000008], 2),
+            ("CapDb", hpplite_store.CAPDB_TYPE, [fleet_addr, fleet_db, 100, 1048576, 1800000009], 2),
+            # the fleet's own bucket (its manifests) is a rollup bucket with the fleet in da, bound by the fleet's funder,
+            # and the anchor's manifest is Content with the fleet in da and the root's sequence as its height
+            ("Bind", hpplite_store.BIND_TYPE, [fleet_addr, funder, 1800000010], 2),
+            ("Content", hpplite_store.CONTENT_TYPE, [fleet_addr, 7, eth.keccak256(b"a fleet's manifest")], 0)]
     v["bucketMessages"] = {"chainId": 181228, "payTo": pay_to, "messages": [
         {"type": t, "typeString": ts, "fields": [("0x" + f.hex()) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
          "digest": "0x" + eth.typed_digest(sdom, ts, *fields).hex(),

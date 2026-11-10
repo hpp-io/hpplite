@@ -103,6 +103,96 @@
     "signature": "0x4fe4e531a59abd2cba15e2af44c0ce3f32c28aee60264b891c21a4958e662b6203752daffe22cb9455946c65f2ecab5786f35b5dcb119342d9537416dc7f1f161c",
     "type": "Delete",
     "typeString": "Delete(address da,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x1bff65ab64c94cf22573294eeeafc65b461103bd22d191686bd8e57d88425c66",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000006
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x63386c02b534ad80f4c677c9ef495ed7d397de5c4accb18da3a477de8763c5112ded1a614f6014d680db6f7c18ec523fc68c1f600d370d0cfbe185d00a33ffbd1c",
+    "type": "BindDb",
+    "typeString": "BindDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x1bff65ab64c94cf22573294eeeafc65b461103bd22d191686bd8e57d88425c66",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000006
+    ],
+    "key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+    "signature": "0xc9f895241f5b3b50b3cd4dba28131f4b87d072d97b02a9c2ae4f1cbc6cd99ea70ce6ca5b4cb5cee3942f57bbe616343853544348772e747c4b0c16d01ce316e91b",
+    "type": "BindDb",
+    "typeString": "BindDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x6eb9b481d4ab5340a7bbe8ab5ce0dd6c7b90ef58e712b502306efb1d7a798334",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000007
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x5436d75c1cfddbfa49d8948c35a25f7be2251af2bf928d34e7a8cbaca4f48fae65d5c3282950e9bb8ad8de5e1d72e51c18b648d6a2c09de96d5caaa464ff3a7b1c",
+    "type": "ReleaseDb",
+    "typeString": "ReleaseDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x99d620870064df3e1cd120a5a098c94bc021f2a08639bfc25418576fe467504f",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000008
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0xd82624d60b0bde23bb5380c23934c84d3baa622c7907a713f367d9261c51f93d5937508bd4706e7f801d8504bc9741173299ddb1c3d8585bf38d9b10affdf8651c",
+    "type": "DeleteDb",
+    "typeString": "DeleteDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x691a4971a531064644821ddcb59ee2d430c92f2821f819f0d58b586d31d841c8",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x2f149213b5aac4d528cd8fe7fea3b32e3d5cb17b2d1f3d70e955e80cea28a1d1",
+     100,
+     1048576,
+     1800000009
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0x9e9c44029b3bb252fb419aa5d934d212c7f01d4f76998b23bb4479b21d3c910f45deb329a97c2fff9650abcd05d902d7e03ec0a9d73a446f9c9488065d3d56871c",
+    "type": "CapDb",
+    "typeString": "CapDb(address fleet,bytes32 dbId,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x26d58ebcfcd168b46bb52ac34b075ba668ef7f2d59c31aef5344f16e448eb0d1",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     1800000010
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0xc6fb966ad4e2291667ced780cdf117dc0c4a40c0253986531efdba33f37348475b35d64a2e0274336cf60fee65d3f7863caab6a25b58fb306163c032303d423c1c",
+    "type": "Bind",
+    "typeString": "Bind(address da,address funder,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x6c11e53304387d1f53f38add6d549e51ec8ffb6ded92f55fa08d0d189adb22b4",
+    "fields": [
+     "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+     7,
+     "0x3d2fd13c9d0f7fadddcde83204940e81c01cb1b6031bc46b57f96d6b6f0e2d8b"
+    ],
+    "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+    "signature": "0xc3da161b53c1fe68e46e245363cae33b07a6e5767c21bb3b088f00b2a8faa1122f5b485773a35af33bbce90dda3edc413810adc12c49050efb6519b5d944ff381b",
+    "type": "Content",
+    "typeString": "Content(address da,uint256 height,bytes32 hash)"
    }
   ],
   "payTo": "0x1111111111111111111111111111111111111111"

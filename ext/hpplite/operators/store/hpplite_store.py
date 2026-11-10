@@ -55,6 +55,11 @@ DELETE_TYPE = "Delete(address da,address funder,uint256 issuedAt)"      # a rele
 CONTENT_TYPE = "Content(address da,uint256 height,bytes32 hash)"
 PRUNE_TYPE = "Prune(address da,uint256 height,uint256 issuedAt)"
 CAP_TYPE = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"   # the funder's daily bound (#274)
+# a fleet database's bucket (hpplite-fleet/1, #297, #310): the same four over (fleet, dbId) instead of a rollup's DA
+BINDDB_TYPE = "BindDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+RELEASEDB_TYPE = "ReleaseDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+DELETEDB_TYPE = "DeleteDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
+CAPDB_TYPE = "CapDb(address fleet,bytes32 dbId,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"
 DAY = 86400
 STATEMENT_TYPE = "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
 BATCH_TYPE = "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)"

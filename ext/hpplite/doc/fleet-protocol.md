@@ -149,8 +149,31 @@ whose earlier heads the store never held (a migration, a second store), is
 fields of `admitFor`. Until the money below is built, a store that charges
 answers fleet writes `501`.
 
-**Funding and caps.** One bucket per `(fleet, dbId)`, bound by one Bind per
-database as today, the fleet's treasury (or a database's own funder in a
+**Funding and caps.** One bucket per `(fleet, dbId)`. Its messages, in the
+store's domain `("HPPLiteStore", "2", chainId, payTo)`, are today's four over
+`(fleet, dbId)` (#310; vectors in `bucketMessages`):
+
+| Type | Signed by |
+|------|-----------|
+| `BindDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the funder, and the database's side: with a record, its sequencer, or its owner alone (as #273); before its record exists, its owner alone, the request carrying `owner` and `nameHash` so the store checks `dbId = keccak256(abi.encode(owner, nameHash))` - no chain read |
+| `ReleaseDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the funder |
+| `DeleteDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)` | the funder |
+| `CapDb(address fleet,bytes32 dbId,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)` | the funder |
+
+A bucket bound before the record costs its funder nothing until bytes come,
+and bytes come only with a head the fleet's record accepts; the record's owner
+is the binding's (#307). The fleet's own bucket (its manifests) is a rollup
+bucket with the fleet in `da`, bound by the fleet's funder with `Bind`; the
+anchor's manifest is `Content` with the fleet in `da` and the root's sequence
+as its height (both with vectors). The listing: `GET /account/<funder>` names
+fleet databases apart, `databases: [{fleet, dbId}]`, `buckets` staying
+addresses; one database's bucket is `GET /fleet/<fleet>/db/<dbId>/bucket`,
+today's bucket body with `fleet` and `dbId` in place of `da`. The database's
+view (`GET /fleet/<fleet>/db/<dbId>`) also carries `anchored: {seq, toHeight,
+time}` - the latest indexed root holding it, its head's height there and
+RootPosted's block time - a hint like `latestRoot`.
+
+One BindDb per database, the fleet's treasury (or a database's own funder in a
 common fleet) as funder, a cap per database; the name write is charged to
 that bucket. Admission and payment stay two decisions by two keys. The
 manifest's bytes are charged to the fleet's own bucket, bound once by the
