@@ -1136,10 +1136,11 @@ static const char *soak_drain(sqlite3 *w) {
 }
 /* ...and for the checkpoint a root batch owes: the timer thread may still be
 ** submitting it when the log reads empty, and hpplite-verify asks the chain */
-static const char *soak_settle(sqlite3 *w) {
+static const char *soak_settle(sqlite3 *w, int store) {
     int i;
     const char *why = soak_drain(w);
     if (why) return why;
+    if (store) return NULL;     /* with a store no checkpoint is sent: the anchor carries the root (#256, #285) */
     for (i = 0; i < 50; i++) {
         if (scalar(w, "SELECT height - 1 - last_checkpoint_height FROM hpplite_status") < 5) return NULL;   /* checkpoint=5 */
         usleep(200000);
@@ -1202,7 +1203,7 @@ static void test_soak(void) {
             double t0, tRebuild, tVerify;
             int vrc;
             checks++;
-            if ((why = soak_settle(w)) != NULL) break;
+            if ((why = soak_settle(w, storeUrl[0] != 0)) != NULL) break;
             t0 = now_s();
             soak_fresh_replica();
             why = replica_equals_as(w, "soak_replica.db", KEY0, replicaExtra);
@@ -1223,7 +1224,9 @@ static void test_soak(void) {
     }
     if (!why) {
         HppliteNode *n = hpplite_get_node(w);
-        why = soak_settle(w);
+        why = soak_settle(w, storeUrl[0] != 0);
+        /* under a store the chain holds what an anchor names: the passes above ran between anchors, the end anchors (#285) */
+        if (!why && storeUrl[0] && scalar(w, "SELECT hpplite_anchor()") <= 0) why = "the anchor at the end failed";
         if (!why) why = chain_contiguous(n);
         if (!why) { soak_fresh_replica(); why = replica_equals_as(w, "soak_replica.db", KEY0, replicaExtra); }
         if (!why && run_verify(verifyCmd, out, sizeof out) != 0) why = out;
