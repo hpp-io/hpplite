@@ -29,6 +29,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include "store.h"
+#include "crypto.h"
 #include "config.h"
 #include <unistd.h>
 #include <time.h>
@@ -2714,6 +2715,92 @@ static void test_contract_beats_factory(void) {
     PASS();
 }
 
+/* #273 + #272 on the real contracts: the platform owns the app's rollup and pays for its bucket from a treasury (here the
+** owner key itself) without holding the app's key: a Bind signed by the funder alone, accepted because the funder is the
+** rollup's owner() on chain; the app opens with funder=<treasury> and writes into the bucket the platform bound, binding
+** nothing and giving no permit of its own. Red before: the store answered 401 to a Bind without the sequencer's signature */
+static void test_owner_binds_alone(void) {
+    TEST("the owner binds the app's bucket to its treasury alone (#273) and the app writes with funder= (#272): no app key at the platform, no funding key at the app");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char *APPKEY = "0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c";
+    char appAddr[48], ownerAddr[48], cmd[1200], out[4000], contract[80], c[43], d[43], sql[300], extra[400], url[64], json[600], sigHex[133];
+    unsigned char ownerKey[32], da[20], digest[32], sig[65], v;
+    HppliteCrypto *cr = hpplite_crypto_init();
+    HppliteKeypair owner;
+    HppliteSignature hs;
+    uint64_t issued;
+    int port;
+    pid_t store;
+    FILE *f;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    (void)!system("rm -f " DIR "/ob_owner.db* " DIR "/ob_app.db*");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", APPKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(appAddr, sizeof appAddr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", appAddr, RPC);
+    if (system(cmd) != 0) FAIL("fund the app's key");
+    if (!cr || hpplite_hex_to_bytes(KEY9 + 2, ownerKey, 32) != 32 || hpplite_crypto_keypair_from_privkey(cr, &owner, ownerKey) != 0) FAIL("the owner's key");
+    ownerAddr[0] = '0'; ownerAddr[1] = 'x';
+    hpplite_bytes_to_hex(owner.address, 20, ownerAddr + 2);
+    for (char *p = ownerAddr; *p; p++) if (*p >= 'A' && *p <= 'F') *p += 32;
+
+    /* the platform: the owner creates the rollup and names the app's key; it never holds the app's key */
+    sqlite3 *own = open_db("ob_owner.db", KEY9, "&dbname=owner-binds");
+    if (!own) FAIL("open the owner");
+    snprintf(contract, sizeof contract, "%s", status_text(own, "contract"));
+    snprintf(sql, sizeof sql, "SELECT hpplite_set_sequencer('%s')", appAddr);
+    if (!contract[0] || exec_sql(own, sql) != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(own)); sqlite3_close(own); FAIL("the owner creates the rollup and names the app's key"); }
+    snprintf(cmd, sizeof cmd, "cast call %s 'getDA(address)(address)' %s --rpc-url %s 2>/dev/null", FACTORY, contract, RPC);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) { sqlite3_close(own); FAIL("the rollup's DA address"); }
+    snprintf(d, sizeof d, "%.42s", out);
+    for (char *p = d; *p; p++) if (*p >= 'A' && *p <= 'F') *p += 32;
+    c[0] = 0;
+    if (hpplite_hex_to_bytes(d + 2, da, 20) != 20) { sqlite3_close(own); FAIL("the DA address"); }
+    port = test_free_port();
+    store = start_pin_service_free(svc, port);
+    if (store < 0) { sqlite3_close(own); FAIL("the store did not come up"); }
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+#define OB_CLEANUP() do { kill(store, SIGTERM); waitpid(store, NULL, 0); sqlite3_close(own); hpplite_crypto_free(cr); } while (0)
+
+    /* the platform's console: Bind(da, treasury, now) signed by the treasury alone; the treasury is the rollup's owner */
+    {
+        HppliteStore *con = hpplite_store_open(url, NULL, 0);
+        issued = (uint64_t)time(NULL);
+        if (!con) { OB_CLEANUP(); FAIL("a store handle for the digest"); }
+        hpplite_store_set_bucket(con, da, 0);
+        if (hpplite_store_bind_digest(con, owner.address, issued, digest) != 0) { hpplite_store_close(con); OB_CLEANUP(); FAIL("the Bind digest"); }
+        hpplite_store_close(con);
+    }
+    if (hpplite_crypto_sign(cr, &owner, digest, &hs) != 0) { OB_CLEANUP(); FAIL("sign the binding"); }
+    hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);
+    sig[64] = v;
+    sigHex[0] = '0'; sigHex[1] = 'x';
+    hpplite_bytes_to_hex(sig, 65, sigHex + 2);
+    snprintf(json, sizeof json, "{\"funder\":\"%s\",\"issuedAt\":%llu,\"funderSignature\":\"%s\"}", ownerAddr, (unsigned long long)issued, sigHex);
+    f = fopen(DIR "/ob_bind.json", "w");
+    if (!f) { OB_CLEANUP(); FAIL("write the binding"); }
+    fputs(json, f); fclose(f);
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data-binary @" DIR "/ob_bind.json %s/bucket/%s", url, d[0] ? d : c);
+    if (run_cmd(cmd, out, sizeof out) != 0 || !strstr(out, "\"covered\"")) { printf("(%s) ", out); OB_CLEANUP(); FAIL("the owner's binding alone should be taken (red: 401, the sequencer's signature wanted)"); }
+
+    /* the app: its own key, the platform's rollup and store, funder=<treasury>: it binds nothing and writes into the bound bucket */
+    snprintf(extra, sizeof extra, "&contract=%s&store=%s&funder=%s", contract, url, ownerAddr);
+    sqlite3 *app = open_db("ob_app.db", APPKEY, extra);
+    if (!app) { OB_CLEANUP(); FAIL("open the app with funder="); }
+    if (exec_sql(app, "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('paid by the platform')") != SQLITE_OK
+        || exec_sql(app, "SELECT hpplite_flush()") != SQLITE_OK) { printf("(%s) ", status_text(app, "last_error")); sqlite3_close(app); OB_CLEANUP(); FAIL("the app's write through the platform's bucket"); }
+    {
+        const char *why = NULL, *h;
+        if (strcmp(status_text(app, "store_funder"), ownerAddr) != 0) { printf("(store_funder %s) ", status_text(app, "store_funder")); why = "store_funder should be the treasury"; }
+        snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/bucket/%s", url, d[0] ? d : c);
+        if (!why && (run_cmd(cmd, out, sizeof out) != 0 || !strstr(out, ownerAddr) || !(h = strstr(out, "\"height\":")) || atoi(h + 9) < 1)) { printf("(%s) ", out); why = "the bucket should stay the treasury's and hold the app's batch"; }
+        sqlite3_close(app);
+        OB_CLEANUP();
+        if (why) FAIL(why);
+    }
+    PASS();
+}
+
 static void test_platform_sidecar(void) {
     TEST("the platform shape (#263, #268): the owner creates and names the app's key, 24 h lease; a plain-connection app with hpplite-sequencer beside it; sleep/wake sends nothing; kill -9, the owner expires, a successor rebuilds from the store and ships; the old host posts nothing over it");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
@@ -2893,6 +2980,7 @@ int main(void) {
     if (wanted(36)) test_two_rollups_same_range_bounds();
     if (wanted(37)) test_platform_sidecar();
     if (wanted(38)) test_contract_beats_factory();
+    if (wanted(39)) test_owner_binds_alone();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

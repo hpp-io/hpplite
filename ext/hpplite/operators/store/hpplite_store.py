@@ -170,7 +170,9 @@ class Rollups:
             return None
         c = "0x" + coord[-40:]
         key, wallet, inst = self._call(c, "sequencer()"), self._call(c, "sequencerWallet()"), self._call(c, "sequencerInstance()")
-        return {"sequencer": "0x" + key[-40:], "leaseWallet": "0x" + wallet[-40:], "leaseInstance": inst[:66].lower()}
+        owner = self._call(c, "owner()")
+        return {"sequencer": "0x" + key[-40:], "leaseWallet": "0x" + wallet[-40:], "leaseInstance": inst[:66].lower(),
+                "owner": "0x" + owner[-40:]}
 
 
 class Token:
@@ -780,9 +782,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with self.L.lock:
             b = self.L.bucket(da)
             if self.service.rollups:
-                seq = self.service.sequencer_of(da, b)
-                if seq is None:
+                r = self.service.roles(da)
+                if r is None:
                     return self.reply(404, {"error": "no HPPLite rollup at this DA", "da": da})
+                seq = r["sequencer"]
+                if not s_sig and same(funder, r["owner"]):
+                    signer = seq          # the funder alone, being the rollup's owner on chain (#273): its authority covers the sequencer's consent
             else:
                 seq = b.get("sequencer") if b and b["state"] != "deleted" else signer   # no chain: the first binder
             if not same(signer, seq):

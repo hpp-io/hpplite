@@ -119,6 +119,13 @@ class Store:
                                                   "sequencerSignature": "0x" + eth.sign(seq_key, d).hex(),
                                                   "funderSignature": "0x" + eth.sign(funder_key, d).hex()})
 
+    def bind_alone(self, da, funder_key, issued=None):
+        """Bind with the funder's signature only (#273): taken when the funder is the rollup's owner on chain"""
+        funder = eth.address(funder_key).lower()
+        issued = issued or int(time.time())
+        d = self.digest(BIND, da, funder, issued)
+        return jpost(self.url + "/bucket/" + da, {"funder": funder, "issuedAt": issued, "funderSignature": "0x" + eth.sign(funder_key, d).hex()})
+
     def permit(self, funder_key, value, deadline):
         funder = eth.address(funder_key)
         nonce = int(cast("call", USDC, "nonces(address)(uint256)", funder).split()[0])
@@ -187,6 +194,11 @@ def main():
         check(code == 401, "a binding signed by another key than the rollup's sequencer: 401 (%s)" % code)
         code, out, _ = S.bind("0x" + "11" * 20, k1, F)
         check(code in (404, 503), "a binding for a DA with no rollup: refused (%s)" % code)
+        code, out, _ = S.bind_alone(da, k3, issued=int(time.time()) - 60)
+        check(code == 401, "a binding signed by the funder alone, a funder that is not the rollup's owner: 401 (%s)" % code)
+        code, out, _ = S.bind_alone(da, k1, issued=int(time.time()) - 50)
+        check(code == 200 and out.get("state") == "covered" and out.get("funder") == eth.address(k1).lower(),
+              "a binding signed by the funder alone when the funder is the rollup's owner (#273): covered, the owner the funder (%s %s)" % (code, out))
         code, out, _ = S.bind(da, k1, F)
         check(code == 200 and out.get("state") == "covered", "bound by the sequencer and the funder: covered (%s %s)" % (code, out))
         code, out, _ = S.bind(da, k1, F, issued=int(time.time()) - 100)

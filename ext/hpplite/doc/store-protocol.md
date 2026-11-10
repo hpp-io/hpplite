@@ -50,7 +50,7 @@ gives it:
 
 | Type | Signed by | For |
 |------|-----------|-----|
-| `Bind(address da,address funder,uint256 issuedAt)` | the sequencer and the funder | bind (or rebind) a bucket to an account |
+| `Bind(address da,address funder,uint256 issuedAt)` | the sequencer and the funder; or the funder alone when it is the rollup's `owner()` on chain (#273) | bind (or rebind) a bucket to an account |
 | `Release(address da,address funder,uint256 issuedAt)` | the funder | stop paying for a bucket |
 | `Content(address da,uint256 height,bytes32 hash)` | the sequencer | put bytes into the bucket (`hash` the keccak-256 of the bytes; `height` the batch they belong to, for pruning) |
 | `Prune(address da,uint256 height,uint256 issuedAt)` | the sequencer | let go of the bucket's history before `height` |
@@ -105,6 +105,12 @@ taken; `410` a read of a parked bucket (the body says what restores it);
   restores it.
 - One funder signing both halves is the self-paying case (an agent, or a
   self-provisioned node whose funding key signs as well).
+- A funder that is the rollup's `owner()` on chain binds alone (#273): the
+  owner names the sequencer, so its authority over the rollup covers the
+  sequencer's consent. The bucket's sequencer is the chain's. This is how a
+  platform that owns its apps' rollups pays for their buckets from one
+  treasury without holding the apps' keys; the node runs with `funder=`
+  (hpplite #272) and binds nothing itself.
 
 ### The permit
 
