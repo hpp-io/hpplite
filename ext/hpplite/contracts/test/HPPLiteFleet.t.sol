@@ -142,6 +142,22 @@ contract HPPLiteFleetTest is Test {
         assertFalse(f.rootIs(2, r, keccak256("another manifest")));
     }
 
+    /// One relay call for a new database: the Admit and the first Claim together (somaro)
+    function test_JoinInOneCall() public {
+        uint256 deadline = block.timestamp + 60;
+        bytes memory a = sig(ADMITTER_PK, f.admitDigest(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1));
+        bytes memory c = sig(SEQ_PK, f.claimDigest(DB, bytes32("host-a"), 0, deadline));
+        f.joinFor(DB, vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a, bytes32("host-a"), deadline, c);
+        HPPLiteFleet.Db memory d = f.db(DB);
+        assertEq(d.instance, bytes32("host-a"));
+        assertEq(d.epoch, 1);
+        assertEq(d.claimNonce, 1);
+        bytes memory c2 = sig(SEQ_PK, f.claimDigest(keccak256("another"), bytes32("host-a"), 0, deadline));
+        bytes memory a2 = sig(STRANGER_PK, f.admitDigest(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1));
+        vm.expectRevert(bytes("Not admitted by the fleet"));
+        f.joinFor(keccak256("another"), vm.addr(DBOWNER_PK), vm.addr(SEQ_PK), 1, a2, bytes32("host-a"), deadline, c2);
+    }
+
     function test_RetiredIsGoneUntilAdmittedAgain() public {
         admit(ADMITTER_PK, 1);
         claim(bytes32("host-a"));

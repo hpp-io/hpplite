@@ -140,18 +140,7 @@ contract HPPLiteFleet {
     /// `migratedFrom` and the genesis fields name the dedicated rollup a database's history began on (0: none)
     function admitFor(bytes32 dbId, address dbOwner, address sequencer, uint256 issuedAt, bytes calldata admitSig,
                       address migratedFrom, uint256 genesisHeight, bytes32 genesisChain, bytes32 genesisRoot) external {
-        address a = admitDigest(dbId, dbOwner, sequencer, issuedAt).recover(admitSig);
-        require(a != address(0) && (a == owner || a == admitter), "Not admitted by the fleet");
-        require(dbOwner != address(0) && sequencer != address(0), "No owner or sequencer");
-        Db storage d = _dbs[dbId];
-        require(d.owner == address(0) || d.retired, "Already in the fleet");
-        require(issuedAt > d.admittedAt, "Admit not newer");
-        uint64 epoch = d.epoch;
-        delete _dbs[dbId];
-        d.owner = dbOwner;
-        d.sequencer = sequencer;
-        d.admittedAt = uint64(issuedAt);
-        d.epoch = epoch;                              // a re-admitted dbId never reuses an epoch
+        Db storage d = _admit(dbId, dbOwner, sequencer, issuedAt, admitSig);
         d.migratedFrom = migratedFrom;
         d.genesisHeight = genesisHeight;
         d.genesisChain = genesisChain;
@@ -159,8 +148,37 @@ contract HPPLiteFleet {
         emit Admitted(dbId, dbOwner, sequencer, migratedFrom);
     }
 
+    /// Admitted and claimed in one call (one relay call per new database): the Admit and the sequencer's first Claim
+    function joinFor(bytes32 dbId, address dbOwner, address sequencer, uint256 issuedAt, bytes calldata admitSig,
+                     bytes32 instanceId, uint256 deadline, bytes calldata claimSig) external {
+        _admit(dbId, dbOwner, sequencer, issuedAt, admitSig);
+        emit Admitted(dbId, dbOwner, sequencer, address(0));
+        _claim(dbId, instanceId, 0, deadline, claimSig);
+    }
+
+    function _admit(bytes32 dbId, address dbOwner, address sequencer, uint256 issuedAt, bytes calldata admitSig) internal returns (Db storage d) {
+        address a = admitDigest(dbId, dbOwner, sequencer, issuedAt).recover(admitSig);
+        require(a != address(0) && (a == owner || a == admitter), "Not admitted by the fleet");
+        require(dbOwner != address(0) && sequencer != address(0), "No owner or sequencer");
+        d = _dbs[dbId];
+        require(d.owner == address(0) || d.retired, "Already in the fleet");
+        require(issuedAt > d.admittedAt, "Admit not newer");
+        uint64 epoch = d.epoch;
+        uint256 nonce = d.claimNonce;
+        delete _dbs[dbId];
+        d.owner = dbOwner;
+        d.sequencer = sequencer;
+        d.admittedAt = uint64(issuedAt);
+        d.epoch = epoch;                              // a re-admitted dbId never reuses an epoch
+        d.claimNonce = nonce;                         // nor a claim signature
+    }
+
     /// The database's sequencer takes the lease (or renews its own); a new holder moves the epoch
     function claimFor(bytes32 dbId, bytes32 instanceId, uint256 nonce, uint256 deadline, bytes calldata sig) external {
+        _claim(dbId, instanceId, nonce, deadline, sig);
+    }
+
+    function _claim(bytes32 dbId, bytes32 instanceId, uint256 nonce, uint256 deadline, bytes calldata sig) internal {
         Db storage d = _live(dbId);
         require(block.timestamp <= deadline, "Expired");
         require(nonce == d.claimNonce, "Bad nonce");
