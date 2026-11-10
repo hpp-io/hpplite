@@ -35,6 +35,7 @@ fails = 0
 
 BIND = "Bind(address da,address funder,uint256 issuedAt)"
 RELEASE = "Release(address da,address funder,uint256 issuedAt)"
+DELETE = "Delete(address da,address funder,uint256 issuedAt)"
 CONTENT = "Content(address da,uint256 height,bytes32 hash)"
 CAP = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"
 PRUNE = "Prune(address da,uint256 height,uint256 issuedAt)"
@@ -366,6 +367,20 @@ def main():
         rsig = eth.sign(F, S.digest(RELEASE, da, fa, issued))
         code, out, _ = jpost(url + "/bucket/%s/release" % da, {"funder": fa, "issuedAt": issued, "signature": "0x" + rsig.hex()})
         check(code == 200 and out.get("state") == "parked", "released by its funder: parked (%s)" % code)
+
+        # --- delete now (#275): bound again, a release with delete signed over Delete: deleted at once, names gone, a new binding empty ---
+        code, out, _ = S.bind(da, k2, F, issued=issued + 1)
+        check(code == 200, "bound again (%s)" % code)
+        rsig = eth.sign(F, S.digest(RELEASE, da, fa, issued + 2))
+        code, out, _ = jpost(url + "/bucket/%s/release" % da, {"funder": fa, "issuedAt": issued + 2, "delete": True, "signature": "0x" + rsig.hex()})
+        check(code == 401, "a release with delete signed over Release, not Delete: 401 (%s)" % code)
+        dsig = eth.sign(F, S.digest(DELETE, da, fa, issued + 2))
+        code, out, _ = jpost(url + "/bucket/%s/release" % da, {"funder": fa, "issuedAt": issued + 2, "delete": True, "signature": "0x" + dsig.hex()})
+        check(code == 200 and out.get("state") == "deleted", "released with delete by its funder: deleted now (%s %s)" % (code, out))
+        check(http("GET", url + "/bucket/" + da)[1].get("state") == "deleted" and http("GET", "%s/name/%s-5" % (url, da[2:]))[0] == 404,
+              "the bucket reads deleted, its names are gone")
+        code, out, _ = S.bind(da, k2, F, issued=issued + 3)
+        check(code == 200 and http("GET", url + "/bucket/" + da)[1].get("objects") == 0, "a new binding starts an empty bucket (%s)" % code)
 
         # --- sweep ---
         if CHECK_SWEEP_FILES:

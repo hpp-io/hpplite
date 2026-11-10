@@ -51,7 +51,8 @@ gives it:
 | Type | Signed by | For |
 |------|-----------|-----|
 | `Bind(address da,address funder,uint256 issuedAt)` | the sequencer and the funder; or the funder alone when it is the rollup's `owner()` on chain (#273) | bind (or rebind) a bucket to an account |
-| `Release(address da,address funder,uint256 issuedAt)` | the funder | stop paying for a bucket |
+| `Release(address da,address funder,uint256 issuedAt)` | the funder | stop paying for a bucket (parked; deleted `parkSeconds` later) |
+| `Delete(address da,address funder,uint256 issuedAt)` | the funder | stop paying and delete the bucket now (#275): `POST /bucket/<da>/release` with `delete: true` |
 | `Content(address da,uint256 height,bytes32 hash)` | the sequencer | put bytes into the bucket (`hash` the keccak-256 of the bytes; `height` the batch they belong to, for pruning) |
 | `Prune(address da,uint256 height,uint256 issuedAt)` | the sequencer | let go of the bucket's history before `height` |
 | `Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)` | the funder | bound what the bucket may take in a day (#274); 0 = no bound on that axis |
@@ -71,7 +72,7 @@ supports it: version 2).
 | Call | Signed / paid | Answer |
 |------|---------------|--------|
 | `POST /bucket/<da>`, body `{funder, issuedAt, sequencerSignature, funderSignature}` | the sequencer and the funder | `200` the bucket |
-| `POST /bucket/<da>/release`, body `{funder, issuedAt, signature}` | the funder | `200` the bucket |
+| `POST /bucket/<da>/release`, body `{funder, issuedAt, signature[, delete]}` (`delete: true` signs `Delete`, not `Release`) | the funder | `200` the bucket (`parked`, or `deleted` with `delete`) |
 | `POST /bucket/<da>/prune`, body `{height, issuedAt, signature}` | the sequencer | `200` the bucket |
 | `POST /bucket/<da>/cap`, body `{funder, writesPerDay, bytesPerDay, issuedAt, signature}` | the funder | `200 {da, cap, today}` |
 | `GET /bucket/<da>` | - | `200 {da, funder, state, bytes, objects, height, pruneHeight, coveredUntil, statement, cap, today}` |
@@ -190,8 +191,12 @@ An x402 account (no permit) is uncovered once its credit is spent.
   written off. A new binding starts an empty bucket.
 
 Only an uncovered account or a release parks a bucket, and only
-`parkSeconds` later is it deleted. A covered bucket is never deleted, and a
-store never deletes for its own failures.
+`parkSeconds` later is it deleted - unless its funder asks for the deletion
+itself (`delete: true` on the release, signed over `Delete`, #275: a
+platform removing an app): then the names and the records go at once, the
+bytes shared with no other bucket are swept, the bucket reads `deleted`, and
+a new binding starts it empty. A covered bucket is never deleted by the
+store, and a store never deletes for its own failures.
 
 ### Pruning and sweeping
 

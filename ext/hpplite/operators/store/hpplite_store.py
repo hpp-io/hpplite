@@ -49,6 +49,7 @@ FOREVER = 2 ** 53 - 1           # coveredUntil when nothing is charged: exact in
 
 BIND_TYPE = "Bind(address da,address funder,uint256 issuedAt)"
 RELEASE_TYPE = "Release(address da,address funder,uint256 issuedAt)"
+DELETE_TYPE = "Delete(address da,address funder,uint256 issuedAt)"      # a release that deletes now (#275)
 CONTENT_TYPE = "Content(address da,uint256 height,bytes32 hash)"
 PRUNE_TYPE = "Prune(address da,uint256 height,uint256 issuedAt)"
 CAP_TYPE = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"   # the funder's daily bound (#274)
@@ -890,16 +891,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             b = self.L.bucket(da)
             if not b or b["state"] == "deleted" or not b.get("funder"):
                 return self.reply(404, {"error": "no bound bucket", "da": da})
-            digest = eth.typed_digest(self.L.domain, RELEASE_TYPE, da, b["funder"], req["issuedAt"])
+            delete = req.get("delete") is True                      # delete now (#275): signed over Delete, not Release
+            digest = eth.typed_digest(self.L.domain, DELETE_TYPE if delete else RELEASE_TYPE, da, b["funder"], req["issuedAt"])
             sig = sig_bytes(req.get("signature"))
             if not sig or not same(eth.recover(digest, sig), b["funder"]) or not same(req.get("funder"), b["funder"]):
-                return self.reply(401, {"error": "not signed by the bucket's funder"})
+                return self.reply(401, {"error": "not signed by the bucket's funder" + (" over Delete(da, funder, issuedAt)" if delete else "")})
             if not self.fresh(req["issuedAt"], b.get("boundAt")):
                 return self.reply(409, {"error": "a release no newer than the binding"})
             now = int(time.time())
             self.L.accrue(b, now)
             b.update({"funder": None, "boundAt": req["issuedAt"], "state": "parked", "parkedAt": now})
             self.L.save_bucket(b)
+            if delete:
+                self.L.delete_bucket(b)                          # what it owed stays booked to the account that released it
+                return self.reply(200, {"da": da, "funder": None, "state": "deleted"})
             return self.reply(200, {"da": da, "funder": None, "state": "parked"})
 
     def check_sequencer(self, da, b, signer):
