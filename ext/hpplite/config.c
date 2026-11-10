@@ -164,19 +164,28 @@ static void fleet_param(HppliteConfig *cfg, const char *name, const char *val) {
     }
 }
 
-/* with fleet=: owner= and dbname= required; what names a rollup or is a fleet anchor's job refuses the open; the dbId */
-static void fleet_check(HppliteConfig *cfg, int contract, int factory, int anchor, int checkpoint, int keep) {
+/* with fleet=: owner=, dbname=, store= and relay= required; what names a rollup or is a fleet anchor's job refuses the
+** open from any source - the URI or the environment (a sidecar's environment is where an old HPPLITE_ANCHOR stays) - and
+** the dbId. uri[]: contract, factory, anchor, checkpoint, keep, snapshot, anchorclose given in the URI */
+static void fleet_check(HppliteConfig *cfg, const int uri[7]) {
+    static const struct { const char *name, *env; int anchors; } k[7] = {
+        { "contract", HPPLITE_ENV_CONTRACT, 0 }, { "factory", HPPLITE_ENV_FACTORY, 0 }, { "anchor", "HPPLITE_ANCHOR", 1 },
+        { "checkpoint", HPPLITE_ENV_CHECKPOINT, 1 }, { "keep", "HPPLITE_KEEP", 1 }, { "snapshot", "HPPLITE_SNAPSHOT", 1 },
+        { "anchorclose", "HPPLITE_ANCHOR_CLOSE", 1 } };
     unsigned char word[64];
+    int i;
     if (!cfg->hasFleet || gConfigError[0]) return;
     if (!cfg->hasFleetOwner) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: owner= is required (with dbname= it names the database)"); return; }
     if (!cfg->dbName || !cfg->dbName[0]) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: dbname= is required (with owner= it names the database)"); return; }
-    if (contract || factory) {
-        snprintf(gConfigError, sizeof(gConfigError), "%s= with fleet=: a database in a fleet is named by fleet=, owner= and dbname= alone", contract ? "contract" : "factory");
-        return;
-    }
-    if (anchor || checkpoint || keep) {
-        snprintf(gConfigError, sizeof(gConfigError), "%s= with fleet=: the fleet's anchor anchors its databases%s", anchor ? "anchor" : checkpoint ? "checkpoint" : "keep",
-                 keep ? " (snapshots and pruning in a fleet: #314)" : "");
+    if (!cfg->storeUrl) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: store= is required: a fleet's batches live at a store"); return; }
+    if (!cfg->relayUrl) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: relay= is required: a fleet database joins and claims through a relay"); return; }
+    for (i = 0; i < 7; i++) {
+        const char *ev = getenv(k[i].env);
+        int env = ev != NULL && ev[0];
+        if (!uri[i] && !env) continue;
+        snprintf(gConfigError, sizeof(gConfigError), "%s%s%s with fleet=: %s%s", uri[i] ? k[i].name : k[i].env, uri[i] ? "=" : " (environment)",
+                 "", k[i].anchors ? "the fleet's anchor anchors its databases" : "a database in a fleet is named by fleet=, owner= and dbname= alone",
+                 (i == 4 || i == 5) ? " (snapshots and pruning in a fleet: #314)" : "");
         return;
     }
     memset(word, 0, 12);
@@ -623,9 +632,11 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     {   /* fleet= (#316): params only */
         static const char *names[] = { "fleet", "owner", "admit" };
         for (int i = 0; i < 3; i++) if (get_uri_param(uri, names[i], buf, sizeof(buf))) fleet_param(cfg, names[i], buf);
-        fleet_check(cfg, get_uri_param(uri, HPPLITE_URI_CONTRACT, buf, sizeof(buf)) != NULL, get_uri_param(uri, HPPLITE_URI_FACTORY, buf, sizeof(buf)) != NULL,
-                    get_uri_param(uri, "anchor", buf, sizeof(buf)) != NULL, get_uri_param(uri, HPPLITE_URI_CHECKPOINT, buf, sizeof(buf)) != NULL,
-                    get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf)) != NULL);
+        static const char *given[7] = { HPPLITE_URI_CONTRACT, HPPLITE_URI_FACTORY, "anchor", HPPLITE_URI_CHECKPOINT, HPPLITE_URI_KEEP,
+                                        HPPLITE_URI_SNAPSHOT, "anchorclose" };
+        int uriGiven[7];
+        for (int i = 0; i < 7; i++) uriGiven[i] = get_uri_param(uri, given[i], buf, sizeof(buf)) != NULL;
+        fleet_check(cfg, uriGiven);
     }
 
     /* the chain's cadence applies to whatever goes to the chain (#162, #164): the batches
@@ -819,9 +830,11 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     {   /* fleet= (#316): params only */
         static const char *names[] = { "fleet", "owner", "admit" };
         for (int i = 0; i < 3; i++) fleet_param(cfg, names[i], sqlite3_uri_parameter(filename, names[i]));
-        fleet_check(cfg, sqlite3_uri_parameter(filename, HPPLITE_URI_CONTRACT) != NULL, sqlite3_uri_parameter(filename, HPPLITE_URI_FACTORY) != NULL,
-                    sqlite3_uri_parameter(filename, "anchor") != NULL, sqlite3_uri_parameter(filename, HPPLITE_URI_CHECKPOINT) != NULL,
-                    sqlite3_uri_parameter(filename, HPPLITE_URI_KEEP) != NULL);
+        static const char *given[7] = { HPPLITE_URI_CONTRACT, HPPLITE_URI_FACTORY, "anchor", HPPLITE_URI_CHECKPOINT, HPPLITE_URI_KEEP,
+                                        HPPLITE_URI_SNAPSHOT, "anchorclose" };
+        int uriGiven[7];
+        for (int i = 0; i < 7; i++) uriGiven[i] = sqlite3_uri_parameter(filename, given[i]) != NULL;
+        fleet_check(cfg, uriGiven);
     }
     return 0;
 }

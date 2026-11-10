@@ -355,7 +355,10 @@ static void test_relay_exact_only(void) {
 ** fleet's anchor does for it (anchor=, checkpoint=, keep=) refuse the open, one line each naming it */
 static void test_fleet_params(void) {
     TEST("fleet=: owner= and dbname= are required; contract=, factory=, anchor=, checkpoint=, keep= refuse the open with fleet= (#316)");
-    static const char *base = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1";
+    static const char *base = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+                              "&store=http://127.0.0.1:1&relay=http://127.0.0.1:2";
+    static const char *bare = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+                              "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes";
     static const char *cases[][2] = {
         { "&dbname=notes", "owner=" }, { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1", "dbname=" },
         { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&contract=0x2222222222222222222222222222222222222222", "contract=" },
@@ -363,6 +366,8 @@ static void test_fleet_params(void) {
         { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&anchor=24h", "anchor=" },
         { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&checkpoint=7", "checkpoint=" },
         { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&keep=7d", "keep=" },
+        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&snapshot=1h", "snapshot=" },
+        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&anchorclose=off", "anchorclose=" },
     };
     char uri[600];
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
@@ -373,6 +378,46 @@ static void test_fleet_params(void) {
         printf("  %s: %s\n", cases[i][1], why ? why : "(no error)");
         if (cfg) hpplite_config_free(cfg);
         if (!refused || !why || !strstr(why, cases[i][1])) { FAIL("fleet= with this should refuse the open, naming it"); }
+    }
+    /* store= and relay= are required: a fleet's batches live at a store; it joins and claims through a relay (v1) */
+    {
+        static const char *missing[][2] = { { "", "store=" }, { "&store=http://127.0.0.1:1", "relay=" } };
+        for (size_t i = 0; i < 2; i++) {
+            snprintf(uri, sizeof uri, "%s%s", bare, missing[i][0]);
+            HppliteConfig *cfg = hpplite_config_load(uri);
+            const char *why = hpplite_config_error();
+            printf("  without %s: %s\n", missing[i][1], why ? why : "(no error)");
+            if (cfg) hpplite_config_free(cfg);
+            if (!why || !strstr(why, missing[i][1])) { FAIL("fleet= without store= or relay= should refuse the open"); }
+        }
+    }
+    /* the same settings from the environment alone refuse it too, naming the variable */
+    {
+        static const char *envs[][2] = { { "HPPLITE_ANCHOR", "24h" }, { "HPPLITE_KEEP", "7d" }, { "HPPLITE_SNAPSHOT", "1h" },
+                                         { "HPPLITE_CHECKPOINT_INTERVAL", "7" }, { "HPPLITE_ANCHOR_CLOSE", "off" },
+                                         { "HPPLITE_CONTRACT_ADDRESS", "0x2222222222222222222222222222222222222222" },
+                                         { "HPPLITE_FACTORY_ADDRESS", "0x2222222222222222222222222222222222222222" } };
+        snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes", base);
+        for (size_t i = 0; i < sizeof envs / sizeof envs[0]; i++) {
+            setenv(envs[i][0], envs[i][1], 1);
+            HppliteConfig *cfg = hpplite_config_load(uri);
+            const char *why = hpplite_config_error();
+            printf("  %s=%s in the environment: %s\n", envs[i][0], envs[i][1], why ? why : "(no error)");
+            unsetenv(envs[i][0]);
+            if (cfg) hpplite_config_free(cfg);
+            if (!why || !strstr(why, envs[i][0])) { FAIL("the setting from the environment should refuse the open beside fleet=, naming the variable"); }
+        }
+    }
+    /* a dbname is any bytes after percent-decoding: somaro names "<app>/<path in the volume>" */
+    {
+        snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=smrt-sqlite%%2Fdata%%2Fmy%%20db.sqlite%%C3%%A9", base);
+        HppliteConfig *cfg = hpplite_config_load(uri);
+        static const unsigned char want2[32] = { 0xf8,0x58,0xca,0x3f,0xda,0x10,0x96,0xc8,0x3d,0x6a,0x1b,0x14,0xbe,0xe2,0xf3,0x21,
+                                                 0xf2,0x31,0xb4,0xb5,0x4f,0x5c,0xf4,0x40,0xc9,0xb7,0xe7,0x96,0x4d,0x4d,0x05,0x37 };
+        int same = cfg && !hpplite_config_error() && memcmp(cfg->dbId, want2, 32) == 0;
+        printf("  dbname \"smrt-sqlite/data/my db.sqlite\\xc3\\xa9\": %s\n", same ? "the dbId fleet.py gives" : (hpplite_config_error() ? hpplite_config_error() : "another dbId"));
+        if (cfg) hpplite_config_free(cfg);
+        if (!same) { FAIL("a percent-encoded dbname with '/', a space and a non-ASCII byte should give the dbId fleet.py computes"); }
     }
     /* the vectors' first database: "notes" of key 0x01..01's address, dbId as operators/conformance/vectors.json (fleet) */
     snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&admit=1800000000:0x%s", base,
