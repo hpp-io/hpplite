@@ -671,11 +671,12 @@ static void test_keep(const char *url) {
 }
 
 /* a store of this test's own, on a port and directory it chooses, so it can be killed and started again */
-static pid_t start_store_at(const char *dir, int port, const char *storeDir, int failPut) {
-    char portStr[16], keyPath[600], script[600], failStr[16];
+static pid_t start_store_at(const char *dir, int port, const char *storeDir, int failPut, int busyPut) {
+    char portStr[16], keyPath[600], script[600], failStr[16], busyStr[16];
     pid_t pid;
     snprintf(portStr, sizeof portStr, "%d", port);
     snprintf(failStr, sizeof failStr, "%d", failPut);
+    snprintf(busyStr, sizeof busyStr, "%d", busyPut);
     snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
     snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
     pid = fork();
@@ -685,6 +686,7 @@ static pid_t start_store_at(const char *dir, int port, const char *storeDir, int
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", storeDir, "--signer-key", keyPath,
                "--pay-to", "0x1111111111111111111111111111111111111111", "--price-per-write", "0", "--price-per-mib-month", "0",
                "--fail-put", failStr,                      /* a test hook: the k-th content put answers 503; 0 none */
+               "--busy-put", busyStr,                      /* and: the k-th answers 429 as an operator's rate limit does */
                (char *)NULL);
         _exit(127);
     }
@@ -721,7 +723,7 @@ static void test_store_down_at_open(const char *dir) {
     hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
     hpplite_node_exec(w, "INSERT INTO t(v) VALUES('written while the store was down')", NULL);
     h1 = hpplite_node_flush_batch(w);                      /* waits: HPPLITE_STORE_FALLBACK=off */
-    pid = start_store_at(dir, port, storeDir, 0);
+    pid = start_store_at(dir, port, storeDir, 0, 0);
     if (pid < 0) { hpplite_node_destroy(w); FAIL("the test's store did not start"); }
     h2 = hpplite_node_flush_batch(w);                      /* the first put after the store answers */
     snprintf(err, sizeof err, "%s", w->ctx->zLastError);
@@ -778,7 +780,7 @@ static void test_restart_store_down(const char *dir) {
     char zIndex[64];
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/sd_pins", test_dir());
-    pid = start_store_at(dir, port, storeDir, 0);
+    pid = start_store_at(dir, port, storeDir, 0, 0);
     if (pid < 0) FAIL("the test's store did not start");
     memset(&o, 0, sizeof o);
     o.storeUrl = url; o.nodeId = "sd_w"; o.privkey = kseq; o.snapshotMs = 1; o.keepSeconds = 3600; o.storeFallbackOff = 1;
@@ -804,7 +806,7 @@ static void test_restart_store_down(const char *dir) {
     w = test_open_node(tpath("sd_w.db"), l1, &o);
     if (!w) { hpplite_store_close(rs); FAIL("reopen"); }
     if (hpplite_node_anchor(w) == 6) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor with the store down should not land"); }
-    pid = start_store_at(dir, port, storeDir, 0);                 /* the same bytes, back */
+    pid = start_store_at(dir, port, storeDir, 0, 0);                 /* the same bytes, back */
     if (pid < 0) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the test's store did not come back"); }
     sleep(2);
     {
@@ -849,7 +851,7 @@ static void test_snapshot_name_refused(const char *dir) {
     int got;
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/nr_pins", test_dir());
-    pid = start_store_at(dir, port, storeDir, 5);              /* content puts: batches 1-3, then the chunk (4), the name (5), the index */
+    pid = start_store_at(dir, port, storeDir, 5, 0);              /* content puts: batches 1-3, then the chunk (4), the name (5), the index */
     if (pid < 0) FAIL("the test's store did not start");
     memset(&o, 0, sizeof o);
     o.storeUrl = url; o.nodeId = "nr_w"; o.privkey = kseq; o.snapshotMs = 1; o.keepSeconds = 3600; o.dbName = "named";
@@ -1038,6 +1040,46 @@ static void test_bucket_cap(const char *url) {
     hpplite_node_destroy(w);
     hpplite_l1_disconnect(l1);
     hpplite_crypto_free(cr);
+    if (why) FAIL(why);
+    PASS();
+}
+
+/* 6l. A store's own rate limit (#280): a 429 that is not bucket_capped. The node keeps the batch pending and names
+** the rate limit in the store's words, not a daily cap nobody set; the next flush goes through. Red before: 'the
+** bucket's daily cap is reached, set by its funder; the write waits for the next window (429 bucket_capped)'. */
+static void test_store_rate_limited(const char *dir) {
+    TEST("a store's rate limit (#280): a 429 that is not bucket_capped keeps the batch pending and is named as the store's rate limit, not a daily cap; the next flush goes through");
+    int port = test_free_port();
+    char url[64], storeDir[600];
+    const char *why = NULL, *err;
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x76 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o;
+    HppliteNode *w;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/rl_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 0, 2);             /* the second content put: batch 2's bytes */
+    if (pid < 0) FAIL("the test's store did not start");
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "rl_w"; o.privkey = kseq;
+    w = test_open_node(tpath("rl_w.db"), l1, &o);
+    if (!w) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open"); }
+    hpplite_node_exec(w, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the first flush"; }
+    if (!why) {
+        hpplite_node_exec(w, "INSERT INTO t VALUES(2)", NULL);
+        if (hpplite_node_flush_batch(w) >= 1) why = "a flush the store answers 429 should keep the batch pending";
+        else {
+            err = status_text(w->db, "last_error");
+            if (strstr(err, "daily cap") || !strstr(err, "rate limit") || !strstr(err, "too many requests")) { printf("(%s) ", err); why = "the node should name the store's rate limit, not a daily cap"; }
+        }
+    }
+    if (!why && hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); why = "the next flush"; }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     if (why) FAIL(why);
     PASS();
 }
@@ -1636,6 +1678,7 @@ int main(int argc, char **argv) {
     test_no_anchor_at_close(url);
     test_external_funder(url, dir);
     test_bucket_cap(url);
+    test_store_rate_limited(dir);
     test_snapshot_made(url);
     test_snapshot_replica(url);
     test_snapshot_chunks(url);

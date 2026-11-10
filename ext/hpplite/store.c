@@ -82,12 +82,18 @@ static int ensureBucket(HppliteStore *s);
 static void storeDigest(HppliteStore *s, const char *zType, const unsigned char *words, size_t nWords, unsigned char out[32]);
 static int signWith(HppliteStore *s, HppliteKeypair *kp, const unsigned char digest[32], unsigned char sig[65]);
 static void lowerHex(const unsigned char *b, size_t n, char *out);
-/* 429 bucket_capped (#274): the funder bounded the bucket's day; the write waits for the window, nothing was charged */
-static void storeCapped(HppliteStore *s, const char *zBody) {
+/* A 429 at a write, nothing charged either way. bucket_capped (#274): the funder bounded the bucket's day and the write
+** waits for the window. Any other (#280): the store's own rate limit, in its words; the write waits for the next flush */
+static void storeBusy(HppliteStore *s, const char *zBody) {
     cJSON *r = zBody ? cJSON_Parse(zBody) : NULL;
+    cJSON *e = r ? cJSON_GetObjectItem(r, "error") : NULL;
     cJSON *d = r ? cJSON_GetObjectItem(r, "detail") : NULL;
-    snprintf(s->error, sizeof s->error, "the bucket's daily cap is reached, set by its funder; the write waits for the next window (%.160s)",
-             d && cJSON_IsString(d) ? d->valuestring : "429 bucket_capped");
+    if (e && cJSON_IsString(e) && strcmp(e->valuestring, "bucket_capped") == 0)
+        snprintf(s->error, sizeof s->error, "the bucket's daily cap is reached, set by its funder; the write waits for the next window (%.160s)",
+                 d && cJSON_IsString(d) ? d->valuestring : "429 bucket_capped");
+    else
+        snprintf(s->error, sizeof s->error, "the store's rate limit is reached; the write waits for the next flush (%.160s)",
+                 e && cJSON_IsString(e) ? e->valuestring : "429");
     cJSON_Delete(r);
 }
 
@@ -1099,7 +1105,7 @@ char *hpplite_store_put_at(HppliteStore *s, uint64_t height, const uint8_t *data
         free(out.p);
         return NULL;
     }
-    if (status == 429) storeCapped(s, out.p);                                  /* the funder's daily cap (#274) */
+    if (status == 429) storeBusy(s, out.p);                                    /* the funder's daily cap (#274), or the store's rate limit */
     if (status != 200) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to put: %.120s", status, out.p ? out.p : "");
         s->lastFailure = status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;
@@ -1205,7 +1211,7 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
         else status = s->v2 ? paidPost(s, path, body, len + 97, NULL, &out) : storeRequest(s, "POST", path, body, len + 97, NULL, &out, NULL, NULL);
         if (status == 200) rc = 0;
         else if (status == -1) { /* the reason is in s->error */ }
-        else if (status == 429) storeCapped(s, out.p);
+        else if (status == 429) storeBusy(s, out.p);
         else if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s: %.120s", status, zName, out.p ? out.p : "");
     }
     free(body);

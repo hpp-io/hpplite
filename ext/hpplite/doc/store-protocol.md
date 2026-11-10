@@ -98,7 +98,9 @@ not held, or no such bucket; `409` a binding or prune older than the last
 taken; `410` a read of a parked bucket (the body says what restores it);
 `413` over the size limit; `429 bucket_capped` a write past the bucket's
 daily cap (below), nothing charged, `Retry-After` and `retryAfter` the
-seconds to the next window. JSON bodies with `error`; for `402` also
+seconds to the next window; a `429` with any other `error` is the store's
+own rate limit, with `Retry-After`: nothing was charged and the write is
+sent again later. JSON bodies with `error`; for `402` also
 `bucket_unbound`, `bucket_parked` or `account_uncovered`.
 
 ### Binding

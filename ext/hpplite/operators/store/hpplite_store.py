@@ -478,7 +478,7 @@ class Ledger:
 class Service:
     def __init__(self, args):
         self.args = args
-        self.puts = 0                     # content puts seen (the --fail-put test hook)
+        self.puts = 0                     # content puts seen (the --fail-put and --busy-put test hooks)
         self.disk = Disk(args.dir)
         with open(args.signer_key) as f:
             key = bytes.fromhex(f.read().strip().replace("0x", ""))
@@ -891,6 +891,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.service.puts += 1
         if self.service.args.fail_put and self.service.puts == self.service.args.fail_put:
             return self.reply(503, {"error": "test hook: this put is refused (--fail-put)"})
+        if self.service.args.busy_put and self.service.puts == self.service.args.busy_put:
+            return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": "60"})
         try:
             height = int((query.get("height") or [""])[0])
         except ValueError:
@@ -1040,6 +1042,7 @@ def main():
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--fail-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th content put answers 503
+    ap.add_argument("--busy-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th answers 429 as an operator's rate limit does
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     args.pay_to = args.pay_to.lower()
