@@ -168,7 +168,7 @@ def paid(chain_id, fl, work):
         def write(height, data, chain):
             after = fleet_store.chain_hash_next(chain, height, eth.keccak256(data))
             head = {"dbId": db, "instanceId": inst, "fromHeight": height, "toHeight": height, "chainHashAfter": after,
-                    "stateRoot": bytes(32), "manifestDigest": bytes(32), "epoch": 1}
+                    "stateRoot": bytes(32), "manifestDigest": hashlib.sha256(data).digest(), "epoch": 1}
             sig = eth.sign(kb(KEY3), F.head_digest(dom, head))
             hj = json.dumps({k: (hx(v) if isinstance(v, bytes) else v) for k, v in head.items()})
             st, body = http("POST", url + "/fleet/%s/name/%s-%d" % (fl, dbx, height), data + inst + sig, {"X-HPPLite-Head": hj})
@@ -228,11 +228,11 @@ def run(chain_id, fl, url, owner, dbowner, seq):
 
     chain = bytes(32)
 
-    def write(height, data, instance, epoch, key=KEY3, chain_after=None):
+    def write(height, data, instance, epoch, key=KEY3, chain_after=None, digest=None):
         nonlocal chain
         after = chain_after or fleet_store.chain_hash_next(chain, height, eth.keccak256(data))
         head = {"dbId": db, "instanceId": instance, "fromHeight": height, "toHeight": height, "chainHashAfter": after,
-                "stateRoot": eth.keccak256(b"root-%d" % height), "manifestDigest": eth.keccak256(b"batch-%d" % height), "epoch": epoch}
+                "stateRoot": eth.keccak256(b"root-%d" % height), "manifestDigest": digest or hashlib.sha256(data).digest(), "epoch": epoch}
         sig = eth.sign(kb(key), F.head_digest(dom, head))
         hj = json.dumps({k: (hx(v) if isinstance(v, bytes) else v) for k, v in head.items()})
         r = http("POST", url + "/fleet/%s/name/%s-%d" % (fl, dbx, height), data + instance + sig, {"X-HPPLite-Head": hj})
@@ -240,6 +240,8 @@ def run(chain_id, fl, url, owner, dbowner, seq):
             chain = after
         return r
 
+    st, body = write(1, b"batch one", inst_a, 1, digest=eth.keccak256(b"not the bytes' digest"))
+    check(st == 400 and "manifestDigest" in body.get("error", ""), "a head whose manifestDigest is not sha-256 of the bytes: 400, nothing stored (%s %s)" % (st, body.get("error")))
     st, body = write(1, b"batch one", inst_a, 1)
     check(st == 200 and body.get("cid"), "batch 1 with its head: taken (%s %s)" % (st, body))
     st, body = write(2, b"batch two", inst_a, 1, chain_after=eth.keccak256(b"not the fold"))

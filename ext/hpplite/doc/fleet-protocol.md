@@ -29,7 +29,7 @@ EIP-712 in the domain `("HPPLiteFleet", "1", chainId, <shared rollup>)`:
 
 | Type | Signed by |
 |------|-----------|
-| `Head(bytes32 dbId,bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 chainHashAfter,bytes32 stateRoot,bytes32 manifestDigest,uint256 epoch)` | the database's sequencer, at each flush: today's `Range` with the database and its lease epoch |
+| `Head(bytes32 dbId,bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 chainHashAfter,bytes32 stateRoot,bytes32 manifestDigest,uint256 epoch)` | the database's sequencer, at each flush: today's `Range` with the database and its lease epoch. A batch's head has `fromHeight = toHeight` = its height and `manifestDigest` = the sha-256 of the batch's bytes (their CID's digest); the store refuses another (#315; vectors `fleet.batchHeads`) |
 | `Admit(bytes32 dbId,address owner,address sequencer,uint256 issuedAt)` | the fleet's owner or its admitter: the first claim of a `dbId` in the fleet needs it, so nobody rides a fleet's roots and sponsorship uninvited |
 | `Retire(bytes32 dbId,uint256 issuedAt)` | the database's owner: the record goes, at `rm` |
 | `Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)` | the fleet's anchor key (the owner may change it); sponsored at the relay |

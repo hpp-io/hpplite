@@ -281,6 +281,10 @@ def _post_name(h, fleet, name, body):
     data, instance, sig = body[:-97], "0x" + body[-97:-65].hex(), body[-65:]
     if head["dbId"].lower() != db or hb["toHeight"] != height or hb["fromHeight"] != height or head["instanceId"].lower() != instance:
         return h.reply(400, {"error": "the head names another database, height or instance than this write"})
+    import hashlib
+    if hb["manifestDigest"] != hashlib.sha256(data).digest():
+        # a batch's head commits to its bytes' sha-256 (its CID's digest): a root then commits to what the store holds (#315)
+        return h.reply(400, {"error": "the head's manifestDigest is not the sha-256 of the bytes written with it"})
     dom = F.domain(book.chain_id, fleet)
     signer = eth.recover(F.head_digest(dom, hb), sig)
     with book.lock:

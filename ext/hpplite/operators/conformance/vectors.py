@@ -170,7 +170,20 @@ def fleet_vectors():
     factory = "0x" + "fa" * 20
     fdom = fleet.factory_domain(chain_id, factory)
     create = [owners[0], eth.address(key(2)).lower(), 604800, 0, 1800000004]
-    return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup,
+    # a batch's head as a node writes it (#315): heights h..h, the rolling hash from the previous head (zero before 1),
+    # manifestDigest the sha-256 of the bytes; the store refuses another
+    import hashlib
+    batch_heads, prev = [], bytes(32)
+    for h, data in ((1, b"batch one"), (2, b"batch two")):
+        after = eth.keccak256(prev + h.to_bytes(32, "big") + eth.keccak256(data))
+        head = {"dbId": dbs[0]["dbId"], "instanceId": dbs[0]["head"]["instanceId"], "fromHeight": h, "toHeight": h,
+                "chainHashAfter": after, "stateRoot": eth.keccak256(b"page root %d" % h), "manifestDigest": hashlib.sha256(data).digest(),
+                "epoch": 1}
+        hd = fleet.head_digest(dom, head)
+        batch_heads.append({"data": hx(data), "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in head.items()},
+                            "headDigest": hx(hd), "key": KEYS[0], "signature": hx(eth.sign(key(0), hd))})
+        prev = after
+    return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup, "batchHeads": batch_heads,
             "databases": [{"name": d["name"], "owner": d["owner"], "dbId": hx(d["dbId"]), "nameHash": hx(fleet.name_hash(d["name"])),
                            "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in d["head"].items()},
                            "headDigest": hx(d["headDigest"]), "key": d["key"], "signature": hx(d["signature"]), "leaf": hx(d["leaf"])}

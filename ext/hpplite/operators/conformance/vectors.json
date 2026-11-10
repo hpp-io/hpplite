@@ -212,6 +212,40 @@
   }
  ],
  "fleet": {
+  "batchHeads": [
+   {
+    "data": "0x6261746368206f6e65",
+    "head": {
+     "chainHashAfter": "0xc6ae4c0439ffd84698dcf457a7243a24ba8058cf8ea970fd3712ed67c99c1d3b",
+     "dbId": "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e",
+     "epoch": 1,
+     "fromHeight": 1,
+     "instanceId": "0x1fe7fbe32f2e527c0da96fe3212cc3bae9ca124c8c3acc793733702b09564abd",
+     "manifestDigest": "0x53945b90d804e43b8b0c14cea96b89ce92a07dd12c3c17f691edbbbbdab771cd",
+     "stateRoot": "0xa93d5018a39cb166a3b2a73ba9c7a89e2a7984d2ade8bf335eb7fafca2e1c938",
+     "toHeight": 1
+    },
+    "headDigest": "0x9dd46cb196a6aa9ca09ca51e635f64152d8bed91d5b55f81e7127605a220c237",
+    "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+    "signature": "0xda76e5d8a494d28834d4931a2957031828247d319b303d4d3748ef9f7c5c83677efd5d01c1938cb099f02dea06f697807c2cbba93feb7e304fbbf1eac3d6a9601b"
+   },
+   {
+    "data": "0x62617463682074776f",
+    "head": {
+     "chainHashAfter": "0x819dda9a9b076259b69762fa8e13e20c4b6a687c606df1215a4e990c543e4369",
+     "dbId": "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e",
+     "epoch": 1,
+     "fromHeight": 2,
+     "instanceId": "0x1fe7fbe32f2e527c0da96fe3212cc3bae9ca124c8c3acc793733702b09564abd",
+     "manifestDigest": "0x9db4fbc7588b158657020b249ef54ff40e13f88514391b68cbc6e473c486111d",
+     "stateRoot": "0x59748853859e88922b2508dcceb2b828af27c74b080efc75aefad86b3b163607",
+     "toHeight": 2
+    },
+    "headDigest": "0x6365a85fc4001313014545751541f05014f9b2a6ab4cef08b4a59e7d37ba995c",
+    "key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+    "signature": "0x1a6ed73038d4bf60e9e24ce406c6fd667561ccfbab29f3c5bd7e514aac60bc061e2eb3127dd958d91602f6b2cad17176d4ba9e66abd7d69f53b4f1f9ce797b411c"
+   }
+  ],
   "chainId": 181228,
   "databases": [
    {
