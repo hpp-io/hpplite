@@ -16,7 +16,8 @@ sh "$script" "$d/out" >"$d/build.log" 2>&1 || { tail -40 "$d/build.log"; fail "t
 [ -x "$d/out/hpplite-sequencer" ] && [ -x "$d/out/hpplite-verify" ] || fail "binaries missing in $d/out"
 n=0
 for image in alpine:3.20 debian:bookworm-slim; do
-    "$docker" pull -q "$image" >/dev/null 2>&1 || fail "cannot pull $image"
+    # pulled only when it is not here: a registry that does not answer must not fail a run that has the image (#278)
+    "$docker" image inspect "$image" >/dev/null 2>&1 || pulled=$("$docker" pull -q "$image" 2>&1) || { echo "$pulled" | tail -3; fail "cannot pull $image"; }
     # a directory of its own per image, never one emptied from the host: on a virtiofs mount (colima) the guest
     # keeps a deleted file's name for about a second, and a create of it then fails (ENOENT; #277)
     n=$((n + 1)); w="$d/w$n"
