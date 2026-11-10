@@ -80,6 +80,39 @@ Every call is paid by x402's `exact` scheme at the quoted amount. The
 cron) were removed in v0.8 (#251): no payer used them, and `exact` at every
 relayed call is the visible x402 use on HPP.
 
+## Accounts and sponsorship (#276)
+
+A platform that runs many apps pays for their rollups from one treasury, so
+no app key holds money. The treasury gives the relay an EIP-2612 permit and
+names the rollups it pays for; a call on a sponsored rollup is answered
+`200` with no `402`, and the node needs no setting for it.
+
+```sh
+sponsor.py http://relay:8430 --key-file treasury.key permit 50000000
+sponsor.py http://relay:8430 --key-file treasury.key --rollup-key-file owner.key sponsor 0x<rollup>
+sponsor.py http://relay:8430 --key-file treasury.key cap 0x<rollup> 200      # calls a day
+sponsor.py http://relay:8430 --key-file treasury.key account
+sponsor.py http://relay:8430 sponsor-of 0x<rollup>
+```
+
+- **The rollup's side agrees.** A `Sponsor` carries the funder's signature
+  and one by the rollup's owner or sequencer, unless the funder is one of
+  them. A funder alone gets `401`: otherwise anybody could take a rollup's
+  sponsorship over with an empty account.
+- **Pulled before the call.** The relay pulls from the treasury with its
+  own key (`permit` when the allowance is short, then `transferFrom`), at
+  least `--min-pull` (1 USDC.e) at a time, and keeps the rest as the
+  account's credit. A call is charged before it is submitted and refunded
+  when it does not land.
+- **When the sponsor cannot pay** (no permit, no balance, the cap reached)
+  the caller gets the usual `402` with `sponsor: {funder, why}`, and may
+  pay it itself. The relay never fronts a call.
+- The book is JSON files under `--dir`. `x402` top-ups go to
+  `POST /account/<funder>/pay?amount=`.
+
+Unlike the per-call path, the money is in before the gas is spent, so the
+relay carries no settlement risk on a sponsored call.
+
 ## Tests
 
 `selftest.sh` (ctest `test_relay`) runs on a fresh anvil with the factory
@@ -90,3 +123,10 @@ and MockUSDC:
 - A range anchored twice, a bad signature, a token transfer and an owner
   call without a signed form are each refused, and nothing is charged.
 - The wallet's ETH balance is zero at the end.
+- Sponsorship (#276): a treasury's permit, a `Sponsor` refused without the
+  rollup's side and taken with the owner's signature beside it, a
+  stranger's takeover refused; sponsored calls on the rollup and its DA
+  answered `200` with the caller paying nothing, the first pulling
+  `--min-pull`, the next paid from credit; a cap, the capped `402` and a
+  caller paying it itself; a release; an x402 top-up. The treasury holds
+  no ETH at the end.

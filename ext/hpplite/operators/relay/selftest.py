@@ -86,6 +86,14 @@ def free_port():
     return p
 
 
+def http_get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+
 def post_raw(url, body):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:
@@ -101,7 +109,7 @@ def start_relay(work, port, keyfile, log, eth_usd="30"):
     url = "http://127.0.0.1:%d" % port
     p = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC,
                           "--key-file", keyfile, "--factory", FACTORY, "--facilitator", os.environ["HPPLITE_ANVIL_FACILITATOR"],
-                          "--asset", USDC, "--eth-usd", eth_usd], stdout=log, stderr=log)
+                          "--asset", USDC, "--eth-usd", eth_usd, "--dir", os.path.join(work, "relay")], stdout=log, stderr=log)
     for _ in range(100):
         if p.poll() is not None:
             return p, None
@@ -231,6 +239,85 @@ def main():
 
         spent = 10_000_000 - balance_usdc(wallet)
         check(balance_eth(wallet) == 0, "the wallet's ETH balance is still 0; it spent %d units (%.4f USDC.e) in all" % (spent, spent / 1e6))
+
+        # 8. accounts and sponsorship (#276): a treasury with USDC.e and no ETH pays for the rollup's calls; the caller
+        # pays nothing and sends no payment; a cap and a release send the caller back to its own 402
+        tkey = secrets.token_bytes(32)
+        treasury = eth.address(tkey).lower()
+        subprocess.run(["cast", "send", "--rpc-url", RPC, "--private-key", KEY0, USDC, "transfer(address,uint256)", treasury, "5000000"], check=True, capture_output=True)
+        tkeyfile = os.path.join(work, "treasury.key")
+        with open(tkeyfile, "w") as f:
+            f.write("0x" + tkey.hex())
+
+        wkeyfile = os.path.join(work, "wallet.key")          # the rollup's owner and sequencer
+        with open(wkeyfile, "w") as f:
+            f.write("0x" + wkey.hex())
+
+        def tool(*args, **kw):
+            r = subprocess.run([sys.executable, "-I", os.path.join(here, "sponsor.py"), url, "--key-file", kw.get("key", tkeyfile)]
+                               + (["--rollup-key-file", kw["rollup_key"]] if kw.get("rollup_key") else []) + list(args), capture_output=True, text=True)
+            try:
+                return r.returncode, json.loads(r.stdout or "{}")
+            except ValueError:
+                return r.returncode, {"stdout": r.stdout, "stderr": r.stderr}
+        rc, out = tool("permit", "5000000")
+        check(rc == 0 and out.get("permit", {}).get("sent") is False, "the treasury's permit taken by the relay, not yet sent (%s %s)" % (rc, out))
+        # who pays for a rollup is named from the rollup's side: a funder that is neither its owner nor its sequencer
+        # needs one of them to sign beside it, so nobody can take a rollup's sponsorship over with an empty account
+        rc, out = tool("sponsor", rollup)
+        check(rc == 1 and "rollup's side" in out.get("error", ""), "the treasury's signature alone: 401, the rollup's side has not agreed (%s %s)" % (rc, out.get("error")))
+        rc, out = tool("sponsor", rollup, rollup_key=tkeyfile)
+        check(rc == 1 and "rollup's side" in out.get("error", ""), "co-signed by a key that is neither owner nor sequencer: 401 (%s)" % rc)
+        rc, out = tool("sponsor", rollup, rollup_key=wkeyfile)
+        check(rc == 0 and out.get("funder") == treasury and out.get("state") == "sponsored", "the treasury sponsors the rollup, the rollup's owner signing beside it (%s %s)" % (rc, out))
+        skeyfile = os.path.join(work, "stranger.key")
+        with open(skeyfile, "w") as f:
+            f.write("0x" + secrets.token_bytes(32).hex())
+        time.sleep(1.1)                                           # a newer issuedAt
+        rc, out = tool("sponsor", rollup, key=skeyfile)
+        rc2, now_ = tool("sponsor-of", rollup)
+        check(rc == 1 and now_.get("funder") == treasury, "a stranger's newer sponsorship of the same rollup: refused, the treasury still pays (%s)" % out.get("error"))
+        u0, t0 = balance_usdc(wallet), balance_usdc(treasury)
+        st, body = post_raw(url + "/commit", {"to": rollup, "data": encode("renewLeaseFor(bytes32,uint256,uint256,bytes)", instance, 4, deadline, lease("renew", 4))})
+        check(st == 200 and body.get("sponsor") == treasury and body.get("charged", 0) > 0,
+              "renewLeaseFor on a sponsored rollup, no payment sent: 200, charged to the sponsor (%s %s)" % (st, body))
+        check(balance_usdc(wallet) == u0 and t0 - balance_usdc(treasury) >= 1_000_000,
+              "the caller paid nothing; the relay pulled at least minPull from the treasury's permit (%d units)" % (t0 - balance_usdc(treasury)))
+        st, acct = http_get(url + "/account/" + treasury)
+        check(st == 200 and acct.get("credit", 0) > 0 and acct.get("permit", {}).get("sent") is True and rollup.lower() in acct.get("rollups", []),
+              "the account view: credit left from the pull, the permit sent, the rollup listed (%s)" % acct)
+        t1 = balance_usdc(treasury)
+        st, body = post_raw(url + "/commit", {"to": rollup, "data": encode("renewLeaseFor(bytes32,uint256,uint256,bytes)", instance, 5, deadline, lease("renew", 5))})
+        check(st == 200 and body.get("sponsor") == treasury and balance_usdc(treasury) == t1,
+              "the next call is paid from the account's credit: nothing pulled (%s, credit %s)" % (st, http_get(url + "/account/" + treasury)[1].get("credit")))
+        # the anchor, on the rollup's DA: sponsored through its coordinator
+        rsig4 = eth.sign(wkey, eth.typed_digest(ddomain, "Range(bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 chainHashAfter,bytes32 stateRoot,bytes32 manifestDigest)",
+                                                instance, 4, 4, chain_after, root, manifest))
+        st, body = post_raw(url + "/commit", {"to": da, "data": encode("commitRangeFor(bytes32,uint256,uint256,bytes32,bytes32,bytes32,bytes,bytes)", instance, 4, 4, chain_after, root, manifest, b"", rsig4)})
+        check(st == 200 and body.get("sponsor") == treasury and int(call_view(da, "lastBatchHeight()"), 16) == 4 and balance_usdc(wallet) == u0,
+              "commitRangeFor on the rollup's DA: sponsored too, anchored to 4, the caller still paid nothing (%s %s)" % (st, body))
+        rc, out = tool("cap", rollup, "3")
+        check(rc == 0 and out.get("cap", {}).get("callsPerDay") == 3 and out.get("today", {}).get("calls") == 3, "the sponsor caps the rollup at three calls a day (%s)" % out)
+        renew6 = {"to": rollup, "data": encode("renewLeaseFor(bytes32,uint256,uint256,bytes)", instance, 6, deadline, lease("renew", 6))}
+        st, body = post_raw(url + "/commit", renew6)
+        check(st == 402 and body.get("sponsor", {}).get("why", "").startswith("capped"), "past the cap the caller gets its 402, saying the sponsor is capped (%s %s)" % (st, body.get("sponsor")))
+        t1 = balance_usdc(treasury)
+        st, body, settlement, paid, _ = commit(renew6["to"], renew6["data"])
+        check(st == 200 and paid > 0 and "sponsor" not in body and balance_usdc(treasury) == t1, "a caller that pays its own 402 goes through, at its own cost (%s, %d units)" % (st, paid))
+        rc, out = tool("release", rollup)
+        check(rc == 0 and out.get("funder") is None and out.get("state") == "released", "the sponsor releases the rollup (%s)" % out)
+        st, body = post_raw(url + "/commit", {"to": rollup, "data": encode("renewLeaseFor(bytes32,uint256,uint256,bytes)", instance, 7, deadline, lease("renew", 7))})
+        check(st == 402 and "sponsor" not in body, "released: a plain 402 again (%s)" % st)
+        rc, out = tool("sponsor-of", rollup)
+        check(rc == 0 and out.get("state") == "released", "GET /sponsor/<rollup> says released")
+        # an account topped up over x402 instead of a permit: the wallet pays 1 USDC.e into its own account
+        u1 = balance_usdc(wallet)
+        st, body, settlement = buyer.call("POST", "/account/%s/pay?amount=1000000" % wallet.lower(), b"")
+        check(st == 200 and isinstance(body, dict) and body.get("credit") == 1_000_000 and u1 - balance_usdc(wallet) == 1_000_000,
+              "an x402 top-up of 1 USDC.e credits the payer's account (%s %s)" % (st, body))
+        st, body = post_raw(url + "/account/%s/pay?amount=5" % wallet.lower(), {})
+        check(st == 400 and body.get("minPull") == 1_000_000, "a top-up below minPull: 400 (%s)" % st)
+        check(balance_eth(treasury) == 0, "the treasury holds no ETH")
     finally:
         proc.terminate()
         proc.wait()

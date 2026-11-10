@@ -42,16 +42,19 @@ import http.server
 import json
 import math
 import os
+import re
 import socketserver
 import sys
 import threading
 import time
+import urllib.parse
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 from x402seller import eth  # noqa: E402
 from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_tx  # noqa: E402
 from x402seller.payments import Payments  # noqa: E402
+from x402seller.token import ChainUnreadable, Token, sig_bytes  # noqa: E402
 
 
 FACTORY_CALLS = {selector("createRollupFor(address,uint256,uint256,uint256,bytes)"): "createRollupFor"}
@@ -68,6 +71,221 @@ DA_CALLS = {selector(s): s.split("(")[0] for s in (
 
 
 PROTOCOL = "hpplite-relay/1"        # the version of doc/relay-protocol.md this relay speaks (#188)
+# accounts and sponsorship (#276): a funder pays the relay for the rollups it names, in the relay's EIP-712 domain
+SPONSOR_TYPE = "Sponsor(address rollup,address funder,uint256 issuedAt)"
+UNSPONSOR_TYPE = "Unsponsor(address rollup,address funder,uint256 issuedAt)"
+CAP_TYPE = "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)"
+PERMIT_TYPE = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+DAY = 86400
+
+
+def same(a, b):
+    return bool(a) and bool(b) and a.lower() == b.lower()
+
+
+class Accounts:
+    """Funders' accounts and the rollups they sponsor (#276), as JSON files under --dir. An account is credited by
+    x402 top-ups or by pulls from the funder's EIP-2612 permit; a sponsored rollup's calls are charged to it."""
+
+    def __init__(self, directory, token, pay_to, min_pull):
+        self.dir, self.token, self.pay_to, self.min_pull = directory, token, pay_to, min_pull
+        self.lock = threading.Lock()
+        for sub in ("a", "s"):
+            os.makedirs(os.path.join(directory, sub), exist_ok=True)
+
+    def _path(self, sub, key):
+        return os.path.join(self.dir, sub, key.lower() + ".json")
+
+    def _load(self, sub, key):
+        try:
+            with open(self._path(sub, key)) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    def _save(self, sub, key, obj):
+        tmp = self._path(sub, key) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, self._path(sub, key))
+
+    def account(self, funder, create=False):
+        a = self._load("a", funder)
+        if a is None and create:
+            a = {"funder": funder.lower(), "credit": 0, "permit": None, "permitSent": False, "uncovered": False, "why": "", "lastPull": 0}
+        return a
+
+    def rollups_of(self, funder):
+        out = []
+        for name in sorted(os.listdir(os.path.join(self.dir, "s"))):
+            if name.endswith(".json"):
+                s = self._load("s", name[:-5])
+                if s and same(s.get("funder"), funder):
+                    out.append(s["rollup"])
+        return out
+
+    @staticmethod
+    def fresh(issued, last):
+        return isinstance(issued, int) and issued > int(last or 0) and issued <= int(time.time()) + 3600
+
+    def today(self, s, now=None):
+        now = now or int(time.time())
+        t = s.get("today") or {"calls": 0, "since": now}
+        if now - int(t.get("since", now)) >= DAY:
+            t = {"calls": 0, "since": now}
+        return t
+
+    def sponsor(self, rollup, da, funder, issued):
+        with self.lock:
+            s = self._load("s", rollup) or {"rollup": rollup.lower(), "da": da, "funder": None, "sponsoredAt": 0, "cap": None, "capAt": 0}
+            if not self.fresh(issued, s.get("sponsoredAt")):
+                return 409, {"error": "a sponsorship no newer than the last taken", "last": s.get("sponsoredAt")}
+            if s.get("funder") and not same(s["funder"], funder):
+                s["cap"], s["capAt"] = None, 0                 # the cap goes with the funder
+            s.update({"funder": funder.lower(), "da": da, "sponsoredAt": issued})
+            self._save("s", rollup, s)
+            self._save("a", funder, self.account(funder, create=True))
+            return 200, self.view_sponsor(rollup)
+
+    def release(self, rollup, funder, issued):
+        with self.lock:
+            s = self._load("s", rollup)
+            if not s or not s.get("funder"):
+                return 404, {"error": "no sponsored rollup", "rollup": rollup}
+            if not same(s["funder"], funder):
+                return 401, {"error": "not signed by the rollup's sponsor"}
+            if not self.fresh(issued, s.get("sponsoredAt")):
+                return 409, {"error": "a release no newer than the sponsorship"}
+            s.update({"funder": None, "sponsoredAt": issued})
+            self._save("s", rollup, s)
+            return 200, self.view_sponsor(rollup)
+
+    def cap(self, rollup, funder, calls, issued):
+        with self.lock:
+            s = self._load("s", rollup)
+            if not s or not s.get("funder"):
+                return 404, {"error": "no sponsored rollup", "rollup": rollup}
+            if not same(s["funder"], funder):
+                return 401, {"error": "not signed by the rollup's sponsor"}
+            if not self.fresh(issued, s.get("capAt")):
+                return 409, {"error": "a cap no newer than the last taken", "last": s.get("capAt")}
+            s["cap"], s["capAt"] = ({"callsPerDay": calls} if calls else None), issued
+            self._save("s", rollup, s)
+            return 200, self.view_sponsor(rollup)
+
+    def give_permit(self, funder, value, deadline, sig):
+        with self.lock:
+            a = self.account(funder, create=True)
+            a["permit"] = {"value": value, "deadline": deadline, "spender": self.token.spender, "signature": "0x" + sig.hex()}
+            a["permitSent"], a["uncovered"], a["why"] = False, False, ""
+            self._save("a", funder, a)
+            return a
+
+    def credit(self, funder, amount):
+        with self.lock:
+            a = self.account(funder, create=True)
+            a["credit"] += amount
+            if a["credit"] >= 0:
+                a["uncovered"], a["why"] = False, ""
+            self._save("a", funder, a)
+            return a
+
+    def cover(self, rollup, amount):
+        """What the book says to a call on a rollup: (None, None) when nobody sponsors it; (funder, None) when its
+        sponsor's account paid `amount` for one more call today - from its credit, or pulling at least min_pull from
+        the funder's permit first; (funder, why) when it cannot. The price is taken here, before the call is sent:
+        refund() when the call does not land"""
+        now = int(time.time())
+        with self.lock:
+            s = self._load("s", rollup) if rollup else None
+            if not s or not s.get("funder"):
+                return None, None
+            funder = s["funder"]
+            t = self.today(s, now)
+            cap = (s.get("cap") or {}).get("callsPerDay", 0)
+            if cap and t["calls"] + 1 > cap:
+                left = int(t["since"]) + DAY - now
+                return funder, "capped: %d of %d calls today; the window opens again in %d s" % (t["calls"], cap, max(left, 1))
+            a = self.account(funder, create=True)
+            if a.get("uncovered"):
+                return funder, "the sponsor's account is uncovered: %s" % a.get("why")
+            if a["credit"] < amount:
+                why = self._pull(a, amount, now)
+                self._save("a", funder, a)
+                if why:
+                    return funder, why
+            a["credit"] -= amount
+            t["calls"] += 1
+            s["today"] = t
+            self._save("a", funder, a)
+            self._save("s", rollup, s)
+            return funder, None
+
+    def refund(self, rollup, funder, amount):
+        """the call did not land: nothing is charged for it, and it does not count in the day"""
+        with self.lock:
+            a = self.account(funder, create=True)
+            a["credit"] += amount
+            self._save("a", funder, a)
+            s = self._load("s", rollup)
+            if s and same(s.get("funder"), funder) and (s.get("today") or {}).get("calls", 0) > 0:
+                s["today"]["calls"] -= 1
+                self._save("s", rollup, s)
+
+    def _pull(self, a, amount, now):
+        """Pull what the call needs past the credit, at least min_pull: the permit first, when the asset does not yet
+        allow the pull. None when the credit now covers the call; else why not. A refusal by the chain leaves the
+        account uncovered until a new permit or a top-up; the relay's own trouble (the RPC, a transaction that did not
+        land) does not"""
+        p = a.get("permit")
+        if not p or int(p["deadline"]) <= now:
+            return "the sponsor's account holds %d and has no permit to pull from" % a["credit"]
+        pull = max(self.min_pull, amount - a["credit"])
+
+        def refused(why):
+            a["uncovered"], a["why"] = True, why
+            return why
+        try:
+            if not a.get("permitSent"):
+                if self.token.allowance(a["funder"]) < pull:
+                    outcome, why = self.token.send(self.token.permit_data(a["funder"], p))
+                    if outcome == "refused":
+                        return refused("the permit was refused: " + why)
+                    if outcome != "ok":
+                        return "the permit could not be sent: " + why
+                a["permitSent"] = True
+            outcome, why = self.token.send(self.token.transfer_data(a["funder"], self.pay_to, pull))
+        except ChainUnreadable as e:
+            return "the chain cannot be read: %s" % e
+        if outcome == "refused":
+            return refused("the pull was refused: " + why)
+        if outcome != "ok":
+            return "the pull could not be sent: " + why
+        a["credit"] += pull
+        a["lastPull"] = now
+        return None
+
+    def view_account(self, funder):
+        a = self.account(funder)
+        if not a:
+            return None
+        try:
+            bal, allow, nonce = self.token.balance(funder), self.token.allowance(funder), self.token.nonce(funder)
+        except ChainUnreadable:
+            bal = allow = nonce = None
+        p = a.get("permit")
+        return {"funder": a["funder"], "credit": a["credit"], "balance": bal, "allowance": allow, "permitNonce": nonce,
+                "permit": {"value": p["value"], "deadline": p["deadline"], "sent": a.get("permitSent", False)} if p else None,
+                "rollups": self.rollups_of(funder), "state": "uncovered" if a.get("uncovered") else "covered", "why": a.get("why", "")}
+
+    def view_sponsor(self, rollup):
+        s = self._load("s", rollup)
+        if not s:
+            return None
+        return {"rollup": s["rollup"], "da": s.get("da"), "funder": s.get("funder"), "cap": s.get("cap"), "today": self.today(s),
+                "state": "sponsored" if s.get("funder") else "released"}
+
 
 
 def quote_key(relay_key: bytes) -> bytes:
@@ -105,31 +323,50 @@ class Relay:
         # the 402's price holds for the paid retry with nothing remembered between them (#184): the quote travels in
         # the offer's extra, MACed under a key derived from the relay's own, so any process holding that key honours it
         self.quote_key = quote_key(self.key)
+        # accounts and sponsorship (#276): the funder's messages in the relay's domain; pulls by the relay's own key
+        self.pay_to = pay_to.lower()
+        self.domain = eth.domain_separator("HPPLiteRelay", "1", self.chain_id, self.pay_to)
+        self.token = Token(self.chain, args.asset, self.key, self.chain_id, args.receipt_timeout, self.lock)   # one lock: one nonce
+        self.accounts = Accounts(args.dir, self.token, self.pay_to, args.min_pull)
         self.submitted = 0
         self.started = int(time.time())
 
     # --- what it takes ---
     def classify(self, to: str, data: str):
-        """The call's name, or (None, why) when the relay does not take it."""
+        """(name, None, rollup) for a call the relay takes - rollup the rollup it is for, None on the factory - or
+        (None, why, None) when it does not."""
         sel = data[2:10]
         to = to.lower()
         try:
             if to == self.factory:
-                return FACTORY_CALLS.get(sel), "not a call the relay takes on the factory"
+                return FACTORY_CALLS.get(sel), "not a call the relay takes on the factory", None
             if sel in ROLLUP_CALLS:
                 da = self.chain.view(self.factory, "daOf(address)", to)
                 if int(da, 16) == 0:
-                    return None, "not a rollup of factory %s" % self.factory
-                return ROLLUP_CALLS[sel], None
+                    return None, "not a rollup of factory %s" % self.factory, None
+                return ROLLUP_CALLS[sel], None, to
             if sel in DA_CALLS:
                 coord = "0x" + self.chain.view(to, "coordinator()")[-40:]
                 da = self.chain.view(self.factory, "daOf(address)", coord)
                 if da[-40:].lower() != to[2:]:
-                    return None, "not the DA of a rollup of factory %s" % self.factory
-                return DA_CALLS[sel], None
+                    return None, "not the DA of a rollup of factory %s" % self.factory, None
+                return DA_CALLS[sel], None, coord
         except (RpcError, OSError, ValueError) as e:
-            return None, "could not check the target: %s" % e
-        return None, "not a call the relay takes"
+            return None, "could not check the target: %s" % e, None
+        return None, "not a call the relay takes", None
+
+    def da_of(self, rollup):
+        """the DA of a rollup of this factory, lowercase, or None"""
+        try:
+            da = self.chain.view(self.factory, "daOf(address)", rollup)
+        except (RpcError, OSError, ValueError):
+            return None
+        return ("0x" + da[-40:]).lower() if int(da, 16) else None
+
+    def roles_of(self, rollup):
+        """the rollup's (owner, sequencer) on chain, lowercase; raises when the chain cannot be read"""
+        owner, seq = self.chain.view(rollup, "owner()"), self.chain.view(rollup, "sequencer()")
+        return ("0x" + owner[-40:]).lower(), ("0x" + seq[-40:]).lower()
 
     # --- what it costs ---
     def _quote_mac(self, to, data, amount, gas, until):
@@ -192,6 +429,10 @@ class Relay:
                         "payTo": self.payments.pay_to, "ethUsd": self.args.eth_usd, "margin": self.args.margin,
                         "minFee": self.args.min_fee, "facilitator": self.args.facilitator}
                        if self.payments.enabled else None,
+            "accounts": {"spender": self.address, "payTo": self.pay_to, "minPull": self.args.min_pull,
+                         "domain": {"name": "HPPLiteRelay", "version": "1", "chainId": self.chain_id, "verifyingContract": self.pay_to},
+                         "asset": self.args.asset, "assetDomain": {"name": self.args.asset_name, "version": self.args.asset_version}}
+                        if self.payments.enabled else None,
             "uptime": int(time.time()) - self.started,
         }
 
@@ -216,10 +457,128 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
             return self.reply(200, self.relay.status())
+        if re.match(r"^/(account|sponsor)/", self.path) and not self.relay.payments.enabled:
+            return self.reply(404, {"error": "a free relay keeps no accounts"})
+        m = re.match(r"^/account/(0x[0-9a-fA-F]{40})$", self.path)
+        if m:
+            a = self.relay.accounts.view_account(m.group(1).lower())
+            return self.reply(200, a) if a else self.reply(404, {"error": "no such account", "funder": m.group(1).lower()})
+        m = re.match(r"^/sponsor/(0x[0-9a-fA-F]{40})$", self.path)
+        if m:
+            s = self.relay.accounts.view_sponsor(m.group(1).lower())
+            return self.reply(200, s) if s else self.reply(404, {"error": "not a sponsored rollup", "rollup": m.group(1).lower()})
         return self.reply(404, {"error": "not found"})
 
+    def body_json(self):
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            return json.loads(self.rfile.read(n) if n > 0 else b"{}")
+        except (ValueError, TypeError):
+            return None
+
+    # --- accounts and sponsorship (#276) ---
+    def post_permit(self, funder):
+        req = self.body_json() or {}
+        r = self.relay
+        try:
+            value, deadline = int(req["value"]), int(req["deadline"])
+            sig = sig_bytes(req["signature"]) if "signature" in req else \
+                bytes.fromhex(req["r"][2:]) + bytes.fromhex(req["s"][2:]) + bytes([int(req["v"])])
+        except (KeyError, TypeError, ValueError):
+            return self.reply(400, {"error": "a permit is {value, deadline, signature} (or v, r, s)"})
+        if not sig or len(sig) != 65 or deadline <= int(time.time()):
+            return self.reply(400, {"error": "a permit with a 65-byte signature and a deadline ahead"})
+        try:
+            nonce = r.token.nonce(funder)
+        except ChainUnreadable as e:
+            return self.reply(503, {"error": "the chain cannot be read: %s" % e})
+        domain = eth.domain_separator(r.args.asset_name, r.args.asset_version, r.chain_id, r.args.asset)
+        digest = eth.typed_digest(domain, PERMIT_TYPE, funder, r.token.spender, value, nonce, deadline)
+        if not same(eth.recover(digest, sig), funder):
+            return self.reply(401, {"error": "the permit does not recover to the funder (spender, nonce, domain?)", "spender": r.token.spender, "nonce": nonce})
+        r.accounts.give_permit(funder, value, deadline, sig)
+        return self.reply(200, r.accounts.view_account(funder))
+
+    def post_pay(self, funder, query):
+        r, p = self.relay, self.relay.payments
+        try:
+            amount = int((query.get("amount") or ["0"])[0])
+        except ValueError:
+            amount = 0
+        if not p.enabled:
+            return self.reply(404, {"error": "this relay takes no x402 payments: give a permit"})
+        if amount < r.args.min_pull:
+            return self.reply(400, {"error": "amount below minPull", "minPull": r.args.min_pull})
+        requirements = p.requirements(amount, "http://%s%s" % (self.headers.get("Host", "localhost"), self.path), "top up %s's account at the relay" % funder)
+        header = self.headers.get("PAYMENT-SIGNATURE")
+        if not header:
+            return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
+        payload = p.decode(header)
+        if not payload or "payload" not in payload:
+            return self.reply(400, {"error": "PAYMENT-SIGNATURE is not a payment payload"})
+        v = p.verify(payload, requirements["accepts"][0])
+        if not v.get("isValid"):
+            requirements["error"] = v.get("invalidReason", "invalid payment")
+            return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
+        st = p.settle(payload, requirements["accepts"][0])
+        if not st.get("success"):
+            return self.reply(402, {"error": "settlement failed: " + st.get("errorReason", "?"), "settlement": st})
+        r.accounts.credit(funder, amount)
+        return self.reply(200, r.accounts.view_account(funder), {"PAYMENT-RESPONSE": base64.b64encode(json.dumps(st).encode()).decode()})
+
+    def post_sponsor(self, rollup, action):
+        req = self.body_json() or {}
+        r = self.relay
+        funder, issued = str(req.get("funder", "")).lower(), req.get("issuedAt")
+        sig = sig_bytes(req.get("signature"))
+        if not ADDR_RE.match(funder) or not isinstance(issued, int) or not sig:
+            return self.reply(400, {"error": "a sponsorship is {funder, issuedAt, signature}" + (" with callsPerDay" if action == "/cap" else "")})
+        if action == "/cap":
+            calls = req.get("callsPerDay")
+            if not isinstance(calls, int) or calls < 0:
+                return self.reply(400, {"error": "a cap is {funder, callsPerDay, issuedAt, signature}"})
+            digest = eth.typed_digest(r.domain, CAP_TYPE, rollup, calls, issued)
+        else:
+            digest = eth.typed_digest(r.domain, UNSPONSOR_TYPE if action == "/release" else SPONSOR_TYPE, rollup, funder, issued)
+        if not same(eth.recover(digest, sig), funder):
+            return self.reply(401, {"error": "the signature does not recover to the funder", "domain": r.status()["accounts"]["domain"]})
+        if action == "/cap":
+            return self.reply(*r.accounts.cap(rollup, funder, calls, issued))
+        if action == "/release":
+            return self.reply(*r.accounts.release(rollup, funder, issued))
+        da = r.da_of(rollup)
+        if not da:
+            return self.reply(404, {"error": "not a rollup of factory %s" % r.factory, "rollup": rollup})
+        # who pays for a rollup is named from the rollup's side: its owner or its sequencer signs the same Sponsor
+        # beside the funder, unless the funder is one of them. A funder alone could take any rollup's sponsorship
+        # over with a newer issuedAt and an empty account, and the rollup's calls would stop being paid.
+        try:
+            owner, seq = r.roles_of(rollup)
+        except (RpcError, OSError, ValueError) as e:
+            return self.reply(503, {"error": "the chain cannot be read for the rollup's owner and sequencer: %s" % e})
+        agreed = funder
+        if req.get("rollupSignature") is not None:
+            rsig = sig_bytes(req.get("rollupSignature"))
+            if not rsig:
+                return self.reply(400, {"error": "rollupSignature is a 65-byte signature, hex"})
+            agreed = eth.recover(digest, rsig)
+        if not (same(agreed, owner) or same(agreed, seq)):
+            return self.reply(401, {"error": "the rollup's side has not agreed: a Sponsor is signed by the funder and, in rollupSignature, by the "
+                                             "rollup's owner or sequencer, unless the funder is one of them",
+                                    "owner": owner, "sequencer": seq})
+        return self.reply(*r.accounts.sponsor(rollup, da, funder, issued))
+
     def do_POST(self):
-        if self.path != "/commit":
+        u = urllib.parse.urlparse(self.path)
+        if re.match(r"^/(account|sponsor)/", u.path) and not self.relay.payments.enabled:
+            return self.reply(404, {"error": "a free relay keeps no accounts"})
+        m = re.match(r"^/account/(0x[0-9a-fA-F]{40})/(permit|pay)$", u.path)
+        if m:
+            return self.post_permit(m.group(1).lower()) if m.group(2) == "permit" else self.post_pay(m.group(1).lower(), urllib.parse.parse_qs(u.query))
+        m = re.match(r"^/sponsor/(0x[0-9a-fA-F]{40})(/release|/cap)?$", u.path)
+        if m:
+            return self.post_sponsor(m.group(1).lower(), m.group(2) or "")
+        if u.path != "/commit":
             return self.reply(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", "0"))
@@ -232,7 +591,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError):
             return self.reply(400, {"error": "the body is {\"to\": address, \"data\": calldata}"})
         r = self.relay
-        name, why = r.classify(to, data)
+        name, why, rollup = r.classify(to, data)
         if not name:
             return self.reply(400, {"error": why})
         now = int(time.time())
@@ -252,11 +611,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             gas = int(gas * 1.25) + 10000                        # headroom: the state moves between estimate and inclusion
             quote = (r.price(gas, r.fees()[2]), gas, now + 120)
         amount, gas, until = quote
+        # a sponsored rollup (#276): its sponsor's account pays, taken before the call is sent and given back when it
+        # does not land, and the caller is asked nothing; when the account cannot pay, the 402 says why and the caller
+        # may still pay itself. A caller that sends a payment pays
+        sponsor, sponsor_why = r.accounts.cover(rollup, amount) if (rollup and p.enabled and not header) else (None, None)
+        if sponsor and not sponsor_why:
+            try:
+                with r.lock:
+                    rcpt, err = r.submit(to, data, gas)
+            except Exception:
+                r.accounts.refund(rollup, sponsor, amount)
+                raise
+            if err or int(rcpt.get("status") or "0x0", 16) != 1:
+                r.accounts.refund(rollup, sponsor, amount)
+                tx = rcpt.get("transactionHash") if rcpt else None
+                return self.reply(409 if rcpt else 502, {"error": err or "the transaction reverted", "tx": tx, "call": name, "charged": False})
+            return self.reply(200, {"tx": rcpt["transactionHash"], "block": int(rcpt["blockNumber"], 16), "gasUsed": int(rcpt["gasUsed"], 16),
+                                    "call": name, "sponsor": sponsor, "charged": amount})
         requirements = None
         if p.enabled:
             requirements = p.requirements(amount, "http://%s/commit" % self.headers.get("Host", "localhost"),
                                           "%s, %d gas, submitted and paid for by the relay" % (name, gas),
                                           r.quote_extra(to, data, amount, gas, until))
+            if sponsor_why:
+                requirements["sponsor"] = {"funder": sponsor, "why": sponsor_why}
             if not header:
                 return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
         if p.enabled:
@@ -306,6 +684,8 @@ def main():
     ap.add_argument("--margin", type=float, default=0.2, help="on top of the gas, for the relay's risk and upkeep")
     ap.add_argument("--min-fee", type=int, default=100, help="atomic units (USDC.e: 1e-6) at least per call")
     ap.add_argument("--receipt-timeout", type=int, default=90)
+    ap.add_argument("--dir", default="./hpplite_relay", help="where accounts and sponsorships are kept (#276)")
+    ap.add_argument("--min-pull", type=int, default=1000000, help="the least a pull from a sponsor's permit, or an x402 top-up, moves (atomic units)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     Handler.relay = Relay(args)

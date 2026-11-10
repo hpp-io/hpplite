@@ -81,6 +81,18 @@ def generate():
         {"chainId": 181228, "to": "0x" + "Ab" * 20, "data": d, "amount": a, "gas": g, "until": u,
          "mac": relay.quote_mac(qk, 181228, "0x" + "Ab" * 20, d, a, g, u)}
         for d, a, g, u in (("0x12345678", 3032, 101000, 1800000000), ("0x" + "00" * 100, 1, 1, 0))]}
+    # hpplite-relay/1's account messages (#276): in ("HPPLiteRelay", "1", chainId, payTo); a Sponsor is signed by the
+    # funder and, as rollupSignature, by the rollup's owner or sequencer over the same digest
+    rdom = eth.domain_separator("HPPLiteRelay", "1", 181228, pay_to)
+    rollup = "0x" + "cd" * 20
+    rmsgs = [("Sponsor", relay.SPONSOR_TYPE, [rollup, funder, 1800000000], 2),
+             ("Sponsor", relay.SPONSOR_TYPE, [rollup, funder, 1800000000], 1),
+             ("Unsponsor", relay.UNSPONSOR_TYPE, [rollup, funder, 1800000001], 2),
+             ("Cap", relay.CAP_TYPE, [rollup, 3, 1800000002], 2)]
+    v["relayMessages"] = {"chainId": 181228, "payTo": pay_to, "messages": [
+        {"type": t, "typeString": ts, "fields": fields, "key": KEYS[k], "digest": "0x" + eth.typed_digest(rdom, ts, *fields).hex(),
+         "signature": "0x" + eth.sign(key(k), eth.typed_digest(rdom, ts, *fields)).hex()}
+        for t, ts, fields, k in rmsgs]}
     v["relayCalls"] = {"factoryVersion": 10, "selectors": {name: "0x" + sel for sel, name in sorted(
         list(relay.FACTORY_CALLS.items()) + list(relay.ROLLUP_CALLS.items()) + list(relay.DA_CALLS.items()), key=lambda x: x[1])}}
     return v

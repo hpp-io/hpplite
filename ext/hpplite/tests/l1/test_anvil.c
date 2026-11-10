@@ -2012,6 +2012,7 @@ static pid_t start_relay(const char *svc, const char *usdc, int port) {
     fprintf(f, "%s\n", KEY9);
     fclose(f);
     snprintf(script, sizeof script, "%s/../relay/relay.py", svc);
+    (void)!system("rm -rf " DIR "/relay_accounts");        /* the relay's book (#276): a fresh one at each start */
     pid_t pid = fork();
     if (pid == 0) {
         char portStr[16];
@@ -2019,7 +2020,7 @@ static pid_t start_relay(const char *svc, const char *usdc, int port) {
         int fd = open(DIR "/relay.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key",
-               "--factory", FACTORY, "--facilitator", FACIL, "--asset", usdc, "--eth-usd", "30", (char *)NULL);
+               "--factory", FACTORY, "--facilitator", FACIL, "--asset", usdc, "--eth-usd", "30", "--dir", DIR "/relay_accounts", (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -2801,6 +2802,83 @@ static void test_owner_binds_alone(void) {
     PASS();
 }
 
+/* #276: a treasury (USDC.e, no ETH) sponsors the app's rollup at the relay; the app's key holds nothing at all and its
+** claim goes through the relay with no payment asked. Red before: the relay answered 402, the app had nothing to pay
+** with, no lease. */
+static void test_sponsored_relay(void) {
+    TEST("relay accounts (#276): the treasury's permit and sponsorship at the relay; an app key with no ETH and no USDC.e claims through the relay, charged to the treasury");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    static const char *APPKEY = "0x5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d";
+    static const char *TKEY = "0x5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";   /* the treasury: USDC.e, no ETH */
+    char appAddr[48], tre[48], cmd[1600], out[4000], contract[80], extra[400], sql[300];
+    int sport = test_free_port(), rport = test_free_port();
+    pid_t store, relay;
+    FILE *f;
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
+    (void)!system("rm -f " DIR "/sp_owner.db* " DIR "/sp_app.db* 2>/dev/null");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", APPKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(appAddr, sizeof appAddr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", TKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(tre, sizeof tre, "%.42s", out);
+    for (char *p = tre; *p; p++) if (*p >= 'A' && *p <= 'F') *p += 32;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 5000000 >/dev/null 2>&1", RPC, KEY0, usdc, tre);
+    if (system(cmd) != 0) FAIL("fund the treasury with MockUSDC");
+    if (eth_balance_of(appAddr) != 0 || eth_balance_of(tre) != 0) FAIL("the app's key and the treasury should hold no ETH");
+    f = fopen(DIR "/treasury.key", "w");
+    if (!f) FAIL("the treasury's key file");
+    fprintf(f, "%s\n", TKEY); fclose(f);
+    f = fopen(DIR "/sp_owner.key", "w");                   /* the rollup's owner signs the sponsorship beside the treasury */
+    if (!f) FAIL("the owner's key file");
+    fprintf(f, "%s\n", KEY9); fclose(f);
+
+    /* the platform: the owner creates the rollup and names the app's key */
+    sqlite3 *own = open_db("sp_owner.db", KEY9, "&dbname=sponsored");
+    if (!own) FAIL("open the owner");
+    snprintf(contract, sizeof contract, "%s", status_text(own, "contract"));
+    snprintf(sql, sizeof sql, "SELECT hpplite_set_sequencer('%s')", appAddr);
+    if (!contract[0] || exec_sql(own, sql) != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(own)); sqlite3_close(own); FAIL("the owner creates the rollup and names the app's key"); }
+    sqlite3_close(own);
+
+    store = start_pin_service_free(svc, sport);
+    if (store < 0) FAIL("the pin service did not come up");
+    relay = start_relay(svc, usdc, rport);
+#define SP_CLEANUP() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); } while (0)
+    if (relay < 0) { SP_CLEANUP(); FAIL("the relay did not come up (see relay.log)"); }
+    /* the treasury's control plane: a permit at the relay, the rollup sponsored (operators/relay/sponsor.py) */
+    snprintf(cmd, sizeof cmd, "python3 -I %s/../relay/sponsor.py http://127.0.0.1:%d --key-file " DIR "/treasury.key permit 5000000", svc, rport);
+    if (run_cmd(cmd, out, sizeof out) != 0 || !strstr(out, "\"permit\"")) { printf("(%s) ", out); SP_CLEANUP(); FAIL("the treasury's permit at the relay"); }
+    snprintf(cmd, sizeof cmd, "python3 -I %s/../relay/sponsor.py http://127.0.0.1:%d --key-file " DIR "/treasury.key sponsor %s", svc, rport, contract);
+    if (run_cmd(cmd, out, sizeof out) == 0 || !strstr(out, "rollup's side")) { printf("(%s) ", out); SP_CLEANUP(); FAIL("a sponsorship by the treasury alone should be refused: the rollup's side has not agreed"); }
+    snprintf(cmd, sizeof cmd, "python3 -I %s/../relay/sponsor.py http://127.0.0.1:%d --key-file " DIR "/treasury.key --rollup-key-file " DIR "/sp_owner.key sponsor %s",
+             svc, rport, contract);
+    if (run_cmd(cmd, out, sizeof out) != 0 || !strstr(out, "\"sponsored\"")) { printf("(%s) ", out); SP_CLEANUP(); FAIL("the sponsorship, the owner signing beside the treasury (red: the relay has no /sponsor)"); }
+
+    /* the app: its own key with nothing, the platform's rollup, the store, the relay */
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);
+    snprintf(extra, sizeof extra, "&contract=%s&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", contract, sport, rport);
+    sqlite3 *app = open_db("sp_app.db", APPKEY, extra);
+    if (!app) { SP_CLEANUP(); FAIL("open the app"); }
+    {
+        long long lease = status_int(app, "lease"), spent = status_int(app, "relay_spent");
+        char path[20], err[300];
+        snprintf(path, sizeof path, "%s", status_text(app, "last_tx_path"));
+        snprintf(err, sizeof err, "%s", status_text(app, "last_error"));
+        int okClaim = lease == 1 && spent == 0 && strcmp(path, "relay") == 0;
+        snprintf(cmd, sizeof cmd, "curl -s -m 5 http://127.0.0.1:%d/sponsor/%s", rport, contract);
+        run_cmd(cmd, out, sizeof out);
+        int charged = strstr(out, "\"calls\": 1") != NULL;
+        sqlite3_close(app);
+        SP_CLEANUP();
+        if (!okClaim) { printf("(lease %lld, relay_spent %lld, path %s, %s) ", lease, spent, path, err); FAIL("the app's claim should go through the relay with nothing paid by the app (red: 402, the app has nothing)"); }
+        if (!charged) { printf("(%s) ", out); FAIL("the sponsorship should count the call"); }
+        if (eth_balance_of(appAddr) != 0) FAIL("the app's key should still hold no ETH");
+    }
+#undef SP_CLEANUP
+    PASS();
+}
+
 static void test_platform_sidecar(void) {
     TEST("the platform shape (#263, #268): the owner creates and names the app's key, 24 h lease; a plain-connection app with hpplite-sequencer beside it; sleep/wake sends nothing; kill -9, the owner expires, a successor rebuilds from the store and ships; the old host posts nothing over it");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
@@ -2981,6 +3059,7 @@ int main(void) {
     if (wanted(37)) test_platform_sidecar();
     if (wanted(38)) test_contract_beats_factory();
     if (wanted(39)) test_owner_binds_alone();
+    if (wanted(40)) test_sponsored_relay();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

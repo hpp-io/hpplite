@@ -264,6 +264,33 @@ def relay(url):
     st, _, _ = commit({"to": status.get("factory", "0x" + "00" * 20), "data": "0x12345678"})
     check(st == 400, "an unknown call on the factory: 400")
 
+    # accounts and sponsorship (#276), where the relay keeps them: what it says of itself and what it refuses, nothing spent
+    acc = status.get("accounts")
+    if acc:
+        dom = acc.get("domain") or {}
+        check(all(k in acc for k in ("spender", "payTo", "minPull", "asset", "assetDomain")) and dom.get("name") == "HPPLiteRelay"
+              and dom.get("version") == "1" and str(dom.get("verifyingContract", "")).lower() == str(acc.get("payTo", "")).lower(),
+              "/status.accounts: spender, payTo, minPull, asset, assetDomain, and the domain (HPPLiteRelay, 1, chainId, payTo)")
+        fk, nobody = secrets.token_bytes(32), "0x" + secrets.token_bytes(20).hex()
+        funder, now = eth.address(fk).lower(), int(time.time())
+        rdom = eth.domain_separator("HPPLiteRelay", "1", int(status.get("chainId", 0)), acc.get("payTo", "0x" + "00" * 20))
+        stype = "Sponsor(address rollup,address funder,uint256 issuedAt)"
+
+        def sponsor(rollup, key):
+            sig = eth.sign(key, eth.typed_digest(rdom, stype, rollup, funder, now))
+            st, _, body = request(url, "POST", "/sponsor/" + rollup, json.dumps({"funder": funder, "issuedAt": now, "signature": "0x" + sig.hex()}).encode(),
+                                  {"Content-Type": "application/json"})
+            return st
+        check(sponsor(nobody, secrets.token_bytes(32)) == 401, "a Sponsor not signed by its funder: 401")
+        check(sponsor(nobody, fk) == 404, "a Sponsor of an address that is no rollup of the factory: 404")
+        st, _, _ = request(url, "GET", "/account/" + funder)
+        check(st == 404, "GET /account/<funder> of a wallet the relay never heard of: 404")
+        st, _, _ = request(url, "GET", "/sponsor/" + nobody)
+        check(st == 404, "GET /sponsor/<rollup> of a rollup nobody sponsors: 404")
+        st, _, _ = request(url, "POST", "/account/%s/permit" % funder, json.dumps({"value": "1000000", "deadline": now + 3600, "signature": "0x" + "11" * 65}).encode(),
+                           {"Content-Type": "application/json"})
+        check(st == 401, "a permit not signed by the funder: 401 (%d)" % st)
+
     # a call that would succeed: a fresh wallet's createRollupFor, signed
     k = secrets.token_bytes(32)
     owner = eth.address(k)
