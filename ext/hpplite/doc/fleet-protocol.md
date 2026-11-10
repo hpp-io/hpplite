@@ -107,6 +107,7 @@ calls below. `<fleet>` is the shared rollup's address, `<db>` a `dbId` (hex).
 | `GET /fleet/<fleet>/name/<db>-<height>` | - | the bytes, as a name today |
 | `GET /fleet/<fleet>/heads?after=<dbId>&limit=<n>` | the anchor | every database whose latest head is not the head in its latest indexed root, by `dbId` ascending (the leaf order), paged: what the next root is built from. Defined by state: a head that moved between the anchor's read and the root is listed again by itself |
 | `GET /fleet/<fleet>/db/<db>` | - | `{dbId, epoch, sequencer, instance, retired, latestHead, latestRoot}`; `latestRoot` is a hint, the path proves it |
+| `POST /fleet/<fleet>/manifest`, the body the manifest; `X-HPPLite-Signature` the fleet's anchor's `Content(address da = <fleet>, uint256 height = <seq>, bytes32 hash = keccak256(body))` in the store's domain | the anchor, before `postRootFor` | the manifest kept under its CID (`GET /get/<cid>`) |
 | `POST /fleet/<fleet>/root` | anyone | a hint to read the chain now; its body is trusted for nothing |
 
 **The chain's side comes from the fleet's events.** The store polls
@@ -131,6 +132,13 @@ records `latestRoot = seq` for each `dbId` in it. The anchor's order is fixed:
 the manifest put first, then `postRootFor`. A root whose manifest is not at
 the store is kept as "manifest missing" and tried again; it is no
 `latestRoot` until it checks.
+
+The reference store serves the calls above (`operators/store/fleet_store.py`,
+ctest `test_store_fleet` on anvil). A head's chain hash must follow from the
+previous head and the bytes (`keccak256(abi.encode(prev, height,
+keccak256(bytes)))`, zero before height 1), which ties the signed head to the
+bytes it is written with. Until the money below is built, a store that
+charges answers fleet writes `501`.
 
 **Funding and caps.** One bucket per `(fleet, dbId)`, bound by one Bind per
 database as today, the fleet's treasury (or a database's own funder in a

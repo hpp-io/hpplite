@@ -344,6 +344,9 @@ if(HPPLITE_BUILD_TESTS)
         # hpplite-store/2 (#213): buckets, accounts, permit pulls and x402 top-ups on anvil (doc/store-protocol.md)
         add_test(NAME test_store_buckets COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/bucket_selftest.sh)
         set_tests_properties(test_store_buckets PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+        # hpplite-fleet/1's store side (#297): the v11 contracts on anvil, heads with their writes, the fence, roots
+        add_test(NAME test_store_fleet COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/fleet_selftest.sh)
+        set_tests_properties(test_store_fleet PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
 
     # === CTest Registration ===

@@ -37,6 +37,7 @@ import threading
 import time
 import urllib.parse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # fleet_store (#297), under python3 -I
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from x402seller import eth  # noqa: E402
 from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_tx  # noqa: E402
@@ -495,6 +496,8 @@ class Service:
                                  args.asset_name, args.asset_version, args.rpc)
         self.spender = eth.address(spender_key)
         self.started = int(time.time())
+        import fleet_store
+        self.fleets = fleet_store.FleetBook(chain, self.disk, self.chain_id) if chain else None   # hpplite-fleet/1 (#297)
 
     def start(self):
         def loop():
@@ -504,6 +507,11 @@ class Service:
                     self.ledger.tick()
                 except (OSError, ValueError) as e:
                     self.ledger.warn("tick", str(e))
+                for fleet in (self.fleets.known() if self.fleets else []):     # the fleets' events, polled (#297)
+                    try:
+                        self.fleets.follow(fleet)
+                    except (ChainUnreadable, OSError, ValueError) as e:
+                        self.ledger.warn("fleet", "%s: %s" % (fleet, e))
         threading.Thread(target=loop, daemon=True).start()
 
     def status(self):
@@ -639,6 +647,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = url.path
         if path == "/status":
             return self.reply(200, self.service.status())
+        if path.startswith("/fleet/") and self.service.fleets and ADDR_RE.match(path.split("/")[2] if path.count("/") >= 2 else ""):
+            import fleet_store
+            try:
+                return fleet_store.fleet_get(self, path, urllib.parse.parse_qs(url.query))
+            except ChainUnreadable as e:
+                return self.reply(503, {"error": "the chain cannot be read to follow the fleet: %s" % e})
         if path.startswith("/bucket/"):
             da = path[8:].lower()
             b = self.L.bucket(da) if ADDR_RE.match(da) else None
@@ -677,8 +691,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = self.service.disk.read("c/%s" % cid) if refs else None
             if data is None:
                 return self.reply(404, {"error": "not held here", "cid": cid})
-            states = [(self.L.bucket(da) or {}).get("state") for da in refs]
-            if "covered" not in states:
+            states = [(self.L.bucket(da) or {}).get("state") for da in refs if ADDR_RE.match(da)]
+            if "covered" not in states and not any(not ADDR_RE.match(k) or (self.service.fleets and k in self.service.fleets.known()) for k in refs):
                 return self.reply(410, {"error": "bucket_parked", "cid": cid})
             return self.reply_bytes(data)
         return self.reply(404, {"error": "no such endpoint"})
@@ -708,6 +722,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(413, {"error": "too large", "max": self.service.args.max_bytes})
         body = self.rfile.read(n) if n else b""
         try:
+            if path.startswith("/fleet/") and self.service.fleets and ADDR_RE.match(path.split("/")[2] if path.count("/") >= 2 else ""):
+                import fleet_store
+                return fleet_store.fleet_post(self, path, body)
             if path.startswith("/name/"):
                 return self.post_name(path[6:], body)
             if path == "/put":
