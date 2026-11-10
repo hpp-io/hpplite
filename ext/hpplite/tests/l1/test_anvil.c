@@ -2062,6 +2062,143 @@ static pid_t start_relay(const char *svc, const char *usdc, int port) {
     kill(pid, SIGKILL); waitpid(pid, NULL, 0);
     return -1;
 }
+/* 42. fleet= (#316 b): the lease path of a database in a shared rollup, through a relay. The v11 factory is deployed here,
+** a fleet created; the database's client joins with the fleet's Admit (joinFor), renews without moving the epoch, a second
+** instance is refused while the lease holds, takes it after the owner's forceExpire (the epoch moves), and a database
+** the fleet has no record of, given no admit=, is refused with the reason. A free relay submits (its money is #313's). */
+static int fleet_word(const char *hex, unsigned char *out, int n) { return hpplite_hex_to_bytes(hex[1] == 'x' ? hex + 2 : hex, out, n) == n ? 0 : -1; }
+static long long fleet_epoch(const char *fl, const char *dbx) {
+    char cmd[600], out[2000];
+    snprintf(cmd, sizeof cmd, "cast call %s 'db(bytes32)(address,address,bytes32,bytes32,uint64,uint64,uint64,uint64,bool,uint256,address,uint256,bytes32,bytes32,address)' %s --rpc-url %s | sed -n 6p", fl, dbx, RPC);
+    return run_cmd(cmd, out, sizeof out) == 0 ? atoll(out) : -1;
+}
+static struct HppliteStore *fleet_relay(const char *url, const unsigned char key[32]) {
+    struct HppliteStore *r = hpplite_store_open(url, key, 0);
+    if (r) hpplite_store_set_relay(r);           /* as the node marks it: /commit takes the signed forms */
+    return r;
+}
+static void test_fleet_lease(void) {
+    TEST("fleet= lease path (#316 b): joinFor with the Admit, a renewal keeps the epoch, a second instance waits, takes it after forceExpire (epoch moves), no record and no admit= refused with the reason");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";   /* the database's own sequencer key: no ETH */
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], helper[600];
+    int rport = test_free_port();
+    pid_t relay = -1;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY);
+    run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    /* the fleet's Admit, signed by its owner (KEY0) as somaro's console does: dbId, nameHash and the signature from fleet.py */
+    snprintf(helper, sizeof helper, DIR "/fleet_admit.py");
+    FILE *f = fopen(helper, "w");
+    if (!f) FAIL("helper");
+    fprintf(f, "import sys, time\nsys.path[:0] = ['%s/..', '%s/../fleet']\nfrom x402seller import eth\nimport fleet\n"
+               "owner, seq, fl, key, name = sys.argv[1].lower(), sys.argv[2].lower(), sys.argv[3].lower(), bytes.fromhex(sys.argv[4][2:]), sys.argv[5]\n"
+               "db = fleet.db_id(owner, name); issued = int(time.time())\n"
+               "sig = eth.sign(key, eth.typed_digest(fleet.domain(31337, fl), fleet.ADMIT_TYPE, db, owner, seq, issued))\n"
+               "print(db.hex(), fleet.name_hash(name).hex(), issued, sig.hex())\n", svc, svc);
+    fclose(f);
+    snprintf(cmd, sizeof cmd, "python3 -I %s %s %s %s %s notes", helper, ownerAddr, seqAddr, fl, KEY0);
+    if (run_cmd(cmd, out, sizeof out) != 0) FAIL("the Admit");
+    char dbHex[70], nhHex[70], sigHex[140];
+    unsigned long long issued = 0;
+    if (sscanf(out, "%66s %66s %llu %132s", dbHex, nhHex, &issued, sigHex) != 4) FAIL("the Admit's fields");
+    unsigned char flb[20], db[32], nh[32], ow[20], sig[65], seqKey[32];
+    fleet_word(fl, flb, 20); fleet_word(dbHex, db, 32); fleet_word(nhHex, nh, 32); fleet_word(ownerAddr, ow, 20); fleet_word(sigHex, sig, 65); fleet_word(SKEY, seqKey, 32);
+    char dbx[70];
+    snprintf(dbx, sizeof dbx, "0x%s", dbHex);
+    /* a free relay serving the v11 factory */
+    f = fopen(DIR "/relay.key", "w");
+    if (!f) FAIL("relay key");
+    fprintf(f, "%s\n", KEY9);
+    fclose(f);
+    (void)!system("rm -rf " DIR "/relay_fleet");
+    relay = fork();
+    if (relay == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", rport);
+        snprintf(script, sizeof script, "%s/../relay/relay.py", svc);
+        int fd = open(DIR "/relay_fleet.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key", "--factory", FACTORY,
+               "--fleet-factory", ff, "--dir", DIR "/relay_fleet", "--verbose", (char *)NULL);
+        _exit(127);
+    }
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    for (int i = 0; i < 50; i++) {
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 %s/status", relayUrl);
+        if (run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "hpplite-relay")) break;
+        usleep(200 * 1000);
+    }
+#define FL_FAIL(why) do { kill(relay, SIGTERM); waitpid(relay, NULL, 0); FAIL(why); } while (0)
+    unsigned char instA[32], instB[32];
+    memset(instA, 0xa1, 32); memset(instB, 0xb2, 32);
+    hpplite_l1_set_default_chain_id(31337);             /* as the node does from chainid= before it connects */
+    HppliteL1 *a = hpplite_l1_connect_fleet(RPC, flb, db, ow, nh, issued, sig);
+    if (!a) FL_FAIL("connect the database's client");
+    hpplite_l1_set_privkey(a, seqKey);
+    hpplite_l1_set_relay(a, fleet_relay(relayUrl, seqKey));
+    char *tx = hpplite_l1_claim_sequencer(a, instA);
+    int landed = tx && hpplite_l1_wait_for_tx(a, tx, 30) == 1;
+    HppliteL1State *st = hpplite_l1_get_state(a);
+    long long e1 = fleet_epoch(fl, dbx);
+    printf("(join: %s, epoch %lld) ", tx ? "a transaction" : (hpplite_l1_relay_error(a) ? hpplite_l1_relay_error(a) : "nothing"), e1);
+    int held = st && memcmp(st->sequencerInstance, instA, 32) == 0 && st->leaseExpiry > st->currentTimestamp
+               && st->leaseDuration == 7 * 86400;              /* the fleet's lease: the node renews in its second half */
+    if (st) hpplite_l1_state_free(st);
+    sqlite3_free(tx);
+    if (!landed || !held || e1 != 1) { hpplite_l1_disconnect(a); FL_FAIL("the first claim joins the fleet with the Admit: the lease the instance's, epoch 1"); }
+    tx = hpplite_l1_renew_lease(a, instA);
+    landed = tx && hpplite_l1_wait_for_tx(a, tx, 30) == 1;
+    sqlite3_free(tx);
+    if (!landed || fleet_epoch(fl, dbx) != 1) { hpplite_l1_disconnect(a); FL_FAIL("a renewal by the holding instance keeps the epoch"); }
+    if (hpplite_l1_release_lease(a, instA) != NULL) { hpplite_l1_disconnect(a); FL_FAIL("a fleet database has no release"); }
+    /* a second instance of the same key: refused while the lease holds; after the owner's forceExpire it takes it */
+    HppliteL1 *b = hpplite_l1_connect_fleet(RPC, flb, db, ow, nh, 0, NULL);
+    hpplite_l1_set_privkey(b, seqKey);
+    hpplite_l1_set_relay(b, fleet_relay(relayUrl, seqKey));
+    tx = hpplite_l1_claim_sequencer(b, instB);
+    printf("(a second instance while held: %s) ", tx ? "a transaction" : (hpplite_l1_relay_error(b) ? hpplite_l1_relay_error(b) : "refused"));
+    int refused = tx == NULL || hpplite_l1_wait_for_tx(b, tx, 30) != 1;
+    sqlite3_free(tx);
+    if (!refused) { hpplite_l1_disconnect(a); hpplite_l1_disconnect(b); FL_FAIL("a second instance must not take a held lease"); }
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'forceExpire(bytes32)' %s --rpc-url %s >/dev/null", KEY1, fl, dbx, RPC);
+    if (system(cmd) != 0) { hpplite_l1_disconnect(a); hpplite_l1_disconnect(b); FL_FAIL("the owner's forceExpire"); }
+    tx = hpplite_l1_claim_sequencer(b, instB);
+    landed = tx && hpplite_l1_wait_for_tx(b, tx, 30) == 1;
+    sqlite3_free(tx);
+    st = hpplite_l1_get_state(b);
+    long long e2 = fleet_epoch(fl, dbx);
+    held = st && memcmp(st->sequencerInstance, instB, 32) == 0;
+    if (st) hpplite_l1_state_free(st);
+    printf("(after forceExpire the second instance claims: epoch %lld) ", e2);
+    if (!landed || !held || e2 <= e1 + 1) { hpplite_l1_disconnect(a); hpplite_l1_disconnect(b); FL_FAIL("after forceExpire the second instance claims (claimFor) and the epoch moves past the expiry's"); }
+    /* a database the fleet has never seen, with no admit=: refused, saying the Admit is needed */
+    unsigned char other[32];
+    memset(other, 0x77, 32);
+    HppliteL1 *c = hpplite_l1_connect_fleet(RPC, flb, other, ow, nh, 0, NULL);
+    hpplite_l1_set_privkey(c, seqKey);
+    hpplite_l1_set_relay(c, fleet_relay(relayUrl, seqKey));
+    tx = hpplite_l1_claim_sequencer(c, instA);
+    const char *why = hpplite_l1_relay_error(c);
+    printf("(no record, no admit=: %s) ", why ? why : "(no reason)");
+    int noAdmit = tx == NULL && why && strstr(why, "admit=");
+    sqlite3_free(tx);
+    hpplite_l1_disconnect(a); hpplite_l1_disconnect(b); hpplite_l1_disconnect(c);
+    if (!noAdmit) FL_FAIL("no record and no admit=: refused with the reason");
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0);
+#undef FL_FAIL
+    PASS();
+}
+
 static void test_relay_no_eth(void) {
     TEST("a wallet with USDC.e and no ETH (#126): its rollup, lease and anchors through the relay, paid in USDC.e; a replica rebuilds; its ETH stays 0");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
@@ -3257,6 +3394,7 @@ int main(void) {
     if (wanted(39)) test_owner_binds_alone();
     if (wanted(40)) test_sponsored_relay();
     if (wanted(41)) test_fleet_sequencer();
+    if (wanted(42)) test_fleet_lease();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

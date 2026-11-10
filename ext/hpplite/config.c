@@ -183,8 +183,8 @@ static void fleet_check(HppliteConfig *cfg, const int uri[7]) {
         const char *ev = getenv(k[i].env);
         int env = ev != NULL && ev[0];
         if (!uri[i] && !env) continue;
-        snprintf(gConfigError, sizeof(gConfigError), "%s%s%s with fleet=: %s%s", uri[i] ? k[i].name : k[i].env, uri[i] ? "=" : " (environment)",
-                 "", k[i].anchors ? "the fleet's anchor anchors its databases" : "a database in a fleet is named by fleet=, owner= and dbname= alone",
+        snprintf(gConfigError, sizeof(gConfigError), "%s%s with fleet=: %s%s", uri[i] ? k[i].name : k[i].env, uri[i] ? "=" : " (environment)",
+                 k[i].anchors ? "the fleet's anchor anchors its databases" : "a database in a fleet is named by fleet=, owner= and dbname= alone",
                  (i == 4 || i == 5) ? " (snapshots and pruning in a fleet: #314)" : "");
         return;
     }
@@ -939,10 +939,16 @@ int hpplite_config_resolve_operators(HppliteConfig *cfg) {
     }
     if (cfg->hasFleet && !gConfigError[0]) {
         /* the dbId said at once, so a wrong owner= or dbname= is seen (#316) */
-        char id[65], fl[41], ow[41];
+        char id[65], fl[41], ow[41], *name = malloc(strlen(cfg->dbName) * 3 + 1), *q = name;
         for (i = 0; i < 32; i++) snprintf(id + 2 * i, 3, "%02x", cfg->dbId[i]);
         for (i = 0; i < 20; i++) { snprintf(fl + 2 * i, 3, "%02x", cfg->fleet[i]); snprintf(ow + 2 * i, 3, "%02x", cfg->fleetOwner[i]); }
-        fprintf(stderr, "hpplite: fleet 0x%s: database \"%s\" of 0x%s, dbId 0x%s\n", fl, cfg->dbName, ow, id);
+        /* the name as given, %HH outside printable ASCII and for '"' and '%': a name cannot write a line of its own */
+        for (const unsigned char *p = (const unsigned char *)cfg->dbName; name && *p; p++) {
+            if (*p < 0x20 || *p > 0x7e || *p == '"' || *p == '%') q += sprintf(q, "%%%02X", *p); else *q++ = (char)*p;
+        }
+        if (name) *q = 0;
+        fprintf(stderr, "hpplite: fleet 0x%s: database \"%s\" of 0x%s, dbId 0x%s\n", fl, name ? name : "?", ow, id);
+        free(name);
         /* until the node's fleet mode is built (#316 b-e), a database in a fleet does not open as anything else */
         snprintf(gConfigError, sizeof(gConfigError), "fleet=: the node's fleet mode is not served yet (#316); this database does not open as a rollup instead");
         return -1;

@@ -362,6 +362,14 @@ HppliteL1 *hpplite_l1_connect_factory(
     const uint8_t privkey[32]
 );
 
+/*
+** fleet= (#316): one database in a shared rollup (hpplite-fleet/1). Its lease is the fleet's record of the database:
+** get_state reads it, claim_sequencer and renew_lease take it (claimFor, or joinFor with the fleet's Admit when the
+** fleet has no live record), release_lease has nothing to release. admitSig NULL: no Admit given. Real chains only.
+*/
+HppliteL1 *hpplite_l1_connect_fleet(const char *rpc_url, const uint8_t fleet[20], const uint8_t dbId[32], const uint8_t owner[20],
+                                    const uint8_t nameHash[32], uint64_t admitIssuedAt, const uint8_t admitSig[65]);
+
 /* === Batch DA Functions (on-chain data availability) === */
 
 /*

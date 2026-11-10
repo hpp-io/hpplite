@@ -60,6 +60,14 @@ typedef struct EthL1 {
     ** holds ETH */
     HppliteStore *relay;
     const char *lastPath;      /* "relay" or "direct": how the last write went (NULL: none yet) */
+
+    /* fleet= (#316): contract is a shared rollup (hpplite-fleet/1) and this client speaks for one database in it:
+    ** its lease is the database's record, taken with joinFor (the fleet's Admit) or claimFor, through the relay */
+    int fleet;
+    uint8_t dbId[32], fleetOwner[20], nameHash[32];
+    uint64_t admitIssuedAt;
+    uint8_t admitSig[65];
+    int hasAdmit;
     char relayError[240];
 } EthL1;
 
@@ -97,6 +105,7 @@ static uint8_t SEL_SET_LEASE_DURATION[4];   /* setLeaseDuration(uint256): the ow
 /* The signed forms (#126): the same call with the wallet's EIP-712 signature, anyone's gas */
 static uint8_t SEL_COMMIT_RANGE_FOR[4], SEL_SUBMIT_BATCH_FOR[4], SEL_COMMIT_BATCH_FOR[4];
 static uint8_t SEL_CLAIM_FOR[4], SEL_RENEW_FOR[4], SEL_RELEASE_FOR[4], SEL_CHECKPOINT_FOR[4], SEL_INTERVAL_FOR[4];
+static uint8_t SEL_FLEET_DB[4], SEL_FLEET_JOIN[4], SEL_FLEET_CLAIM[4], SEL_FLEET_LEASE[4];   /* hpplite-fleet/1 (#316) */
 static uint8_t SEL_CREATE_FOR[4], SEL_LEASE_NONCE[4], SEL_OWNER_NONCE[4], SEL_CREATE_NONCE[4];
 static uint8_t SEL_RELEASE_LEASE[4];
 static uint8_t SEL_GET_OR_CREATE_ROLLUP[4];
@@ -164,6 +173,10 @@ static void init_selectors_once(void) {
     abi_function_selector("submitBatchFor(bytes32,uint256,bytes,bytes)", SEL_SUBMIT_BATCH_FOR);
     abi_function_selector("commitBatchFor(bytes32,uint256,bytes32,bytes,bytes,bytes)", SEL_COMMIT_BATCH_FOR);
     abi_function_selector("claimSequencerFor(bytes32,uint256,uint256,bytes)", SEL_CLAIM_FOR);
+    abi_function_selector("db(bytes32)", SEL_FLEET_DB);
+    abi_function_selector("leaseDuration()", SEL_FLEET_LEASE);
+    abi_function_selector("joinFor(bytes32,address,address,bytes32,uint256,bytes,bytes32,uint256,uint256,bytes)", SEL_FLEET_JOIN);
+    abi_function_selector("claimFor(bytes32,bytes32,uint256,uint256,bytes)", SEL_FLEET_CLAIM);
     abi_function_selector("renewLeaseFor(bytes32,uint256,uint256,bytes)", SEL_RENEW_FOR);
     abi_function_selector("releaseLeaseFor(bytes32,uint256,uint256,bytes)", SEL_RELEASE_FOR);
     abi_function_selector("submitCheckpointFor(bytes32,uint256,uint256,bytes32,bytes)", SEL_CHECKPOINT_FOR);
@@ -514,8 +527,12 @@ static int eth_set_signer(HppliteL1 *l1, HppliteSignFn fn, void *arg, const unsi
     return eth_client_set_signer(self->eth, (EthSignFn)fn, arg, address);
 }
 
+static HppliteL1State *fleet_get_state(HppliteL1 *l1);
+static char *fleet_claim(HppliteL1 *l1, const unsigned char instanceId[32]);
+
 static HppliteL1State *eth_get_state(HppliteL1 *l1) {
     if (!l1) return NULL;
+    if (self->fleet) return fleet_get_state(l1);
     if (self->version == 0) {
         HppliteSystemConfig *cfg = eth_get_system_config(l1);     /* the VERSION first: contracts before 8 are not read (#252) */
         if (cfg) hpplite_l1_system_config_free(cfg);
@@ -751,6 +768,7 @@ static char *eth_submit_checkpoint(
 static char *eth_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[32]) {
     if (!l1 || !self->has_privkey || !instanceId) return NULL;
     init_selectors();
+    if (self->fleet) return fleet_claim(l1, instanceId);
 
     if (self->relay) {
         char *zTx;
@@ -776,6 +794,7 @@ static char *eth_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[3
 static char *eth_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
     if (!l1 || !self->has_privkey || !instanceId) return NULL;
     init_selectors();
+    if (self->fleet) return fleet_claim(l1, instanceId);          /* a renewal is a claim by the holding instance */
 
     if (self->relay) {
         char *zTx;
@@ -801,6 +820,11 @@ static char *eth_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) 
 static char *eth_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
     if (!l1 || !self->has_privkey) return NULL;
     init_selectors();
+    if (self->fleet) {
+        /* a fleet has no release: the lease runs out, and the owner's forceExpire is the failover's tool (#316) */
+        snprintf(self->relayError, sizeof self->relayError, "a fleet database has no release: its lease runs out");
+        return NULL;
+    }
 
     /* releaseLease(instanceId): the active instance gives the lease up; without an
     ** instance, the owner-only forceExpireLease() (a stale lease after a crash, the owner's call) */
@@ -858,6 +882,12 @@ static int eth_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
 
 static int eth_is_lease_active(HppliteL1 *l1) {
     if (!l1) return 0;
+    if (self->fleet) {
+        HppliteL1State *st = fleet_get_state(l1);
+        int active = st && st->leaseExpiry > st->currentTimestamp;
+        if (st) hpplite_l1_state_free(st);
+        return active;
+    }
 
     uint8_t calldata[4];
     memcpy(calldata, SEL_IS_LEASE_ACTIVE, 4);
@@ -1763,6 +1793,124 @@ static int eth_factory_create_rollup_for(const char *rpc_url, const char *factor
         if (k > 0) { memcpy(rollup_out, all[k - 1], 20); rc = 0; }
     }
     return rc;
+}
+
+/* ============ fleet= (#316): one database in a shared rollup ============ */
+
+/* The database's record: db(dbId) -> owner, sequencer, nameHash, instance, until, epoch, epochSince, admittedAt,
+** retired, claimNonce, ... (15 words). 0 with it read (owner zero: no record), -1 when the chain did not answer */
+typedef struct FleetRecord { uint8_t owner[20], sequencer[20], instance[32]; uint64_t until, epoch, claimNonce; int retired; } FleetRecord;
+static int fleet_record(HppliteL1 *l1, FleetRecord *r) {
+    uint8_t calldata[4 + 32];
+    size_t n = 0;
+    uint8_t *res;
+    init_selectors();
+    memcpy(calldata, SEL_FLEET_DB, 4);
+    memcpy(calldata + 4, self->dbId, 32);
+    res = eth_client_call(self->eth, self->contract, calldata, sizeof calldata, &n);
+    if (!res || n < 15 * 32) { free(res); return -1; }
+    memset(r, 0, sizeof *r);
+    abi_decode_address(res, r->owner);
+    abi_decode_address(res + 32, r->sequencer);
+    abi_decode_bytes32(res + 96, r->instance);
+    r->until = abi_decode_uint64(res + 128);
+    r->epoch = abi_decode_uint64(res + 160);
+    r->retired = abi_decode_uint64(res + 256) != 0;
+    r->claimNonce = abi_decode_uint64(res + 288);
+    free(res);
+    return 0;
+}
+
+static int fleet_has_record(const FleetRecord *r) {
+    static const uint8_t zero[20];
+    return memcmp(r->owner, zero, 20) != 0;
+}
+
+/* the record as the node reads a lease: the holder is the database's sequencer while an instance holds it */
+static HppliteL1State *fleet_get_state(HppliteL1 *l1) {
+    static const uint8_t zero32[32];
+    FleetRecord r;
+    HppliteL1State *state;
+    if (fleet_record(l1, &r) != 0) return NULL;
+    state = sqlite3_malloc(sizeof(HppliteL1State));
+    if (!state) return NULL;
+    memset(state, 0, sizeof *state);
+    memcpy(state->owner, r.owner, 20);
+    if (!r.retired && memcmp(r.instance, zero32, 32) != 0) {
+        memcpy(state->sequencerWallet, r.sequencer, 20);
+        memcpy(state->sequencerInstance, r.instance, 32);
+        state->leaseExpiry = r.until;
+    }
+    if (eth_client_latest_block(self->eth, &state->currentBlock, &state->currentTimestamp) != 0) {
+        state->currentBlock = 0;
+        state->currentTimestamp = (uint64_t)time(NULL);
+    }
+    {   /* the fleet's lease duration: the node renews in its second half, never before (#316) */
+        uint64_t d = view_u64(self->eth, self->contract, SEL_FLEET_LEASE, NULL);
+        if (d != (uint64_t)-1) state->leaseDuration = d;
+    }
+    return state;
+}
+
+/* Take or renew the lease: claimFor with the record's claim nonce, or - no live record - joinFor with the fleet's Admit;
+** signed by the database's key, through the relay (v1: relay only; the wallet submits only when the relay fails and it
+** holds ETH, as for a rollup). NULL with the reason in relayError */
+static char *fleet_claim(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    FleetRecord r;
+    uint8_t f[4 * 32], digest[32], sig[65], *data, *copy;
+    size_t n = 0;
+    char *zTx = NULL;
+    int join;
+    if (fleet_record(l1, &r) != 0) { snprintf(self->relayError, sizeof self->relayError, "the fleet's record of the database could not be read"); return NULL; }
+    join = !fleet_has_record(&r) || r.retired;
+    if (join && !self->hasAdmit) {
+        snprintf(self->relayError, sizeof self->relayError, "the fleet has no live record of this database and no admit= was given: the fleet's Admit is needed to join");
+        return NULL;
+    }
+    memcpy(f, self->dbId, 32);
+    memcpy(f + 32, instanceId, 32);
+    abi_encode_uint64(r.claimNonce, f + 64);
+    abi_encode_uint64(sig_deadline(self->eth), f + 96);
+    eip712_digest("HPPLiteFleet", "1", eth_chain_id(l1), self->contract,
+                  "Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)", f, 4, digest);
+    if (sign_digest(l1, digest, sig) != 0) { snprintf(self->relayError, sizeof self->relayError, "the Claim could not be signed"); return NULL; }
+    if (join) {
+        uint8_t wOwner[32] = {0}, wSeq[32] = {0}, wIssued[32];
+        memcpy(wOwner + 12, self->fleetOwner, 20);
+        memcpy(wSeq + 12, self->address, 20);
+        abi_encode_uint64(self->admitIssuedAt, wIssued);
+        AbiArg a[] = { {self->dbId, 32, 0}, {wOwner, 32, 0}, {wSeq, 32, 0}, {self->nameHash, 32, 0}, {wIssued, 32, 0},
+                       {self->admitSig, 65, 1}, {instanceId, 32, 0}, {f + 64, 32, 0}, {f + 96, 32, 0}, {sig, 65, 1} };
+        data = abi_call(SEL_FLEET_JOIN, a, 10, &n);
+    } else {
+        AbiArg a[] = { {self->dbId, 32, 0}, {instanceId, 32, 0}, {f + 64, 32, 0}, {f + 96, 32, 0}, {sig, 65, 1} };
+        data = abi_call(SEL_FLEET_CLAIM, a, 5, &n);
+    }
+    if (!data) { snprintf(self->relayError, sizeof self->relayError, "out of memory"); return NULL; }
+    copy = malloc(n);
+    if (copy) memcpy(copy, data, n);
+    if (relay_first(l1, self->contract, data, n, join ? "joinFor" : "claimFor", &zTx)) { free(copy); return zTx; }
+    if (copy) {
+        uint8_t *tx = eth_client_send_tx(self->eth, self->contract, copy, n, join ? 400000 : 200000, 0);
+        free(copy);
+        if (tx) { self->lastPath = "direct"; return txHashString(tx); }
+    }
+    return NULL;
+}
+
+HppliteL1 *hpplite_l1_connect_fleet(const char *rpc_url, const uint8_t fleet[20], const uint8_t dbId[32], const uint8_t owner[20],
+                                    const uint8_t nameHash[32], uint64_t admitIssuedAt, const uint8_t admitSig[65]) {
+    char *hex = eth_hex_encode(fleet, 20);
+    HppliteL1 *l1 = hex ? eth_connect(rpc_url, hex) : NULL;
+    free(hex);
+    if (!l1) return NULL;
+    self->fleet = 1;
+    self->version = 11;                       /* no getSystemConfig on a fleet: VERSION 11 */
+    memcpy(self->dbId, dbId, 32);
+    memcpy(self->fleetOwner, owner, 20);
+    memcpy(self->nameHash, nameHash, 32);
+    if (admitSig && admitIssuedAt) { self->admitIssuedAt = admitIssuedAt; memcpy(self->admitSig, admitSig, 65); self->hasAdmit = 1; }
+    return l1;
 }
 
 const HppliteL1Ops hppliteL1EthOps = {

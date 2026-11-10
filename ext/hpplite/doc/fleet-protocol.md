@@ -231,6 +231,24 @@ SponsorDb from another funder re-sponsors, the cap going with the old funder);
 [{fleet, dbId}]` apart from `rollups`. The reference relay serves them with
 `--fleet-factory` (#313; ctest `test_relay_fleet` on anvil).
 
+## The node (fleet=, #316)
+
+`fleet=<shared rollup>&owner=<address>&dbname=<name>` names the database; the
+node derives its dbId and prints it at open. `store=` and `relay=` are
+required. The lease is the fleet's record of the database: the node reads
+`db(dbId)` and, when the lease is not its own, takes it through the relay -
+`joinFor` with the fleet's Admit (`admit=<issuedAt>:0x<signature>`) when the
+fleet has no live record, `claimFor` with the record's `claimNonce`
+otherwise. A lease that is its own (same instance, same key) with more than
+half of the fleet's lease duration left makes no call - not at open, not at a
+flush, not at close; in the second half the next post renews it (`claimFor`
+by the holding instance, the epoch unchanged). With somaro's 7-day lease a
+database costs about one chain call in three and a half days of writing, and
+none while idle. There is no release: the lease runs out at close, and an
+operator who wants fast failover uses the owner's `forceExpire`, not a short
+lease. A database the fleet has no live record of, opened without `admit=`,
+stops with one line saying the Admit is needed.
+
 ## Not decided here
 
 The contract is built (`contracts/src/HPPLiteFleet.sol`, `HPPLiteFleetFactory.sol`,
