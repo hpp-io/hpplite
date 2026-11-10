@@ -96,25 +96,55 @@ carries no database's content and names only as hashes.
   released bucket's do today; a verifier of past roots still finds the heads
   in their manifests.
 
-## The store (step 3, draft for decision)
+## The store (step 3; somaro's decisions folded in, before code)
 
 A fleet's databases write to a store that speaks `hpplite-store/2` plus the
 calls below. `<fleet>` is the shared rollup's address, `<db>` a `dbId` (hex).
 
 | Call | By | What |
 |------|----|------|
-| `POST /fleet/<fleet>/name/<db>-<height>`, the body the batch's bytes, the instance (32 bytes) and the `Head` signature (65 bytes); header `X-HPPLite-Head` the head's fields as JSON | the database's sequencer | the batch and its head in one write (#296). The store checks: the head's `dbId` and `toHeight` are this name's; its signature recovers to the database's `sequencer` on chain; its `instanceId` and `epoch` are the lease's on chain (the epoch is the fence: an older one is `409`); the bytes' keccak is the batch's. It keeps the bytes under their CID, the name, and the database's latest head |
+| `POST /fleet/<fleet>/name/<db>-<height>`, the body the batch's bytes, the instance (32 bytes) and the `Head` signature (65 bytes); header `X-HPPLite-Head` the head's fields as JSON | the database's sequencer | the batch and its head in one write (#296). Checks: the head's `dbId` and `toHeight` are this name's; its signature recovers to the database's `sequencer`; its `instanceId` and `epoch` are the lease's; the bytes' keccak is the batch's. An older epoch is `409`: the fence. Kept: the bytes under their CID, the name `<fleet>-<dbId>-<height>`, the database's latest head |
 | `GET /fleet/<fleet>/name/<db>-<height>` | - | the bytes, as a name today |
-| `GET /fleet/<fleet>/heads?since=<seq>` | the anchor | the latest head of every database whose head moved after root `seq`: what the next root is built from |
-| `POST /fleet/<fleet>/root`, body `{seq, root, manifestDigest}` | the anchor, after `postRootFor` | the store fetches nothing it was not given: it reads `rootIs(seq, root, manifestDigest)` on chain, takes the manifest (already put as content under its CID), checks it hashes to the digest and its leaves to the root, and records, per `dbId` in it, `latestRoot = seq` |
-| `GET /fleet/<fleet>/db/<db>` | - | `{dbId, epoch, sequencer, latestHead, latestRoot, retired}`: the latest head held, and the latest root that holds one of its heads (a hint: the path proves it) |
+| `GET /fleet/<fleet>/heads?after=<dbId>&limit=<n>` | the anchor | every database whose latest head is not the head in its latest indexed root, by `dbId` ascending (the leaf order), paged: what the next root is built from. Defined by state: a head that moved between the anchor's read and the root is listed again by itself |
+| `GET /fleet/<fleet>/db/<db>` | - | `{dbId, epoch, sequencer, instance, retired, latestHead, latestRoot}`; `latestRoot` is a hint, the path proves it |
+| `POST /fleet/<fleet>/root` | anyone | a hint to read the chain now; its body is trusted for nothing |
 
-Funding and caps (D): a bucket per `(fleet, dbId)`, bound and funded like a
-bucket today (the fleet's treasury as funder, one Bind per database, a cap
-per database); the name write is charged to that bucket. Open: whether the
-fleet may bind all its databases with one signature instead of one Bind each.
+**The chain's side comes from the fleet's events.** The store polls
+`eth_getLogs` for each fleet every few seconds - `Admitted`, `Claimed`,
+`EpochMoved`, `SequencerSet`, `Retired`, `Promoted`, `RootPosted` - and keeps
+sequencer, instance, epoch and retirement for every database: a cost that
+does not grow with databases or writes. A head whose epoch or instance is
+ahead of what the store holds makes it read that one database on chain at
+once, so a new holder's first write is not refused for the store being behind.
+(v10's store reads the rollup's roles at a write, cached and read again on a
+mismatch: per write, not a stronger guarantee in kind.)
 
-Names (E, retirement): a retired database's names stay until its bucket is
+**The node's part of the fence.** After a claim, the new holder waits until
+`GET /fleet/<fleet>/db/<db>` shows its own epoch before it reads names to
+rebuild; from then the store refuses the old epoch, so nothing the old holder
+writes after the takeover is read.
+
+**Roots come from the same events.** `RootPosted(seq, root, manifestDigest)`
+names the manifest; the store takes it from its own content by CID, checks
+its sha-256 against the digest and its leaves against the root, and then
+records `latestRoot = seq` for each `dbId` in it. The anchor's order is fixed:
+the manifest put first, then `postRootFor`. A root whose manifest is not at
+the store is kept as "manifest missing" and tried again; it is no
+`latestRoot` until it checks.
+
+**Funding and caps.** One bucket per `(fleet, dbId)`, bound by one Bind per
+database as today, the fleet's treasury (or a database's own funder in a
+common fleet) as funder, a cap per database; the name write is charged to
+that bucket. Admission and payment stay two decisions by two keys. The
+manifest's bytes are charged to the fleet's own bucket, bound once by the
+fleet's funder when the fleet is made.
+
+**Limits.** Every fleet call is counted per `dbId` (the signed head names
+it), the per-address guard far above it: a platform's apps write from one
+address. The relay counts a fleet's joins and claims per `dbId` and its roots
+per fleet.
+
+**Retirement.** A retired database's names stay until its bucket is
 released, as a released bucket's do today.
 
 ## Not decided here
