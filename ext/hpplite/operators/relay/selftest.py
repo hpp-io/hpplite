@@ -11,6 +11,7 @@ wallet's ETH balance is zero at the end.
 """
 import base64
 import json
+import math
 import os
 import secrets
 import socket
@@ -76,6 +77,11 @@ def balance_eth(addr):
 
 def balance_usdc(addr):
     return int(call_view(USDC, "balanceOf(address)", addr), 16)
+
+
+def price_units(gas, fee, eth_usd, margin=0.2, min_fee=100):
+    """the protocol's price (doc/relay-protocol.md; relay.py's call_price), at the relay's default margin and minimum"""
+    return max(math.ceil(gas * fee * (1 + margin) * eth_usd * 1e6 / 1e18), min_fee)
 
 
 def free_port():
@@ -222,6 +228,19 @@ def main():
         proc.terminate(); proc.wait()
         proc, status = start_relay(work, port, keyfile, log, eth_usd="3000")
         check(status is not None, "the relay restarted, at 100 times the price")
+        # the quote prices the estimate; the headroom (x1.25 + 10000) is the transaction's limit only (#293)
+        st2, hdrs2, _ = buyer._request("POST", "/commit", cbody)
+        hdr2 = {k.upper(): v for k, v in hdrs2.items()}.get("PAYMENT-REQUIRED", "")
+        offer2 = json.loads(base64.b64decode(hdr2))["accepts"][0] if hdr2 else {}
+        est = int(chain.call("eth_estimateGas", {"from": relay_addr, "to": rollup, "data": json.loads(cbody)["data"]}), 16)
+        base = int(chain.call("eth_getBlockByNumber", "latest", False).get("baseFeePerGas", "0x0"), 16)
+        try:
+            tip = int(chain.call("eth_maxPriorityFeePerGas"), 16)
+        except Exception:
+            tip = 0
+        want = price_units(est, base + tip, 3000)
+        check(st2 == 402 and int(offer2.get("amount", 0)) == want and offer2.get("extra", {}).get("quote", {}).get("gas") == int(est * 1.25) + 10000,
+              "the quote at 3000: the estimate's price, %d units for %d gas (offered %s, quote gas %s)" % (want, est, offer2.get("amount"), offer2.get("extra", {}).get("quote", {}).get("gas")))
         forged = dict(offered, accepts=[dict(offered["accepts"][0], amount="1")])
         u0 = balance_usdc(wallet)
         st, _, _ = buyer._request("POST", "/commit", cbody, {"PAYMENT-SIGNATURE": buyer._payment(base64.b64encode(json.dumps(forged).encode()).decode())})

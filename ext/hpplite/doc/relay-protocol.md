@@ -42,15 +42,17 @@ changes a signed form changes this list; a relay serves one factory.
 
 ## The price and the quote
 
-The `402` quotes the call's gas (the estimate plus headroom) at the current
-fee, plus the relay's margin, converted to the asset's atomic units, at
-least its minimum fee: `max(ceil(gas × fee × (1 + margin) × ethUsd × 10^6 /
-10^18), minFee)` in IEEE doubles in that order (cases in
-`operators/conformance/vectors.json`). The offer is x402's `exact` (the
+The `402` quotes the call's estimated gas at the current fee, plus the
+relay's margin, converted to the asset's atomic units, at least its minimum
+fee: `max(ceil(gas × fee × (1 + margin) × ethUsd × 10^6 / 10^18), minFee)`
+in IEEE doubles in that order (cases in `operators/conformance/vectors.json`).
+`gas` is the estimate itself; the headroom a transaction needs (the
+estimate × 1.25 + 10,000 in both relays) is its gas limit, not charged
+(#293). The offer is x402's `exact` (the
 `batch-settlement` channels of v0.5-v0.7 were removed in v0.8, #251).
 
-Every offer's `extra.quote` is `{gas, until, mac}`: the gas the price was
-computed for, the quote's expiry (unix seconds), and a MAC by the relay over
+Every offer's `extra.quote` is `{gas, until, mac}`: the gas limit the
+transaction will carry, the quote's expiry (unix seconds), and a MAC by the relay over
 the chain, the target, the calldata, the amount, the gas and the expiry
 (#184). The payer repeats the call naming the offer unchanged as `accepted`;
 a relay honours a quote it made, for that call, until `until`, with nothing

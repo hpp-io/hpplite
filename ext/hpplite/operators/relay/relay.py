@@ -15,8 +15,8 @@ EIP-712) and Payments (the seller's side of x402).
 Endpoints
   POST /commit   {"to": "0x...", "data": "0x..."}: one of the signed calls below, to the factory or
                  to a rollup it created. Simulated first (eth_estimateGas): a call that would revert
-                 is answered 422 with the reason and costs nothing. Then 402 with the price (the gas
-                 at the current fee, a margin, converted at --eth-usd, at least --min-fee; the quote
+                 is answered 422 with the reason and costs nothing. Then 402 with the price (the estimated
+                 gas at the current fee, a margin, converted at --eth-usd, at least --min-fee; the quote
                  MACed in the offer's extra, honoured for two minutes by any process with the key,
                  #184); paid, it is
                  submitted and the answer waits for its receipt: 200 {tx, block, gasUsed}. The payment
@@ -608,8 +608,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 gas = int(r.chain.call("eth_estimateGas", {"from": r.address, "to": to, "data": data}), 16)
             except RpcError as e:
                 return self.reply(422, {"error": "the call would revert: %s" % revert_reason(e), "call": name})
-            gas = int(gas * 1.25) + 10000                        # headroom: the state moves between estimate and inclusion
-            quote = (r.price(gas, r.fees()[2]), gas, now + 120)
+            est, gas = gas, int(gas * 1.25) + 10000              # headroom: the state moves between estimate and inclusion
+            quote = (r.price(est, r.fees()[2]), gas, now + 120)  # priced at the estimate; the headroom is the limit only (#293)
         amount, gas, until = quote
         # a sponsored rollup (#276): its sponsor's account pays, taken before the call is sent and given back when it
         # does not land, and the caller is asked nothing; when the account cannot pay, the 402 says why and the caller

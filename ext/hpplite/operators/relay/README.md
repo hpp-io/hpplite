@@ -31,9 +31,10 @@ relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file relay.key \
 2. **Would it succeed?** It runs `eth_estimateGas`. A call that would revert
    (a bad signature, a range already anchored) gets `422` with the reason,
    and nothing is charged.
-3. **The price.** A `402` quotes the gas plus a quarter of headroom at the
-   current fee (base plus tip), plus `--margin` (20%), converted at
-   `--eth-usd`, and at least `--min-fee` units. The quote holds for two
+3. **The price.** A `402` quotes the estimated gas at the current fee
+   (base plus tip), plus `--margin` (20%), converted at `--eth-usd`, and at
+   least `--min-fee` units; the transaction carries the estimate plus a
+   quarter and 10,000 as its gas limit, which is not charged (#293). The quote holds for two
    minutes, so the paid retry pays exactly what was quoted. The quote is
    carried in the offer itself (`extra.quote`: the gas, the expiry and a MAC
    under a key derived from the relay's), and the paid retry names it back
