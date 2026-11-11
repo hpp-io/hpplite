@@ -166,7 +166,8 @@ def fleet_vectors():
     msgs = [("Head", fleet.HEAD_TYPE, [dbs[0]["head"][k] for k in ("dbId", "instanceId", "fromHeight", "toHeight", "chainHashAfter",
                                                                      "stateRoot", "manifestDigest", "epoch")], 0),
             ("Admit", fleet.ADMIT_TYPE, admit, 2), ("Retire", fleet.RETIRE_TYPE, retire, 1), ("Root", fleet.ROOT_TYPE, rootmsg, 2),
-            ("Claim", fleet.CLAIM_TYPE, [dbs[0]["dbId"], dbs[0]["head"]["instanceId"], 0, 1800000003], 0)]
+            ("Claim", fleet.CLAIM_TYPE, [dbs[0]["dbId"], dbs[0]["head"]["instanceId"], 0, 1800000003], 0),
+            ("Expire", fleet.EXPIRE_TYPE, [dbs[0]["dbId"], 1, 1800000005], 1)]
     factory = "0x" + "fa" * 20
     fdom = fleet.factory_domain(chain_id, factory)
     create = [owners[0], eth.address(key(2)).lower(), 604800, 0, 1800000004]

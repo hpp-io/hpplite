@@ -34,6 +34,7 @@ EIP-712 in the domain `("HPPLiteFleet", "1", chainId, <shared rollup>)`:
 | `Retire(bytes32 dbId,uint256 issuedAt)` | the database's owner: the record goes, at `rm` |
 | `Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)` | the fleet's anchor key (the owner may change it); sponsored at the relay |
 | `Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)` | the database's sequencer, to take or renew its lease (`claimFor`, or with the Admit in `joinFor`); `nonce` is the record's `claimNonce` - 0 for a dbId the fleet never had, carried on when a retired one is admitted again |
+| `Expire(bytes32 dbId,uint256 nonce,uint256 deadline)` | the database's owner, for `expireFor` (#321): `forceExpire`'s effect, sent by anyone (a relay), so a restored host with N databases costs the owner's key N signatures and no gas; `nonce` is the record's `claimNonce`, consumed, so an Expire once sent cannot be played against a later lease |
 
 In the factory's domain `("HPPLiteFleetFactory", "11", chainId, <the factory>)`:
 
@@ -229,9 +230,9 @@ messages over `(fleet, dbId)` (vectors in `relayMessages`):
 A fleet's roots are sponsored with today's `Sponsor` and `Cap`, the fleet in
 place of the rollup and the fleet's owner as the other side (not the anchor):
 roots are counted per fleet. A database's sponsor pays its `joinFor`,
-`claimFor` and `retireFor`; CapDb counts joins and claims, and `retireFor` is
-charged but never refused by the cap nor counted (it is the owner's, once per
-record; somaro's order at `rm` is retire, UnsponsorDb, DeleteDb). No fallback
+`claimFor`, `retireFor` and `expireFor`; CapDb counts joins and claims, and
+`retireFor` and `expireFor` are charged but never refused by the cap nor
+counted (they are the owner's: a retirement once per record; somaro's order at `rm` is retire, UnsponsorDb, DeleteDb). No fallback
 between the two: a database with no SponsorDb is not covered by the fleet's
 Sponsor, and the fleet's Sponsor pays `postRootFor` only. `createFleetFor` has
 no sponsor (no fleet yet): its caller pays over x402, as for `createRollupFor`.
@@ -263,8 +264,8 @@ flush, not at close; in the second half the next post renews it (`claimFor`
 by the holding instance, the epoch unchanged). With somaro's 7-day lease a
 database costs about one chain call in three and a half days of writing, and
 none while idle. There is no release: the lease runs out at close, and an
-operator who wants fast failover uses the owner's `forceExpire`, not a short
-lease. A database the fleet has no live record of, opened without `admit=`,
+operator who wants fast failover uses the owner's `forceExpire` or its signed
+`expireFor` through the relay, not a short lease. A database the fleet has no live record of, opened without `admit=`,
 stops with one line saying the Admit is needed.
 
 Each flush writes its batch to `/fleet/<fleet>/name/<dbId>-<height>` with the

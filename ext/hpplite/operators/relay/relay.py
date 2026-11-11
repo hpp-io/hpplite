@@ -62,7 +62,8 @@ FACTORY_CALLS = {selector("createRollupFor(address,uint256,uint256,uint256,bytes
 FLEET_FACTORY_CALLS = {selector("createFleetFor(address,address,uint64,uint256,uint256,bytes)"): "createFleetFor"}
 FLEET_DB_CALLS = {selector(s): s.split("(")[0] for s in (            # sponsored per database: the dbId is the first word
     "joinFor(bytes32,address,address,bytes32,uint256,bytes,bytes32,uint256,uint256,bytes)",
-    "claimFor(bytes32,bytes32,uint256,uint256,bytes)", "retireFor(bytes32,uint256,bytes)")}
+    "claimFor(bytes32,bytes32,uint256,uint256,bytes)", "retireFor(bytes32,uint256,bytes)",
+    "expireFor(bytes32,uint256,uint256,bytes)")}
 FLEET_ROOT_CALLS = {selector("postRootFor(uint256,bytes32,bytes32,uint256,bytes)"): "postRootFor"}   # sponsored per fleet
 ROLLUP_CALLS = {selector(s): s.split("(")[0] for s in (
     "claimSequencerFor(bytes32,uint256,uint256,bytes)",
@@ -731,7 +732,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # a sponsored rollup (#276): its sponsor's account pays, taken before the call is sent and given back when it
         # does not land, and the caller is asked nothing; when the account cannot pay, the 402 says why and the caller
         # may still pay itself. A caller that sends a payment pays
-        sponsor, sponsor_why = (r.accounts.cover(rollup, amount, counted=(name != "retireFor"))   # retireFor: charged, outside the cap (#313)
+        sponsor, sponsor_why = (r.accounts.cover(rollup, amount, counted=(name not in ("retireFor", "expireFor")))   # charged, outside the cap (#313, #321)
                                 if (rollup and p.enabled and not header) else (None, None))
         if sponsor and not sponsor_why:
             try:

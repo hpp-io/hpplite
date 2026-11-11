@@ -25,6 +25,7 @@ contract HPPLiteFleet {
     bytes32 public constant ROOT_TYPEHASH = keccak256("Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)");
     /// the database's sequencer takes or renews its lease (a relay submits it)
     bytes32 public constant CLAIM_TYPEHASH = keccak256("Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)");
+    bytes32 public constant EXPIRE_TYPEHASH = keccak256("Expire(bytes32 dbId,uint256 nonce,uint256 deadline)");
 
     struct Db {
         address owner;          // never changes inside a fleet: a new owner is a new dbId
@@ -97,6 +98,10 @@ contract HPPLiteFleet {
 
     function retireDigest(bytes32 dbId, uint256 issuedAt) public view returns (bytes32) {
         return domainSeparator().digest(keccak256(abi.encode(RETIRE_TYPEHASH, dbId, issuedAt)));
+    }
+
+    function expireDigest(bytes32 dbId, uint256 nonce, uint256 deadline) public view returns (bytes32) {
+        return domainSeparator().digest(keccak256(abi.encode(EXPIRE_TYPEHASH, dbId, nonce, deadline)));
     }
 
     function rootDigest(uint256 seq, bytes32 root, bytes32 manifestDigest, uint256 deadline) public view returns (bytes32) {
@@ -204,6 +209,20 @@ contract HPPLiteFleet {
     function forceExpire(bytes32 dbId) external {
         Db storage d = _live(dbId);
         require(msg.sender == d.owner, "Not the database's owner");
+        d.until = uint64(block.timestamp);
+        d.instance = bytes32(0);
+        _moveEpoch(dbId, d);
+    }
+
+    /// forceExpire signed by the database's owner and sent by anyone (a relay, #321): a host restored with N databases
+    /// costs the owner's key N signatures, no gas. `nonce` is the record's claimNonce, consumed: an Expire once sent
+    /// cannot be played against a later lease
+    function expireFor(bytes32 dbId, uint256 nonce, uint256 deadline, bytes calldata sig) external {
+        Db storage d = _live(dbId);
+        require(block.timestamp <= deadline, "Expired");
+        require(nonce == d.claimNonce, "Bad nonce");
+        require(expireDigest(dbId, nonce, deadline).recover(sig) == d.owner, "Not the database's owner");
+        d.claimNonce++;
         d.until = uint64(block.timestamp);
         d.instance = bytes32(0);
         _moveEpoch(dbId, d);

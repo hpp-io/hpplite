@@ -183,6 +183,12 @@ def run(chain_id, ff, url, owner, anchor):
     claim2 = eth.sign(kb(KEY2), eth.typed_digest(dom, F.CLAIM_TYPE, db, inst, 1, deadline))
     code, body = http("POST", url + "/commit", {"to": fl, "data": calldata("claimFor(bytes32,bytes32,uint256,uint256,bytes)", dbx, hx(inst), 1, deadline, hx(claim2))})
     check(code == 402 and (body.get("sponsor") or {}).get("why", "").startswith("capped"), "the claim past the cap: 402 naming the sponsor and why (%s %s)" % (code, body.get("sponsor")))
+    # expireFor (#321): the owner's signed forceExpire, through the relay over the cap: charged, not counted, as a retirement
+    esig = eth.sign(kb(KEY1), eth.typed_digest(dom, F.EXPIRE_TYPE, db, 1, deadline))
+    code, body = http("POST", url + "/commit", {"to": fl, "data": calldata("expireFor(bytes32,uint256,uint256,bytes)", dbx, 1, deadline, hx(esig))})
+    view = http("GET", url + "/fleet/%s/db/%s/sponsor" % (fl, dbx))[1]
+    check(code == 200 and body.get("sponsor") == fa and body.get("charged", 0) > 0 and view.get("today", {}).get("calls") == 1,
+          "expireFor over the cap: through, charged to the database's sponsor, not counted (%s %s, today %s)" % (code, body.get("charged", body.get("error")), view.get("today", {}).get("calls")))
     rsig = eth.sign(kb(KEY1), eth.typed_digest(dom, F.RETIRE_TYPE, db, issued + 2))
     code, body = http("POST", url + "/commit", {"to": fl, "data": calldata("retireFor(bytes32,uint256,bytes)", dbx, issued + 2, hx(rsig))})
     view = http("GET", url + "/fleet/%s/db/%s/sponsor" % (fl, dbx))[1]

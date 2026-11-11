@@ -439,6 +439,18 @@
     "signature": "0xa05047c042bf9cb3859dd3e4b48db5aa04ddf69895b47a6fafbd7561e6bc0f480f6cb35bd9d971f56c5d55fbe5c043f17f955056e5c5f1a0180cd9fa4e56480b1c",
     "type": "Claim",
     "typeString": "Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)"
+   },
+   {
+    "digest": "0xd808cb353259a4f23c5cd96ada978c5c032b97024aadef90d5bcb3ff210d4619",
+    "fields": [
+     "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e",
+     1,
+     1800000005
+    ],
+    "key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+    "signature": "0x86dcb4dd0fd1e26601bcb2dce3f41cc098a113e209c43056135fe07dfc7011ae2294e3767b9535a7c2a347ca24f242459cc5c74e7573f1560bd3c044e6f902e91b",
+    "type": "Expire",
+    "typeString": "Expire(bytes32 dbId,uint256 nonce,uint256 deadline)"
    }
   ],
   "protocol": "hpplite-fleet/1",

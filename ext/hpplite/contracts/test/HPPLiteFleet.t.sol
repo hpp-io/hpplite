@@ -65,6 +65,7 @@ contract HPPLiteFleetTest is Test {
         assertEq(g.retireDigest(bytes32(0xdc4fb9e0ec665f4dfce66a84073b1f0514c146d33659b188f0b1dadbce45995d), 1800000001), bytes32(0xdd7bcc3b8b855ffc9f29d003d99e75ccbd478cf919747b964670f851af1c1075), "Retire");
         assertEq(g.rootDigest(7, bytes32(0xa24e7097511cbf69ba9b33d4171578f371645f33ca180f2ba89eb4a460f53c6e), bytes32(0x6d9f53466d05b337ec71e9240f9180bf3da5c63eac6b0708f32174b8556b6ca5), 1800000002), bytes32(0xdcbb5c14cbe0dd5d7206420f60a43adb396f9534f306cadf1a564f80e046e62d), "Root");
         assertEq(g.claimDigest(bytes32(0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e), bytes32(0x1fe7fbe32f2e527c0da96fe3212cc3bae9ca124c8c3acc793733702b09564abd), 0, 1800000003), bytes32(0x6ea6d51ed3e465f53232df0d0a13d2fc7094b27284b3c1330d9ae53f3f961da8), "Claim");
+        assertEq(g.expireDigest(bytes32(0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e), 1, 1800000005), bytes32(0xd808cb353259a4f23c5cd96ada978c5c032b97024aadef90d5bcb3ff210d4619), "Expire");
         deployCodeTo("HPPLiteFleetFactory.sol", 0xFafafAfafAFaFAFaFafafafAfaFaFAfAfAfAFaFA);
         assertEq(HPPLiteFleetFactory(0xFafafAfafAFaFAFaFafafafAfaFaFAfAfAfAFaFA).createDigest(0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1, 0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025, 604800, 0, 1800000004), bytes32(0x1d06d9b1718113556856c6c1086ca64b5b6193a479106264023ceb52c1b3de49), "CreateFleet");
         assertEq(g.dbIdOf(0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1, "notes"), bytes32(0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e), "dbId");
@@ -112,6 +113,40 @@ contract HPPLiteFleetTest is Test {
         bytes memory bad = sig(STRANGER_PK, f.claimDigest(DB, bytes32("host-c"), nonce, deadline));
         vm.expectRevert(bytes("Not the database's sequencer"));
         f.claimFor(DB, bytes32("host-c"), nonce, deadline, bad);
+    }
+
+    /// #321: forceExpire signed by the database's owner, sent by anyone; the claim nonce consumed
+    function test_ExpireForIsTheOwnersSignedForceExpire() public {
+        admit(ADMITTER_PK, 1_800_000_000);
+        claim(bytes32("host-a"));
+        uint256 epoch = f.db(DB).epoch;
+        uint256 nonce = f.db(DB).claimNonce;
+        uint256 deadline = block.timestamp + 60;
+        bytes memory bad = sig(STRANGER_PK, f.expireDigest(DB, nonce, deadline));
+        vm.expectRevert(bytes("Not the database's owner"));
+        f.expireFor(DB, nonce, deadline, bad);
+        bytes memory seqSig = sig(SEQ_PK, f.expireDigest(DB, nonce, deadline));
+        vm.expectRevert(bytes("Not the database's owner"));                // the sequencer's key is not the owner's
+        f.expireFor(DB, nonce, deadline, seqSig);
+        bytes memory good = sig(DBOWNER_PK, f.expireDigest(DB, nonce, deadline));
+        vm.prank(vm.addr(STRANGER_PK));                                     // sent by anyone: a relay
+        f.expireFor(DB, nonce, deadline, good);
+        HPPLiteFleet.Db memory d = f.db(DB);
+        assertEq(d.epoch, epoch + 1, "the epoch moves");
+        assertEq(d.instance, bytes32(0), "no instance holds it");
+        assertEq(d.claimNonce, nonce + 1, "the nonce consumed");
+        vm.expectRevert(bytes("Bad nonce"));                                // the same Expire again: refused
+        f.expireFor(DB, nonce, deadline, good);
+        claim(bytes32("host-b"));                                           // another instance claims at once
+        assertEq(f.db(DB).instance, bytes32("host-b"));
+        assertEq(f.db(DB).epoch, epoch + 2);
+        vm.expectRevert(bytes("Bad nonce"));                                // nor against the later lease
+        f.expireFor(DB, nonce, deadline, good);
+        nonce = f.db(DB).claimNonce;
+        bytes memory late = sig(DBOWNER_PK, f.expireDigest(DB, nonce, block.timestamp + 60));
+        vm.warp(block.timestamp + 61);
+        vm.expectRevert(bytes("Expired"));
+        f.expireFor(DB, nonce, block.timestamp - 1, late);
     }
 
     function test_RootsByTheAnchorInSequence() public {

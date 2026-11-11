@@ -24,6 +24,7 @@ ADMIT_TYPE = "Admit(bytes32 dbId,address owner,address sequencer,uint256 issuedA
 RETIRE_TYPE = "Retire(bytes32 dbId,uint256 issuedAt)"                                   # the database's owner
 ROOT_TYPE = "Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)"     # the fleet's anchor key
 CLAIM_TYPE = "Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)"     # the database's sequencer; nonce: the record's claimNonce
+EXPIRE_TYPE = "Expire(bytes32 dbId,uint256 nonce,uint256 deadline)"     # the database's owner: forceExpire, relayable (#321); nonce: the claimNonce
 # in the factory's domain ("HPPLiteFleetFactory", "11", chainId, <the factory>): the fleet's owner; nonce: the factory's createNonce(owner)
 CREATE_FLEET_TYPE = "CreateFleet(address owner,address anchor,uint64 leaseDuration,uint256 nonce,uint256 deadline)"
 
