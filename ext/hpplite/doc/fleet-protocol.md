@@ -111,6 +111,18 @@ rule gives a leaf - the rule a rollup's anchor follows (#308, #309); an idle
 fleet sends nothing. The interval is the operator's (24 h by default for the
 reference `hpplite-anchor`; somarod's own setting).
 
+The reference anchor is `operators/fleet/anchor.py` (`hpplite-anchor`: `--rpc
+--fleet --key-file --store`, `--relay` or `--send`, `--interval`, `--once`),
+for a fleet run without somaro and for conformance. **Verifying a database**
+is `operators/fleet/verify.py --rpc --fleet --store --db <dbId>`: one call
+that trusts the store for nothing - the store's `anchored` only says where to
+look; the root and the manifest digest come from `RootPosted(seq)` and
+`rootIs` on chain, the manifest's sha-256 must be that digest, the leaf's
+owner and name the database's record, and the path must lead from the leaf
+rebuilt from the head to the root. It answers `{verified, why, dbId, seq,
+root, manifestDigest, block, time, toHeight, head, path}`: the database's
+history to `toHeight` is anchored at `block`.
+
 ## Finding a database's latest root, and its epoch there
 
 - The store keeps, per fleet and `dbId`, the sequence of the latest root that
@@ -368,5 +380,7 @@ The contract (`contracts/src/HPPLiteFleet.sol`, `HPPLiteFleetFactory.sol`,
 `0x2880d4136720bd5dac2d3b16eb63e4f063ccfea2` (2026-11-11). The reference store
 and relay serve fleets (#310-#317), and so do HPP's canonical ones
 (hpplite-operators #42-#44) except a fleet's roots; the node's `fleet=` mode is
-built (#316). The anchor tool (the roots: manifests, `postRootFor`, the store's
-indexing of `RootPosted`) and verify follow.
+built (#316). The roots are built: the store's manifests and its indexing of
+`RootPosted` (the reference and HPP's canonical store), the builder's rule
+with a vector, the reference `hpplite-anchor` and `verify` (somarod anchors
+its own fleet).

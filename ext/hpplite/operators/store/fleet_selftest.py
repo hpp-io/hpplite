@@ -419,6 +419,31 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     check(st == 200 and data[:-97] == b"batch two", "the old life's names stay readable (verify): its batch 2 (%s)" % st)
     st, heads = http("GET", url + "/fleet/%s/heads" % fl)
     check([hh["head"]["toHeight"] for hh in heads.get("heads", [])] == [1], "GET heads lists the current life's head (%s)" % [hh["head"]["toHeight"] for hh in heads.get("heads", [])])
+
+    # the reference hpplite-anchor (operators/fleet/anchor.py) and verify (operators/fleet/verify.py), as somaro's are
+    here = os.path.dirname(os.path.abspath(__file__))
+    kf = os.path.join(tempfile.mkdtemp(prefix="fleet-anchor-"), "anchor.key")
+    with open(kf, "w") as f:
+        f.write(KEY2)
+    def tool(name, *a):
+        r = subprocess.run([sys.executable, "-I", os.path.join(here, "..", "fleet", name), "--rpc", RPC, "--fleet", fl, "--store", url] + list(a),
+                           capture_output=True, text=True)
+        try:
+            return r.returncode, json.loads(r.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return r.returncode, {"stderr": r.stderr[-300:]}
+    rc, line = tool("anchor.py", "--key-file", kf, "--send", "--once", "--force")
+    check(rc == 0 and line.get("posted") and line.get("seq") == 4 and line.get("leaves") == [dbx],
+          "hpplite-anchor: root 4 holds the one database that moved - the re-admitted one's new life (%s)" % line)
+    rc, line = tool("anchor.py", "--key-file", kf, "--send", "--once", "--force")
+    check(rc == 0 and line.get("posted") is False and line.get("leaves") == [], "hpplite-anchor again, nothing moved: nothing posted (%s)" % line)
+    rc, v = tool("verify.py", "--db", dbx)
+    check(rc == 0 and v.get("verified") and v.get("seq") == 4 and v.get("toHeight") == 1 and v.get("block"),
+          "verify: the database's head in root 4 at block %s, checked on chain (%s)" % (v.get("block"), v.get("why")))
+    rc, v = tool("verify.py", "--db", odbx)
+    check(rc == 0 and v.get("verified") and v.get("seq") == 3 and v.get("toHeight") == 2, "verify: the other database's head in root 3 (%s)" % v.get("why"))
+    rc, v = tool("verify.py", "--db", "0x" + "ab" * 32)
+    check(rc == 1 and not v.get("verified") and "no root" in v.get("why", ""), "verify: a database no root holds - not verified, why said (%s)" % v.get("why"))
     print("fleet store selftest: %s" % ("ok" if not fails else "%d FAIL" % fails))
     return 1 if fails else 0
 
