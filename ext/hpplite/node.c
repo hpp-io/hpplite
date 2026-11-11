@@ -159,6 +159,21 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.keepLease = config->keepLease;
     node->config.noAnchorAtClose = config->noAnchorAtClose;
     node->config.snapshotIntervalMs = config->snapshotIntervalMs;
+    if (config->hasFleet) {
+        /* fleet= (#316): one database in a shared rollup - the fleet's anchor anchors, there is no release */
+        node->config.hasFleet = 1;
+        memcpy(node->config.fleet, config->fleet, 20);
+        memcpy(node->config.dbId, config->dbId, 32);
+        memcpy(node->config.fleetOwner, config->fleetOwner, 20);
+        memcpy(node->config.nameHash, config->nameHash, 32);
+        node->config.admitIssuedAt = config->admitIssuedAt;
+        memcpy(node->config.admitSig, config->admitSig, 65);
+        node->config.hasAdmit = config->hasAdmit;
+        node->config.anchorIntervalMs = 0;
+        node->config.snapshotIntervalMs = 0;
+        node->config.keepLease = 1;
+        node->config.noAnchorAtClose = 1;
+    }
     node->config.fromSnapshot = config->fromSnapshot;
     node->config.keepSeconds = config->keepSeconds;
     node->config.relayUrl = node_strdup(config->relayUrl);
@@ -631,12 +646,20 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
     if (node->follower) return;
     if (!config->rpcUrl) return;
     if (config->chainId) hpplite_l1_set_default_chain_id(config->chainId);
-    if (!config->hasContract && !config->hasFactory) return;
+    if (!config->hasContract && !config->hasFactory && !config->hasFleet) return;
     node->wantsL1 = 1;
 
     /* contract= names the rollup and wins over any factory beside it - the alias's (l1=hpp-sepolia), HPPLITE_FACTORY,
     ** factory= (#271): the factory only finds or creates a rollup when none is named */
-    if (config->hasFactory && config->hasPrivkey && !config->hasContract) {
+    if (config->hasFleet) {
+        /* fleet= (#316): the chain client's fleet form, for this database; its lease is the fleet's record. First:
+        ** a chain alias's factory never makes it a rollup instead */
+        node->l1 = hpplite_l1_connect_fleet(config->rpcUrl, config->fleet, config->dbId, config->fleetOwner, config->nameHash,
+                                            config->hasAdmit ? config->admitIssuedAt : 0, config->hasAdmit ? config->admitSig : NULL);
+        node->ownsL1 = (node->l1 != NULL);
+        if (node->l1 && config->hasPrivkey) hpplite_l1_set_privkey(node->l1, config->privkey);
+        else if (node->l1 && node->hasSigner) hpplite_l1_set_signer(node->l1, node->signer.sign, node->signer.arg, node->signer.address);
+    } else if (config->hasFactory && config->hasPrivkey && !config->hasContract) {
         /* Use factory to find/create rollup */
         char factoryHex[43];
         snprintf(factoryHex, sizeof(factoryHex), "0x");
@@ -743,6 +766,18 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
     /* Catch up with whatever is already on L1, then take the lease now
     ** rather than at the first write: a restart has no window in which the
     ** rollup is unclaimed, and lease trouble shows at open */
+    if (node->l1 && node->config.hasFleet && node->store && !node->config.verifyOnly) {
+        /* until a fleet database rebuilds from the store's heads (#316 d), it opens only where the file is at the store's
+        ** head or ahead: a file behind the history the store holds stops here, before any claim, rather than fork it */
+        uint64_t to = 0;
+        if (hpplite_store_fleet_head_height(node->store, node->config.fleet, node->config.dbId, &to) == 0 && to + 1 > node->ctx->blockHeight) {
+            hpplite_error(node->ctx, "the store holds this database's history to height %llu and the file is at %llu: rebuilding a fleet "
+                          "database from the store comes with #316 (d); not opened as its sequencer", (unsigned long long)to,
+                          (unsigned long long)(node->ctx->blockHeight - 1));
+            node->state = HPPLITE_STATE_ERROR;
+            return;
+        }
+    }
     if (node->l1) {
         node_learn_batch_limit(node);
         if (hpplite_node_sync_from_l1(node, 1) < 0) {
@@ -2722,7 +2757,24 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         /* the sidecar knows the batch before the chain does: a process that dies
         ** between the submit and the finalize finds it its own on reopen */
         if (hppliteMarkInflightPages(ctx, height, root) != SQLITE_OK) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); free(sealed); free(framed); *pMore = 0; return 0; }
-        if (node->store) {
+        if (node->store && node->config.hasFleet) {
+            /* fleet= (#316 c): the batch and its head, signed by this database's key, in one write - the rolling hash
+            ** after it, the page root, the bytes' sha-256 and the lease's epoch; the fleet's anchor commits to it */
+            unsigned char k[32], after[32];
+            uint64_t chainId = hpplite_l1_chain_id(node->l1);
+            if (!chainId) chainId = hpplite_l1_default_chain_id();
+            hpplite_keccak256(payload, payloadLen, k);
+            hpplite_chain_hash_next(ctx->chainHash, height, k, after);
+            if (hpplite_store_put_fleet_name(node->store, node->config.fleet, chainId, node->config.dbId, height, node->instanceId, after, root,
+                                             hpplite_l1_fleet_epoch(node->l1), payload, payloadLen) == 0) {
+                node->warnedStoreDown = 0;
+                node->warnedFunder = 0;
+                storedOnly = 1;
+            } else {
+                snprintf(zStoreWhy, sizeof zStoreWhy, "the store did not take it: %s", hpplite_store_error(node->store));
+            }
+            txHash = NULL;
+        } else if (node->store) {
             /* the bytes to the store, the commitment to the chain (#11), as the row flush does */
             char *zRef = NULL;
             int named = 0;
@@ -2801,7 +2853,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         *pMore = 0;
         return 0;
     }
-    ctx->pAnchorRow = storedOnly ? &node->anchorRow : NULL;
+    ctx->pAnchorRow = storedOnly && !node->config.hasFleet ? &node->anchorRow : NULL;   /* a fleet's anchor is the fleet's */
     rc = hppliteAdvanceMetaPages(ctx, height, node->l1 ? payload : NULL, node->l1 ? payloadLen : 0, root, hpplite_pagemode_piece_more(node->pm));
     ctx->pAnchorRow = NULL;
     if (rc == SQLITE_OK) {

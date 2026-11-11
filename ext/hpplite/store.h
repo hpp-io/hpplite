@@ -122,6 +122,14 @@ void hpplite_store_sha256(const uint8_t *data, size_t len, uint8_t out[32]);
 int hpplite_store_sign_batch(HppliteStore *store, const unsigned char da[20], uint64_t chainId, const unsigned char instance[32],
                              uint64_t height, const uint8_t *data, size_t len, uint8_t sig[65]);
 int hpplite_store_put_named(HppliteStore *store, const char *zName, const unsigned char instance[32], const uint8_t *data, size_t len, const uint8_t sig[65]);
+/* hpplite-fleet/1 (#316 c): a batch's Head digest, and the batch written with its head signed by the store's key */
+void hpplite_store_fleet_head_digest(const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], const unsigned char instance[32],
+                                     uint64_t fromHeight, uint64_t toHeight, const unsigned char chainAfter[32], const unsigned char stateRoot[32],
+                                     const unsigned char manifestDigest[32], uint64_t epoch, unsigned char digest[32]);
+int hpplite_store_fleet_head_height(HppliteStore *store, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t *pTo);
+int hpplite_store_put_fleet_name(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t height,
+                                 const unsigned char instance[32], const unsigned char chainAfter[32], const unsigned char stateRoot[32],
+                                 uint64_t epoch, const uint8_t *data, size_t len);
 uint8_t *hpplite_store_get_named(HppliteStore *store, const char *zName, size_t *pLen, uint8_t sig[65], unsigned char instance[32]);
 /* The wallet a named entry's signature recovers to (0), or -1 when it does not recover */
 int hpplite_store_batch_signer(const unsigned char da[20], uint64_t chainId, const unsigned char instance[32], uint64_t height,

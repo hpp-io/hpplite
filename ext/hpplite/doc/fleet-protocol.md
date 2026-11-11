@@ -249,6 +249,17 @@ operator who wants fast failover uses the owner's `forceExpire`, not a short
 lease. A database the fleet has no live record of, opened without `admit=`,
 stops with one line saying the Admit is needed.
 
+Each flush writes its batch to `/fleet/<fleet>/name/<dbId>-<height>` with the
+head (`fromHeight = toHeight =` the batch's height, the rolling chain hash
+after it, the page root, `manifestDigest` the sha-256 of the bytes, the
+lease's epoch) signed by the database's key in `X-HPPLite-Head`; the node
+posts no root and no anchor (the fleet's anchor does). A file that already
+has rows when first opened (written by the app or a migration before its
+sequencer) is a first open: the join, then its state as batch 1. A file
+behind the heads the store holds (a fresh or recreated file for a database
+with history) is refused before any claim until the node rebuilds from the
+store's heads (#316 d).
+
 ## Not decided here
 
 The contract is built (`contracts/src/HPPLiteFleet.sol`, `HPPLiteFleetFactory.sol`,

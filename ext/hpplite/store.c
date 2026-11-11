@@ -1151,6 +1151,104 @@ static void batchDigest(const unsigned char da[20], uint64_t chainId, const unsi
     hpplite_keccak256(pre, 66, digest);
 }
 
+/* hpplite-fleet/1's Head (#297, #316): Head(dbId, instanceId, fromHeight, toHeight, chainHashAfter, stateRoot,
+** manifestDigest, epoch) in ("HPPLiteFleet", "1", chainId, fleet) - a batch's head: fromHeight = toHeight = its height,
+** manifestDigest the sha-256 of its bytes (#315) */
+void hpplite_store_fleet_head_digest(const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], const unsigned char instance[32],
+                                     uint64_t fromHeight, uint64_t toHeight, const unsigned char chainAfter[32], const unsigned char stateRoot[32],
+                                     const unsigned char manifestDigest[32], uint64_t epoch, unsigned char digest[32]) {
+    static const char zDomainType[] = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+    static const char zHeadType[] = "Head(bytes32 dbId,bytes32 instanceId,uint256 fromHeight,uint256 toHeight,bytes32 chainHashAfter,"
+                                    "bytes32 stateRoot,bytes32 manifestDigest,uint256 epoch)";
+    unsigned char w[32 * 9], domain[32], h[32], pre[66];
+    hpplite_keccak256((const unsigned char *)zDomainType, sizeof(zDomainType) - 1, w);
+    hpplite_keccak256((const unsigned char *)"HPPLiteFleet", 12, w + 32);
+    hpplite_keccak256((const unsigned char *)"1", 1, w + 64);
+    wordInt(chainId, w + 96);
+    memset(w + 128, 0, 32); memcpy(w + 128 + 12, fleet, 20);
+    hpplite_keccak256(w, 160, domain);
+    hpplite_keccak256((const unsigned char *)zHeadType, sizeof(zHeadType) - 1, w);
+    memcpy(w + 32, dbId, 32);
+    memcpy(w + 64, instance, 32);
+    wordInt(fromHeight, w + 96);
+    wordInt(toHeight, w + 128);
+    memcpy(w + 160, chainAfter, 32);
+    memcpy(w + 192, stateRoot, 32);
+    memcpy(w + 224, manifestDigest, 32);
+    wordInt(epoch, w + 256);
+    hpplite_keccak256(w, 288, h);
+    pre[0] = 0x19; pre[1] = 0x01; memcpy(pre + 2, domain, 32); memcpy(pre + 34, h, 32);
+    hpplite_keccak256(pre, 66, digest);
+}
+
+/* The store's latest head of a fleet database (#316): its toHeight in *pTo (0: the store holds none); 0, or -1 when the
+** store did not answer */
+int hpplite_store_fleet_head_height(HppliteStore *s, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t *pTo) {
+    char fl[43], db[67], path[200];
+    cJSON *v = NULL, *head, *h;
+    long status;
+    *pTo = 0;
+    if (!s) return -1;
+    lowerHex(fleet, 20, fl); lowerHex(dbId, 32, db);
+    snprintf(path, sizeof path, "/fleet/%s/db/%s", fl, db);
+    status = getJson(s, path, &v);
+    if (status == 404) { cJSON_Delete(v); return 0; }                  /* the fleet has no record yet: nothing held */
+    if (status != 200 || !v) { cJSON_Delete(v); return -1; }
+    head = cJSON_GetObjectItem(v, "latestHead");
+    h = head && cJSON_IsObject(head) ? cJSON_GetObjectItem(cJSON_GetObjectItem(head, "head"), "toHeight") : NULL;
+    if (h && cJSON_IsNumber(h)) *pTo = (uint64_t)h->valuedouble;
+    cJSON_Delete(v);
+    return 0;
+}
+
+/* A fleet database's batch and its signed head, one write (#316 c): POST /fleet/<fleet>/name/<dbId>-<height>, the body
+** the bytes, the instance and the head's signature, X-HPPLite-Head the head's fields. 0, or -1 with the reason in error */
+int hpplite_store_put_fleet_name(HppliteStore *s, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t height,
+                                 const unsigned char instance[32], const unsigned char chainAfter[32], const unsigned char stateRoot[32],
+                                 uint64_t epoch, const uint8_t *data, size_t len) {
+    unsigned char manifest[32], digest[32], sig[65], v;
+    char fl[43], db[67], in[67], ca[67], sr[67], md[67], path[200];
+    HppliteSignature hs;
+    char *zHeader;
+    uint8_t *body;
+    Buf out = {0};
+    long status;
+    int rc = -1;
+    if (!s || !s->hasKey || !data || !len) return -1;
+    s->error[0] = 0;
+    s->funderWait = 0;
+    s->lastFailure = HPPLITE_STORE_FAIL_NONE;
+    s->lastBytes = len;
+    if (protocolOk(s) != 0) return -1;
+    hpplite_store_sha256(data, len, manifest);
+    hpplite_store_fleet_head_digest(fleet, chainId, dbId, instance, height, height, chainAfter, stateRoot, manifest, epoch, digest);
+    if (hpplite_crypto_sign(s->crypto, &s->kp, digest, &hs) != 0) { snprintf(s->error, sizeof s->error, "the head could not be signed"); return -1; }
+    hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);
+    sig[64] = v;
+    lowerHex(fleet, 20, fl); lowerHex(dbId, 32, db); lowerHex(instance, 32, in);
+    lowerHex(chainAfter, 32, ca); lowerHex(stateRoot, 32, sr); lowerHex(manifest, 32, md);
+    zHeader = sqlite3_mprintf("X-HPPLite-Head: {\"dbId\":\"%s\",\"instanceId\":\"%s\",\"fromHeight\":%llu,\"toHeight\":%llu,"
+                              "\"chainHashAfter\":\"%s\",\"stateRoot\":\"%s\",\"manifestDigest\":\"%s\",\"epoch\":%llu}",
+                              db, in, (unsigned long long)height, (unsigned long long)height, ca, sr, md, (unsigned long long)epoch);
+    body = malloc(len + 97);
+    if (!zHeader || !body) { sqlite3_free(zHeader); free(body); return -1; }
+    memcpy(body, data, len);
+    memcpy(body + len, instance, 32);
+    memcpy(body + len + 32, sig, 65);
+    snprintf(path, sizeof path, "/fleet/%s/name/%s-%llu", fl, db, (unsigned long long)height);
+    status = paidPost(s, path, body, len + 97, zHeader, &out);
+    if (status == 200) { rc = 0; s->nOk++; }
+    else if (status == -1) { /* the reason is in s->error */ }
+    else if (status == 429) storeBusy(s, out.p);
+    else if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the fleet name %llu: %.160s", status, (unsigned long long)height, out.p ? out.p : "");
+    if (rc != 0 && s->lastFailure == HPPLITE_STORE_FAIL_NONE)
+        s->lastFailure = status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;
+    sqlite3_free(zHeader);
+    free(body);
+    free(out.p);
+    return rc;
+}
+
 int hpplite_store_batch_signer(const unsigned char da[20], uint64_t chainId, const unsigned char instance[32], uint64_t height,
                                const uint8_t *data, size_t len, const uint8_t sig[65], unsigned char out[20]) {
     unsigned char digest[32], pub[33];

@@ -427,10 +427,10 @@ static void test_fleet_params(void) {
                                             0x60,0xa4,0x2d,0x13,0x9b,0x75,0xe4,0xad,0x10,0x8a,0xe5,0xd5,0xa3,0x48,0x03,0x0e };
     int ok = cfg && !hpplite_config_error() && cfg->hasFleet && memcmp(cfg->dbId, want, 32) == 0 && cfg->hasAdmit && cfg->admitIssuedAt == 1800000000;
     printf("  owner, dbname and admit: %s\n", ok ? "parsed, the vectors' dbId" : (hpplite_config_error() ? hpplite_config_error() : "the dbId differs"));
-    int stops = cfg && hpplite_config_resolve_operators(cfg) != 0 && hpplite_config_error() && strstr(hpplite_config_error(), "not served yet");
+    int resolves = cfg && hpplite_config_resolve_operators(cfg) == 0;              /* served since #316 (c) */
     if (cfg) hpplite_config_free(cfg);
     if (!ok) { FAIL("fleet=, owner= and dbname= should give the vectors' dbId, admit= its issuedAt"); }
-    if (!stops) { FAIL("until the fleet mode is built, the open stops saying so"); }
+    if (!resolves) { printf("(%s) ", hpplite_config_error() ? hpplite_config_error() : "?"); FAIL("a fleet= open resolves its operators and goes on"); }
     PASS();
 }
 

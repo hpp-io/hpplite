@@ -68,6 +68,7 @@ typedef struct EthL1 {
     uint64_t admitIssuedAt;
     uint8_t admitSig[65];
     int hasAdmit;
+    uint64_t fleetEpoch;       /* the record's epoch at the last read: what a head is signed at (#316 c) */
     char relayError[240];
 } EthL1;
 
@@ -1832,6 +1833,7 @@ static HppliteL1State *fleet_get_state(HppliteL1 *l1) {
     FleetRecord r;
     HppliteL1State *state;
     if (fleet_record(l1, &r) != 0) return NULL;
+    self->fleetEpoch = r.epoch;
     state = sqlite3_malloc(sizeof(HppliteL1State));
     if (!state) return NULL;
     memset(state, 0, sizeof *state);
@@ -1896,6 +1898,14 @@ static char *fleet_claim(HppliteL1 *l1, const unsigned char instanceId[32]) {
         if (tx) { self->lastPath = "direct"; return txHashString(tx); }
     }
     return NULL;
+}
+
+/* the database's lease epoch as last read (a head is signed at it); read now when none was */
+uint64_t hpplite_l1_fleet_epoch(HppliteL1 *l1) {
+    FleetRecord r;
+    if (!l1 || l1->ops != &hppliteL1EthOps || !self->fleet) return 0;
+    if (!self->fleetEpoch && fleet_record(l1, &r) == 0) self->fleetEpoch = r.epoch;
+    return self->fleetEpoch;
 }
 
 HppliteL1 *hpplite_l1_connect_fleet(const char *rpc_url, const uint8_t fleet[20], const uint8_t dbId[32], const uint8_t owner[20],

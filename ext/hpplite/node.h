@@ -81,6 +81,11 @@ typedef struct HppliteNodeConfig {
     uint64_t storeCap;              /* HPPLITE_STORE_CAP: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storePermit;           /* HPPLITE_STORE_PERMIT: what the funding wallet's permit lets the store pull (0: none, #214) */
     unsigned char funder[20];       /* funder= (#272): the bucket's funding wallet is external; the node binds nothing, gives no permit */
+    int hasFleet;                   /* fleet= (#316): one database in a shared rollup */
+    unsigned char fleet[20], dbId[32], fleetOwner[20], nameHash[32];
+    uint64_t admitIssuedAt;
+    unsigned char admitSig[65];
+    int hasAdmit;
     int hasFunder;
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
     int fromSnapshot;               /* a new replica (no role=verify, an empty file) starts from the latest snapshot (#222); a verifier

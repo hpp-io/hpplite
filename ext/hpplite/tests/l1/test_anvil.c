@@ -2199,6 +2199,133 @@ static void test_fleet_lease(void) {
     PASS();
 }
 
+/* 43. fleet= (#316 c): a database in a fleet as a node opens it - the URI names fleet=, owner=, dbname=, admit=, store=,
+** relay=; the first open joins (through a free relay), each flush writes the batch with its head signed by the database's
+** key and the reference store takes it (the head's chain hash, digest, epoch and instance checked there); the store's
+** head is the file's height; a reopen within the lease sends the relay nothing; a fresh file for the same database is
+** refused before any claim while rebuilding from the store is (d)'s */
+static long fleet_relay_posts(void) {
+    char out[64];
+    return run_cmd("grep -c 'POST /commit' " DIR "/relay_fleet.log 2>/dev/null || true", out, sizeof out) == 0 ? atol(out) : -1;
+}
+static void test_fleet_node_writes(void) {
+    TEST("fleet= node (#316 c): joins at open, each flush a batch with its signed head the store takes, the store's head the file's height, a reopen within the lease calls nothing, a fresh file behind the store refused before any claim, a file with rows and no record joins and writes its state as batch 1");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000];
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s notes", ownerAddr, seqAddr, fl, KEY0);
+    if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0) FAIL("the Admit (scenario 42's helper)");
+    char dbHex[70], nhHex[70], sigHex[140];
+    unsigned long long issued = 0;
+    if (sscanf(out, "%66s %66s %llu %132s", dbHex, nhHex, &issued, sigHex) != 4) FAIL("the Admit's fields");
+    store = start_pin_service_free(svc, sport);
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    FILE *f = fopen(DIR "/relay.key", "w");
+    if (!f) FAIL("relay key");
+    fprintf(f, "%s\n", KEY9);
+    fclose(f);
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/fleet_n.db* " DIR "/fleet_m.db* " DIR "/fleet_p.db*");
+    relay = fork();
+    if (relay == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", rport);
+        snprintf(script, sizeof script, "%s/../relay/relay.py", svc);
+        int fd = open(DIR "/relay_fleet.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key", "--factory", FACTORY,
+               "--fleet-factory", ff, "--dir", DIR "/relay_fleet", "--verbose", (char *)NULL);
+        _exit(127);
+    }
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    for (int i = 0; i < 50; i++) {
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 %s/status", relayUrl);
+        if (run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "hpplite-relay")) break;
+        usleep(200 * 1000);
+    }
+#define FN_FAIL(why) do { kill(relay, SIGTERM); waitpid(relay, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0); FAIL(why); } while (0)
+    const char *fmt = "file:" DIR "/%s?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=0&fleet=%s&owner=%s&dbname=notes"
+                      "&admit=%llu:0x%s&store=%s&relay=%s";
+    snprintf(uri, sizeof uri, fmt, "fleet_n.db", RPC, SKEY, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    sqlite3 *w = NULL;
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) {
+        printf("(%s) ", sqlite3_errmsg(w)); sqlite3_close(w); FN_FAIL("open with fleet=");
+    }
+    sqlite3_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    long long last = 0;
+    for (int i = 0; i < 3; i++) {
+        char sql[100];
+        snprintf(sql, sizeof sql, "INSERT INTO t(v) VALUES('fleet row %d')", i);
+        sqlite3_exec(w, sql, NULL, NULL, NULL);
+        last = scalar(w, "SELECT hpplite_flush()");
+        if (last <= 0) { printf("(flush %d: %lld, %s) ", i, last, status_text(w, "last_error")); sqlite3_close(w); FN_FAIL("each flush writes the batch with its head"); }
+    }
+    long long height = scalar(w, "SELECT height FROM hpplite_status");
+    long posts = fleet_relay_posts();
+    sqlite3_close(w);
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
+    run_cmd(cmd, out, sizeof out);
+    char want[64];
+    snprintf(want, sizeof want, "\"toHeight\": %lld", height - 1);
+    printf("(height %lld after three flushes, the relay's calls %ld, the store: %.160s) ", height, posts, strstr(out, "\"latestHead\"") ? strstr(out, "\"latestHead\"") : out);
+    if (!strstr(out, want) || posts != 1) FN_FAIL("the store's head is the file's last height, and the relay saw one call (the join)");
+    /* a reopen within the lease: same instance, no call; it writes on */
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(w); FN_FAIL("reopen"); }
+    sqlite3_exec(w, "INSERT INTO t(v) VALUES('after the reopen')", NULL, NULL, NULL);
+    long long again = scalar(w, "SELECT hpplite_flush()");
+    long posts2 = fleet_relay_posts();
+    sqlite3_close(w);
+    printf("(after a reopen: flush %lld, the relay's calls %ld) ", again, posts2);
+    if (again <= 0 || posts2 != 1) FN_FAIL("a reopen within the lease writes on and sends the relay nothing");
+    /* a fresh file for the same database: behind the store's history, refused before any claim */
+    snprintf(uri, sizeof uri, fmt, "fleet_m.db", RPC, SKEY, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    sqlite3 *m = NULL;
+    sqlite3_open_v2(uri, &m, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    char why[400] = "";
+    snprintf(why, sizeof why, "%s", m ? status_text(m, "last_error") : "");
+    long posts3 = fleet_relay_posts();
+    sqlite3_close(m);
+    printf("(a fresh file: '%.120s', the relay's calls %ld) ", why, posts3);
+    if (!strstr(why, "#316 (d)") || posts3 != 1) FN_FAIL("a fresh file behind the store's history is refused before any claim");
+    /* somaro's common path: a file the app (or a migration) wrote before its sequencer's first open - rows, no bookkeeping -
+    ** for a database the fleet has no record of and the store no head: a first open, the join, the file's state as batch 1 */
+    sqlite3 *p = NULL;
+    if (sqlite3_open(DIR "/fleet_p.db", &p) != SQLITE_OK) { sqlite3_close(p); FN_FAIL("a plain file"); }
+    sqlite3_exec(p, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('before the sequencer'), ('a migration')", NULL, NULL, NULL);
+    sqlite3_close(p);
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s prefilled", ownerAddr, seqAddr, fl, KEY0);
+    char pdbHex[70], pnhHex[70], psigHex[140];
+    unsigned long long pissued = 0;
+    if (run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", pdbHex, pnhHex, &pissued, psigHex) != 4) FN_FAIL("the second database's Admit");
+    snprintf(uri, sizeof uri, "file:" DIR "/fleet_p.db?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=0&fleet=%s&owner=%s"
+             "&dbname=prefilled&admit=%llu:0x%s&store=%s&relay=%s", RPC, SKEY, fl, ownerAddr, pissued, psigHex, storeUrl, relayUrl);
+    if (sqlite3_open_v2(uri, &p, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(p)); sqlite3_close(p); FN_FAIL("open the file with rows"); }
+    long long pflush = scalar(p, "SELECT hpplite_flush()"), prows = scalar(p, "SELECT count(*) FROM t");
+    char perr[300];
+    snprintf(perr, sizeof perr, "%s", status_text(p, "last_error"));
+    long posts4 = fleet_relay_posts();
+    sqlite3_close(p);
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, pdbHex);
+    run_cmd(cmd, out, sizeof out);
+    printf("(a file with rows: flush %lld, rows %lld, the relay's calls %ld, %s; the store: %.80s) ", pflush, prows, posts4, perr[0] ? perr : "no error",
+           strstr(out, "\"toHeight\"") ? strstr(out, "\"toHeight\"") : out);
+    if (pflush <= 0 || prows != 2 || posts4 != 2 || !strstr(out, "\"toHeight\": 1")) FN_FAIL("a file with rows and no record joins and writes its state as batch 1");
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0);
+#undef FN_FAIL
+    PASS();
+}
+
 static void test_relay_no_eth(void) {
     TEST("a wallet with USDC.e and no ETH (#126): its rollup, lease and anchors through the relay, paid in USDC.e; a replica rebuilds; its ETH stays 0");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
@@ -3395,6 +3522,7 @@ int main(void) {
     if (wanted(40)) test_sponsored_relay();
     if (wanted(41)) test_fleet_sequencer();
     if (wanted(42)) test_fleet_lease();
+    if (wanted(43)) test_fleet_node_writes();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

@@ -191,6 +191,7 @@ static void fleet_check(HppliteConfig *cfg, const int uri[7]) {
     memset(word, 0, 12);
     memcpy(word + 12, cfg->fleetOwner, 20);
     hpplite_keccak256((const unsigned char *)cfg->dbName, strlen(cfg->dbName), word + 32);
+    memcpy(cfg->nameHash, word + 32, 32);
     hpplite_keccak256(word, 64, cfg->dbId);
 }
 
@@ -949,9 +950,6 @@ int hpplite_config_resolve_operators(HppliteConfig *cfg) {
         if (name) *q = 0;
         fprintf(stderr, "hpplite: fleet 0x%s: database \"%s\" of 0x%s, dbId 0x%s\n", fl, name ? name : "?", ow, id);
         free(name);
-        /* until the node's fleet mode is built (#316 b-e), a database in a fleet does not open as anything else */
-        snprintf(gConfigError, sizeof(gConfigError), "fleet=: the node's fleet mode is not served yet (#316); this database does not open as a rollup instead");
-        return -1;
     }
     return 0;
 }

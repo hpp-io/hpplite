@@ -176,6 +176,7 @@ typedef struct HppliteConfig {
     unsigned char fleetOwner[20];    /* owner=: the database's owner; with dbname= it makes the dbId */
     int hasFleetOwner;
     unsigned char dbId[32];          /* keccak256(abi.encode(owner, keccak256(dbname))), derived when fleet= is given */
+    unsigned char nameHash[32];      /* keccak256(dbname) */
     uint64_t admitIssuedAt;          /* admit=<issuedAt>:0x<signature>: the fleet's Admit, for a database with no live record */
     unsigned char admitSig[65];
     int hasAdmit;
