@@ -287,7 +287,10 @@ sequencer.
 
 ## Not decided here
 
-The contract is built (`contracts/src/HPPLiteFleet.sol`, `HPPLiteFleetFactory.sol`,
-#300-#303; not deployed). The store's calls above are a draft; the relay's
-acceptance of the v11 factory's and fleets' calls, the node (`fleet=`), the
-anchor tool and verify follow.
+The contract (`contracts/src/HPPLiteFleet.sol`, `HPPLiteFleetFactory.sol`,
+#300-#303, #321) is deployed on HPP Sepolia: the fleet factory
+`0x2880d4136720bd5dac2d3b16eb63e4f063ccfea2` (2026-11-11). The reference store
+and relay serve fleets (#310-#317), and so do HPP's canonical ones
+(hpplite-operators #42-#44) except a fleet's roots; the node's `fleet=` mode is
+built (#316). The anchor tool (the roots: manifests, `postRootFor`, the store's
+indexing of `RootPosted`) and verify follow.
