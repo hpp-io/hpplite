@@ -25,6 +25,9 @@ RETIRE_TYPE = "Retire(bytes32 dbId,uint256 issuedAt)"                           
 ROOT_TYPE = "Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)"     # the fleet's anchor key
 CLAIM_TYPE = "Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)"     # the database's sequencer; nonce: the record's claimNonce
 EXPIRE_TYPE = "Expire(bytes32 dbId,uint256 nonce,uint256 deadline)"     # the database's owner: forceExpire, relayable (#321); nonce: the claimNonce
+# the database's sequencer (#314): a piece of its snapshot at a height - part 0 the index, part i >= 1 its i-th chunk;
+# digest the sha-256 of the piece's bytes (its CID's digest)
+SNAPSHOT_TYPE = "Snapshot(bytes32 dbId,uint256 admittedAt,uint256 height,uint256 part,bytes32 digest)"
 # in the factory's domain ("HPPLiteFleetFactory", "11", chainId, <the factory>): the fleet's owner; nonce: the factory's createNonce(owner)
 CREATE_FLEET_TYPE = "CreateFleet(address owner,address anchor,uint64 leaseDuration,uint256 nonce,uint256 deadline)"
 
@@ -55,6 +58,31 @@ def name_hash(name):
 def head_digest(dom, h):
     return eth.typed_digest(dom, HEAD_TYPE, h["dbId"], h["instanceId"], h["fromHeight"], h["toHeight"],
                             h["chainHashAfter"], h["stateRoot"], h["manifestDigest"], h["epoch"])
+
+
+def snapshot_digest(dom, db, admitted_at, height, part, digest):
+    return eth.typed_digest(dom, SNAPSHOT_TYPE, db, admitted_at, height, part, digest)
+
+
+def snapshot_index(rollup, db, admitted_at, height, root, chain, block, at, size, chunks, prune=True):
+    """A snapshot's index (#314), part 0: canonical JSON (sorted keys, no spaces). The database's state at `height` as
+    one page image, sealed as a batch at that height is and cut into chunks (their sha-256s, in order; `size` their
+    bytes in all); `root` and `chain` the head's stateRoot and chainHashAfter at that height, `block` the bookkeeping's
+    block hash there; `prune` whether the store may let go of the history below it once a root holds a later head"""
+    hx = lambda b: "0x" + b.hex()
+    body = {"protocol": PROTOCOL, "rollup": rollup.lower(), "dbId": hx(db) if isinstance(db, bytes) else db.lower(),
+            "admittedAt": admitted_at, "height": height, "root": hx(root), "chain": hx(chain), "block": hx(block), "at": at,
+            "bytes": size, "chunks": [hx(c) for c in chunks], "prune": bool(prune)}
+    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+
+
+def prune_height(snapshots, anchored_height):
+    """The rule a store prunes by (#314): the height below which a database's history may go - the highest snapshot,
+    complete and checked, with prune set, at or under the height of the database's latest anchored head of the same
+    admission; 0 when none. snapshots: [{height, prune}] (only those the store checked: index and every chunk held,
+    signed by the record's sequencer, root and chain the head's at that height)"""
+    ok = [s["height"] for s in snapshots if s.get("prune") and s["height"] >= 2 and s["height"] <= anchored_height]
+    return max(ok) if ok else 0
 
 
 def leaf(db, owner, nhash, hdigest):

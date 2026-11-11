@@ -167,7 +167,8 @@ def fleet_vectors():
                                                                      "stateRoot", "manifestDigest", "epoch")], 0),
             ("Admit", fleet.ADMIT_TYPE, admit, 2), ("Retire", fleet.RETIRE_TYPE, retire, 1), ("Root", fleet.ROOT_TYPE, rootmsg, 2),
             ("Claim", fleet.CLAIM_TYPE, [dbs[0]["dbId"], dbs[0]["head"]["instanceId"], 0, 1800000003], 0),
-            ("Expire", fleet.EXPIRE_TYPE, [dbs[0]["dbId"], 1, 1800000005], 1)]
+            ("Expire", fleet.EXPIRE_TYPE, [dbs[0]["dbId"], 1, 1800000005], 1),
+            ("Snapshot", fleet.SNAPSHOT_TYPE, [dbs[0]["dbId"], 1800000000, 100, 0, eth.keccak256(b"an index")], 0)]
     factory = "0x" + "fa" * 20
     fdom = fleet.factory_domain(chain_id, factory)
     create = [owners[0], eth.address(key(2)).lower(), 604800, 0, 1800000004]
@@ -209,7 +210,26 @@ def fleet_vectors():
     # a batch's name at the store, by its admission (#318): a re-admission (Admitted after Retired) starts a new life
     names = [{"dbId": hx(dbs[0]["dbId"]), "admittedAt": a, "height": h, "name": fleet.store_name(dbs[0]["dbId"], a, h)}
              for a, h in ((1800000000, 1), (1800000000, 2), (1800000900, 1))]
+    # a snapshot (#314): two chunks and the index naming them, each piece signed by the database's sequencer as
+    # Snapshot(dbId, admittedAt, height, part, sha-256); and the height a store prunes below, by the rule
+    chunks = [b"chunk one of the image", b"chunk two"]
+    csha = [hashlib.sha256(c).digest() for c in chunks]
+    sidx = fleet.snapshot_index(rollup, dbs[0]["dbId"], 1800000000, 100, eth.keccak256(b"page root 100"), eth.keccak256(b"chain 100"),
+                                eth.keccak256(b"block 100"), 1800003600, sum(len(c) for c in chunks), csha)
+    pieces = []
+    for part, data in enumerate([sidx] + chunks):
+        sd = fleet.snapshot_digest(dom, dbs[0]["dbId"], 1800000000, 100, part, hashlib.sha256(data).digest())
+        pieces.append({"part": part, "bytes": hx(data), "sha256": hx(hashlib.sha256(data).digest()), "digest": hx(sd),
+                       "signature": hx(eth.sign(key(0), sd))})
+    cases = [([{"height": 100, "prune": True}], 150, 100), ([{"height": 100, "prune": True}], 99, 0),
+             ([{"height": 100, "prune": True}, {"height": 200, "prune": True}], 250, 200),
+             ([{"height": 100, "prune": True}, {"height": 200, "prune": True}], 199, 100),
+             ([{"height": 100, "prune": False}], 150, 0), ([{"height": 1, "prune": True}], 150, 0)]
+    snapshot = {"dbId": hx(dbs[0]["dbId"]), "admittedAt": 1800000000, "height": 100, "key": KEYS[0], "index": sidx.decode(), "pieces": pieces,
+                "prune": [{"snapshots": sn, "anchoredHeight": a, "pruneBelow": fleet.prune_height(sn, a)} for sn, a, _ in cases]}
+    assert [c["pruneBelow"] for c in snapshot["prune"]] == [w for _, _, w in cases]
     return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup, "batchHeads": batch_heads, "names": names, "builder": builder,
+            "snapshot": snapshot,
             "databases": [{"name": d["name"], "owner": d["owner"], "dbId": hx(d["dbId"]), "nameHash": hx(fleet.name_hash(d["name"])),
                            "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in d["head"].items()},
                            "headDigest": hx(d["headDigest"]), "key": d["key"], "signature": hx(d["signature"]), "leaf": hx(d["leaf"])}

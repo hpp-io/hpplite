@@ -35,6 +35,7 @@ EIP-712 in the domain `("HPPLiteFleet", "1", chainId, <shared rollup>)`:
 | `Root(uint256 seq,bytes32 root,bytes32 manifestDigest,uint256 deadline)` | the fleet's anchor key (the owner may change it); sponsored at the relay |
 | `Claim(bytes32 dbId,bytes32 instanceId,uint256 nonce,uint256 deadline)` | the database's sequencer, to take or renew its lease (`claimFor`, or with the Admit in `joinFor`); `nonce` is the record's `claimNonce` - 0 for a dbId the fleet never had, carried on when a retired one is admitted again |
 | `Expire(bytes32 dbId,uint256 nonce,uint256 deadline)` | the database's owner, for `expireFor` (#321): `forceExpire`'s effect, sent by anyone (a relay), so a restored host with N databases costs the owner's key N signatures and no gas; `nonce` is the record's `claimNonce`, consumed, so an Expire once sent cannot be played against a later lease |
+| `Snapshot(bytes32 dbId,uint256 admittedAt,uint256 height,uint256 part,bytes32 digest)` | the database's sequencer (#314): one piece of its snapshot at `height` - part 0 the index, part `i >= 1` its `i`-th chunk; `digest` the sha-256 of the piece's bytes (vectors `fleet.snapshot`) |
 
 In the factory's domain `("HPPLiteFleetFactory", "11", chainId, <the factory>)`:
 
@@ -279,6 +280,67 @@ per fleet.
 
 **Retirement.** A retired database's names stay until its bucket is
 released, as a released bucket's do today.
+
+## Snapshots and pruning (#314)
+
+Without them a fleet database's history at the store only grows and a
+rebuild replays every batch from height 1. A **snapshot** is the database's
+state at a height `S`: one page image (every page, as a rollup's snapshot,
+#221), sealed as a batch at `S` is, cut into chunks of at most 8 MiB, and an
+index (`fleet.snapshot_index`, canonical JSON):
+
+    {"admittedAt", "at", "block", "bytes", "chain", "chunks": ["0x<sha-256>", ...],
+     "dbId", "height", "protocol": "hpplite-fleet/1", "prune", "rollup", "root"}
+
+`root` and `chain` are the head's `stateRoot` and `chainHashAfter` at `S`,
+`block` the bookkeeping's block hash there, `bytes` the chunks' size in all,
+`prune` whether the history below it may go. Each piece is signed by the
+database's sequencer as `Snapshot(dbId, admittedAt, S, part, sha-256)`.
+
+| Call | By | What |
+|------|----|------|
+| `POST /fleet/<fleet>/snapshot/<db>-<admittedAt>-<S>/<part>`, the body the piece's bytes; `X-HPPLite-Signature` its `Snapshot` signature | the database's sequencer | chunks first (parts 1..n), the index last (part 0). Checks: the signature recovers to the record's sequencer, `admittedAt` is the record's; for the index, its fields are this name's, the store holds the head at `S` of this admission and the index's `root` and `chain` are that head's, and every chunk it names is held. Charged to the database's bucket as a name write. `200 {cid, bytes}` |
+| `GET /fleet/<fleet>/db/<db>` | - | also `snapshot: {height, index, signature, at, prune}` - the current admission's latest checked snapshot, `index` the CID of its index - and `prunedBelow` (0: nothing pruned) |
+
+**Rebuilding from a snapshot.** A node whose file is behind the store (an
+empty file, a lost volume) and below the latest snapshot `S` - or below
+`prunedBelow`, where the batches are gone - starts there: the index by its
+CID, its `Snapshot` signature recovering to the database's key; each chunk by
+its sha-256; the image opened with the database's keys and its root the
+index's `root`; written as the file and the bookkeeping set at `S`
+(`block`, `chain`, `root`); then batches `S+1` to the latest head as before,
+and the rolling hash after the last must be the latest head's
+`chainHashAfter`, signed by the database's key. Nothing is written to the
+file before every check up to the image's root has passed.
+
+**Verifying from a snapshot.** The anchored head at `T >= S` signs
+`chainHashAfter(T)` and `stateRoot(T)`; the batches `S+1..T` roll from the
+snapshot's `chain` to that hash and apply from its image to that root. A
+snapshot that is not the history - another image, another chain hash - does
+not reach the anchored head. `verify` (the leaf's path into the root on
+chain) is unchanged.
+
+**Pruning, the store's rule** (`fleet.prune_height`, vectors
+`fleet.snapshot.prune`). The store may delete a database's names below `P`
+and the pieces of its snapshots below `P`, where `P` is the highest checked
+snapshot of the current admission with `prune` set, at `S >= 2`, at or under
+the height of the database's anchored head - and that anchored head is of the
+same admission (the head the store holds at that height is the root's). It
+prunes on its own when a root is indexed or a snapshot is checked, and never
+before the root on chain holds a head at or past `S`. Kept: the names from
+`P` on (the head at `P` with them), the snapshot at `P` and any above it.
+A bucket's bytes then stay near one snapshot and the batches since the last
+anchor. Names once pruned are never written again: a write below
+`prunedBelow` is `409`. `GET /fleet/<fleet>/db/<db>/bucket` shows the bytes
+after the prune.
+
+**The node's part.** With `fleet=` the node takes a snapshot while it holds
+the lease, after a flush, when 100 batches have gone since the last one or
+`snapshot=` (a duration, default 24 h) has passed with any batch in between;
+`snapshot=0` takes none. `keep=all` keeps the history (`prune: false` in the
+index); `keep=<duration>` is not taken with `fleet=`. A snapshot the store did
+not take is said once and tried at the next flush; the batches are written
+regardless.
 
 ## The relay (sponsorship of a fleet's calls; vectors first, #312)
 
