@@ -130,26 +130,56 @@ void hpplite_pageroot_get(const HpplitePageRoot *pr, unsigned char out[32]) {
   hpplite_sha256_final(&c, out);
 }
 
+struct HppliteDbFile { sqlite3_file *f; char *zName; };
+HppliteDbFile *hpplite_dbfile_open(const char *zPath) {
+  sqlite3_vfs *vfs = sqlite3_vfs_find(NULL);
+  HppliteDbFile *d;
+  int outFlags = 0;
+  if (!vfs || !zPath) return NULL;
+  d = sqlite3_malloc64(sizeof(*d));
+  if (!d) return NULL;
+  d->f = sqlite3_malloc64((sqlite3_uint64)vfs->szOsFile);
+  d->zName = sqlite3_mprintf("%s", zPath);                /* the VFS keeps the name for the file's life */
+  if (!d->f || !d->zName) { sqlite3_free(d->f); sqlite3_free(d->zName); sqlite3_free(d); return NULL; }
+  memset(d->f, 0, (size_t)vfs->szOsFile);
+  if (vfs->xOpen(vfs, d->zName, d->f, SQLITE_OPEN_READONLY | SQLITE_OPEN_MAIN_DB, &outFlags) != SQLITE_OK) {
+    if (d->f->pMethods) d->f->pMethods->xClose(d->f);
+    sqlite3_free(d->f); sqlite3_free(d->zName); sqlite3_free(d);
+    return NULL;
+  }
+  return d;
+}
+size_t hpplite_dbfile_read(HppliteDbFile *d, void *buf, size_t n, int64_t off) {
+  sqlite3_int64 size = 0;
+  if (!d || d->f->pMethods->xFileSize(d->f, &size) != SQLITE_OK || off >= size) return 0;
+  if ((sqlite3_int64)n > size - off) n = (size_t)(size - off);
+  return d->f->pMethods->xRead(d->f, buf, (int)n, off) == SQLITE_OK ? n : 0;
+}
+void hpplite_dbfile_close(HppliteDbFile *d) {
+  if (!d) return;
+  d->f->pMethods->xClose(d->f);
+  sqlite3_free(d->f); sqlite3_free(d->zName); sqlite3_free(d);
+}
+
 HpplitePageRoot *hpplite_pageroot_from_file(const char *zPath, int *pPageSize) {
-  FILE *f = fopen(zPath, "rb");
+  HppliteDbFile *f = hpplite_dbfile_open(zPath);
   unsigned char hdr[100], *page;
   int pageSize;
   unsigned n, i;
   HpplitePageRoot *pr;
   if (!f) return NULL;
-  if (fread(hdr, 1, 100, f) != 100) { fclose(f); return NULL; }
+  if (hpplite_dbfile_read(f, hdr, 100, 0) != 100) { hpplite_dbfile_close(f); return NULL; }
   pageSize = (hdr[16] << 8) | hdr[17];
   if (pageSize == 1) pageSize = 65536;
   n = ((unsigned)hdr[28] << 24) | ((unsigned)hdr[29] << 16) | ((unsigned)hdr[30] << 8) | hdr[31];   /* the header's page count */
   pr = hpplite_pageroot_new(pageSize);
   page = sqlite3_malloc64((sqlite3_uint64)pageSize);
-  if (!pr || !page || grow(pr, n ? n : 1) != SQLITE_OK) { hpplite_pageroot_free(pr); sqlite3_free(page); fclose(f); return NULL; }
-  fseek(f, 0, SEEK_SET);
+  if (!pr || !page || grow(pr, n ? n : 1) != SQLITE_OK) { hpplite_pageroot_free(pr); sqlite3_free(page); hpplite_dbfile_close(f); return NULL; }
   for (i = 1; i <= n; i++) {
-    if (fread(page, 1, (size_t)pageSize, f) != (size_t)pageSize) break;
+    if (hpplite_dbfile_read(f, page, (size_t)pageSize, (int64_t)(i - 1) * pageSize) != (size_t)pageSize) break;
     hpplite_pageroot_set(pr, i, page);
   }
-  fclose(f);
+  hpplite_dbfile_close(f);
   sqlite3_free(page);
   if (pPageSize) *pPageSize = pageSize;
   return pr;

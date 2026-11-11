@@ -30,6 +30,16 @@ void hpplite_pageroot_get(const HpplitePageRoot *pr, unsigned char out[32]);
 uint64_t hpplite_pageroot_crc(const HpplitePageRoot *pr);
 /* from a database file as it is (a node opening, a verifier): every page read once */
 HpplitePageRoot *hpplite_pageroot_from_file(const char *zPath, int *pPageSize);
+/* A database file read through SQLite's own VFS, never a plain open(): the
+** close of any descriptor on a file drops every POSIX lock the process holds
+** on it, its connections' SHARED lock among them, and an application's last
+** close then checkpoints and deletes the WAL under them (somaro#116). The
+** VFS keeps one lock set per file and holds a closed descriptor open while a
+** lock is. NULL: no such file. A read past the end gives fewer than n. */
+typedef struct HppliteDbFile HppliteDbFile;
+HppliteDbFile *hpplite_dbfile_open(const char *zPath);
+size_t hpplite_dbfile_read(HppliteDbFile *f, void *buf, size_t n, int64_t off);
+void hpplite_dbfile_close(HppliteDbFile *f);
 uint64_t hpplite_crc64(uint64_t crc, const unsigned char *p, size_t n);
 
 /* ---- the batch ---- */

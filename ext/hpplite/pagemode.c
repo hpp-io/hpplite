@@ -82,25 +82,25 @@ static int ensurePrev(HpplitePageMode *pm, unsigned n) {
 
 HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch, unsigned startFrame) {
   HpplitePageMode *pm = sqlite3_malloc64(sizeof(*pm));
-  FILE *f;
+  HppliteDbFile *f;
   unsigned char hdr[100];
   unsigned i, n;
   if (!pm) return NULL;
   memset(pm, 0, sizeof(*pm));
   pthread_mutex_init(&pm->mu, NULL);
   pm->zPath = sqlite3_mprintf("%s", zPath);
-  /* the file as it is: every page's image, the root */
-  f = fopen(zPath, "rb");
-  if (f && fread(hdr, 1, 100, f) == 100) {
+  /* the file as it is: every page's image, the root (read through the VFS:
+  ** a plain fclose would drop the node's own SHARED lock, somaro#116) */
+  f = hpplite_dbfile_open(zPath);
+  if (f && hpplite_dbfile_read(f, hdr, 100, 0) == 100) {
     pm->pageSize = (hdr[16] << 8) | hdr[17];
     if (pm->pageSize == 1) pm->pageSize = 65536;
     n = ((unsigned)hdr[28] << 24) | ((unsigned)hdr[29] << 16) | ((unsigned)hdr[30] << 8) | hdr[31];
     pm->pRoot = hpplite_pageroot_new(pm->pageSize);
     if (pm->pRoot && ensurePrev(pm, n) == SQLITE_OK) {
-      fseek(f, 0, SEEK_SET);
       for (i = 1; i <= n; i++) {
         unsigned char *img = sqlite3_malloc64((sqlite3_uint64)pm->pageSize);
-        if (!img || fread(img, 1, (size_t)pm->pageSize, f) != (size_t)pm->pageSize) { sqlite3_free(img); break; }
+        if (!img || hpplite_dbfile_read(f, img, (size_t)pm->pageSize, (int64_t)(i - 1) * pm->pageSize) != (size_t)pm->pageSize) { sqlite3_free(img); break; }
         pm->aPrev[i - 1] = img;
         hpplite_pageroot_set(pm->pRoot, i, img);
       }
@@ -109,7 +109,7 @@ HpplitePageMode *hpplite_pagemode_start(const char *zPath, int bWatch, unsigned 
   } else {
     pm->pRoot = hpplite_pageroot_new(0);          /* an empty file: the first commit says the page size */
   }
-  if (f) fclose(f);
+  hpplite_dbfile_close(f);
   if (!pm->pRoot) { hpplite_pagemode_stop(pm); return NULL; }
   pm->bWatch = bWatch;
   if (bWatch) hpplite_walread_watch(zPath, sink, pm, startFrame);

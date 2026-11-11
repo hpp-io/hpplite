@@ -288,6 +288,40 @@ static int writer_main(char **argv) {
     return w.failed ? 1 : 0;
 }
 
+/* An application beside the sequencer that opens a plain connection per
+** request (Flask, PHP), here Python's sqlite3 with its own SQLite: it writes
+** and closes. Its close is the last one but for the sequencer's, so the
+** sequencer's SHARED lock on the file must hold, or that close checkpoints
+** and deletes the WAL before the reader has its frames (somaro#116: one
+** batch, then none, the rows in the file) */
+static void test_connection_per_request(void) {
+    TEST("a plain connection per write beside the sequencer (Python's sqlite3): its close leaves the WAL, every write is in the next batch");
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR);
+    HppliteL1 *l1;
+    HppliteNode *n = open_shared(DIR "/cpr.db", &l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k)", NULL);
+    uint64_t h0 = hpplite_node_flush_batch(n);
+    int lost = 0, unposted = 0, failed = 0;
+    for (int i = 0; i < 3; i++) {
+        char cmd[512];
+        snprintf(cmd, sizeof cmd, "python3 -c \"import sqlite3; c = sqlite3.connect('%s', timeout=20); "
+                 "c.execute('INSERT INTO t(who, k) VALUES(?, ?)', ('app', %d)); c.commit(); c.close()\"", DIR "/cpr.db", i);
+        if (system(cmd) != 0) failed++;
+        if (access(DIR "/cpr.db-wal", F_OK) != 0) lost++;           /* the app's close took the WAL: the sequencer held no lock */
+        if (!hpplite_node_flush_batch(n)) unposted++;
+    }
+    const char *why = replica_differs(n, l1, DIR "/cpr_replica.db");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (!h0) FAIL("the schema's batch");
+    if (failed) FAIL("an application write failed (python3 with sqlite3 needed)");
+    if (lost || unposted || why)
+        FAILF("the WAL deleted by the application's close %d of 3 times; %d of 3 writes made no batch; the replica: %s", lost, unposted, why ? why : "equal");
+    PASS();
+}
+
 /* The election across processes: the first full node on a file sequences;
 ** one opened by another process meanwhile is a follower - it captures, it does
 ** not post - and has the same instance id (the file's): when the sequencer
@@ -509,6 +543,7 @@ int main(int argc, char **argv) {
     test_two_processes();
     test_mixed_threads_and_processes();
     test_sequencer_across_processes();
+    test_connection_per_request();
     test_lease_on_close();
     test_keep_lease_on_close();
     test_rerun_after_foreign_schema_change();
