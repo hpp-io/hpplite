@@ -134,6 +134,7 @@ typedef struct HppliteFleetView {
     uint64_t toHeight;
     unsigned char chainAfter[32], stateRoot[32], headSigner[20];
 } HppliteFleetView;
+int hpplite_store_retry_after(HppliteStore *store);
 int hpplite_store_fleet_view(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], HppliteFleetView *out);
 uint8_t *hpplite_store_get_fleet_name(HppliteStore *store, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t height, size_t *pLen);
 int hpplite_store_put_fleet_name(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t height,

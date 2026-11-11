@@ -337,7 +337,7 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_anvil hpplite_testlib)
         target_include_directories(test_anvil PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME test_anvil COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/anvil_test.sh $<TARGET_FILE:test_anvil>)
-        set_tests_properties(test_anvil PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+        set_tests_properties(test_anvil PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)   # every scenario; the fleet ones (#316) wait on leases and Retry-Afters
         # the reference relay (#170): a wallet with USDC.e and no ETH, its rollup, lease and anchor through it
         add_test(NAME test_relay COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/relay/selftest.sh)
         set_tests_properties(test_relay PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)

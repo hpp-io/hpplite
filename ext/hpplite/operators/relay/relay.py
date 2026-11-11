@@ -349,6 +349,7 @@ class Relay:
         self.chain_id = int(self.chain.call("eth_chainId"), 16)
         self.factory = args.factory.lower()
         self.fleet_factory = (args.fleet_factory or "").lower() or None   # VERSION 11 (#313); none: no fleet calls
+        self.busy_commits = getattr(args, "busy_commits", 0)             # the test hook's count left
         pay_to = args.pay_to or self.address
         self.payments = Payments(args.facilitator, "eip155:%d" % self.chain_id, args.asset, pay_to,
                                  args.asset_name, args.asset_version, args.rpc)
@@ -698,6 +699,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.post_sponsor_db(m.group(1).lower(), m.group(2).lower(), m.group(3) or "")
         if u.path != "/commit":
             return self.reply(404, {"error": "not found"})
+        if self.relay.busy_commits > 0:                 # a test hook: the first k calls answer 429 as an operator's rate limit does
+            self.relay.busy_commits -= 1
+            return self.reply(429, {"error": "too many requests from this address: try again later"},
+                              {"Retry-After": str(self.relay.args.busy_retry_after)})
         try:
             n = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(n) if n > 0 else b"{}")
@@ -799,6 +804,8 @@ def main():
     ap.add_argument("--rpc", required=True)
     ap.add_argument("--key-file", required=True, help="file with the hex key that pays the gas")
     ap.add_argument("--factory", required=True, help="the HPPLite factory whose rollups the relay serves (VERSION 10)")
+    ap.add_argument("--busy-commits", type=int, default=0, help=argparse.SUPPRESS)    # a test hook: the first k commits answer 429
+    ap.add_argument("--busy-retry-after", type=int, default=60, help=argparse.SUPPRESS)  # ...with this Retry-After (somaro#48)
     ap.add_argument("--fleet-factory", default=None, help="the VERSION 11 fleet factory whose fleets the relay serves (#313); none: no fleets")
     ap.add_argument("--pay-to", default=None, help="where payments land (default: the relay's own address)")
     ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, or none: free")

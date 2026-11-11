@@ -736,6 +736,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path.startswith("/fleet/") and self.service.fleets and ADDR_RE.match(path.split("/")[2] if path.count("/") >= 2 else ""):
                 import fleet_store
+                if "/name/" in path:                    # a fleet name is a put for the test hooks too
+                    self.service.puts += 1
+                    if self.service.args.busy_put and self.service.puts == self.service.args.busy_put:
+                        return self.reply(429, {"error": "too many requests from this address: try again later"},
+                                          {"Retry-After": str(self.service.args.busy_retry_after)})
                 return fleet_store.fleet_post(self, path, body)
             if path.startswith("/name/"):
                 return self.post_name(path[6:], body)
@@ -871,7 +876,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.service.args.fail_put and self.service.puts == self.service.args.fail_put:
             return self.reply(503, {"error": "test hook: this put is refused (--fail-put)"})
         if self.service.args.busy_put and self.service.puts == self.service.args.busy_put:
-            return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": "60"})
+            return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": str(self.service.args.busy_retry_after)})
         instance, data = "0x" + body[-97:-65].hex(), body[:-97]
         signer = eth.recover(batch_digest(self.service.chain_id, da, instance, height, data), body[-65:])
         if not signer:
@@ -927,7 +932,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.service.args.fail_put and self.service.puts == self.service.args.fail_put:
             return self.reply(503, {"error": "test hook: this put is refused (--fail-put)"})
         if self.service.args.busy_put and self.service.puts == self.service.args.busy_put:
-            return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": "60"})
+            return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": str(self.service.args.busy_retry_after)})
         try:
             height = int((query.get("height") or [""])[0])
         except ValueError:
@@ -1081,6 +1086,7 @@ def main():
     ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--fail-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th content put or batch name answers 503
     ap.add_argument("--busy-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th answers 429 as an operator's rate limit does
+    ap.add_argument("--busy-retry-after", type=int, default=60, help=argparse.SUPPRESS)   # ...with this Retry-After (somaro#48)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     args.pay_to = args.pay_to.lower()

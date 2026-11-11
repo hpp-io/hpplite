@@ -317,7 +317,9 @@ static size_t node_envelope_overhead(HppliteNode *node) {
 static void node_file_instance_id(HppliteNode *node, const unsigned char seed[32]) {
     unsigned char buf[32 + 256];
     memcpy(buf, seed, 32);
-    if (gethostname((char *)buf + 32, 255) != 0) buf[32] = 0;
+    const char *zHost = getenv("HPPLITE_HOST_NAME");          /* a host name the platform keeps across machines (somaro): it wins */
+    if (zHost && zHost[0]) snprintf((char *)buf + 32, 255, "%s", zHost);
+    else if (gethostname((char *)buf + 32, 255) != 0) buf[32] = 0;
     buf[32 + 255] = 0;
     keccak256(buf, 32 + strlen((char *)buf + 32), node->instanceId);
 }
@@ -1726,6 +1728,8 @@ static int node_ensure_lease(HppliteNode *node) {
                     node->warnedClaim = 1;
                 }
                 node->leaseRecheckAt = now + 30000;
+                if (node->relay && hpplite_store_retry_after(node->relay) > 0)           /* the relay's 429 says when (somaro#48) */
+                    node->leaseRecheckAt = now + hpplite_store_retry_after(node->relay) * 1000LL;
             }
             return 0;
         }
@@ -3013,6 +3017,8 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         if (adopted == 1) { sqlite3_free(bytes); free(packed); free(sealed); free(framed); return height; }
         if (node->failStreak < 6) node->failStreak++;
         node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 0 ? node->config.batchIntervalMs : 5000);
+        if (zStoreWhy[0] && node->store && hpplite_store_retry_after(node->store) * 1000LL > node->retryAt - node_current_time_ms())
+            node->retryAt = node_current_time_ms() + hpplite_store_retry_after(node->store) * 1000LL;     /* a 429's Retry-After (somaro#48) */
         if (zStoreWhy[0]) {
             /* an external funder's refusal (#272) and a bucket's daily cap (#288) are the funder's to lift: said once per episode, not at every flush */
             int funder = node->store && hpplite_store_waiting_on_funder(node->store);

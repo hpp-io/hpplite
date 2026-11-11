@@ -1371,6 +1371,7 @@ static int run_cmd(const char *cmd, char *out, size_t n) {
 ** costs a fraction of posting the bytes. KEY2, its own named database. */
 static pid_t start_pin_service_dir(const char *svc, int port, const char *dir);
 static pid_t start_pin_service_free(const char *svc, int port) { return start_pin_service_dir(svc, port, DIR "/store_pins"); }
+static const char *gStoreBusy[4];        /* scenario 46: the store's 429 test hook (--busy-put k --busy-retry-after s) */
 static pid_t start_pin_service_dir(const char *svc, int port, const char *dir) {
     pid_t pid;
     FILE *f = fopen(DIR "/store_signer.key", "w");
@@ -1386,7 +1387,8 @@ static pid_t start_pin_service_dir(const char *svc, int port, const char *dir) {
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", dir, "--signer-key", DIR "/store_signer.key",
                "--pay-to", "0x1111111111111111111111111111111111111111", "--network", "eip155:31337",   /* the store's domain: anvil's chain */
-               "--rpc", RPC, "--price-per-write", "0", "--price-per-mib-month", "0", (char *)NULL);       /* free; the rollup's sequencer and lease from the chain (#165, #214) */
+               "--rpc", RPC, "--price-per-write", "0", "--price-per-mib-month", "0", "--verbose",            /* free; the rollup's sequencer and lease from the chain (#165, #214) */
+               gStoreBusy[0], gStoreBusy[1], gStoreBusy[2], gStoreBusy[3], (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -2354,6 +2356,7 @@ static void test_fleet_node_writes(void) {
 ** next write is refused by the store within its bound (#317) and the node fences itself - "fenced:" said once with the
 ** epochs, no claim, no relay call, the store's history what it was; a retired database reopened with its used Admit is
 ** refused with the reason before any call. */
+static const char *gRelayBusy[4];        /* scenario 46: the relay's 429 test hook (--busy-commits k --busy-retry-after s) */
 static pid_t start_fleet_relay(const char *svc, const char *ff, int port, const char *usdc) {
     char cmd[200], out[400];
     FILE *f = fopen(DIR "/relay.key", "w");
@@ -2372,7 +2375,7 @@ static pid_t start_fleet_relay(const char *svc, const char *ff, int port, const 
                    "--fleet-factory", ff, "--facilitator", FACIL, "--asset", usdc, "--eth-usd", "30", "--dir", DIR "/relay_fleet_paid", "--verbose", (char *)NULL);
         else
             execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key", "--factory", FACTORY,
-                   "--fleet-factory", ff, "--dir", DIR "/relay_fleet", "--verbose", (char *)NULL);
+                   "--fleet-factory", ff, "--dir", DIR "/relay_fleet", "--verbose", gRelayBusy[0], gRelayBusy[1], gRelayBusy[2], gRelayBusy[3], (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -2691,6 +2694,135 @@ static void test_fleet_onforeign(void) {
 #undef FO_HEAD
 #undef FO_EXPIRE
 #undef FO_FAIL
+    PASS();
+}
+
+/* 46. fleet= (#316 e, somaro's production paths): (1) 20 databases of one fleet start in the same minute through one relay
+** and one store, the relay answering its first 3 calls and the store its 7th write with 429 and an 8 s Retry-After: every
+** join lands, each refused node tries again once, after the Retry-After; (2) a restore through expireFor - the owner's
+** signed Expire sent by the relay - then a fresh file on a new instance claims at once and rebuilds; (3) a new host name on
+** the same volume: a new instance, the old one's lease held - it waits, says so once, no error loop, and claims when the
+** lease is ended. */
+static int expire_via_relay(const char *fl, const char *dbHex, const char *relayUrl) {
+    char cmd[2400], out[600];
+    snprintf(cmd, sizeof cmd,
+             "R=$(cast call %s 'db(bytes32)' 0x%s --rpc-url %s) && N=$(printf %%d 0x$(echo $R | cut -c%d-%d)) && "
+             "T=$(cast block latest -f timestamp --rpc-url %s) && DL=$((T + 3600)) && "
+             "D=$(cast call %s 'expireDigest(bytes32,uint256,uint256)(bytes32)' 0x%s $N $DL --rpc-url %s) && "
+             "S=$(cast wallet sign --no-hash --private-key %s $D) && C=$(cast calldata 'expireFor(bytes32,uint256,uint256,bytes)' 0x%s $N $DL $S) && "
+             "curl -s -m 60 -X POST %s/commit -H 'Content-Type: application/json' -d \"{\\\"to\\\":\\\"%s\\\",\\\"data\\\":\\\"$C\\\"}\"",
+             fl, dbHex, RPC, 3 + 64 * 9, 2 + 64 * 10, RPC, fl, dbHex, RPC, KEY1, dbHex, relayUrl, fl);
+    if (run_cmd(cmd, out, sizeof out) != 0) return -1;
+    return strstr(out, "\"tx\"") && strstr(out, "expireFor") ? 0 : (printf("(expireFor: %.200s) ", out), -1);
+}
+static long store_head_of(const char *storeUrl, const char *fl, const char *dbHex) {
+    char cmd[400], out[3000];
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
+    if (run_cmd(cmd, out, sizeof out) != 0) return -1;
+    const char *p = strstr(out, "\"toHeight\": ");
+    return p ? atol(p + 12) : 0;
+}
+#define MANY 20
+static void test_fleet_many(void) {
+    TEST("fleet= (#316 e): 20 databases start at once, 429s retried by their Retry-After, every join lands; a restore through the relayed expireFor; a new host name waits for the old lease, says so once, claims when it ends");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000];
+    static char dbHex[MANY][70], sigHex[MANY][140];
+    unsigned long long issued[MANY];
+    char nh[70];
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    for (int i = 0; i < MANY; i++) {
+        snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s many-%d", ownerAddr, seqAddr, fl, KEY0, i);
+        if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex[i], nh, &issued[i], sigHex[i]) != 4)
+            FAIL("the Admits (scenario 42's helper)");
+    }
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/many_*.db* " DIR "/fleet_err.log");
+    gStoreBusy[0] = "--busy-put"; gStoreBusy[1] = "7"; gStoreBusy[2] = "--busy-retry-after"; gStoreBusy[3] = "8";
+    store = start_pin_service_free(svc, sport);
+    memset(gStoreBusy, 0, sizeof gStoreBusy);
+    gRelayBusy[0] = "--busy-commits"; gRelayBusy[1] = "3"; gRelayBusy[2] = "--busy-retry-after"; gRelayBusy[3] = "8";
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    memset(gRelayBusy, 0, sizeof gRelayBusy);
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+#define FM_FAIL(why) do { for (int j = 0; j < MANY; j++) if (w[j]) sqlite3_close(w[j]); if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } \
+                          if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } unsetenv("HPPLITE_HOST_NAME"); FAIL(why); } while (0)
+    sqlite3 *w[MANY] = {0};
+    if (store < 0 || relay < 0) FM_FAIL("the store or the relay did not come up");
+    const char *fmt = "file:" DIR "/many_%d.db?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=1s&fleet=%s&owner=%s&dbname=many-%d"
+                      "&admit=%llu:0x%s&store=%s&relay=%s";
+    /* (1) a replaced host starting every app at once */
+    time_t t0 = time(NULL);
+    for (int i = 0; i < MANY; i++) {
+        snprintf(uri, sizeof uri, fmt, i, RPC, SKEY, fl, ownerAddr, i, issued[i], sigHex[i], storeUrl, relayUrl);
+        if (sqlite3_open_v2(uri, &w[i], SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FM_FAIL("open one of the 20");
+        char sql[120];
+        snprintf(sql, sizeof sql, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('app %d')", i);
+        sqlite3_exec(w[i], sql, NULL, NULL, NULL);
+    }
+    int landed = 0;
+    while (time(NULL) - t0 < 40) {
+        landed = 0;
+        for (int i = 0; i < MANY; i++) landed += store_head_of(storeUrl, fl, dbHex[i]) >= 1;
+        if (landed == MANY) break;
+        sleep(1);
+    }
+    long took = (long)(time(NULL) - t0);
+    long r429 = count_in_file(DIR "/relay_fleet.log", "POST /commit HTTP/1.1. 429"), r200 = count_in_file(DIR "/relay_fleet.log", "POST /commit HTTP/1.1. 200");
+    long s429 = count_in_file(DIR "/store_service.log", "/name/.* 429"), sPosts = count_in_file(DIR "/store_service.log", "POST /fleet/.*/name/");
+    printf("(20 at once: %d landed in %ld s; the relay 429 %ld, joins %ld; the store 429 %ld, name writes %ld) ", landed, took, r429, r200, s429, sPosts);
+    if (landed != MANY || took >= 30 || r429 != 3 || r200 != MANY || s429 != 1 || sPosts != MANY + 1)    /* the 8 s Retry-After, not a 30 s retry */
+        FM_FAIL("every join lands; each 429 tried again once, after its Retry-After");
+    for (int i = 0; i < MANY; i++) { sqlite3_close(w[i]); w[i] = NULL; }
+    /* (2) a restore through the relayed expireFor: the owner's signature, no gas of its own; a fresh file claims at once */
+    if (expire_via_relay(fl, dbHex[0], relayUrl) != 0) FM_FAIL("expireFor through the relay");
+    (void)!system("rm -f " DIR "/many_0.db*");
+    snprintf(uri, sizeof uri, fmt, 0, RPC, SKEY, fl, ownerAddr, 0, issued[0], sigHex[0], storeUrl, relayUrl);
+    if (sqlite3_open_v2(uri, &w[0], SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FM_FAIL("open the restored file");
+    long long rows0 = scalar(w[0], "SELECT count(*) FROM t");
+    sqlite3_exec(w[0], "INSERT INTO t(v) VALUES('restored')", NULL, NULL, NULL);
+    long long f0 = scalar(w[0], "SELECT hpplite_flush()");
+    sqlite3_close(w[0]); w[0] = NULL;
+    printf("(expireFor restore: rows %lld, then flush %lld, the store %ld) ", rows0, f0, store_head_of(storeUrl, fl, dbHex[0]));
+    if (rows0 != 1 || f0 != 2 || store_head_of(storeUrl, fl, dbHex[0]) != 2) FM_FAIL("after the relayed expireFor a fresh file claims at once, rebuilds and writes on");
+    /* (3) a new host name on the same volume: a new instance against the old one's lease */
+    setenv("HPPLITE_HOST_NAME", "a-host-moved-elsewhere", 1);
+    fflush(stderr);
+    int saved = dup(2), efd = open(DIR "/fleet_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+    snprintf(uri, sizeof uri, fmt, 1, RPC, SKEY, fl, ownerAddr, 1, issued[1], sigHex[1], storeUrl, relayUrl);
+    if (sqlite3_open_v2(uri, &w[1], SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { fflush(stderr); dup2(saved, 2); FM_FAIL("reopen under a new host name"); }
+    sqlite3_exec(w[1], "INSERT INTO t(v) VALUES('on the moved host')", NULL, NULL, NULL);
+    sleep(6);                                                         /* the timer flushes every second: it must wait quietly */
+    char waitState[40], waitErr[300];
+    snprintf(waitState, sizeof waitState, "%s", status_text(w[1], "state"));
+    snprintf(waitErr, sizeof waitErr, "%s", status_text(w[1], "last_error"));
+    long said = count_in_file(DIR "/fleet_err.log", "another sequencer instance holds the lease");
+    long headWait = store_head_of(storeUrl, fl, dbHex[1]);
+    if (expire_via_relay(fl, dbHex[1], relayUrl) != 0) { fflush(stderr); dup2(saved, 2); FM_FAIL("expireFor of the old instance's lease"); }
+    long headAfter = 0;
+    for (int i = 0; i < 45 && headAfter < 2; i++) { sleep(1); headAfter = store_head_of(storeUrl, fl, dbHex[1]); }
+    long saidAfter = count_in_file(DIR "/fleet_err.log", "another sequencer instance holds the lease");
+    sqlite3_close(w[1]); w[1] = NULL;
+    fflush(stderr); dup2(saved, 2); close(saved);
+    unsetenv("HPPLITE_HOST_NAME");
+    printf("(new host name: state %s, said %ld (then %ld), '%.90s', the store %ld while held, %ld after expireFor) ", waitState, said, saidAfter, waitErr, headWait, headAfter);
+    if (strcmp(waitState, "waiting") != 0 || said != 1 || saidAfter != 1 || headWait != 1 || headAfter != 2)
+        FM_FAIL("a new host name waits for the old lease, says so once, and claims when it ends");
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0);
+#undef FM_FAIL
     PASS();
 }
 
@@ -3893,6 +4025,7 @@ int main(void) {
     if (wanted(43)) test_fleet_node_writes();
     if (wanted(44)) test_fleet_fence();
     if (wanted(45)) test_fleet_onforeign();
+    if (wanted(46)) test_fleet_many();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }
