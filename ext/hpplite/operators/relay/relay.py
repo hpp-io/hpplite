@@ -794,6 +794,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def main():
     ap = argparse.ArgumentParser(description="HPPLite reference relay (#170)")
     ap.add_argument("--port", type=int, default=8430)
+    ap.add_argument("--host", default="127.0.0.1", help="the address to listen on (default 127.0.0.1; 0.0.0.0 for every interface)")
     ap.add_argument("--rpc", required=True)
     ap.add_argument("--key-file", required=True, help="file with the hex key that pays the gas")
     ap.add_argument("--factory", required=True, help="the HPPLite factory whose rollups the relay serves (VERSION 10)")
@@ -812,9 +813,9 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     Handler.relay = Relay(args)
-    srv = Server(("127.0.0.1", args.port), Handler)
-    print("relay: listening on 127.0.0.1:%d, address %s, chain %d, factory %s, %s" % (
-        args.port, Handler.relay.address, Handler.relay.chain_id, args.factory,
+    srv = Server((args.host, args.port), Handler)
+    print("relay: listening on %s:%d, address %s, chain %d, factory %s, %s" % (
+        args.host, args.port, Handler.relay.address, Handler.relay.chain_id, args.factory,
         ("paid via " + args.facilitator) if args.facilitator else "free"), flush=True)
     try:
         srv.serve_forever()

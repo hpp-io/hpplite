@@ -1049,6 +1049,7 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def main():
     ap = argparse.ArgumentParser(description="HPPLite reference store, hpplite-store/2 (#213)")
     ap.add_argument("--port", type=int, default=8420)
+    ap.add_argument("--host", default="127.0.0.1", help="the address to listen on (default 127.0.0.1; 0.0.0.0 for every interface)")
     ap.add_argument("--dir", default="./hpplite_store")
     ap.add_argument("--signer-key", required=True, help="file with the hex key that signs bucket statements")
     ap.add_argument("--spender-key", default=None, help="file with the hex key that pulls (holds a little ETH); the signer's by default")
@@ -1077,9 +1078,9 @@ def main():
     args.pay_to = args.pay_to.lower()
     Handler.service = Service(args)
     Handler.service.start()
-    srv = Server(("127.0.0.1", args.port), Handler)
-    print("hpplite_store: listening on 127.0.0.1:%d, signer %s, %s" % (
-        args.port, Handler.service.ledger.signer, "chain " + args.rpc if args.rpc else "no chain (development)"), flush=True)
+    srv = Server((args.host, args.port), Handler)
+    print("hpplite_store: listening on %s:%d, signer %s, %s" % (
+        args.host, args.port, Handler.service.ledger.signer, "chain " + args.rpc if args.rpc else "no chain (development)"), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

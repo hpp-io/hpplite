@@ -168,14 +168,15 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 def main():
     ap = argparse.ArgumentParser(description="x402 facilitator for anvil (#183)")
     ap.add_argument("--port", type=int, default=8440)
+    ap.add_argument("--host", default="127.0.0.1", help="the address to listen on (default 127.0.0.1; 0.0.0.0 for every interface)")
     ap.add_argument("--rpc", required=True)
     ap.add_argument("--key", required=True, help="hex key that sends the settlements (a funded anvil account)")
     ap.add_argument("--settle-cache", action=argparse.BooleanOptionalAction, default=True,
                     help="answer a /settle body seen before with the earlier result, as HPP's does")
     args = ap.parse_args()
     Handler.f = Facilitator(args.rpc, args.key, args.settle_cache)
-    srv = Server(("127.0.0.1", args.port), Handler)
-    print("facilitator_mock: listening on 127.0.0.1:%d, address %s, chain %d" % (args.port, Handler.f.address, Handler.f.chain_id), flush=True)
+    srv = Server((args.host, args.port), Handler)
+    print("facilitator_mock: listening on %s:%d, address %s, chain %d" % (args.host, args.port, Handler.f.address, Handler.f.chain_id), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
