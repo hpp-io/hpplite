@@ -322,6 +322,39 @@ static void test_connection_per_request(void) {
     PASS();
 }
 
+/* The same for an application that holds one connection for its life and
+** closes it cleanly when it stops (a container put to sleep): that close is a
+** last close too. Its writes just before the stop, and its writes once woken,
+** are in the next batches */
+static void test_close_at_stop(void) {
+    TEST("a long connection's clean close at stop beside the sequencer (Python's sqlite3): the WAL stays, its writes and the woken app's are in the next batches");
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR);
+    HppliteL1 *l1;
+    HppliteNode *n = open_shared(DIR "/stop.db", &l1);
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k)", NULL);
+    uint64_t h0 = hpplite_node_flush_batch(n);
+    int lost = 0, unposted = 0, failed = 0;
+    for (int life = 0; life < 2; life++) {                         /* the app's run, its stop; woken, a second run and stop */
+        char cmd[640];
+        snprintf(cmd, sizeof cmd, "python3 -c \"import sqlite3; c = sqlite3.connect('%s', timeout=20)\n"
+                 "for k in range(5): c.execute('INSERT INTO t(who, k) VALUES(?, ?)', ('app%d', k)); c.commit()\n"
+                 "c.close()\"", DIR "/stop.db", life);
+        if (system(cmd) != 0) failed++;
+        if (access(DIR "/stop.db-wal", F_OK) != 0) lost++;
+        if (!hpplite_node_flush_batch(n)) unposted++;
+    }
+    const char *why = replica_differs(n, l1, DIR "/stop_replica.db");
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    if (!h0) FAIL("the schema's batch");
+    if (failed) FAIL("an application write failed (python3 with sqlite3 needed)");
+    if (lost || unposted || why)
+        FAILF("the WAL deleted by the application's stop %d of 2 times; %d of 2 runs made no batch; the replica: %s", lost, unposted, why ? why : "equal");
+    PASS();
+}
+
 /* The election across processes: the first full node on a file sequences;
 ** one opened by another process meanwhile is a follower - it captures, it does
 ** not post - and has the same instance id (the file's): when the sequencer
@@ -544,6 +577,7 @@ int main(int argc, char **argv) {
     test_mixed_threads_and_processes();
     test_sequencer_across_processes();
     test_connection_per_request();
+    test_close_at_stop();
     test_lease_on_close();
     test_keep_lease_on_close();
     test_rerun_after_foreign_schema_change();
