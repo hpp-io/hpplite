@@ -69,6 +69,10 @@ typedef struct EthL1 {
     uint8_t admitSig[65];
     int hasAdmit;
     uint64_t fleetEpoch;       /* the record's epoch at the last read: what a head is signed at (#316 c) */
+    uint8_t fleetInstance[32]; /* the node's instance (#316 d): the record holding it is this run's lease */
+    int hasFleetInstance;
+    uint64_t heldEpoch;        /* the epoch this run's lease holds; once the record moves past it the run is fenced */
+    int fenced;
     char relayError[240];
 } EthL1;
 
@@ -1800,7 +1804,7 @@ static int eth_factory_create_rollup_for(const char *rpc_url, const char *factor
 
 /* The database's record: db(dbId) -> owner, sequencer, nameHash, instance, until, epoch, epochSince, admittedAt,
 ** retired, claimNonce, ... (15 words). 0 with it read (owner zero: no record), -1 when the chain did not answer */
-typedef struct FleetRecord { uint8_t owner[20], sequencer[20], instance[32]; uint64_t until, epoch, claimNonce; int retired; } FleetRecord;
+typedef struct FleetRecord { uint8_t owner[20], sequencer[20], instance[32]; uint64_t until, epoch, admittedAt, claimNonce; int retired; } FleetRecord;
 static int fleet_record(HppliteL1 *l1, FleetRecord *r) {
     uint8_t calldata[4 + 32];
     size_t n = 0;
@@ -1816,6 +1820,7 @@ static int fleet_record(HppliteL1 *l1, FleetRecord *r) {
     abi_decode_bytes32(res + 96, r->instance);
     r->until = abi_decode_uint64(res + 128);
     r->epoch = abi_decode_uint64(res + 160);
+    r->admittedAt = abi_decode_uint64(res + 224);
     r->retired = abi_decode_uint64(res + 256) != 0;
     r->claimNonce = abi_decode_uint64(res + 288);
     free(res);
@@ -1827,6 +1832,22 @@ static int fleet_has_record(const FleetRecord *r) {
     return memcmp(r->owner, zero, 20) != 0;
 }
 
+/* The fence (#316 d): the record holding this run's instance is its lease, at that epoch; once the record has moved
+** to another epoch (forceExpire, retireFor, setSequencer, another holder) this run is fenced - it claims no more and
+** signs no head - until it is reopened */
+static void fleet_fence(HppliteL1 *l1, const FleetRecord *r) {
+    if (self->fenced || !self->hasFleetInstance) return;
+    if (!r->retired && memcmp(r->instance, self->fleetInstance, 32) == 0) {
+        if (!self->heldEpoch || self->heldEpoch == r->epoch) { self->heldEpoch = r->epoch; return; }
+    }
+    if (self->heldEpoch && r->epoch != self->heldEpoch) {
+        self->fenced = 1;
+        snprintf(self->relayError, sizeof self->relayError, "fenced: the fleet's record of this database moved from epoch %llu to %llu (forceExpire, retire, "
+                 "a new sequencer key or another holder); this run writes no more - reopen to take the lease again",
+                 (unsigned long long)self->heldEpoch, (unsigned long long)r->epoch);
+    }
+}
+
 /* the record as the node reads a lease: the holder is the database's sequencer while an instance holds it */
 static HppliteL1State *fleet_get_state(HppliteL1 *l1) {
     static const uint8_t zero32[32];
@@ -1834,6 +1855,7 @@ static HppliteL1State *fleet_get_state(HppliteL1 *l1) {
     HppliteL1State *state;
     if (fleet_record(l1, &r) != 0) return NULL;
     self->fleetEpoch = r.epoch;
+    fleet_fence(l1, &r);
     state = sqlite3_malloc(sizeof(HppliteL1State));
     if (!state) return NULL;
     memset(state, 0, sizeof *state);
@@ -1864,7 +1886,15 @@ static char *fleet_claim(HppliteL1 *l1, const unsigned char instanceId[32]) {
     char *zTx = NULL;
     int join;
     if (fleet_record(l1, &r) != 0) { snprintf(self->relayError, sizeof self->relayError, "the fleet's record of the database could not be read"); return NULL; }
+    if (!self->hasFleetInstance) { memcpy(self->fleetInstance, instanceId, 32); self->hasFleetInstance = 1; }
+    fleet_fence(l1, &r);
+    if (self->fenced) return NULL;                /* relayError says the epochs */
     join = !fleet_has_record(&r) || r.retired;
+    if (join && r.retired && self->hasAdmit && self->admitIssuedAt <= r.admittedAt) {
+        snprintf(self->relayError, sizeof self->relayError, "the fleet retired this database (its last Admit issued at %llu, this admit= at %llu): "
+                 "rejoining needs a newer Admit", (unsigned long long)r.admittedAt, (unsigned long long)self->admitIssuedAt);
+        return NULL;
+    }
     if (join && !self->hasAdmit) {
         snprintf(self->relayError, sizeof self->relayError, "the fleet has no live record of this database and no admit= was given: the fleet's Admit is needed to join");
         return NULL;
@@ -1904,8 +1934,21 @@ static char *fleet_claim(HppliteL1 *l1, const unsigned char instanceId[32]) {
 uint64_t hpplite_l1_fleet_epoch(HppliteL1 *l1) {
     FleetRecord r;
     if (!l1 || l1->ops != &hppliteL1EthOps || !self->fleet) return 0;
+    if (self->heldEpoch) return self->heldEpoch;
     if (!self->fleetEpoch && fleet_record(l1, &r) == 0) self->fleetEpoch = r.epoch;
     return self->fleetEpoch;
+}
+
+/* the node's instance, so the record holding it is known as this run's lease (#316 d) */
+void hpplite_l1_fleet_set_instance(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    if (!l1 || l1->ops != &hppliteL1EthOps || !self->fleet) return;
+    memcpy(self->fleetInstance, instanceId, 32);
+    self->hasFleetInstance = 1;
+}
+
+/* 1 when the record has moved past this run's epoch (#316 d) */
+int hpplite_l1_fleet_fenced(HppliteL1 *l1) {
+    return l1 && l1->ops == &hppliteL1EthOps && self->fleet && self->fenced;
 }
 
 HppliteL1 *hpplite_l1_connect_fleet(const char *rpc_url, const uint8_t fleet[20], const uint8_t dbId[32], const uint8_t owner[20],

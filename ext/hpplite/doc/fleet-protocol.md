@@ -137,6 +137,13 @@ the same rolling hash: a new holder that waits for its epoch at the store and
 then rebuilds includes it, so nothing is lost; a name, once written, is never
 replaced, which is what makes that safe.
 
+**The node fences itself too.** A node holding the lease at an epoch stops
+writing for the rest of its run once the record shows another epoch - read at
+its lease checks, or at once after the store refuses its head as not the
+lease's epoch. It stays up, claims nothing and reads nothing more, and says
+`hpplite: fenced: ...` once with the epoch it held and the record's; a restart
+is a new run, which may claim like any other.
+
 **The node's part of the fence.** After a claim, the new holder waits until
 `GET /fleet/<fleet>/db/<db>` shows its own epoch before it reads names to
 rebuild; from then the store refuses the old epoch, so nothing the old holder

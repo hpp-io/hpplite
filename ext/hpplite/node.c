@@ -1510,6 +1510,14 @@ static int node_adopt_existing(HppliteNode *node) {
 ** when ours is past half its life, claimed when free, and left alone when
 ** someone else holds it. Returns 1 when posting is allowed.
 */
+/* fleet= (#316 d): the fence's line, once - an operator sees the epoch held and the record's */
+static void node_say_fenced(HppliteNode *node) {
+    if (node->warnedFenced) return;
+    node->warnedFenced = 1;
+    hpplite_error(node->ctx, "%s", hpplite_l1_relay_error(node->l1) && strncmp(hpplite_l1_relay_error(node->l1), "fenced:", 7) == 0
+                                   ? hpplite_l1_relay_error(node->l1) : "fenced: the fleet's record of this database moved past this run's epoch; this run writes no more - reopen to take the lease again");
+}
+
 static int node_ensure_lease(HppliteNode *node) {
     int64_t now = node_current_time_ms();
     HppliteL1State *st;
@@ -1518,10 +1526,23 @@ static int node_ensure_lease(HppliteNode *node) {
 
     if (now < node->leaseRecheckAt) return node->hasLease;
 
+    if (node->config.hasFleet) {
+        /* fleet= (#316 d): the record moved past this run's epoch - it writes no more and reads nothing, until reopened;
+        ** it stays up (a restart is a new run that may claim) */
+        hpplite_l1_fleet_set_instance(node->l1, node->instanceId);
+        if (hpplite_l1_fleet_fenced(node->l1)) { node->hasLease = 0; node->leaseRecheckAt = INT64_MAX; return 0; }
+    }
     st = hpplite_l1_get_state(node->l1);
     if (!st) {
         hpplite_error(node->ctx, "cannot read the sequencer lease from L1; not posting");
         node->leaseRecheckAt = now + 5000;
+        return 0;
+    }
+    if (node->config.hasFleet && hpplite_l1_fleet_fenced(node->l1)) {
+        hpplite_l1_state_free(st);
+        node_say_fenced(node);
+        node->hasLease = 0;
+        node->leaseRecheckAt = INT64_MAX;
         return 0;
     }
     chainNow = st->currentTimestamp ? st->currentTimestamp : (uint64_t)time(NULL);
@@ -1561,8 +1582,21 @@ static int node_ensure_lease(HppliteNode *node) {
         if (hpplite_node_claim_lease(node) != 0) {
             if (getenv("HPPLITE_TRACE_LEASE")) fprintf(stderr, "hpplite: lease check: claim failed\n");
             node->leaseRecheckAt = now + 5000;
+            if (node->config.hasFleet) {
+                /* fleet= (#316 d): fenced, or refused (the relay's 402, a retired record...): rows stay pending; the claim
+                ** is tried again every 30 s, the reason said once per episode */
+                const char *why = hpplite_l1_relay_error(node->l1);
+                if (hpplite_l1_fleet_fenced(node->l1)) { node_say_fenced(node); node->leaseRecheckAt = INT64_MAX; return 0; }
+                if (!node->warnedClaim) {
+                    hpplite_error(node->ctx, "the fleet's lease could not be taken: %s; batches are kept pending, tried again every 30 s",
+                                  why && why[0] ? why : "no reason given");
+                    node->warnedClaim = 1;
+                }
+                node->leaseRecheckAt = now + 30000;
+            }
             return 0;
         }
+        node->warnedClaim = 0;
         if (getenv("HPPLITE_TRACE_LEASE")) fprintf(stderr, "hpplite: lease check: claim ok\n");
         /* a mined claim can still have reverted (this wallet is not the
         ** sequencer the owner named, #17): the chain says whose it is */
@@ -2772,6 +2806,9 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
                 storedOnly = 1;
             } else {
                 snprintf(zStoreWhy, sizeof zStoreWhy, "the store did not take it: %s", hpplite_store_error(node->store));
+                /* not the lease's epoch (#316 d): the record is read again at the next look - moved past this run's epoch,
+                ** the run is fenced; still ours (the store behind), the batch goes again at the next flush */
+                if (strstr(hpplite_store_error(node->store), "not the lease's epoch")) { node->hasLease = 0; node->leaseRecheckAt = 0; }
             }
             txHash = NULL;
         } else if (node->store) {

@@ -371,6 +371,8 @@ HppliteL1 *hpplite_l1_connect_fleet(const char *rpc_url, const uint8_t fleet[20]
                                     const uint8_t nameHash[32], uint64_t admitIssuedAt, const uint8_t admitSig[65]);
 /* the database's lease epoch as the fleet client last read it (0: not a fleet client) */
 uint64_t hpplite_l1_fleet_epoch(HppliteL1 *l1);
+void hpplite_l1_fleet_set_instance(HppliteL1 *l1, const unsigned char instanceId[32]);
+int hpplite_l1_fleet_fenced(HppliteL1 *l1);
 
 /* === Batch DA Functions (on-chain data availability) === */
 

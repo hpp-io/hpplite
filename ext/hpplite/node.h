@@ -121,6 +121,8 @@ typedef struct HppliteNode {
     int64_t idleSyncAt;             /* An idle lease holder asks the chain again at this time, not at every tick (#292) */
     uint64_t leaseDuration;         /* Seconds, learned from the contract (default 300) */
     int warnedForeignLease;         /* "someone else holds the lease" said once */
+    int warnedClaim;                /* fleet= (#316 d): why the claim failed, said once per episode */
+    int warnedFenced;               /* fleet= (#316 d): "fenced" said once */
     int leaseHeldElsewhere;         /* The last look found another instance's lease (hpplite_status.state = waiting) */
     int lastFetchForeign;           /* The last fetch found a batch that fails our authentication */
     int failStreak;                 /* Consecutive flushes that did not reach L1 */

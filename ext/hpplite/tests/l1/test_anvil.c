@@ -2326,6 +2326,159 @@ static void test_fleet_node_writes(void) {
     PASS();
 }
 
+/* 44. fleet= (#316 d, the part a node needs to write safely): a join the relay refuses with 402 keeps the rows pending,
+** says why once, and is tried again every 30 s (a free relay then takes it); after the owner's forceExpire the node's
+** next write is refused by the store within its bound (#317) and the node fences itself - "fenced:" said once with the
+** epochs, no claim, no relay call, the store's history what it was; a retired database reopened with its used Admit is
+** refused with the reason before any call. */
+static pid_t start_fleet_relay(const char *svc, const char *ff, int port, const char *usdc) {
+    char cmd[200], out[400];
+    FILE *f = fopen(DIR "/relay.key", "w");
+    if (!f) return -1;
+    fprintf(f, "%s\n", KEY9);
+    fclose(f);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", port);
+        snprintf(script, sizeof script, "%s/../relay/relay.py", svc);
+        int fd = open(DIR "/relay_fleet.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        if (usdc)
+            execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key", "--factory", FACTORY,
+                   "--fleet-factory", ff, "--facilitator", FACIL, "--asset", usdc, "--eth-usd", "30", "--dir", DIR "/relay_fleet_paid", "--verbose", (char *)NULL);
+        else
+            execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key", "--factory", FACTORY,
+                   "--fleet-factory", ff, "--dir", DIR "/relay_fleet", "--verbose", (char *)NULL);
+        _exit(127);
+    }
+    for (int i = 0; i < 50; i++) {
+        if (!test_child_alive(pid)) return -1;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", port);
+        if (run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "hpplite-relay")) return pid;
+        usleep(200 * 1000);
+    }
+    kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+    return -1;
+}
+static long fleet_relay_taken(void) {
+    char out[64];
+    return run_cmd("grep -c 'POST /commit HTTP/1.1\" 200' " DIR "/relay_fleet.log 2>/dev/null || true", out, sizeof out) == 0 ? atol(out) : -1;
+}
+static long count_in_file(const char *path, const char *what) {
+    char cmd[400], out[64];
+    snprintf(cmd, sizeof cmd, "grep -c '%s' %s 2>/dev/null || true", what, path);
+    return run_cmd(cmd, out, sizeof out) == 0 ? atol(out) : -1;
+}
+static void test_fleet_fence(void) {
+    TEST("fleet= node (#316 d): a join refused with 402 keeps rows pending, says why once, is tried again in 30 s; after forceExpire the store refuses within its bound and the node fences itself, said once, no call; a retired database's used Admit refused before any call");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    static const char SKEY[] = "0x5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000];
+    char dbHex[70], nhHex[70], sigHex[140], gdbHex[70], gsigHex[140];
+    unsigned long long issued = 0, gissued = 0;
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no operators or MockUSDC in the environment) "); PASS(); return; }
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s fence", ownerAddr, seqAddr, fl, KEY0);
+    if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex, nhHex, &issued, sigHex) != 4)
+        FAIL("the Admit (scenario 42's helper)");
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s gone", ownerAddr, seqAddr, fl, KEY0);
+    if (run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", gdbHex, nhHex, &gissued, gsigHex) != 4) FAIL("the second Admit");
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet_paid " DIR "/relay_fleet.log " DIR "/fleet_a.db* " DIR "/fleet_g.db* " DIR "/fleet_err.log");
+    store = start_pin_service_free(svc, sport);
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    relay = start_fleet_relay(svc, ff, rport, usdc);                 /* a paying relay: the database is nobody's sponsored one */
+#define FF_FAIL(why) do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); FAIL(why); } while (0)
+    if (relay < 0) FF_FAIL("the paying relay did not come up");
+    const char *fmt = "file:" DIR "/%s?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=0&fleet=%s&owner=%s&dbname=%s"
+                      "&admit=%llu:0x%s&store=%s&relay=%s";
+    snprintf(uri, sizeof uri, fmt, "fleet_a.db", RPC, SKEY, fl, ownerAddr, "fence", issued, sigHex, storeUrl, relayUrl);
+    /* what the node says goes to a file: each line is counted */
+    fflush(stderr);
+    int saved = dup(2), efd = open(DIR "/fleet_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+#define RESTORE_STDERR() do { fflush(stderr); dup2(saved, 2); } while (0)
+    sqlite3 *w = NULL;
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { RESTORE_STDERR(); sqlite3_close(w); FF_FAIL("open with fleet="); }
+    sqlite3_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('before the relay takes it')", NULL, NULL, NULL);
+    long long f1 = scalar(w, "SELECT hpplite_flush()"), f2 = scalar(w, "SELECT hpplite_flush()");
+    char why402[400];
+    snprintf(why402, sizeof why402, "%s", status_text(w, "last_error"));
+    long said402 = count_in_file(DIR "/fleet_err.log", "lease could not be taken"), taken0 = fleet_relay_taken();
+    /* the relay comes round (a free one on the same address): the next try, 30 s on, joins and the rows go */
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0);
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    if (relay < 0) { RESTORE_STDERR(); sqlite3_close(w); FF_FAIL("the free relay did not come up"); }
+    sleep(31);
+    long long f3 = scalar(w, "SELECT hpplite_flush()"), height = scalar(w, "SELECT height FROM hpplite_status");
+    long taken1 = fleet_relay_taken();
+    RESTORE_STDERR();
+    printf("(402: flushes %lld %lld, '%.110s', said %ld, taken %ld; 31 s on: flush %lld, height %lld, taken %ld) ", f1, f2, why402, said402, taken0, f3, height, taken1);
+    if (f1 > 0 || f2 > 0 || !strstr(why402, "lease could not be taken") || said402 != 1 || taken0 != 0 || f3 <= 0 || taken1 != 1) {
+        sqlite3_close(w); FF_FAIL("a refused join keeps the rows pending, says why once, and joins at the next try");
+    }
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
+    run_cmd(cmd, out, sizeof out);
+    char want[64];
+    snprintf(want, sizeof want, "\"toHeight\": %lld", height - 1);
+    if (!strstr(out, want)) { printf("(the store: %.200s) ", out); sqlite3_close(w); FF_FAIL("the store's history is the file's"); }
+    /* the owner ends the lease (a host lost): past the store's bound the old run's write is refused and the run fences itself */
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'forceExpire(bytes32)' 0x%s --rpc-url %s >/dev/null", KEY1, fl, dbHex, RPC);
+    if (run_cmd(cmd, out, sizeof out) != 0) { sqlite3_close(w); FF_FAIL("forceExpire"); }
+    sleep(6);
+    fflush(stderr);
+    efd = open(DIR "/fleet_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+    sqlite3_exec(w, "INSERT INTO t(v) VALUES('after the takeover')", NULL, NULL, NULL);
+    long long g1 = scalar(w, "SELECT hpplite_flush()"), g2 = scalar(w, "SELECT hpplite_flush()"), g3 = scalar(w, "SELECT hpplite_flush()");
+    char fenced[400];
+    snprintf(fenced, sizeof fenced, "%s", status_text(w, "last_error"));
+    long saidFenced = count_in_file(DIR "/fleet_err.log", "hpplite: fenced:"), taken2 = fleet_relay_taken();
+    RESTORE_STDERR();
+    sqlite3_close(w);
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
+    run_cmd(cmd, out, sizeof out);
+    printf("(after forceExpire: flushes %lld %lld %lld, '%.120s', said %ld, taken %ld) ", g1, g2, g3, fenced, saidFenced, taken2);
+    if (g1 > 0 || g2 > 0 || g3 > 0 || strncmp(fenced, "fenced:", 7) != 0 || !strstr(fenced, "from epoch 1 to 2") || saidFenced != 1 || taken2 != 1 || !strstr(out, want))
+        FF_FAIL("after a takeover the old run writes no more, says 'fenced:' once with the epochs, claims nothing, and the store's history stays");
+    /* a retired database reopened with the Admit it was admitted with: refused before any call */
+    snprintf(uri, sizeof uri, fmt, "fleet_g.db", RPC, SKEY, fl, ownerAddr, "gone", gissued, gsigHex, storeUrl, relayUrl);
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(w); FF_FAIL("open the second database"); }
+    sqlite3_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('soon retired')", NULL, NULL, NULL);
+    long long r1 = scalar(w, "SELECT hpplite_flush()");
+    sqlite3_close(w);
+    snprintf(cmd, sizeof cmd, "D=$(cast call %s 'retireDigest(bytes32,uint256)(bytes32)' 0x%s %llu --rpc-url %s) && S=$(cast wallet sign --no-hash --private-key %s $D) && "
+             "cast send --private-key %s %s 'retireFor(bytes32,uint256,bytes)' 0x%s %llu $S --rpc-url %s >/dev/null",
+             fl, gdbHex, gissued + 1, RPC, KEY1, KEY0, fl, gdbHex, gissued + 1, RPC);
+    if (r1 <= 0 || run_cmd(cmd, out, sizeof out) != 0) { printf("(flush %lld) ", r1); FF_FAIL("join, write and retire the second database"); }
+    long posts3 = fleet_relay_posts();
+    sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL);
+    sqlite3_exec(w, "INSERT INTO t(v) VALUES('after the retirement')", NULL, NULL, NULL);
+    long long r2 = scalar(w, "SELECT hpplite_flush()");
+    char retired[400];
+    snprintf(retired, sizeof retired, "%s", status_text(w, "last_error"));
+    long posts4 = fleet_relay_posts();
+    sqlite3_close(w);
+    printf("(retired: flush %lld, '%.110s', the relay's calls %ld -> %ld) ", r2, retired, posts3, posts4);
+    if (r2 > 0 || !strstr(retired, "rejoining needs a newer Admit") || posts4 != posts3) FF_FAIL("a retired database's used Admit is refused before any call");
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0);
+    close(saved);
+#undef RESTORE_STDERR
+#undef FF_FAIL
+    PASS();
+}
+
 static void test_relay_no_eth(void) {
     TEST("a wallet with USDC.e and no ETH (#126): its rollup, lease and anchors through the relay, paid in USDC.e; a replica rebuilds; its ETH stays 0");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
@@ -3523,6 +3676,7 @@ int main(void) {
     if (wanted(41)) test_fleet_sequencer();
     if (wanted(42)) test_fleet_lease();
     if (wanted(43)) test_fleet_node_writes();
+    if (wanted(44)) test_fleet_fence();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }
