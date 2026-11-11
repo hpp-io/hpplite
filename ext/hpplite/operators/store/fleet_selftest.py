@@ -255,13 +255,14 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     st, body = write(5, b"past a gap", inst_a, 1)
     check(st == 409 and body.get("expected") == 3, "a write past a gap: 409 with the height expected (%s %s)" % (st, body))
 
-    # the fence: the owner expires the lease; the old holder's next write is refused once the store has heard
+    # the fence: the owner expires the lease; with no hint and the tick an hour away, the old holder's next write is
+    # refused once the store's view is older than --fleet-follow (5 s): the window is bounded by it (#317)
     cast("send", "--private-key", KEY1, fl, "forceExpire(bytes32)", dbx)
-    http("POST", url + "/fleet/%s/root" % fl, b"")          # a hint: the store reads the fleet's events now
-    st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))
-    check(view.get("epoch") == 2, "after forceExpire the store holds epoch 2 (%s)" % view.get("epoch"))
+    time.sleep(6)
     st, body = write(3, b"from the old holder", inst_a, 1)
-    check(st == 409, "the old holder's write after the takeover: 409, the fence (%s %s)" % (st, body.get("error")))
+    check(st == 409, "the old holder's write 6 s after the takeover, no hint, the tick an hour away: 409, the fence (%s %s)" % (st, body.get("error")))
+    st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))
+    check(view.get("epoch") == 2, "after forceExpire the store's view holds epoch 2 (%s)" % view.get("epoch"))
     # a new holder claims; its first write comes before the store polled: read on chain at once, taken
     inst_b = eth.keccak256(b"host-b")
     nonce = int(cast("call", fl, "db(bytes32)(address,address,bytes32,bytes32,uint64,uint64,uint64,uint64,bool,uint256,address,uint256,bytes32,bytes32,address)", dbx).split("\n")[9].split()[0])

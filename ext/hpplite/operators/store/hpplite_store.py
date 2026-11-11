@@ -502,7 +502,7 @@ class Service:
         self.spender = eth.address(spender_key)
         self.started = int(time.time())
         import fleet_store
-        self.fleets = fleet_store.FleetBook(chain, self.disk, self.chain_id) if chain else None   # hpplite-fleet/1 (#297)
+        self.fleets = fleet_store.FleetBook(chain, self.disk, self.chain_id, args.fleet_follow) if chain else None   # hpplite-fleet/1 (#297)
 
     def start(self):
         def loop():
@@ -1068,6 +1068,8 @@ def main():
     ap.add_argument("--retry-seconds", type=int, default=24 * 3600, help="how often an uncovered account's pull is tried again")
     ap.add_argument("--park-seconds", type=int, default=MONTH, help="a parked bucket is deleted after this long")
     ap.add_argument("--tick-interval", type=float, default=3600, help="seconds between ticks: accrue, pull, park, delete, sweep")
+    ap.add_argument("--fleet-follow", type=float, default=5, help="a fleet's events are read again when the store's view is older than this "
+                    "many seconds, before a head is checked or a database shown (#317)")
     ap.add_argument("--sweep-age", type=int, default=3600, help="bytes in no bucket older than this are swept")
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)

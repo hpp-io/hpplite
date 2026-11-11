@@ -116,8 +116,10 @@ calls below. `<fleet>` is the shared rollup's address, `<db>` a `dbId` (hex).
 | `POST /fleet/<fleet>/manifest`, the body the manifest; `X-HPPLite-Signature` the fleet's anchor's `Content(address da = <fleet>, uint256 height = <seq>, bytes32 hash = keccak256(body))` in the store's domain | the anchor, before `postRootFor` | the manifest kept under its CID (`GET /get/<cid>`) |
 | `POST /fleet/<fleet>/root` | anyone | a hint to read the chain now; its body is trusted for nothing |
 
-**The chain's side comes from the fleet's events.** The store polls
-`eth_getLogs` for each fleet every few seconds - `Admitted`, `Claimed`,
+**The chain's side comes from the fleet's events.** The store reads
+`eth_getLogs` for a fleet whenever its view is older than a few seconds (the
+reference store's `--fleet-follow`, 5 s) before it checks a head or shows a
+database - `Admitted`, `Claimed`,
 `EpochMoved`, `SequencerSet`, `Retired`, `Promoted`, `RootPosted` - and keeps
 sequencer, instance, epoch and retirement for every database: a cost that
 does not grow with databases or writes. A head whose epoch or instance is
@@ -125,6 +127,15 @@ ahead of what the store holds makes it read that one database on chain at
 once, so a new holder's first write is not refused for the store being behind.
 (v10's store reads the rollup's roles at a write, cached and read again on a
 mismatch: per write, not a stronger guarantee in kind.)
+
+**The bound.** After a takeover on chain (`forceExpire`, `retireFor`,
+`setSequencer`, a new holder's claim), the store takes the old holder's writes
+for at most that interval plus a block; a refusal reads the database's record
+first, so nothing is refused on a view the chain has left (#317). What the old
+holder wrote in that window is history signed by the database's own key, on
+the same rolling hash: a new holder that waits for its epoch at the store and
+then rebuilds includes it, so nothing is lost; a name, once written, is never
+replaced, which is what makes that safe.
 
 **The node's part of the fence.** After a claim, the new holder waits until
 `GET /fleet/<fleet>/db/<db>` shows its own epoch before it reads names to

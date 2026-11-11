@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import threading
+import time
 
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
@@ -39,9 +40,11 @@ class FleetBook:
     """Per fleet: every database's sequencer, owner, lease instance, epoch and retirement, from the fleet's logs;
     the roots posted and which of them checked; per database the latest head held and the latest indexed root"""
 
-    def __init__(self, chain, disk, chain_id):
+    def __init__(self, chain, disk, chain_id, max_age=5.0):
         self.chain, self.disk, self.chain_id = chain, disk, chain_id
+        self.max_age = max_age          # a view older than this is followed again before a write is checked or a db shown (#317)
         self.lock = threading.RLock()
+        self.read_at = {}
 
     def _key(self, fleet):
         return "f/%s/state.json" % fleet
@@ -69,7 +72,16 @@ class FleetBook:
                 raise ChainUnreadable(str(e)[:200])
             self._check_roots(fleet, st)
             self.disk.set_json(self._key(fleet), st)
+            self.read_at[fleet] = time.time()
             return st
+
+    def fresh(self, fleet):
+        """the fleet's state, followed again when the last read is older than max_age (or never was, in this run):
+        an old holder's write after a takeover is refused within max_age plus a block, not at the next tick (#317)"""
+        with self.lock:
+            if self.disk.json(self._key(fleet)) and time.time() - self.read_at.get(fleet, 0) < self.max_age:
+                return self.state(fleet)
+            return self.follow(fleet)
 
     def _apply(self, st, log):
         name = EVENTS.get(log["topics"][0][2:])
@@ -171,7 +183,7 @@ def fleet_get(h, path, query):
     parts = path.split("/")             # ['', 'fleet', <fleet>, ...]
     fleet = parts[2].lower()
     book = h.service.fleets
-    st = book.state(fleet) if book.disk.json(book._key(fleet)) else book.follow(fleet)
+    st = book.fresh(fleet)
     if len(parts) == 5 and parts[3] == "db":
         db = parts[4].lower()
         d = st["dbs"].get(db)
@@ -288,7 +300,7 @@ def _post_name(h, fleet, name, body):
     dom = F.domain(book.chain_id, fleet)
     signer = eth.recover(F.head_digest(dom, hb), sig)
     with book.lock:
-        st = book.follow(fleet) if not book.disk.json(book._key(fleet)) else book.state(fleet)
+        st = book.fresh(fleet)
         d = st["dbs"].get(db)
         if not d or d.get("epoch", 0) < hb["epoch"] or (d.get("instance") or "").lower() != instance:
             fresh = book.read_db(fleet, db)          # ahead of what the store holds: the chain at once
@@ -302,6 +314,11 @@ def _post_name(h, fleet, name, body):
             return h.reply(410, {"error": "the database is retired"})
         if not signer or not eth_same(signer, d["sequencer"]):
             return h.reply(403, {"error": "the head is not signed by the database's sequencer", "signer": signer, "sequencer": d["sequencer"]})
+        if hb["epoch"] != d["epoch"] or (d.get("instance") or "").lower() != instance:
+            fresh = book.read_db(fleet, db)          # a refusal reads the record first: never refused on a view the chain has left (#317)
+            if fresh:
+                d.update(fresh)
+                book.disk.set_json(book._key(fleet), st)
         if hb["epoch"] != d["epoch"] or (d.get("instance") or "").lower() != instance:
             return h.reply(409, {"error": "not the lease's epoch and instance", "epoch": hb["epoch"], "leaseEpoch": d["epoch"],
                                  "instance": instance, "leaseInstance": d.get("instance")})
