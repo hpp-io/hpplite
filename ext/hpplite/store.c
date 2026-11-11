@@ -1210,6 +1210,7 @@ int hpplite_store_fleet_view(HppliteStore *s, const unsigned char fleet[20], uin
     if (status == 404) { cJSON_Delete(v); return 0; }                  /* the fleet has no record yet: nothing held */
     if (status != 200 || !v) { cJSON_Delete(v); snprintf(s->error, sizeof s->error, "the store answered %ld to the database's view", status); return -1; }
     out->epoch = jnum(v, "epoch");
+    out->admittedAt = jnum(v, "admittedAt");
     if (hexField(v, "instance", out->instance, 32) != 0) memset(out->instance, 0, 32);
     ret = cJSON_GetObjectItem(v, "retired");
     out->retired = ret && cJSON_IsTrue(ret);
@@ -1242,7 +1243,7 @@ int hpplite_store_fleet_view(HppliteStore *s, const unsigned char fleet[20], uin
 
 /* A fleet name's batch bytes (#316 d): GET /fleet/<fleet>/name/<dbId>-<height>, the instance and signature after them cut.
 ** malloc'd, terminated; NULL with the reason in error */
-uint8_t *hpplite_store_get_fleet_name(HppliteStore *s, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t height, size_t *pLen) {
+uint8_t *hpplite_store_get_fleet_name(HppliteStore *s, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t admittedAt, uint64_t height, size_t *pLen) {
     char fl[43], db[67], path[200];
     Buf out = {0};
     long status;
@@ -1250,7 +1251,7 @@ uint8_t *hpplite_store_get_fleet_name(HppliteStore *s, const unsigned char fleet
     *pLen = 0;
     if (!s) return NULL;
     lowerHex(fleet, 20, fl); lowerHex(dbId, 32, db);
-    snprintf(path, sizeof path, "/fleet/%s/name/%s-%llu", fl, db, (unsigned long long)height);
+    snprintf(path, sizeof path, "/fleet/%s/name/%s-%llu-%llu", fl, db, (unsigned long long)admittedAt, (unsigned long long)height);   /* by its admission (#318) */
     status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
     if (status != 200 || out.n <= 97) {
         snprintf(s->error, sizeof s->error, "the store answered %ld to the fleet name %llu", status, (unsigned long long)height);
@@ -1265,7 +1266,7 @@ uint8_t *hpplite_store_get_fleet_name(HppliteStore *s, const unsigned char fleet
 
 /* A fleet database's batch and its signed head, one write (#316 c): POST /fleet/<fleet>/name/<dbId>-<height>, the body
 ** the bytes, the instance and the head's signature, X-HPPLite-Head the head's fields. 0, or -1 with the reason in error */
-int hpplite_store_put_fleet_name(HppliteStore *s, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t height,
+int hpplite_store_put_fleet_name(HppliteStore *s, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t admittedAt, uint64_t height,
                                  const unsigned char instance[32], const unsigned char chainAfter[32], const unsigned char stateRoot[32],
                                  uint64_t epoch, const uint8_t *data, size_t len) {
     unsigned char manifest[32], digest[32], sig[65], v;
@@ -1297,7 +1298,7 @@ int hpplite_store_put_fleet_name(HppliteStore *s, const unsigned char fleet[20],
     memcpy(body, data, len);
     memcpy(body + len, instance, 32);
     memcpy(body + len + 32, sig, 65);
-    snprintf(path, sizeof path, "/fleet/%s/name/%s-%llu", fl, db, (unsigned long long)height);
+    snprintf(path, sizeof path, "/fleet/%s/name/%s-%llu-%llu", fl, db, (unsigned long long)admittedAt, (unsigned long long)height);   /* by its admission (#318) */
     status = paidPost(s, path, body, len + 97, zHeader, &out);
     if (status == 200) { rc = 0; s->nOk++; }
     else if (status == -1) { /* the reason is in s->error */ }

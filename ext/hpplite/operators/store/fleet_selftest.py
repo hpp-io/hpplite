@@ -171,7 +171,7 @@ def paid(chain_id, fl, work):
                     "stateRoot": bytes(32), "manifestDigest": hashlib.sha256(data).digest(), "epoch": 1}
             sig = eth.sign(kb(KEY3), F.head_digest(dom, head))
             hj = json.dumps({k: (hx(v) if isinstance(v, bytes) else v) for k, v in head.items()})
-            st, body = http("POST", url + "/fleet/%s/name/%s-%d" % (fl, dbx, height), data + inst + sig, {"X-HPPLite-Head": hj})
+            st, body = http("POST", url + "/fleet/%s/name/%s" % (fl, F.store_name(db, issued, height)), data + inst + sig, {"X-HPPLite-Head": hj})
             return st, body, after
 
         # the funder's permit: the account can pay
@@ -231,15 +231,16 @@ def run(chain_id, fl, url, owner, dbowner, seq):
           "joined: the store's view from the fleet's events, epoch 1, the lease's instance (%s %s)" % (st, view))
 
     chain = bytes(32)
+    life = issued                                     # the admission the names are written under (#318)
 
-    def write(height, data, instance, epoch, key=KEY3, chain_after=None, digest=None):
+    def write(height, data, instance, epoch, key=KEY3, chain_after=None, digest=None, admitted=None):
         nonlocal chain
         after = chain_after or fleet_store.chain_hash_next(chain, height, eth.keccak256(data))
         head = {"dbId": db, "instanceId": instance, "fromHeight": height, "toHeight": height, "chainHashAfter": after,
                 "stateRoot": eth.keccak256(b"root-%d" % height), "manifestDigest": digest or hashlib.sha256(data).digest(), "epoch": epoch}
         sig = eth.sign(kb(key), F.head_digest(dom, head))
         hj = json.dumps({k: (hx(v) if isinstance(v, bytes) else v) for k, v in head.items()})
-        r = http("POST", url + "/fleet/%s/name/%s-%d" % (fl, dbx, height), data + instance + sig, {"X-HPPLite-Head": hj})
+        r = http("POST", url + "/fleet/%s/name/%s" % (fl, F.store_name(db, admitted or life, height)), data + instance + sig, {"X-HPPLite-Head": hj})
         if r[0] == 200:
             chain = after
         return r
@@ -254,7 +255,7 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     check(st == 403, "a head signed by another key than the database's sequencer: 403 (%s)" % st)
     st, body = write(2, b"batch two", inst_a, 1)
     check(st == 200, "batch 2: taken (%s %s)" % (st, body))
-    st, data = http("GET", url + "/fleet/%s/name/%s-2" % (fl, dbx))
+    st, data = http("GET", url + "/fleet/%s/name/%s" % (fl, F.store_name(db, issued, 2)))
     check(st == 200 and data[:-97] == b"batch two", "batch 2 read back by its name")
     st, body = write(5, b"past a gap", inst_a, 1)
     check(st == 409 and body.get("expected") == 3, "a write past a gap: 409 with the height expected (%s %s)" % (st, body))
@@ -307,6 +308,34 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     check(len(heads.get("heads", [])) == 1 and heads["heads"][0]["head"]["toHeight"] == 4, "a new write: the database listed again, at 4")
     st, got = http("GET", url + "/get/" + fleet_store._cid(hashlib.sha256(mdata).digest()))
     check(st == 200 and got == mdata, "the manifest read back by its CID (%s)" % st)
+    # a new life (#318): retired, then admitted again - names keyed by the admission, the view the new life's, heights from 1
+    rsig2 = eth.sign(kb(KEY1), eth.typed_digest(dom, F.RETIRE_TYPE, db, issued + 1))
+    cast("send", "--private-key", KEY2, fl, "retireFor(bytes32,uint256,bytes)", dbx, str(issued + 1), hx(rsig2))
+    issued2 = issued + 900
+    inst_c = eth.keccak256(b"host-c")
+    nonce = int(cast("call", fl, "db(bytes32)(address,address,bytes32,bytes32,uint64,uint64,uint64,uint64,bool,uint256,address,uint256,bytes32,bytes32,address)", dbx).split("\n")[9].split()[0])
+    admit2 = eth.sign(kb(KEY0), eth.typed_digest(dom, F.ADMIT_TYPE, db, dbowner, seq, issued2))
+    claim2 = eth.sign(kb(KEY3), eth.typed_digest(dom, F.CLAIM_TYPE, db, inst_c, nonce, deadline))
+    cast("send", "--private-key", KEY2, fl, "joinFor(bytes32,address,address,bytes32,uint256,bytes,bytes32,uint256,uint256,bytes)",
+         dbx, dbowner, seq, hx(F.name_hash(name)), str(issued2), hx(admit2), hx(inst_c), str(nonce), str(deadline), hx(claim2))
+    time.sleep(6)                                     # the store's view follows within --fleet-follow (#317)
+    st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))
+    check(st == 200 and view.get("admittedAt") == issued2 and view.get("latestHead") is None and not view.get("retired"),
+          "re-admitted: the view is the new life's - admittedAt %d, no head yet (%s, %s)" % (issued2, view.get("admittedAt"), view.get("latestHead")))
+    ep = view.get("epoch")
+    st, body = write(5, b"the old life's next", inst_c, ep)
+    check(st == 409 and body.get("error") == "not the database's current admission" and body.get("leaseAdmittedAt") == issued2,
+          "a head under the old admission: 409, not the current admission (%s %s)" % (st, body))
+    chain = bytes(32)
+    life = issued2
+    st, body = write(1, b"a new life's first", inst_c, ep)
+    check(st == 200, "the new life's first batch at height 1, its chain hash from zero: taken (%s %s)" % (st, body))
+    st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))
+    check((view.get("latestHead") or {}).get("head", {}).get("toHeight") == 1, "the view's latest head is the new life's, at 1 (%s)" % view.get("latestHead"))
+    st, data = http("GET", url + "/fleet/%s/name/%s" % (fl, F.store_name(db, issued, 2)))
+    check(st == 200 and data[:-97] == b"batch two", "the old life's names stay readable (verify): its batch 2 (%s)" % st)
+    st, heads = http("GET", url + "/fleet/%s/heads" % fl)
+    check([hh["head"]["toHeight"] for hh in heads.get("heads", [])] == [1], "GET heads lists the current life's head (%s)" % [hh["head"]["toHeight"] for hh in heads.get("heads", [])])
     print("fleet store selftest: %s" % ("ok" if not fails else "%d FAIL" % fails))
     return 1 if fails else 0
 

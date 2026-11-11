@@ -184,7 +184,10 @@ def fleet_vectors():
         batch_heads.append({"data": hx(data), "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in head.items()},
                             "headDigest": hx(hd), "key": KEYS[0], "signature": hx(eth.sign(key(0), hd))})
         prev = after
-    return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup, "batchHeads": batch_heads,
+    # a batch's name at the store, by its admission (#318): a re-admission (Admitted after Retired) starts a new life
+    names = [{"dbId": hx(dbs[0]["dbId"]), "admittedAt": a, "height": h, "name": fleet.store_name(dbs[0]["dbId"], a, h)}
+             for a, h in ((1800000000, 1), (1800000000, 2), (1800000900, 1))]
+    return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup, "batchHeads": batch_heads, "names": names,
             "databases": [{"name": d["name"], "owner": d["owner"], "dbId": hx(d["dbId"]), "nameHash": hx(fleet.name_hash(d["name"])),
                            "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in d["head"].items()},
                            "headDigest": hx(d["headDigest"]), "key": d["key"], "signature": hx(d["signature"]), "leaf": hx(d["leaf"])}

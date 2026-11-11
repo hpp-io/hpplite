@@ -453,6 +453,26 @@
     "typeString": "Expire(bytes32 dbId,uint256 nonce,uint256 deadline)"
    }
   ],
+  "names": [
+   {
+    "admittedAt": 1800000000,
+    "dbId": "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e",
+    "height": 1,
+    "name": "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e-1800000000-1"
+   },
+   {
+    "admittedAt": 1800000000,
+    "dbId": "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e",
+    "height": 2,
+    "name": "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e-1800000000-2"
+   },
+   {
+    "admittedAt": 1800000900,
+    "dbId": "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e",
+    "height": 1,
+    "name": "0x0d0046e214cb0216941a015673fa828c60a42d139b75e4ad108ae5d5a348030e-1800000900-1"
+   }
+  ],
   "protocol": "hpplite-fleet/1",
   "rollup": "0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
   "roots": [

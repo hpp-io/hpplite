@@ -69,6 +69,7 @@ typedef struct EthL1 {
     uint8_t admitSig[65];
     int hasAdmit;
     uint64_t fleetEpoch;       /* the record's epoch at the last read: what a head is signed at (#316 c) */
+    uint64_t fleetAdmittedAt;  /* ...its admittedAt: the life the names are written under (#318) */
     uint8_t fleetInstance[32]; /* the node's instance (#316 d): the record holding it is this run's lease */
     int hasFleetInstance;
     uint64_t heldEpoch;        /* the epoch this run's lease holds; once the record moves past it the run is fenced */
@@ -1855,6 +1856,7 @@ static HppliteL1State *fleet_get_state(HppliteL1 *l1) {
     HppliteL1State *state;
     if (fleet_record(l1, &r) != 0) return NULL;
     self->fleetEpoch = r.epoch;
+    if (!r.retired) self->fleetAdmittedAt = r.admittedAt;
     fleet_fence(l1, &r);
     state = sqlite3_malloc(sizeof(HppliteL1State));
     if (!state) return NULL;
@@ -1937,6 +1939,14 @@ uint64_t hpplite_l1_fleet_epoch(HppliteL1 *l1) {
     if (self->heldEpoch) return self->heldEpoch;
     if (!self->fleetEpoch && fleet_record(l1, &r) == 0) self->fleetEpoch = r.epoch;
     return self->fleetEpoch;
+}
+
+/* the database's current admission, the record's admittedAt (#318): read now when none was; 0 with no live record */
+uint64_t hpplite_l1_fleet_admitted_at(HppliteL1 *l1) {
+    FleetRecord r;
+    if (!l1 || l1->ops != &hppliteL1EthOps || !self->fleet) return 0;
+    if (!self->fleetAdmittedAt && fleet_record(l1, &r) == 0 && fleet_has_record(&r) && !r.retired) self->fleetAdmittedAt = r.admittedAt;
+    return self->fleetAdmittedAt;
 }
 
 /* the node's instance, so the record holding it is known as this run's lease (#316 d) */

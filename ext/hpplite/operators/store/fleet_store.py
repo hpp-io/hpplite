@@ -97,7 +97,7 @@ class FleetBook:
         d = st["dbs"].setdefault(db, {"epoch": 0})
         if name == "Admitted":
             d.update({"owner": "0x" + log["topics"][2][-40:], "sequencer": "0x" + _w(data, 0)[-40:], "nameHash": "0x" + _w(data, 1),
-                      "instance": "0x" + "00" * 32, "retired": False})
+                      "instance": "0x" + "00" * 32, "retired": False, "admittedAt": None})     # a new life (#318): its admittedAt read from the record
         elif name == "Claimed":
             d["instance"] = "0x" + _w(data, 0)
         elif name == "EpochMoved":
@@ -118,7 +118,7 @@ class FleetBook:
             return None
         # Db: owner, sequencer, nameHash, instance, until, epoch, epochSince, admittedAt, retired, claimNonce, ...
         return {"owner": "0x" + _w(r, 0)[-40:], "sequencer": "0x" + _w(r, 1)[-40:], "nameHash": "0x" + _w(r, 2), "instance": "0x" + _w(r, 3),
-                "epoch": int(_w(r, 5), 16), "epochSince": int(_w(r, 6), 16), "retired": int(_w(r, 8), 16) != 0}
+                "epoch": int(_w(r, 5), 16), "epochSince": int(_w(r, 6), 16), "admittedAt": int(_w(r, 7), 16), "retired": int(_w(r, 8), 16) != 0}
 
     def _check_roots(self, fleet, st):
         for seq in sorted((s for s, r in st["roots"].items() if r["state"] != "ok"), key=int):
@@ -189,9 +189,10 @@ def fleet_get(h, path, query):
         d = st["dbs"].get(db)
         if not d:
             return h.reply(404, {"error": "no such database in the fleet", "dbId": db})
-        head = h.service.disk.json("f/%s/%s/head.json" % (fleet, db))
+        admitted = _admission(book, st, fleet, db)
+        head = h.service.disk.json(_hpath(fleet, db, admitted)) if admitted is not None else None
         out = {"dbId": db, "epoch": d.get("epoch", 0), "sequencer": d.get("sequencer"), "instance": d.get("instance"),
-               "retired": d.get("retired", False), "latestHead": head, "latestRoot": d.get("latestRoot")}
+               "retired": d.get("retired", False), "admittedAt": admitted, "latestHead": head, "latestRoot": d.get("latestRoot")}
         if d.get("anchored"):
             out["anchored"] = d["anchored"]             # absent before the first indexed root that holds it
         return h.reply(200, out)
@@ -212,15 +213,16 @@ def fleet_get(h, path, query):
         for db in sorted(st["dbs"], key=lambda x: int(x, 16)):
             if int(db, 16) <= int(after, 16) and after != "0x" + "00" * 32:
                 continue
-            head = h.service.disk.json("f/%s/%s/head.json" % (fleet, db))
+            admitted = _admission(book, st, fleet, db)        # the current life's head (#318)
+            head = h.service.disk.json(_hpath(fleet, db, admitted)) if admitted is not None else None
             if head and _head_digest_hex(fleet, book.chain_id, head["head"]) != st["dbs"][db].get("rootHead"):
                 out.append(head)
                 if len(out) >= limit:
                     break
         return h.reply(200, {"fleet": fleet, "heads": out})
     if len(parts) == 5 and parts[3] == "name":
-        db, _, height = parts[4].partition("-")
-        rec = h.service.disk.read("f/%s/%s/n/%s" % (fleet, db.lower(), height)) if height.isdigit() else None
+        parsed = parse_name(parts[4])                 # any admission's: an old life stays readable (#318)
+        rec = h.service.disk.read(_npath(fleet, *parsed)) if parsed else None
         data = h.service.disk.read("c/%s" % rec[97:].decode()) if rec else None
         if data is None:
             return h.reply(404, {"error": "no such name"})
@@ -278,13 +280,43 @@ def _post_manifest(h, fleet, body):
     return h.reply(200, {"cid": cid, "bytes": len(body)})
 
 
+def _npath(fleet, db, admitted, height):
+    """a name's record at the store, by its admission (#318)"""
+    return "f/%s/%s/%d/n/%d" % (fleet, db, admitted, height)
+
+
+def _hpath(fleet, db, admitted):
+    """an admission's latest head (#318)"""
+    return "f/%s/%s/%d/head.json" % (fleet, db, admitted)
+
+
+def _admission(book, st, fleet, db):
+    """the database's current admission, the record's admittedAt (#318): read on chain when the store does not hold it"""
+    d = st["dbs"].get(db)
+    if d is None:
+        return None
+    if d.get("admittedAt") is None:
+        fresh = book.read_db(fleet, db)
+        if fresh:
+            d.update(fresh)
+            book.disk.set_json(book._key(fleet), st)
+    return d.get("admittedAt")
+
+
+def parse_name(name):
+    """<dbId>-<admittedAt>-<height> (#318): (dbId lowercase, admittedAt, height), or None"""
+    parts = name.split("-")
+    if len(parts) != 3 or len(parts[0]) != 66 or not parts[1].isdigit() or not parts[2].isdigit():
+        return None
+    return parts[0].lower(), int(parts[1]), int(parts[2])
+
+
 def _post_name(h, fleet, name, body):
     book = h.service.fleets
-    db, _, hs = name.partition("-")
-    db = db.lower()
-    if not hs.isdigit() or len(db) != 66 or len(body) <= 97:
-        return h.reply(400, {"error": "a fleet name is <dbId>-<height>, the body the bytes, the instance (32 bytes) and the Head signature (65)"})
-    height = int(hs)
+    parsed = parse_name(name)
+    if not parsed or len(body) <= 97:
+        return h.reply(400, {"error": "a fleet name is <dbId>-<admittedAt>-<height>, the body the bytes, the instance (32 bytes) and the Head signature (65)"})
+    db, admitted, height = parsed
     try:
         head = json.loads(h.headers.get("X-HPPLite-Head") or "")
         hb = _head(head)
@@ -322,9 +354,18 @@ def _post_name(h, fleet, name, body):
         if hb["epoch"] != d["epoch"] or (d.get("instance") or "").lower() != instance:
             return h.reply(409, {"error": "not the lease's epoch and instance", "epoch": hb["epoch"], "leaseEpoch": d["epoch"],
                                  "instance": instance, "leaseInstance": d.get("instance")})
-        prev = h.service.disk.json("f/%s/%s/head.json" % (fleet, db))
+        current = _admission(book, st, fleet, db)
+        if admitted != current:
+            fresh = book.read_db(fleet, db)          # as for the epoch: never refused on a view the chain has left
+            if fresh:
+                d.update(fresh)
+                book.disk.set_json(book._key(fleet), st)
+                current = d.get("admittedAt")
+        if admitted != current:
+            return h.reply(409, {"error": "not the database's current admission", "admittedAt": admitted, "leaseAdmittedAt": current})
+        prev = h.service.disk.json(_hpath(fleet, db, admitted))
         if prev and int(prev["head"]["toHeight"]) >= height:
-            same = h.service.disk.read("f/%s/%s/n/%d" % (fleet, db, height))
+            same = h.service.disk.read(_npath(fleet, db, admitted, height))
             if same and same[:97] == body[-97:]:
                 return h.reply(200, {"name": name, "bytes": len(data), "held": True})
             return h.reply(409, {"error": "the database's head is already past this height", "head": prev["head"]["toHeight"]})
@@ -353,10 +394,10 @@ def _post_name(h, fleet, name, body):
                 b.setdefault("content", {})[cid] = {"height": height, "bytes": len(data)}
                 b["bytes"] += len(data) + 97
                 b["objects"] += 1
-                b["height"] = max(b.get("height", 0), height)
+                b["height"] = height                   # the current life's (#318)
                 h.L.save_bucket(b)
-            h.service.disk.write("f/%s/%s/n/%d" % (fleet, db, height), body[-97:] + cid.encode())
-            h.service.disk.set_json("f/%s/%s/head.json" % (fleet, db), {"head": head, "signature": "0x" + sig.hex()})
+            h.service.disk.write(_npath(fleet, db, admitted, height), body[-97:] + cid.encode())
+            h.service.disk.set_json(_hpath(fleet, db, admitted), {"head": head, "signature": "0x" + sig.hex(), "admittedAt": admitted})
             return 200, {"name": name, "bytes": len(data), "cid": cid}
         if h.L.free:
             status, obj = work()

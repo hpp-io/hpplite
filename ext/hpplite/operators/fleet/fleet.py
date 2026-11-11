@@ -42,6 +42,12 @@ def db_id(owner, name):
     return eth.keccak256(eth.word(owner) + eth.word(eth.keccak256(name.encode())))
 
 
+def store_name(db, admitted_at, height):
+    """a database's batch at the store, by its admission (#318): <dbId>-<admittedAt>-<height>, dbId 0x-hex lowercase,
+    admittedAt the record's (the Admit's issuedAt) and the height in decimal; a re-admission starts a new life at 1"""
+    return "0x%s-%d-%d" % ((db.hex() if isinstance(db, bytes) else db[2:]).lower(), admitted_at, height)
+
+
 def name_hash(name):
     return eth.keccak256(name.encode())
 

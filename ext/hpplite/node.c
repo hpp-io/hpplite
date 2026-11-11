@@ -844,7 +844,8 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
             for (i = 0; i < 60 && !atEpoch; i++) {
                 if (i) usleep(500 * 1000);
                 atEpoch = hpplite_store_fleet_view(node->store, node->config.fleet, node_fleet_chain_id(node), node->config.dbId, &v) == 0
-                          && v.epoch == hpplite_l1_fleet_epoch(node->l1) && memcmp(v.instance, node->instanceId, 32) == 0;
+                          && v.epoch == hpplite_l1_fleet_epoch(node->l1) && memcmp(v.instance, node->instanceId, 32) == 0
+                          && v.admittedAt == hpplite_l1_fleet_admitted_at(node->l1);      /* and its admission (#318) */
             }
             if (!atEpoch) {
                 hpplite_error(node->ctx, "the store does not show this run's lease (epoch %llu) after 30 s: the rebuild waits for it (the fence); not opened as its sequencer",
@@ -857,7 +858,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                 ** rolling hash and root - and the file, not that root, goes whole as N+1 (case 1's path) */
                 size_t n = 0;
                 unsigned char blk[32];
-                uint8_t *raw = hpplite_store_get_fleet_name(node->store, node->config.fleet, node->config.dbId, v.toHeight, &n);
+                uint8_t *raw = hpplite_store_get_fleet_name(node->store, node->config.fleet, node->config.dbId, v.admittedAt, v.toHeight, &n);
                 unsigned char me[20];
                 if (!raw || (hpplite_l1_get_my_address(node->l1, me) == 0 && memcmp(me, v.headSigner, 20) != 0)) {
                     free(raw);
@@ -1476,7 +1477,7 @@ static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t heig
     if (node->config.hasFleet) {
         /* fleet= (#316 d): a batch is a name at the store; the seal is the database's key, the rolling hash is checked
         ** against the signed latest head when the sync is done */
-        data = node->store ? hpplite_store_get_fleet_name(node->store, node->config.fleet, node->config.dbId, height, pLen) : NULL;
+        data = node->store ? hpplite_store_get_fleet_name(node->store, node->config.fleet, node->config.dbId, hpplite_l1_fleet_admitted_at(node->l1), height, pLen) : NULL;
         if (!data) hpplite_error(node->ctx, "batch %llu: %s", (unsigned long long)height, node->store ? hpplite_store_error(node->store) : "no store= names one");
         return data;
     }
@@ -2958,7 +2959,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
             if (!chainId) chainId = hpplite_l1_default_chain_id();
             hpplite_keccak256(payload, payloadLen, k);
             hpplite_chain_hash_next(ctx->chainHash, height, k, after);
-            if (hpplite_store_put_fleet_name(node->store, node->config.fleet, chainId, node->config.dbId, height, node->instanceId, after, root,
+            if (hpplite_store_put_fleet_name(node->store, node->config.fleet, chainId, node->config.dbId, hpplite_l1_fleet_admitted_at(node->l1), height, node->instanceId, after, root,
                                              hpplite_l1_fleet_epoch(node->l1), payload, payloadLen) == 0) {
                 node->warnedStoreDown = 0;
                 node->warnedFunder = 0;

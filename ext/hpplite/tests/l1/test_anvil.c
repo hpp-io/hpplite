@@ -2420,7 +2420,7 @@ static void test_fleet_fence(void) {
         FAIL("the Admit (scenario 42's helper)");
     snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s gone", ownerAddr, seqAddr, fl, KEY0);
     if (run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", gdbHex, nhHex, &gissued, gsigHex) != 4) FAIL("the second Admit");
-    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet_paid " DIR "/relay_fleet.log " DIR "/fleet_a.db* " DIR "/fleet_g.db* " DIR "/fleet_err.log");
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet_paid " DIR "/relay_fleet.log " DIR "/fleet_a.db* " DIR "/fleet_g.db* " DIR "/fleet_g2.db* " DIR "/fleet_err.log");
     store = start_pin_service_free(svc, sport);
     snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
     snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
@@ -2515,6 +2515,32 @@ static void test_fleet_fence(void) {
     sqlite3_close(w);
     printf("(retired: flush %lld, '%.110s', the relay's calls %ld -> %ld) ", r2, retired, posts3, posts4);
     if (r2 > 0 || !strstr(retired, "rejoining needs a newer Admit") || posts4 != posts3) FF_FAIL("a retired database's used Admit is refused before any call");
+    /* a new life (#318): a newer Admit re-admits it; a fresh file joins and starts at height 1 under the new admission -
+    ** the store's view the new life's, the first life's names still readable */
+    sleep(2);
+    char g2db[70], g2nh[70], g2sig[140];
+    unsigned long long g2issued = 0;
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s gone", ownerAddr, seqAddr, fl, KEY0);
+    if (run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", g2db, g2nh, &g2issued, g2sig) != 4 || g2issued <= gissued) FF_FAIL("a newer Admit");
+    (void)!system("rm -f " DIR "/fleet_g2.db*");
+    snprintf(uri, sizeof uri, fmt, "fleet_g2.db", RPC, SKEY, fl, ownerAddr, "gone", g2issued, g2sig, storeUrl, relayUrl);
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(w)); sqlite3_close(w); FF_FAIL("open the re-admitted database"); }
+    sqlite3_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('a new life')", NULL, NULL, NULL);
+    long long n1 = scalar(w, "SELECT hpplite_flush()");
+    char nerr[300];
+    snprintf(nerr, sizeof nerr, "%s", status_text(w, "last_error"));
+    sqlite3_close(w);
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, gdbHex);
+    run_cmd(cmd, out, sizeof out);
+    char wantA[80];
+    snprintf(wantA, sizeof wantA, "\"admittedAt\": %llu", g2issued);
+    int newLife = strstr(out, wantA) && strstr(out, "\"toHeight\": 1");
+    snprintf(cmd, sizeof cmd, "curl -s -o /dev/null -w '%%{http_code}' -m 5 %s/fleet/%s/name/0x%s-%llu-1", storeUrl, fl, gdbHex, gissued);
+    char oldCode[16] = "";
+    run_cmd(cmd, oldCode, sizeof oldCode);
+    printf("(re-admitted: flush %lld, '%s', the view %s, the first life's batch 1 %s) ", n1, nerr[0] ? nerr : "no error",
+           newLife ? "the new life's at 1" : "NOT the new life's", oldCode);
+    if (n1 != 1 || !newLife || strcmp(oldCode, "200") != 0) FF_FAIL("a re-admitted database starts a new life at height 1, the first life's names readable");
     kill(relay, SIGTERM); waitpid(relay, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0);
     close(saved);
 #undef RESTORE_STDERR

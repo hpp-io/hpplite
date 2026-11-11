@@ -106,14 +106,24 @@ carries no database's content and names only as hashes.
 ## The store (step 3; somaro's decisions folded in, before code)
 
 A fleet's databases write to a store that speaks `hpplite-store/2` plus the
-calls below. `<fleet>` is the shared rollup's address, `<db>` a `dbId` (hex).
+calls below. **A database's lives (#318).** A batch's name carries the
+admission it belongs to: `<dbId>-<admittedAt>-<height>` (dbId 0x-hex
+lowercase, `admittedAt` the record's - the Admit's `issuedAt` - and the height,
+both decimal; `fleet.store_name`, vectors `fleet.names`). An admission after a
+retirement (`Admitted` following `Retired`) starts a new life: its heights
+start at 1, the store's view of the database (its latest head, its heights)
+is the new life's, a head written under another admission is refused `409`,
+and a node rebuilds from the current admission's names only. Every key is
+derived from the chain - the record's `admittedAt` - with no state of the
+store's own. An old life's names stay readable (verify) until the database's
+bucket is deleted; DeleteDb deletes every life's bytes. `<fleet>` is the shared rollup's address, `<db>` a `dbId` (hex).
 
 | Call | By | What |
 |------|----|------|
-| `POST /fleet/<fleet>/name/<db>-<height>`, the body the batch's bytes, the instance (32 bytes) and the `Head` signature (65 bytes); header `X-HPPLite-Head` the head's fields as JSON | the database's sequencer | the batch and its head in one write (#296). Checks: the head's `dbId` and `toHeight` are this name's; its signature recovers to the database's `sequencer`; its `instanceId` and `epoch` are the lease's; the bytes' keccak is the batch's. An older epoch is `409`: the fence. Kept: the bytes under their CID, the name `<fleet>-<dbId>-<height>`, the database's latest head |
-| `GET /fleet/<fleet>/name/<db>-<height>` | - | the bytes, as a name today |
+| `POST /fleet/<fleet>/name/<db>-<admittedAt>-<height>`, the body the batch's bytes, the instance (32 bytes) and the `Head` signature (65 bytes); header `X-HPPLite-Head` the head's fields as JSON | the database's sequencer | the batch and its head in one write (#296). Checks: the head's `dbId` and `toHeight` are this name's; its signature recovers to the database's `sequencer`; its `instanceId` and `epoch` are the lease's; `admittedAt` is the record's (another admission's is `409`, as an old epoch's); the bytes' keccak is the batch's. An older epoch is `409`: the fence. Kept: the bytes under their CID, the name `<fleet>-<dbId>-<admittedAt>-<height>`, the admission's latest head |
+| `GET /fleet/<fleet>/name/<db>-<admittedAt>-<height>` | - | the bytes, the instance and the signature, of any admission (an old life stays readable for verify) |
 | `GET /fleet/<fleet>/heads?after=<dbId>&limit=<n>` | the anchor | every database whose latest head is not the head in its latest indexed root, by `dbId` ascending (the leaf order), paged: what the next root is built from. Defined by state: a head that moved between the anchor's read and the root is listed again by itself |
-| `GET /fleet/<fleet>/db/<db>` | - | `{dbId, epoch, sequencer, instance, retired, latestHead, latestRoot}`; `latestRoot` is a hint, the path proves it |
+| `GET /fleet/<fleet>/db/<db>` | - | `{dbId, epoch, sequencer, instance, retired, admittedAt, latestHead, latestRoot}`, `latestHead` the current admission's; `latestRoot` is a hint, the path proves it |
 | `POST /fleet/<fleet>/manifest`, the body the manifest; `X-HPPLite-Signature` the fleet's anchor's `Content(address da = <fleet>, uint256 height = <seq>, bytes32 hash = keccak256(body))` in the store's domain | the anchor, before `postRootFor` | the manifest kept under its CID (`GET /get/<cid>`) |
 | `POST /fleet/<fleet>/root` | anyone | a hint to read the chain now; its body is trusted for nothing |
 
