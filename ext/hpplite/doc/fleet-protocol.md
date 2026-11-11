@@ -246,9 +246,13 @@ as its height (both with vectors). The listing: `GET /account/<funder>` names
 fleet databases apart, `databases: [{fleet, dbId}]`, `buckets` staying
 addresses; one database's bucket is `GET /fleet/<fleet>/db/<dbId>/bucket`,
 today's bucket body with `fleet` and `dbId` in place of `da`. The database's
-view (`GET /fleet/<fleet>/db/<dbId>`) also carries `anchored: {seq, toHeight,
-time}` - the latest indexed root holding it, its head's height there and
-RootPosted's block time - a hint like `latestRoot`.
+view (`GET /fleet/<fleet>/db/<dbId>`) also carries `anchored: {seq, root,
+toHeight, time, path}` - the latest indexed root holding it, that root, its
+head's height there, RootPosted's block time, and the leaf's path into the
+root (`[{hash, left}]`, siblings bottom up; empty when the root is the leaf).
+It is a hint, the path its proof against the root on chain. A root is a delta:
+a database absent from a later root keeps the `anchored` of the last root that
+held it, never moved back, and a root indexed late never replaces a newer one.
 
 One BindDb per database, the fleet's treasury (or a database's own funder in a
 common fleet) as funder, a cap per database; the name write is charged to

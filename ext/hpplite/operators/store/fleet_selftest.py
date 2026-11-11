@@ -306,6 +306,41 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     st, body = write(4, b"batch four", inst_b, 3)
     st, heads = http("GET", url + "/fleet/%s/heads" % fl)
     check(len(heads.get("heads", [])) == 1 and heads["heads"][0]["head"]["toHeight"] == 4, "a new write: the database listed again, at 4")
+    an1 = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))[1].get("anchored") or {}
+    p1 = [(bytes.fromhex(x["hash"][2:]), x["left"]) for x in an1.get("path", [])]
+    check(an1.get("root") == hx(root) and F.verify(F.leaf(db, dbowner, F.name_hash(name), hd), p1, root),
+          "anchored names root 1 and the leaf's path into it, which verifies (%s)" % an1.get("path"))
+    # root 2 holds another database only (a delta): the first stays anchored in root 1, never moved back
+    oname = "ledger"
+    odb = F.db_id(dbowner, oname)
+    odbx, onh = hx(odb), F.name_hash(oname)
+    oissued, oinst = issued + 2, eth.keccak256(b"host-orders")
+    oadmit = eth.sign(kb(KEY0), eth.typed_digest(dom, F.ADMIT_TYPE, odb, dbowner, seq, oissued))
+    oclaim = eth.sign(kb(KEY3), eth.typed_digest(dom, F.CLAIM_TYPE, odb, oinst, 0, deadline))
+    cast("send", "--private-key", KEY2, fl, "joinFor(bytes32,address,address,bytes32,uint256,bytes,bytes32,uint256,uint256,bytes)",
+         odbx, dbowner, seq, hx(onh), str(oissued), hx(oadmit), hx(oinst), "0", str(deadline), hx(oclaim))
+    ohead = {"dbId": odb, "instanceId": oinst, "fromHeight": 1, "toHeight": 1, "chainHashAfter": fleet_store.chain_hash_next(bytes(32), 1, eth.keccak256(b"order 1")),
+             "stateRoot": eth.keccak256(b"orders-root-1"), "manifestDigest": hashlib.sha256(b"order 1").digest(), "epoch": 1}
+    osig = eth.sign(kb(KEY3), F.head_digest(dom, ohead))
+    time.sleep(6)                                     # the store's view of the new database follows within --fleet-follow
+    st, body = http("POST", url + "/fleet/%s/name/%s" % (fl, F.store_name(odb, oissued, 1)), b"order 1" + oinst + osig,
+                    {"X-HPPLite-Head": json.dumps({k: (hx(v) if isinstance(v, bytes) else v) for k, v in ohead.items()})})
+    check(st == 200, "a second database's batch 1 (%s %s)" % (st, body))
+    oitems = [{"dbId": odbx, "owner": dbowner, "nameHash": hx(onh), "head": {k: (hx(v) if isinstance(v, bytes) else v) for k, v in ohead.items()}, "signature": hx(osig)}]
+    m2, d2 = F.manifest(chain_id, fl, 2, oitems)
+    csig2 = eth.sign(kb(KEY2), eth.typed_digest(sdom, "Content(address da,uint256 height,bytes32 hash)", fl, 2, eth.keccak256(m2)))
+    check(http("POST", url + "/fleet/%s/manifest" % fl, m2, {"X-HPPLite-Signature": hx(csig2)})[0] == 200, "root 2's manifest put")
+    ohd = F.head_digest(dom, ohead)
+    root2 = F.root([(odb, F.leaf(odb, dbowner, onh, ohd))])
+    rsig2b = eth.sign(kb(KEY2), eth.typed_digest(dom, F.ROOT_TYPE, 2, root2, d2, deadline))
+    cast("send", "--private-key", KEY0, fl, "postRootFor(uint256,bytes32,bytes32,uint256,bytes)", "2", hx(root2), hx(d2), str(deadline), hx(rsig2b))
+    http("POST", url + "/fleet/%s/root" % fl, b"")
+    an1b = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))[1].get("anchored") or {}
+    an2 = http("GET", url + "/fleet/%s/db/%s" % (fl, odbx))[1].get("anchored") or {}
+    check(an1b.get("seq") == 1 and an1b.get("toHeight") == 3 and an1b.get("root") == hx(root),
+          "a database absent from root 2 keeps root 1's anchored, never moved back (%s)" % {k: an1b.get(k) for k in ("seq", "toHeight")})
+    check(an2.get("seq") == 2 and an2.get("toHeight") == 1 and an2.get("root") == hx(root2) and an2.get("path") == [],
+          "the database in root 2: anchored seq 2, its one leaf the root, an empty path (%s)" % {k: an2.get(k) for k in ("seq", "toHeight", "path")})
     st, got = http("GET", url + "/get/" + fleet_store._cid(hashlib.sha256(mdata).digest()))
     check(st == 200 and got == mdata, "the manifest read back by its CID (%s)" % st)
     # a new life (#318): retired, then admitted again - names keyed by the admission, the view the new life's, heights from 1

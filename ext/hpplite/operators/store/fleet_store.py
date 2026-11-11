@@ -137,11 +137,21 @@ class FleetBook:
                 when = int(blk.get("timestamp", "0x0"), 16)
             except (RpcError, OSError, ValueError):
                 when = None
-            for leaf in json.loads(data)["leaves"]:
+            leaves = json.loads(data)["leaves"]
+            dom = F.domain(self.chain_id, fleet)
+            entries = [(bytes.fromhex(l["dbId"][2:]), F.leaf(bytes.fromhex(l["dbId"][2:]), l["owner"], bytes.fromhex(l["nameHash"][2:]),
+                                                             F.head_digest(dom, _head(l["head"])))) for l in leaves]
+            for leaf in leaves:
                 d = st["dbs"].setdefault(leaf["dbId"].lower(), {"epoch": 0})
+                if d.get("latestRoot") and d["latestRoot"] >= int(seq):
+                    continue                           # a root indexed late never moves a database back
                 d["latestRoot"] = int(seq)
                 d["rootHead"] = _head_digest_hex(fleet, self.chain_id, leaf["head"])
-                d["anchored"] = {"seq": int(seq), "toHeight": int(leaf["head"]["toHeight"]), "time": when}
+                path = F.proof(entries, bytes.fromhex(leaf["dbId"][2:]))
+                # the database's latest root that holds it: what somaro's status shows and verify checks on chain - the leaf's
+                # path into the root, siblings bottom up with their side; a database absent from a later root keeps it
+                d["anchored"] = {"seq": int(seq), "root": r["root"], "toHeight": int(leaf["head"]["toHeight"]), "time": when,
+                                 "path": [{"hash": "0x" + hsh.hex(), "left": left} for hsh, left in path]}
 
 
 def _cid(digest):
