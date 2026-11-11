@@ -503,6 +503,8 @@ class Service:
         self.started = int(time.time())
         import fleet_store
         self.fleets = fleet_store.FleetBook(chain, self.disk, self.chain_id, args.fleet_follow) if chain else None   # hpplite-fleet/1 (#297)
+        if self.fleets:
+            self.fleets.ledger = self.ledger            # a prune lets go of a database's bytes in its bucket (#314)
 
     def start(self):
         def loop():

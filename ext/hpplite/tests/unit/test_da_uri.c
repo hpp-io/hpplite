@@ -354,7 +354,7 @@ static void test_relay_exact_only(void) {
 /* #316 (a): fleet= names a database by owner= and dbname= alone; what names a rollup (contract=, factory=) and what a
 ** fleet's anchor does for it (anchor=, checkpoint=, keep=) refuse the open, one line each naming it */
 static void test_fleet_params(void) {
-    TEST("fleet=: owner= and dbname= are required; contract=, factory=, anchor=, checkpoint=, keep= refuse the open with fleet= (#316)");
+    TEST("fleet=: owner= and dbname= are required; contract=, factory=, anchor=, checkpoint=, keep=<duration> refuse the open with fleet= (#316); snapshot= and keep=all are taken (#314)");
     static const char *base = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
                               "&store=http://127.0.0.1:1&relay=http://127.0.0.1:2";
     static const char *bare = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
@@ -366,7 +366,6 @@ static void test_fleet_params(void) {
         { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&anchor=24h", "anchor=" },
         { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&checkpoint=7", "checkpoint=" },
         { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&keep=7d", "keep=" },
-        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&snapshot=1h", "snapshot=" },
         { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&anchorclose=off", "anchorclose=" },
     };
     char uri[600];
@@ -393,7 +392,7 @@ static void test_fleet_params(void) {
     }
     /* the same settings from the environment alone refuse it too, naming the variable */
     {
-        static const char *envs[][2] = { { "HPPLITE_ANCHOR", "24h" }, { "HPPLITE_KEEP", "7d" }, { "HPPLITE_SNAPSHOT", "1h" },
+        static const char *envs[][2] = { { "HPPLITE_ANCHOR", "24h" }, { "HPPLITE_KEEP", "7d" },
                                          { "HPPLITE_CHECKPOINT_INTERVAL", "7" }, { "HPPLITE_ANCHOR_CLOSE", "off" },
                                          { "HPPLITE_CONTRACT_ADDRESS", "0x2222222222222222222222222222222222222222" },
                                          { "HPPLITE_FACTORY_ADDRESS", "0x2222222222222222222222222222222222222222" } };
@@ -406,6 +405,22 @@ static void test_fleet_params(void) {
             unsetenv(envs[i][0]);
             if (cfg) hpplite_config_free(cfg);
             if (!why || !strstr(why, envs[i][0])) { FAIL("the setting from the environment should refuse the open beside fleet=, naming the variable"); }
+        }
+    }
+    /* snapshots and pruning in a fleet (#314): snapshot= sets how often, keep=all keeps the history - from the URI or the
+    ** environment */
+    {
+        static const char *ok[][3] = { { "&snapshot=1h", NULL, NULL }, { "&keep=all", NULL, NULL }, { "", "HPPLITE_SNAPSHOT", "1h" }, { "", "HPPLITE_KEEP", "all" } };
+        for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++) {
+            snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes%s", base, ok[i][0]);
+            if (ok[i][1]) setenv(ok[i][1], ok[i][2], 1);
+            HppliteConfig *cfg = hpplite_config_load(uri);
+            const char *why = hpplite_config_error();
+            int good = cfg && !why && (strstr(ok[i][0], "keep") || (ok[i][1] && strstr(ok[i][1], "KEEP")) ? cfg->keepAll : cfg->snapshotGiven && cfg->snapshotIntervalMs == 3600000);
+            printf("  %s%s%s with fleet=: %s\n", ok[i][1] ? ok[i][1] : ok[i][0] + 1, ok[i][1] ? "=" : "", ok[i][1] ? ok[i][2] : "", good ? "taken" : (why ? why : "not read"));
+            if (ok[i][1]) unsetenv(ok[i][1]);
+            if (cfg) hpplite_config_free(cfg);
+            if (!good) { FAIL("snapshot= and keep=all should be taken with fleet= (#314)"); }
         }
     }
     /* a dbname is any bytes after percent-decoding: somaro names "<app>/<path in the volume>" */

@@ -425,6 +425,7 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     kf = os.path.join(tempfile.mkdtemp(prefix="fleet-anchor-"), "anchor.key")
     with open(kf, "w") as f:
         f.write(KEY2)
+    KF.append(kf)
     def tool(name, *a):
         r = subprocess.run([sys.executable, "-I", os.path.join(here, "..", "fleet", name), "--rpc", RPC, "--fleet", fl, "--store", url] + list(a),
                            capture_output=True, text=True)
@@ -444,8 +445,77 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     check(rc == 0 and v.get("verified") and v.get("seq") == 3 and v.get("toHeight") == 2, "verify: the other database's head in root 3 (%s)" % v.get("why"))
     rc, v = tool("verify.py", "--db", "0x" + "ab" * 32)
     check(rc == 1 and not v.get("verified") and "no root" in v.get("why", ""), "verify: a database no root holds - not verified, why said (%s)" % v.get("why"))
+    snapshots(chain_id, fl, url, dom, odb, oissued, oinst, ohead2, tool)
     print("fleet store selftest: %s" % ("ok" if not fails else "%d FAIL" % fails))
     return 1 if fails else 0
+
+
+def snapshots(chain_id, fl, url, dom, odb, oissued, oinst, head, tool):
+    """#314: a snapshot at 4 of the second database (heads 1..6), its pieces signed by the database's sequencer; the store
+    prunes below it only once a root holds a head at or past 4"""
+    odbx = hx(odb)
+    heads = {2: head}
+    for h in range(3, 7):
+        data = b"order %d" % h
+        heads[h] = dict(heads[h - 1], fromHeight=h, toHeight=h, chainHashAfter=fleet_store.chain_hash_next(heads[h - 1]["chainHashAfter"], h, eth.keccak256(data)),
+                        stateRoot=eth.keccak256(b"orders-root-%d" % h), manifestDigest=hashlib.sha256(data).digest())
+        sig = eth.sign(kb(KEY3), F.head_digest(dom, heads[h]))
+        st, body = http("POST", url + "/fleet/%s/name/%s" % (fl, F.store_name(odb, oissued, h)), data + oinst + sig,
+                        {"X-HPPLite-Head": json.dumps({k: (hx(v) if isinstance(v, bytes) else v) for k, v in heads[h].items()})})
+        check(st == 200, "the second database's batch %d (%s %s)" % (h, st, body))
+
+    def piece(part, data, height=4, key=KEY3):
+        sd = F.snapshot_digest(dom, odb, oissued, height, part, hashlib.sha256(data).digest())
+        return http("POST", url + "/fleet/%s/snapshot/%s/%d" % (fl, F.store_name(odb, oissued, height), part), data,
+                    {"X-HPPLite-Signature": hx(eth.sign(kb(key), sd))})
+    chunks = [b"the image, part one " * 50, b"the image, part two"]
+    shas = [hashlib.sha256(c).digest() for c in chunks]
+    idx = F.snapshot_index(fl, odb, oissued, 4, heads[4]["stateRoot"], heads[4]["chainHashAfter"], eth.keccak256(b"block 4"), int(time.time()),
+                           sum(map(len, chunks)), shas)
+    st, body = piece(0, idx)
+    check(st == 409 and "chunks" in body.get("error", ""), "a snapshot's index before its chunks: 409, the parts missing named (%s %s)" % (st, body))
+    st, body = piece(1, chunks[0], key=KEY1)
+    check(st == 403, "a snapshot chunk signed by another key than the database's sequencer: 403 (%s %s)" % (st, body.get("error")))
+    for i, c in enumerate(chunks):
+        st, body = piece(i + 1, c)
+        check(st == 200 and body.get("cid") == fleet_store._cid(shas[i]), "snapshot chunk %d taken under its CID (%s %s)" % (i + 1, st, body))
+    bad = F.snapshot_index(fl, odb, oissued, 4, eth.keccak256(b"another root"), heads[4]["chainHashAfter"], eth.keccak256(b"block 4"), int(time.time()),
+                           sum(map(len, chunks)), shas)
+    st, body = piece(0, bad)
+    check(st == 409 and "root or chain" in body.get("error", ""), "an index whose root is not the head's at its height: 409 (%s %s)" % (st, body))
+    st, body = piece(0, idx)
+    check(st == 200, "the index, after its chunks: taken (%s %s)" % (st, body))
+    st, body = piece(0, idx)
+    check(st == 200 and body.get("held"), "the same index again (a lost answer's retry): 200, held (%s %s)" % (st, body))
+    st, body = piece(0, idx.replace(b'"root":"0x', b'"root":7,"x":"0x'))
+    check(st == 400, "an index whose root is not 32 bytes of hex: 400 (%s %s)" % (st, body.get("error")))
+    st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, odbx))
+    sn = view.get("snapshot") or {}
+    check(sn.get("height") == 4 and sn.get("index") == fleet_store._cid(hashlib.sha256(idx).digest()) and sn.get("prune") is True,
+          "the view names the snapshot at 4 by its index's CID (%s)" % sn)
+    check(view.get("prunedBelow") == 0 and (view.get("anchored") or {}).get("toHeight") == 2,
+          "anchored at 2, under the snapshot: nothing pruned yet (%s, %s)" % (view.get("prunedBelow"), (view.get("anchored") or {}).get("toHeight")))
+    old = [fleet_store._cid(hashlib.sha256(b"order %d" % h).digest()) for h in (1, 2, 3)]
+    check(all(http("GET", url + "/get/" + c)[0] == 200 for c in old), "batches 1 to 3 still served before the root")
+    rc, line = tool("anchor.py", "--key-file", KF[0], "--send", "--once", "--force")
+    check(rc == 0 and line.get("posted") and line.get("leaves") == [odbx], "a root holding the second database at 6 (%s)" % line)
+    st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, odbx))
+    check(view.get("prunedBelow") == 4 and (view.get("anchored") or {}).get("toHeight") == 6,
+          "the root holds 6, past the snapshot: the store pruned below 4 on its own (%s)" % view.get("prunedBelow"))
+    check(all(http("GET", url + "/fleet/%s/name/%s" % (fl, F.store_name(odb, oissued, h)))[0] == 404 for h in (1, 2, 3)),
+          "names 1 to 3 gone after the prune")
+    check(all(http("GET", url + "/get/" + c)[0] == 404 for c in old), "their bytes gone too")
+    check(all(http("GET", url + "/fleet/%s/name/%s" % (fl, F.store_name(odb, oissued, h)))[0] == 200 for h in (4, 5, 6)),
+          "names 4 to 6 kept: the head at the snapshot and the batches after it")
+    check(http("GET", url + "/get/" + sn.get("index", ""))[1] == idx and all(http("GET", url + "/get/" + fleet_store._cid(x))[0] == 200 for x in shas),
+          "the snapshot at 4 kept: its index and chunks served")
+    st, body = piece(0, idx, height=3)
+    check(st == 409 and body.get("prunedBelow") == 4, "a snapshot below the prune: 409 (%s %s)" % (st, body))
+    rc, v = tool("verify.py", "--db", odbx)
+    check(rc == 0 and v.get("verified") and v.get("toHeight") == 6, "verify after the prune: the head at 6 anchored (%s)" % v.get("why"))
+
+
+KF = []
 
 
 if __name__ == "__main__":

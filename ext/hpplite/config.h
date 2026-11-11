@@ -155,6 +155,7 @@ typedef struct HppliteConfig {
     int checkpointInterval;          /* Batches per checkpoint (0 = node default, 100) */
     int intervalGiven;               /* interval= was said: a chain alias's own cadence does not apply */
     int snapshotIntervalMs;          /* snapshot=: how often a sequencer at a store snapshots the database at an anchor (#221); 0: never */
+    int snapshotGiven;               /* snapshot= was set (a fleet database snapshots by default, #314) */
     int anchorIntervalMs;            /* anchor=: how often a store node anchors its batches on the chain (#164); default 30 min, the chain's cadence */
     int anchorGiven;
     int keepLease;                   /* keeplease=on / HPPLITE_KEEP_LEASE: a sequencer closing alone lets its lease run instead of releasing it (#265) */
@@ -185,6 +186,7 @@ typedef struct HppliteConfig {
     unsigned char funder[20];        /* funder= (#272): the external funding wallet the bucket must be bound to */
     int hasFunder;
     int64_t keepSeconds;             /* keep= (#223): how long the store keeps the history behind the latest snapshot; 0: all of it */
+    int keepAll;                     /* keep=all was set: with fleet=, snapshots that let no history go (#314) */
     uint64_t syncTo;                 /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;               /* syncat=: ...none written after this time, ms since the epoch (#205); 0: none */
     uint64_t spendCap, spendWindow;  /* HPPLITE_SPEND_CAP: the most paid in the window (seconds), store and relay together (0 = none, #173) */

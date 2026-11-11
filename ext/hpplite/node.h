@@ -89,6 +89,7 @@ typedef struct HppliteNodeConfig {
     int onForeign;                  /* somaro#93: a file with pages, no bookkeeping, history at the store - 0 refuse, 1 history, 2 file */
     int hasFunder;
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
+    int keepAll;                    /* keep=all: a fleet database's snapshots let no history go (#314) */
     int fromSnapshot;               /* a new replica (no role=verify, an empty file) starts from the latest snapshot (#222); a verifier
                                     ** reads batch 1 and, when the store has pruned it, starts from the oldest snapshot kept (#224, #255) */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
@@ -99,6 +100,7 @@ typedef struct HppliteNodeConfig {
     uint64_t relayCap;              /* HPPLITE_RELAY_CAP: the most to pay the relay per call (0 = pay nothing) */
     int storeFallback;              /* HPPLITE_STORE_FALLBACK: a store that does not answer lets the chain carry the bytes (default on) */
     int snapshotIntervalMs;         /* snapshot=: a snapshot at an anchor when the last is older than this (#221); 0: never */
+    int snapshotGiven;              /* snapshot= was set: a fleet database snapshots every 24 h otherwise (#314) */
     int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
     int keepLease;                  /* keeplease=on: a sequencer closing alone lets its lease run instead of releasing it (#265) */
     int noAnchorAtClose;            /* anchorclose=off: the close flushes to the store and leaves the anchor to the timer or hpplite_anchor() (#266) */

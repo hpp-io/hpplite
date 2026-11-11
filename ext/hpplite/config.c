@@ -197,9 +197,11 @@ static void fleet_check(HppliteConfig *cfg, const int uri[7]) {
         const char *ev = getenv(k[i].env);
         int env = ev != NULL && ev[0];
         if (!uri[i] && !env) continue;
-        snprintf(gConfigError, sizeof(gConfigError), "%s%s with fleet=: %s%s", uri[i] ? k[i].name : k[i].env, uri[i] ? "=" : " (environment)",
-                 k[i].anchors ? "the fleet's anchor anchors its databases" : "a database in a fleet is named by fleet=, owner= and dbname= alone",
-                 (i == 4 || i == 5) ? " (snapshots and pruning in a fleet: #314)" : "");
+        if (i == 5) continue;                       /* snapshot=: how often the node snapshots a fleet database (#314) */
+        if (i == 4 && cfg->keepAll) continue;       /* keep=all: snapshots, and the history kept (#314) */
+        snprintf(gConfigError, sizeof(gConfigError), "%s%s with fleet=: %s", uri[i] ? k[i].name : k[i].env, uri[i] ? "=" : " (environment)",
+                 i == 4 ? "a fleet database's history goes below an anchored snapshot, or with keep=all is kept (#314)"
+                 : k[i].anchors ? "the fleet's anchor anchors its databases" : "a database in a fleet is named by fleet=, owner= and dbname= alone");
         return;
     }
     memset(word, 0, 12);
@@ -333,7 +335,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
     val = getenv("HPPLITE_KEEP");
-    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) cfg->keepSeconds = k; }
+    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; cfg->keepAll = k == 0; } }
     val = getenv("HPPLITE_KEEP_LEASE");
     if (val) cfg->keepLease = parse_on(val);
     val = getenv("HPPLITE_ANCHOR_CLOSE");
@@ -343,7 +345,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv("HPPLITE_SNAPSHOT");
     if (val) {
         int ms = parse_duration_ms(val);
-        if (ms >= 0) cfg->snapshotIntervalMs = ms;
+        if (ms >= 0) { cfg->snapshotIntervalMs = ms; cfg->snapshotGiven = 1; }
     }
 
     /* Encryption */
@@ -598,7 +600,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, "anchorclose", buf, sizeof(buf))) cfg->anchorClose = !parse_off(buf);
     if (get_uri_param(uri, HPPLITE_URI_SNAPSHOT, buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
-        if (ms >= 0) cfg->snapshotIntervalMs = ms;
+        if (ms >= 0) { cfg->snapshotIntervalMs = ms; cfg->snapshotGiven = 1; }
     }
 
     /* Encryption */
@@ -628,7 +630,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (HPPLITE_RELAY_CAP bounds a call)");
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf))) refuse_soft();
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
-    if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) { int64_t k = parse_keep_seconds(buf); if (k >= 0) cfg->keepSeconds = k; }
+    if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) { int64_t k = parse_keep_seconds(buf); if (k >= 0) { cfg->keepSeconds = k; cfg->keepAll = k == 0; } }
     if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) refuse_from();
     if (get_uri_param(uri, HPPLITE_URI_SYNC_AT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncAtMs = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_RELAY, buf, sizeof(buf)) && buf[0]) {
@@ -795,7 +797,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SNAPSHOT);
     if (val) {
         int ms = parse_duration_ms(val);
-        if (ms >= 0) cfg->snapshotIntervalMs = ms;
+        if (ms >= 0) { cfg->snapshotIntervalMs = ms; cfg->snapshotGiven = 1; }
     }
 
     /* Encryption */
@@ -822,7 +824,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_TO);
     if (val && atoll(val) > 0) cfg->syncTo = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_KEEP);
-    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) cfg->keepSeconds = k; }
+    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; cfg->keepAll = k == 0; } }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_FROM);
     if (val) refuse_from();
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_AT);

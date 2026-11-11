@@ -43,6 +43,7 @@ class FleetBook:
     def __init__(self, chain, disk, chain_id, max_age=5.0):
         self.chain, self.disk, self.chain_id = chain, disk, chain_id
         self.max_age = max_age          # a view older than this is followed again before a write is checked or a db shown (#317)
+        self.ledger = None              # the store's ledger: a prune lets go of a database's bytes in its bucket (#314)
         self.lock = threading.RLock()
         self.read_at = {}
 
@@ -70,9 +71,11 @@ class FleetBook:
                     st["block"] = latest
             except (RpcError, OSError, ValueError) as e:
                 raise ChainUnreadable(str(e)[:200])
-            self._check_roots(fleet, st)
+            moved = self._check_roots(fleet, st)
             self.disk.set_json(self._key(fleet), st)
             self.read_at[fleet] = time.time()
+            for db in moved:                            # a root holds a later head: a snapshot under it may let history go (#314)
+                self.prune(fleet, st, db)
             return st
 
     def fresh(self, fleet):
@@ -148,6 +151,8 @@ class FleetBook:
                 self.disk.set_json("f/%s/manifests.json" % fleet, pend)
 
     def _check_roots(self, fleet, st):
+        """index the roots whose manifest is held; the databases whose anchored head moved"""
+        moved = set()
         for seq in sorted((s for s, r in st["roots"].items() if r["state"] != "ok"), key=int):
             r = st["roots"][seq]
             digest = bytes.fromhex(r["manifest"][2:])
@@ -179,6 +184,87 @@ class FleetBook:
                 # path into the root, siblings bottom up with their side; a database absent from a later root keeps it
                 d["anchored"] = {"seq": int(seq), "root": r["root"], "toHeight": int(leaf["head"]["toHeight"]), "time": when,
                                  "path": [{"hash": "0x" + hsh.hex(), "left": left} for hsh, left in path]}
+                moved.add(leaf["dbId"].lower())
+        return moved
+
+    # --- snapshots and pruning (#314) ---
+    def snaps(self, fleet, db, admitted):
+        return self.disk.json(_spath(fleet, db, admitted)) or {"prunedBelow": 0, "snapshots": [], "pieces": {}}
+
+    def anchored_height(self, fleet, st, db, admitted):
+        """the height of the database's anchored head when it is of this admission (the head the store holds there is
+        the root's), else 0"""
+        d = st["dbs"].get(db) or {}
+        a = d.get("anchored")
+        if not a or not d.get("rootHead"):
+            return 0
+        held = self.disk.json(_hhpath(fleet, db, admitted, a["toHeight"]))
+        if not held:
+            latest = self.disk.json(_hpath(fleet, db, admitted))
+            held = latest if latest and int(latest["head"]["toHeight"]) == a["toHeight"] else None
+        if not held or _head_digest_hex(fleet, self.chain_id, held["head"]) != d["rootHead"]:
+            return 0
+        return a["toHeight"]
+
+    def prune(self, fleet, st, db):
+        """the store's rule (fleet.prune_height): the names below the highest checked snapshot with prune set, at or under
+        the database's anchored head of the same admission, and the snapshots below it, let go"""
+        with self.lock:
+            d = st["dbs"].get(db)
+            admitted = d.get("admittedAt") if d else None
+            if admitted is None:
+                return 0
+            sn = self.snaps(fleet, db, admitted)
+            p = F.prune_height(sn["snapshots"], self.anchored_height(fleet, st, db, admitted))
+            if p <= sn["prunedBelow"]:
+                return 0
+            key = bucket_key(fleet, db)
+            b = self.ledger.bucket(key) if self.ledger else None
+            gone = []
+            for f in self.disk.list("f/%s/%s/%d/n" % (fleet, db, admitted)):
+                if f.isdigit() and int(f) < p:
+                    rec = self.disk.read(_npath(fleet, db, admitted, int(f)))
+                    if rec:
+                        gone.append(rec[97:].decode())
+                    self.disk.delete(_npath(fleet, db, admitted, int(f)))
+                    self.disk.delete(_hhpath(fleet, db, admitted, int(f)))
+                    if b:
+                        b["bytes"] -= 97
+            keep = [s for s in sn["snapshots"] if s["height"] >= p]
+            for s in sn["snapshots"]:
+                if s["height"] < p:
+                    gone += [s["index"]] + s["chunks"]
+            for cid, e in list(sn["pieces"].items()):
+                if e["height"] < p:                    # chunks of a snapshot never completed below the prune
+                    gone.append(cid)
+                    del sn["pieces"][cid]
+            kept = {c for s in keep for c in [s["index"]] + s["chunks"]} | {c for c, e in sn["pieces"].items() if e["height"] >= p}
+            for life in self.disk.list("f/%s/%s" % (fleet, db)):
+                for f in self.disk.list("f/%s/%s/%s/n" % (fleet, db, life)) if life.isdigit() else []:
+                    rec = self.disk.read(_npath(fleet, db, int(life), int(f))) if f.isdigit() else None
+                    if rec:
+                        kept.add(rec[97:].decode())     # the same bytes at a later height, or in another life (a CID is its bytes): kept
+            for cid in set(gone) - kept:
+                self._unref(key, cid, b)
+            sn["snapshots"], sn["prunedBelow"] = keep, p
+            self.disk.set_json(_spath(fleet, db, admitted), sn)
+            if b:                                       # the bucket's pruneHeight is a rollup's: a fleet database's is per life (prunedBelow)
+                self.ledger.accrue(b, int(time.time()))
+                self.ledger.save_bucket(b)
+            return p
+
+    def _unref(self, key, cid, b):
+        if b and cid in b.get("content", {}):
+            e = b["content"].pop(cid)
+            b["bytes"] -= e["bytes"]
+            b["objects"] -= 1
+        refs = self.disk.json("c/%s.refs" % cid) or {}
+        refs.pop(key, None)
+        if refs:
+            self.disk.set_json("c/%s.refs" % cid, refs)
+        else:
+            self.disk.delete("c/%s.refs" % cid)
+            self.disk.delete("c/%s" % cid)
 
 
 def _cid(digest):
@@ -232,6 +318,12 @@ def fleet_get(h, path, query):
                "retired": d.get("retired", False), "admittedAt": admitted, "latestHead": head, "latestRoot": d.get("latestRoot")}
         if d.get("anchored"):
             out["anchored"] = d["anchored"]             # absent before the first indexed root that holds it
+        if admitted is not None:
+            sn = book.snaps(fleet, db, admitted)        # the latest checked snapshot, and how far the history is pruned (#314)
+            out["prunedBelow"] = sn["prunedBelow"]
+            if sn["snapshots"]:
+                s = sn["snapshots"][-1]
+                out["snapshot"] = {k: s[k] for k in ("height", "index", "signature", "at", "prune")}
         return h.reply(200, out)
     if len(parts) == 6 and parts[3] == "db" and parts[5] == "bucket":
         b = h.L.bucket(bucket_key(fleet, parts[4].lower()))
@@ -288,6 +380,8 @@ def fleet_post(h, path, body):
         return _post_manifest(h, fleet, body)
     if len(parts) == 5 and parts[3] == "name":
         return _post_name(h, fleet, parts[4], body)
+    if len(parts) == 6 and parts[3] == "snapshot" and parts[5].isdigit():
+        return _post_snapshot(h, fleet, parts[4], int(parts[5]), body)
     return h.reply(404, {"error": "no such endpoint"})
 
 
@@ -347,6 +441,16 @@ def _post_manifest(h, fleet, body):
 def _npath(fleet, db, admitted, height):
     """a name's record at the store, by its admission (#318)"""
     return "f/%s/%s/%d/n/%d" % (fleet, db, admitted, height)
+
+
+def _hhpath(fleet, db, admitted, height):
+    """the head written with a name, kept beside it: a snapshot's root and chain are checked against it (#314)"""
+    return "f/%s/%s/%d/h/%d.json" % (fleet, db, admitted, height)
+
+
+def _spath(fleet, db, admitted):
+    """an admission's snapshots, checked, and how far its history is pruned (#314)"""
+    return "f/%s/%s/%d/snapshots.json" % (fleet, db, admitted)
 
 
 def _hpath(fleet, db, admitted):
@@ -461,6 +565,7 @@ def _post_name(h, fleet, name, body):
                 b["height"] = height                   # the current life's (#318)
                 h.L.save_bucket(b)
             h.service.disk.write(_npath(fleet, db, admitted, height), body[-97:] + cid.encode())
+            h.service.disk.set_json(_hhpath(fleet, db, admitted, height), {"head": head, "signature": "0x" + sig.hex()})
             h.service.disk.set_json(_hpath(fleet, db, admitted), {"head": head, "signature": "0x" + sig.hex(), "admittedAt": admitted})
             return 200, {"name": name, "bytes": len(data), "cid": cid}
         if h.L.free:
@@ -468,6 +573,104 @@ def _post_name(h, fleet, name, body):
             return h.reply(status, obj)
     # a store that charges: the database's bucket pays, as a rollup's does (unbound: the same 402)
     return h.write(h.L.bucket(key), len(data) + 97, lambda: _locked(book, work))
+
+
+def _post_snapshot(h, fleet, name, part, body):
+    """a piece of a database's snapshot (#314): chunks first, the index (part 0) last; each signed by the database's
+    sequencer as Snapshot(dbId, admittedAt, height, part, sha-256). The index is checked against the head the store
+    holds at its height and the chunks it names; then a prune may follow"""
+    import hashlib
+    import hpplite_store as S
+    book = h.service.fleets
+    parsed = parse_name(name)
+    if not parsed or not body:
+        return h.reply(400, {"error": "a snapshot piece is /fleet/<fleet>/snapshot/<dbId>-<admittedAt>-<height>/<part>, the body its bytes"})
+    db, admitted, height = parsed
+    if len(body) > h.service.args.max_bytes:
+        return h.reply(413, {"error": "too large", "max": h.service.args.max_bytes})
+    sha = hashlib.sha256(body).digest()
+    sig = S.sig_bytes(h.headers.get("X-HPPLite-Signature"))
+    signer = eth.recover(F.snapshot_digest(F.domain(book.chain_id, fleet), bytes.fromhex(db[2:]), admitted, height, part, sha), sig) if sig else ""
+    with book.lock:
+        st = book.fresh(fleet)
+        d = st["dbs"].get(db)
+        if d and (not signer or not eth_same(signer, d.get("sequencer") or "")):
+            fresh = book.read_db(fleet, db)          # never refused on a view the chain has left
+            if fresh:
+                d.update(fresh)
+                book.disk.set_json(book._key(fleet), st)
+        if not d or not d.get("sequencer"):
+            return h.reply(404, {"error": "no such database in the fleet", "dbId": db})
+        if d.get("retired"):
+            return h.reply(410, {"error": "the database is retired"})
+        if not signer or not eth_same(signer, d["sequencer"]):
+            return h.reply(403, {"error": "X-HPPLite-Signature: the database's sequencer's Snapshot signature", "signer": signer})
+        if admitted != _admission(book, st, fleet, db):
+            return h.reply(409, {"error": "not the database's current admission", "admittedAt": admitted})
+        sn = book.snaps(fleet, db, admitted)
+        if height < sn["prunedBelow"]:
+            return h.reply(409, {"error": "the database's history is pruned below %d" % sn["prunedBelow"], "prunedBelow": sn["prunedBelow"]})
+        cid = _cid(sha)
+        key = bucket_key(fleet, db)
+        if part == 0:
+            try:
+                ix = json.loads(body)
+                chunks = [bytes.fromhex(c[2:]) for c in ix["chunks"]]
+                ok = (ix["protocol"] == F.PROTOCOL and ix["rollup"].lower() == fleet and ix["dbId"].lower() == db
+                      and ix["admittedAt"] == admitted and ix["height"] == height and isinstance(ix["prune"], bool) and chunks
+                      and all(len(c) == 32 for c in chunks) and re_hex32(ix["root"]) and re_hex32(ix["chain"]))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                ok = False
+            if not ok:
+                return h.reply(400, {"error": "a snapshot's index is hpplite-fleet/1's (fleet.snapshot_index) for this name"})
+            held = h.service.disk.json(_hhpath(fleet, db, admitted, height))
+            if not held:
+                latest = h.service.disk.json(_hpath(fleet, db, admitted))
+                held = latest if latest and int(latest["head"]["toHeight"]) == height else None
+            if not held:
+                return h.reply(409, {"error": "this store holds no head of the database at height %d" % height})
+            if held["head"]["stateRoot"].lower() != ix["root"].lower() or held["head"]["chainHashAfter"].lower() != ix["chain"].lower():
+                return h.reply(409, {"error": "the index's root or chain hash is not the head's at its height"})
+            if any(x["index"] == cid for x in sn["snapshots"]):
+                return h.reply(200, {"cid": cid, "bytes": len(body), "held": True})     # the same index again: a lost answer's retry
+            missing = [i + 1 for i, c in enumerate(chunks) if _cid(c) not in sn["pieces"]]
+            if missing:
+                return h.reply(409, {"error": "the index names chunks this store does not hold", "parts": missing[:16]})
+        size = len(body)
+
+        def work():
+            sn2 = book.snaps(fleet, db, admitted)
+            fresh_piece = cid not in sn2["pieces"] and not any(s["index"] == cid for s in sn2["snapshots"])
+            h.service.disk.write("c/%s" % cid, body)
+            refs = h.service.disk.json("c/%s.refs" % cid) or {}
+            refs[key] = height
+            h.service.disk.set_json("c/%s.refs" % cid, refs)
+            b = h.L.bucket(key)
+            if b and cid not in b.get("content", {}):
+                b.setdefault("content", {})[cid] = {"height": height, "bytes": size}
+                b["bytes"] += size
+                b["objects"] += 1
+                h.L.save_bucket(b)
+            if part:
+                sn2["pieces"][cid] = {"height": height, "part": part}
+            else:
+                cids = [_cid(c) for c in chunks]
+                for c in cids:
+                    sn2["pieces"].pop(c, None)
+                for old in [x for x in sn2["snapshots"] if x["height"] == height]:
+                    for c in set([old["index"]] + old["chunks"]) - set(cids):     # a snapshot at this height replaced: what only it held goes
+                        book._unref(key, c, h.L.bucket(key))
+                sn2["snapshots"] = sorted([s for s in sn2["snapshots"] if s["height"] != height]
+                                          + [{"height": height, "index": cid, "chunks": cids, "signature": "0x" + sig.hex(),
+                                              "at": ix.get("at"), "prune": ix["prune"]}], key=lambda s: s["height"])
+            book.disk.set_json(_spath(fleet, db, admitted), sn2)
+            if not part:
+                book.prune(fleet, book.state(fleet), db)
+            return 200, {"cid": cid, "bytes": size, "held": not fresh_piece}
+        if h.L.free:
+            status, obj = work()
+            return h.reply(status, obj)
+    return h.write(h.L.bucket(key), size, lambda: _locked(book, work))
 
 
 def _locked(book, work):

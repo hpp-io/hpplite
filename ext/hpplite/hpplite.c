@@ -703,6 +703,8 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->relayCap = cfg->relayCap;
     nc->storeFallback = cfg->storeFallback;
     nc->snapshotIntervalMs = cfg->snapshotIntervalMs;   /* snapshots at anchors (#221) */
+    nc->snapshotGiven = cfg->snapshotGiven;             /* ...a fleet database's by default (#314) */
+    nc->keepAll = cfg->keepAll;
     nc->anchorIntervalMs = cfg->anchorIntervalMs;   /* the anchor's cadence (#164) */
     nc->keepLease = cfg->keepLease;                  /* the lease left running at a close alone (#265) */
     nc->noAnchorAtClose = !cfg->anchorClose;         /* the close anchors nothing (#266) */

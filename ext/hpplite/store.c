@@ -1186,6 +1186,81 @@ void hpplite_store_fleet_head_digest(const unsigned char fleet[20], uint64_t cha
     hpplite_keccak256(pre, 66, digest);
 }
 
+/* hpplite-fleet/1's Snapshot (#314): Snapshot(dbId, admittedAt, height, part, digest) in ("HPPLiteFleet", "1", chainId, fleet) */
+void hpplite_store_fleet_snapshot_digest(const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t admittedAt,
+                                         uint64_t height, uint64_t part, const unsigned char sha[32], unsigned char digest[32]) {
+    static const char zDomainType[] = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+    static const char zType[] = "Snapshot(bytes32 dbId,uint256 admittedAt,uint256 height,uint256 part,bytes32 digest)";
+    unsigned char w[32 * 6], domain[32], h[32], pre[66];
+    hpplite_keccak256((const unsigned char *)zDomainType, sizeof(zDomainType) - 1, w);
+    hpplite_keccak256((const unsigned char *)"HPPLiteFleet", 12, w + 32);
+    hpplite_keccak256((const unsigned char *)"1", 1, w + 64);
+    wordInt(chainId, w + 96);
+    memset(w + 128, 0, 32); memcpy(w + 128 + 12, fleet, 20);
+    hpplite_keccak256(w, 160, domain);
+    hpplite_keccak256((const unsigned char *)zType, sizeof(zType) - 1, w);
+    memcpy(w + 32, dbId, 32);
+    wordInt(admittedAt, w + 64);
+    wordInt(height, w + 96);
+    wordInt(part, w + 128);
+    memcpy(w + 160, sha, 32);
+    hpplite_keccak256(w, 192, h);
+    pre[0] = 0x19; pre[1] = 0x01; memcpy(pre + 2, domain, 32); memcpy(pre + 34, h, 32);
+    hpplite_keccak256(pre, 66, digest);
+}
+
+int hpplite_store_recover(const unsigned char digest[32], const unsigned char sig[65], unsigned char out[20]) {
+    unsigned char pub[33];
+    HppliteSignature hs;
+    HppliteCrypto *crypto;
+    int rc;
+    memcpy(hs.sig, sig, 64);
+    hs.recid = sig[64] >= 27 ? sig[64] - 27 : sig[64];
+    if (hs.recid > 1) return -1;
+    crypto = hpplite_crypto_init();
+    if (!crypto) return -1;
+    rc = hpplite_crypto_recover_pubkey(crypto, digest, &hs, pub);
+    hpplite_crypto_free(crypto);
+    return rc != 0 || eth_address_from_compressed_pubkey(pub, out) != 0 ? -1 : 0;
+}
+
+/* A piece of a fleet database's snapshot (#314): POST /fleet/<fleet>/snapshot/<dbId>-<admittedAt>-<height>/<part>, the
+** body its bytes, X-HPPLite-Signature its Snapshot signature by this database's key; charged as a name write. 0, or -1
+** with the reason in error */
+int hpplite_store_put_fleet_snapshot(HppliteStore *s, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t admittedAt,
+                                     uint64_t height, uint64_t part, const uint8_t *data, size_t len) {
+    unsigned char sha[32], digest[32], sig[65], v;
+    char fl[43], db[67], sg[133], path[220], *zHeader;
+    HppliteSignature hs;
+    Buf out = {0};
+    long status;
+    int rc = -1;
+    if (!s || !s->hasKey || !data || !len) return -1;
+    s->error[0] = 0;
+    s->lastFailure = HPPLITE_STORE_FAIL_NONE;
+    if (protocolOk(s) != 0) return -1;
+    hpplite_store_sha256(data, len, sha);
+    hpplite_store_fleet_snapshot_digest(fleet, chainId, dbId, admittedAt, height, part, sha, digest);
+    if (hpplite_crypto_sign(s->crypto, &s->kp, digest, &hs) != 0) { snprintf(s->error, sizeof s->error, "the snapshot could not be signed"); return -1; }
+    hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);
+    sig[64] = v;
+    lowerHex(fleet, 20, fl); lowerHex(dbId, 32, db); lowerHex(sig, 65, sg);
+    zHeader = sqlite3_mprintf("X-HPPLite-Signature: %s", sg);
+    if (!zHeader) return -1;
+    snprintf(path, sizeof path, "/fleet/%s/snapshot/%s-%llu-%llu/%llu", fl, db, (unsigned long long)admittedAt, (unsigned long long)height, (unsigned long long)part);
+    status = paidPost(s, path, data, len, zHeader, &out);
+    if (status == 200) { rc = 0; s->nOk++; }
+    else if (status == -1) { /* the reason is in s->error */ }
+    else if (status == 429) storeBusy(s, out.p);
+    else if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the snapshot at %llu, part %llu: %.160s", status,
+                                    (unsigned long long)height, (unsigned long long)part, out.p ? out.p : "");
+    if (rc != 0 && s->lastFailure == HPPLITE_STORE_FAIL_NONE)
+        s->lastFailure = status == 0 ? HPPLITE_STORE_FAIL_UNREACHABLE : HPPLITE_STORE_FAIL_OTHER;
+    sqlite3_free(zHeader);
+    free(out.p);
+    return rc;
+}
+
 /* The store's latest head of a fleet database (#316): its toHeight in *pTo (0: the store holds none); 0, or -1 when the
 ** store did not answer */
 static int hexField(cJSON *o, const char *k, unsigned char *out, size_t n) {
@@ -1236,6 +1311,17 @@ int hpplite_store_fleet_view(HppliteStore *s, const unsigned char fleet[20], uin
             return -1;
         }
         out->hasHead = 1;
+    }
+    out->prunedBelow = jnum(v, "prunedBelow");
+    {
+        /* the latest checked snapshot (#314): a hint - the node checks its signature and every piece's hash */
+        cJSON *sn = cJSON_GetObjectItem(v, "snapshot");
+        const char *ix = sn && cJSON_IsObject(sn) ? jstr(sn, "index") : NULL;
+        if (ix && strlen(ix) < sizeof out->snapIndex && hexField(sn, "signature", out->snapSig, 65) == 0 && jnum(sn, "height") >= 2) {
+            out->snapHeight = jnum(sn, "height");
+            snprintf(out->snapIndex, sizeof out->snapIndex, "%s", ix);
+            out->snapAt = (int64_t)jnum(sn, "at");
+        }
     }
     cJSON_Delete(v);
     return 0;

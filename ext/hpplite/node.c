@@ -172,12 +172,15 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         node->config.hasAdmit = config->hasAdmit;
         node->config.onForeign = config->onForeign;
         node->config.anchorIntervalMs = 0;
-        node->config.snapshotIntervalMs = 0;
+        /* a snapshot every HPPLITE_FLEET_SNAPSHOT_BATCHES batches, or after snapshot= (default 24 h) with any batch since;
+        ** snapshot=0: none (#314) */
+        node->config.snapshotIntervalMs = config->snapshotGiven ? config->snapshotIntervalMs : 24 * 3600 * 1000;
         node->config.keepLease = 1;
         node->config.noAnchorAtClose = 1;
     }
     node->config.fromSnapshot = config->fromSnapshot;
     node->config.keepSeconds = config->keepSeconds;
+    node->config.keepAll = config->keepAll;
     node->config.relayUrl = node_strdup(config->relayUrl);
     node->config.relayCap = config->relayCap;
     if (node->config.relayUrl) {
@@ -2353,6 +2356,170 @@ done:
 
 static void node_prune_plan(HppliteNode *node);
 
+#define HPPLITE_FLEET_SNAPSHOT_BATCHES 100
+
+/*
+** A fleet database's snapshot (#314, doc/fleet-protocol.md "Snapshots and pruning"): after a flush, while the lease is
+** this run's, when HPPLITE_FLEET_SNAPSHOT_BATCHES batches have gone since the last one or snapshot= has passed with any
+** batch since. The page mode's image at the height just finalized, its root the head's; sealed as a batch at that
+** height is, in chunks, then the index naming them - each piece signed by this database's key. The store checks the
+** index against the head it holds there and lets the history below go once a root holds a later head (unless
+** keep=all). Not taken: said once, tried at the next flush; the batches go on regardless.
+*/
+static void node_fleet_snapshot(HppliteNode *node, uint64_t height, const unsigned char root[32]) {
+    HppliteCtx *ctx = node->ctx;
+    unsigned char *image = NULL, imgRoot[32], sha[32];
+    uint8_t *sealed = NULL;
+    size_t len = 0, sealedLen = 0, off, nChunks = 0;
+    const char *why = NULL;
+    char fl[43], db[67], hx[67], *zChunks = NULL, *zIndex = NULL;
+    uint64_t chainId, admitted, part;
+    int64_t now = (int64_t)time(NULL);
+    int prc, i;
+    if (node->config.snapshotIntervalMs <= 0 || !node->pm || !node->store || !node->hasLease || height < 2) return;
+    if (!node->snapAt) node->snapAt = now;          /* none known: the interval counts from this run */
+    if (height < node->snapHeight + HPPLITE_FLEET_SNAPSHOT_BATCHES
+        && !(height > node->snapHeight && (now - node->snapAt) * 1000 >= (int64_t)node->config.snapshotIntervalMs)) return;
+    if (ctx->blockHeight != height + 1 || ctx->openTxnId) return;          /* a commit cut over batches: the next flush */
+    prc = hpplite_pagemode_image(node->pm, &image, &len, imgRoot);
+    if (prc == SQLITE_BUSY) { sqlite3_free(image); return; }               /* commits still queued: the next flush */
+    if (prc != SQLITE_OK) why = "the image could not be built";
+    else if (memcmp(imgRoot, root, 32) != 0) why = "the image's root is not the head's";
+    if (!why && !(sealed = node_seal_at(node, height, image, len, 6, &sealedLen))) why = "the image could not be sealed";
+    sqlite3_free(image);
+    chainId = hpplite_l1_chain_id(node->l1);
+    if (!chainId) chainId = hpplite_l1_default_chain_id();
+    admitted = hpplite_l1_fleet_admitted_at(node->l1);
+    zChunks = sqlite3_mprintf("");
+    for (off = 0, part = 1; !why && off < sealedLen; off += HPPLITE_SNAPSHOT_CHUNK, part++) {
+        size_t n = sealedLen - off < HPPLITE_SNAPSHOT_CHUNK ? sealedLen - off : HPPLITE_SNAPSHOT_CHUNK;
+        char *z;
+        if (hpplite_store_put_fleet_snapshot(node->store, node->config.fleet, chainId, node->config.dbId, admitted, height, part, sealed + off, n) != 0) {
+            why = hpplite_store_error(node->store);
+            break;
+        }
+        hpplite_store_sha256(sealed + off, n, sha);
+        hpplite_bytes_to_hex(sha, 32, hx);
+        z = sqlite3_mprintf("%s%s\"0x%s\"", zChunks, nChunks ? "," : "", hx);
+        sqlite3_free(zChunks); zChunks = z;
+        nChunks++;
+    }
+    if (!why && zChunks) {
+        /* fleet.snapshot_index: canonical JSON, keys sorted */
+        char blk[67], ch[67], rt[67];
+        for (i = 0; i < 20; i++) snprintf(fl + 2 * i, 3, "%02x", node->config.fleet[i]);
+        for (i = 0; i < 32; i++) snprintf(db + 2 * i, 3, "%02x", node->config.dbId[i]);
+        hpplite_bytes_to_hex(ctx->prevBlockHash, 32, blk); hpplite_bytes_to_hex(ctx->chainHash, 32, ch); hpplite_bytes_to_hex(root, 32, rt);
+        zIndex = sqlite3_mprintf("{\"admittedAt\":%llu,\"at\":%lld,\"block\":\"0x%s\",\"bytes\":%llu,\"chain\":\"0x%s\",\"chunks\":[%s],"
+                                 "\"dbId\":\"0x%s\",\"height\":%llu,\"protocol\":\"hpplite-fleet/1\",\"prune\":%s,\"rollup\":\"0x%s\",\"root\":\"0x%s\"}",
+                                 (unsigned long long)admitted, (long long)now, blk, (unsigned long long)sealedLen, ch, zChunks, db,
+                                 (unsigned long long)height, node->config.keepAll ? "false" : "true", fl, rt);
+        if (!zIndex || hpplite_store_put_fleet_snapshot(node->store, node->config.fleet, chainId, node->config.dbId, admitted, height, 0,
+                                                        (const uint8_t *)zIndex, strlen(zIndex)) != 0)
+            why = zIndex ? hpplite_store_error(node->store) : "out of memory";
+    }
+    free(sealed);
+    sqlite3_free(zChunks);
+    sqlite3_free(zIndex);
+    node->storeBalanceOk = 0;
+    if (why) {
+        if (!node->warnedSnapshot) fprintf(stderr, "hpplite: no snapshot at height %llu: %s; tried at the next flush\n", (unsigned long long)height, why);
+        node->warnedSnapshot = 1;
+        return;
+    }
+    node->warnedSnapshot = 0;
+    node->snapHeight = height;
+    node->snapAt = now;
+    fprintf(stderr, "hpplite: snapshot at height %llu put at the store (%llu bytes in %llu chunk%s)%s\n", (unsigned long long)height,
+            (unsigned long long)sealedLen, (unsigned long long)nChunks, nChunks == 1 ? "" : "s",
+            node->config.keepAll ? ", the history kept (keep=all)" : "; the history below it goes once a root holds a later head");
+}
+
+/*
+** A fleet database rebuilt from its latest snapshot (#314): the file behind it (empty, a lost volume) or below the
+** history the store pruned. The index by its CID, its Snapshot signature this database's key's; each chunk by its
+** sha-256; the image opened with this database's keys, every page, its root the index's - all before the file is
+** touched. Then written as the file, the bookkeeping set at its height (block, chain, root), and the batches after it
+** follow; the rolling hash after the last must be the latest head's, signed by this database's key (the caller's
+** check), which ties the snapshot's chain hash to the history. 1 started there; 0 not (why said); -1 the file could
+** not be written.
+*/
+static int node_fleet_start_from_snapshot(HppliteNode *node, const HppliteFleetView *fv) {
+    HppliteCtx *ctx = node->ctx;
+    uint8_t *text = NULL, *all = NULL;
+    size_t n = 0, total = 0, want = 0;
+    unsigned char sha[32], digest[32], signer[20], me[20], root[32], chain[32], block[32];
+    char cid[64];
+    cJSON *ix = NULL, *chunks = NULL, *c;
+    HppliteBatch *batch = NULL;
+    const char *why = NULL;
+    uint64_t h = fv->snapHeight, chainId = hpplite_l1_chain_id(node->l1);
+    if (!chainId) chainId = hpplite_l1_default_chain_id();
+    text = hpplite_store_get(node->store, fv->snapIndex, &n);
+    if (text) { hpplite_store_sha256(text, n, sha); hpplite_store_cid_from_sha256(sha, cid); }
+    if (!text || strcmp(cid, fv->snapIndex) != 0) why = "its index is not at the store under its CID";
+    if (!why) {
+        hpplite_store_fleet_snapshot_digest(node->config.fleet, chainId, node->config.dbId, fv->admittedAt, h, 0, sha, digest);
+        if (hpplite_store_recover(digest, fv->snapSig, signer) != 0 || hpplite_l1_get_my_address(node->l1, me) != 0 || memcmp(signer, me, 20) != 0)
+            why = "its index is not signed by this database's key";
+    }
+    if (!why && !(ix = cJSON_ParseWithLength((const char *)text, n))) why = "its index is not JSON";
+    if (!why) {
+        const cJSON *jh = cJSON_GetObjectItemCaseSensitive(ix, "height"), *ja = cJSON_GetObjectItemCaseSensitive(ix, "admittedAt"),
+                    *jn = cJSON_GetObjectItemCaseSensitive(ix, "bytes");
+        unsigned char jdb[32];
+        chunks = cJSON_GetObjectItemCaseSensitive(ix, "chunks");
+        if (!cJSON_IsNumber(jh) || (uint64_t)jh->valuedouble != h || !cJSON_IsNumber(ja) || (uint64_t)ja->valuedouble != fv->admittedAt
+            || !cJSON_IsNumber(jn) || !cJSON_IsArray(chunks) || !json_hex32(cJSON_GetObjectItemCaseSensitive(ix, "dbId"), jdb) || memcmp(jdb, node->config.dbId, 32) != 0
+            || !json_hex32(cJSON_GetObjectItemCaseSensitive(ix, "root"), root) || !json_hex32(cJSON_GetObjectItemCaseSensitive(ix, "chain"), chain)
+            || !json_hex32(cJSON_GetObjectItemCaseSensitive(ix, "block"), block))
+            why = "its index is malformed or names another database, admission or height";
+        else want = (size_t)jn->valuedouble;
+    }
+    free(text);
+    if (!why) {
+        cJSON_ArrayForEach(c, chunks) {
+            unsigned char d[32];
+            uint8_t *piece = NULL, *grown;
+            if (json_hex32(c, d)) { hpplite_store_cid_from_sha256(d, cid); piece = node_store_get_checked(node, cid, d, &n); }
+            if (!piece) { why = "a chunk is not at the store, or not the one the index names"; break; }
+            grown = realloc(all, total + n);
+            if (!grown) { free(piece); why = "out of memory"; break; }
+            all = grown; memcpy(all + total, piece, n); total += n; free(piece);
+        }
+        if (!why && total != want) why = "its chunks do not add up to its size";
+    }
+    cJSON_Delete(ix);
+    if (!why && !(batch = node_decode_batch(node, h, all, total))) why = "it does not open with this database's keys";
+    free(all);
+    if (!why && !batch->bPages) why = "it is not a page image";
+    if (!why) {
+        HpplitePageBatch *pb = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
+        if (!pb || pb->nPages != pb->commitSize || pb->bMore || memcmp(pb->root, root, 32) != 0) why = "its image is not the state its index names";
+        if (pb) hpplite_pagebatch_free(pb);
+    }
+    if (why) {
+        if (batch) hpplite_batch_free(batch);
+        fprintf(stderr, "hpplite: the fleet's snapshot at height %llu is not used (%s)\n", (unsigned long long)h, why);
+        return 0;
+    }
+    batch->height = h;
+    node->snapApply = 1; memcpy(node->snapChain, chain, 32); memcpy(node->snapBlock, block, 32);
+    if (node_apply_pages(node, batch) != SQLITE_OK) {
+        node->snapApply = 0;
+        hpplite_batch_free(batch);
+        return -1;
+    }
+    node->snapApply = 0;
+    hpplite_batch_free(batch);
+    node->snapHeight = h;
+    node->snapAt = fv->snapAt;
+    fprintf(stderr, "hpplite: started from the fleet's snapshot at height %llu (signed by this database's key, its root matched); replaying from %llu\n",
+            (unsigned long long)h, (unsigned long long)(h + 1));
+    (void)ctx;
+    return 1;
+}
+
 /* The snapshot this anchor's manifest names (#221): a new one when snapshot= says the last is old
 ** enough, else the latest an earlier anchor named (read once from that anchor's manifest) */
 static void node_anchor_snapshot(HppliteNode *node, cJSON *m, uint64_t lastBatch, uint64_t to, const unsigned char root[32]) {
@@ -3063,6 +3230,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         node->retryAt = 0;
         hpplite_error_clear(ctx);
         test_crash_point(*pMore ? "mid_series" : "after_finalize");
+        if (node->config.hasFleet && storedOnly && !*pMore) node_fleet_snapshot(node, height, root);   /* #314 */
     } else {
         /* on the chain, not finalized here: the next flush adopts it (#90) */
         hpplite_pagemode_failed(node->pm);
@@ -3607,6 +3775,16 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
 
+    if (node->config.hasFleet && fv.snapHeight > node->snapHeight) { node->snapHeight = fv.snapHeight; node->snapAt = fv.snapAt; }   /* #314 */
+    if (node->config.hasFleet && fv.snapHeight >= 2 && fv.snapHeight <= lastBatch && node->ctx->blockHeight <= fv.snapHeight
+        && (node->ctx->blockHeight == 1 || fv.prunedBelow > node->ctx->blockHeight) && node->pm && !node->config.verifyOnly
+        && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0) {
+        /* a fleet database behind its latest snapshot (#314): from it rather than batch 1 - and below the store's prune,
+        ** the only way back */
+        int started = node_fleet_start_from_snapshot(node, &fv);
+        if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
+        if (started > 0) synced++;
+    }
     if (!node->config.hasFleet && node->config.fromSnapshot && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2
         && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0) {
         /* a new replica: from the latest snapshot rather than batch 1 (#222) */

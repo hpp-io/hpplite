@@ -3056,6 +3056,135 @@ static void test_fleet_rebuild_other_writer(void) {
     PASS();
 }
 
+/* 49. fleet= snapshots and pruning (#314, somaro's spec): a 6 MB database to 200 batches; the node snapshots it at 100
+** and 200; a root holding a later head lets the store prune below the snapshot - the batches' bytes go - and a fresh file
+** rebuilt from the snapshot and the batches after it equals the file; verify still passes after each prune */
+static long long dir_bytes(const char *dir) {
+    char cmd[400], out[64] = "";
+    snprintf(cmd, sizeof cmd, "du -sk %s | awk '{print $1 * 1024}'", dir);
+    return run_cmd(cmd, out, sizeof out) == 0 ? atoll(out) : -1;
+}
+static int same_but_counter(const char *a, const char *b) {
+    char cmd[600], out[64] = "";
+    snprintf(cmd, sizeof cmd, "cmp -l %s %s | awk '$1 < 25 || ($1 > 28 && $1 < 93) || $1 > 96' | wc -l | tr -d ' '; "
+             "[ $(stat -f %%z %s) = $(stat -f %%z %s) ] && echo same-size || echo other-size", a, b, a, b);
+    run_cmd(cmd, out, sizeof out);
+    return strncmp(out, "0\nsame-size", 11) == 0;
+}
+static void test_fleet_snapshots(void) {
+    TEST("fleet= snapshots and pruning (#314): 6 MB to 200 batches, snapshots at 100 and 200; a root past each prunes the store below it; fresh files rebuilt from them equal the file; verify passes");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000];
+    char dbHex[70], nhHex[70], sigHex[140], tools[400];
+    unsigned long long issued = 0;
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s snaps", ownerAddr, seqAddr, fl, KEY0);
+    if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex, nhHex, &issued, sigHex) != 4)
+        FAIL("the Admit (scenario 42's helper)");
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/sp_*.db* " DIR "/store_snap");
+    {   FILE *k = fopen(DIR "/anchor3.key", "w"); if (k) { fprintf(k, "%s\n", KEY3); fclose(k); } }
+    store = start_pin_service_dir(svc, sport, DIR "/store_snap");
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    snprintf(tools, sizeof tools, "%s/../fleet", svc);
+#define FS_FAIL(why) do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } FAIL(why); } while (0)
+#define FS_EXPIRE() do { snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'forceExpire(bytes32)' 0x%s --rpc-url %s >/dev/null", KEY1, fl, dbHex, RPC); \
+                         if (run_cmd(cmd, out, sizeof out) != 0) FS_FAIL("forceExpire"); } while (0)
+/* the reference anchor posts a root of what moved; the store indexes it from RootPosted and prunes on its own */
+#define FS_ANCHOR() do { snprintf(cmd, sizeof cmd, "python3 -I %s/anchor.py --rpc %s --fleet %s --key-file " DIR "/anchor3.key --store %s --send --once --force 2>&1 | tail -1", \
+                                  tools, RPC, fl, storeUrl); run_cmd(cmd, out, sizeof out); } while (0)
+#define FS_VERIFY(want) do { snprintf(cmd, sizeof cmd, "python3 -I %s/verify.py --rpc %s --fleet %s --store %s --db 0x%s", tools, RPC, fl, storeUrl, dbHex); \
+                             if (run_cmd(cmd, out, sizeof out) != 0 || !strstr(out, "\"verified\": true") || !strstr(out, want)) { printf("(verify: %.300s) ", out); FS_FAIL("verify after the prune"); } } while (0)
+    if (store < 0 || relay < 0) FS_FAIL("the store or the relay did not come up");
+    plain_db(DIR "/sp_a.db", "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB);"
+                             "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1500) INSERT INTO t(v) SELECT randomblob(4000) FROM c");
+    const char *fmt = "file:" DIR "/%s?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=0&fleet=%s&owner=%s&dbname=snaps"
+                      "&admit=%llu:0x%s&store=%s&relay=%s&keeplease=on";
+    snprintf(uri, sizeof uri, fmt, "sp_a.db", RPC, SKEY, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    sqlite3 *a = NULL;
+    if (sqlite3_open_v2(uri, &a, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { printf("(%s) ", sqlite3_errmsg(a)); sqlite3_close(a); FS_FAIL("open the 6 MB file"); }
+    /* the first state as its series, then one small batch a flush to 150 */
+    long long height = 0;
+    for (int i = 0; i < 600; i++) {
+        height = scalar(a, "SELECT height FROM hpplite_status") - 1;
+        if (height >= 150 && scalar(a, "SELECT pending FROM hpplite_status") == 0) break;
+        if (scalar(a, "SELECT pending FROM hpplite_status") == 0) {
+            snprintf(cmd, sizeof cmd, "UPDATE t SET v = randomblob(4000) WHERE id = %d", 1 + i % 1500);
+            sqlite3_exec(a, cmd, NULL, NULL, NULL);
+        }
+        if (scalar(a, "SELECT hpplite_flush()") <= 0) { printf("(flush %d: %s) ", i, status_text(a, "last_error")); break; }
+    }
+    long long bytesBefore = dir_bytes(DIR "/store_snap/c");
+    snprintf(cmd, sizeof cmd, "curl -s %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
+    run_cmd(cmd, out, sizeof out);
+    int snap100 = strstr(out, "\"height\": 100") != NULL && strstr(out, "\"prunedBelow\": 0") != NULL;
+    printf("(at %lld, the store %ld; the view %s) ", height, store_head_of(storeUrl, fl, dbHex), snap100 ? "names the snapshot at 100, nothing pruned" : out);
+    if (height != 150 || !snap100) { sqlite3_close(a); FS_FAIL("the node snapshots at 100; nothing pruned before a root"); }
+    FS_ANCHOR();
+    snprintf(cmd, sizeof cmd, "curl -s %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
+    run_cmd(cmd, out, sizeof out);
+    long long bytesAfter = dir_bytes(DIR "/store_snap/c");
+    snprintf(cmd, sizeof cmd, "curl -s -o /dev/null -w '%%{http_code}' %s/fleet/%s/name/0x%s-%llu-50", storeUrl, fl, dbHex, issued);
+    char code50[8] = ""; run_cmd(cmd, code50, sizeof code50);
+    printf("(a root at 150: the view %s, name 50 %s, the store's bytes %lld -> %lld) ", strstr(out, "\"prunedBelow\": 100") ? "pruned below 100" : out, code50, bytesBefore, bytesAfter);
+    if (!strstr(out, "\"prunedBelow\": 100") || strcmp(code50, "404") != 0 || bytesAfter >= bytesBefore - 3000000) { sqlite3_close(a); FS_FAIL("the root past the snapshot prunes the store below 100, the bytes drop"); }
+    FS_VERIFY("\"toHeight\": 150");
+    sqlite3_close(a);
+    /* a new volume: rebuilt from the snapshot at 100 and the batches 101..150 - the only way, the batches below gone */
+    FS_EXPIRE();
+    snprintf(uri, sizeof uri, fmt, "sp_b.db", RPC, SKEY, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    sqlite3 *b = NULL;
+    if (sqlite3_open_v2(uri, &b, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(b); FS_FAIL("open a fresh file"); }
+    long long hb = scalar(b, "SELECT height FROM hpplite_status") - 1;
+    char berr[300]; snprintf(berr, sizeof berr, "%s", status_text(b, "last_error"));
+    int eqB = same_but_counter(DIR "/sp_a.db", DIR "/sp_b.db");
+    printf("(rebuilt from the snapshot: height %lld, '%.100s', the bytes %s) ", hb, berr[0] ? berr : "no error", eqB ? "equal" : "DIFFER");
+    if (hb != 150 || !eqB) { sqlite3_close(b); FS_FAIL("a fresh file rebuilt from the snapshot at 100 and the batches after it equals the file"); }
+    /* on to 200 on the rebuilt file: the second snapshot; a root at 200 prunes below it */
+    for (int i = 0; i < 100 && scalar(b, "SELECT height FROM hpplite_status") - 1 < 200; i++) {
+        snprintf(cmd, sizeof cmd, "UPDATE t SET v = randomblob(4000) WHERE id = %d", 700 + i);
+        sqlite3_exec(b, cmd, NULL, NULL, NULL);
+        if (scalar(b, "SELECT hpplite_flush()") <= 0) { printf("(flush: %s) ", status_text(b, "last_error")); break; }
+    }
+    hb = scalar(b, "SELECT height FROM hpplite_status") - 1;
+    sqlite3_close(b);
+    FS_ANCHOR();
+    snprintf(cmd, sizeof cmd, "curl -s %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
+    run_cmd(cmd, out, sizeof out);
+    printf("(on to %lld: the view %s) ", hb, strstr(out, "\"prunedBelow\": 200") ? "pruned below 200" : out);
+    if (hb != 200 || !strstr(out, "\"prunedBelow\": 200")) FS_FAIL("the snapshot at 200, pruned below once a root holds 200");
+    FS_VERIFY("\"toHeight\": 200");
+    FS_EXPIRE();
+    snprintf(uri, sizeof uri, fmt, "sp_c.db", RPC, SKEY, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    sqlite3 *c = NULL;
+    int crc = sqlite3_open_v2(uri, &c, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    long long hc = crc == SQLITE_OK ? scalar(c, "SELECT height FROM hpplite_status") - 1 : -1;
+    long long ok = crc == SQLITE_OK ? scalar(c, "SELECT count(*) FROM pragma_integrity_check WHERE integrity_check = 'ok'") : 0;
+    sqlite3_close(c);
+    int eqC = same_but_counter(DIR "/sp_b.db", DIR "/sp_c.db");
+    printf("(rebuilt at 200: height %lld, integrity %lld, the bytes %s) ", hc, ok, eqC ? "equal" : "DIFFER");
+    if (hc != 200 || ok != 1 || !eqC) FS_FAIL("a fresh file rebuilt at 200 equals the file");
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0);
+#undef FS_FAIL
+#undef FS_EXPIRE
+#undef FS_ANCHOR
+#undef FS_VERIFY
+    PASS();
+}
+
 static void test_relay_no_eth(void) {
     TEST("a wallet with USDC.e and no ETH (#126): its rollup, lease and anchors through the relay, paid in USDC.e; a replica rebuilds; its ETH stays 0");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
@@ -4258,6 +4387,7 @@ int main(void) {
     if (wanted(46)) test_fleet_many();
     if (wanted(47)) test_fleet_big_first_state();
     if (wanted(48)) test_fleet_rebuild_other_writer();
+    if (wanted(49)) test_fleet_snapshots();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }
