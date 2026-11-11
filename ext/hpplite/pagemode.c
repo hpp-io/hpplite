@@ -152,6 +152,13 @@ int hpplite_pagemode_snapshot(HpplitePageMode *pm) {
 int hpplite_pagemode_applied(HpplitePageMode *pm, unsigned pgno, const unsigned char *page) {
   if (!pm || !pm->pRoot) return SQLITE_MISUSE;
   if (pm->pageSize == 0 && pgno == 1) { pm->pageSize = (page[16] << 8) | page[17]; if (pm->pageSize == 1) pm->pageSize = 65536; hpplite_pageroot_free(pm->pRoot); pm->pRoot = hpplite_pageroot_new(pm->pageSize); }
+  /* the page as written is also what this file's next commits are diffed against: a sequencer that rebuilt its file
+  ** and writes on in the same run must diff against the rebuilt pages, as every replica of the history has them - left
+  ** at the file as it was before the rebuild, its first diffs replayed elsewhere to another page (somaro's restore #3) */
+  if (pgno >= 1 && pm->pageSize > 0 && ensurePrev(pm, pgno) == SQLITE_OK) {
+    if (!pm->aPrev[pgno - 1]) pm->aPrev[pgno - 1] = sqlite3_malloc64((sqlite3_uint64)pm->pageSize);
+    if (pm->aPrev[pgno - 1]) memcpy(pm->aPrev[pgno - 1], page, (size_t)pm->pageSize);
+  }
   return hpplite_pageroot_set(pm->pRoot, pgno, page);
 }
 /* A replica rebuilt in another file and copied over this one (#166): its page tree is this file's now */
@@ -165,8 +172,10 @@ int hpplite_pagemode_take_root(HpplitePageMode *pm, HpplitePageMode *from) {
 }
 
 int hpplite_pagemode_applied_size(HpplitePageMode *pm, unsigned nPages) {
+  unsigned pg;
   if (!pm || !pm->pRoot) return SQLITE_MISUSE;
   pm->sizeThen = nPages;
+  for (pg = nPages + 1; pg <= pm->nPrev; pg++) { sqlite3_free(pm->aPrev[pg - 1]); pm->aPrev[pg - 1] = NULL; }   /* cut off with the file */
   return hpplite_pageroot_truncate(pm->pRoot, nPages);
 }
 
