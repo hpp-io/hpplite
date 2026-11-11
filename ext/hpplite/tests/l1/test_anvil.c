@@ -25,6 +25,7 @@
 #include "eth/eth_client.h"
 #include "batch.h"
 #include "pages.h"
+#include <ctype.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -2273,7 +2274,16 @@ static void test_fleet_node_writes(void) {
     }
     long long height = scalar(w, "SELECT height FROM hpplite_status");
     long posts = fleet_relay_posts();
+    char sFleet[80], sDb[80], wantFleet[80], wantDb[80];
+    snprintf(sFleet, sizeof sFleet, "%s", status_text(w, "fleet"));
+    snprintf(sDb, sizeof sDb, "%s", status_text(w, "db_id"));
+    long long sEpoch = status_int(w, "epoch");
     sqlite3_close(w);
+    snprintf(wantFleet, sizeof wantFleet, "%s", fl);
+    for (char *q = wantFleet; *q; q++) *q = (char)tolower((unsigned char)*q);
+    snprintf(wantDb, sizeof wantDb, "0x%s", dbHex);
+    printf("(status: fleet %.10s, db_id %.10s, epoch %lld) ", sFleet, sDb, sEpoch);
+    if (strcmp(sFleet, wantFleet) != 0 || strcmp(sDb, wantDb) != 0 || sEpoch != 1) FN_FAIL("hpplite_status names the fleet, the dbId and the lease's epoch");
     snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
     run_cmd(cmd, out, sizeof out);
     char want[64];

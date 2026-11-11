@@ -653,7 +653,9 @@ and what runs out and when at the recent rate, NULL when nothing does), and
 height its soft batches reach, with `height` staying the anchored one; and
 how many times the chain committed another batch than the store served, each
 followed by a rebuild), and `snapshot_height` (#221: the latest snapshot the
-anchors name, NULL for none). `state` says what this node is doing about posting: `sequencing`,
+anchors name, NULL for none), and `fleet`, `db_id` and `epoch` (#316: with
+`fleet=`, the shared rollup, the database's dbId and the lease epoch this run's
+heads are signed at; NULL for a rollup of its own). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:
