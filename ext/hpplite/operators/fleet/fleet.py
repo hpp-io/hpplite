@@ -107,6 +107,44 @@ def verify(leaf_hash, path, want_root):
     return h == want_root
 
 
+def build_root(chain_id, rollup, seq, records, heads, held):
+    """The manifest builder's rule (doc/fleet-protocol.md, "Building a root"): which databases a root holds, the same for
+    every builder from the same inputs. records: {dbId: {owner, sequencer, nameHash, epoch, admittedAt, retired}} - the
+    fleet's records read at the block the build starts from; heads: {dbId: {head, signature, admittedAt}} - the store's
+    latest head of each database (bytes fields as bytes); held: {dbId: headDigest} - the head in each database's latest
+    root. Returns (items, entries, root, manifest bytes, manifest digest, left): left names why each other database is
+    not in this root. No leaf: root None, nothing to post."""
+    dom = domain(chain_id, rollup)
+    items, entries, left = [], [], {}
+    hx = lambda b: "0x" + b.hex()
+    for db in sorted(records, key=lambda d: int.from_bytes(d, "big")):
+        r, h = records[db], heads.get(db)
+        why = None
+        if r.get("retired") or not r.get("owner"):
+            why = "retired"
+        elif not h:
+            why = "no head"
+        elif h.get("admittedAt") != r["admittedAt"]:
+            why = "another admission"
+        elif h["head"]["epoch"] != r["epoch"]:
+            why = "not the record's epoch: the next root"
+        hd = head_digest(dom, h["head"]) if h and not why else None
+        if not why and eth.recover(hd, h["signature"]).lower() != r["sequencer"].lower():
+            why = "not the database's sequencer"
+        if not why and held.get(db) == hd:
+            why = "unchanged since its latest root"
+        if why:
+            left[db] = why
+            continue
+        entries.append((db, leaf(db, r["owner"], r["nameHash"], hd)))
+        items.append({"dbId": hx(db), "owner": r["owner"].lower(), "nameHash": hx(r["nameHash"]),
+                      "head": {k: (hx(v) if isinstance(v, bytes) else v) for k, v in h["head"].items()}, "signature": hx(h["signature"])})
+    if not entries:
+        return [], [], None, None, None, left
+    data, digest = manifest(chain_id, rollup, seq, items)
+    return items, entries, root(entries), data, digest, left
+
+
 def manifest(chain_id, rollup, seq, items):
     """the manifest a root's digest names, as bytes: canonical JSON (sorted keys, no spaces), leaves by dbId.
     items: [{dbId, owner, nameHash, head, signature}] with bytes as 0x-hex. Its digest is sha-256: the store keeps

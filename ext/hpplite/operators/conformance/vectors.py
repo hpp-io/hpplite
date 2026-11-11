@@ -184,10 +184,32 @@ def fleet_vectors():
         batch_heads.append({"data": hx(data), "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in head.items()},
                             "headDigest": hx(hd), "key": KEYS[0], "signature": hx(eth.sign(key(0), hd))})
         prev = after
+    # the manifest builder's rule (somaro's decision): from the records at the build's block, the store's heads and the
+    # heads in the latest roots - dbs[0] and dbs[4] moved; dbs[1] signed by another key than its record's sequencer;
+    # dbs[2] at an older epoch than its record's (a fence raced the build); dbs[3] unchanged since its latest root; and a
+    # retired database
+    seqs = [eth.address(key(i % 3)).lower() for i in range(5)]
+    gone = fleet.db_id(owners[0], "gone")
+    recs = {d["dbId"]: {"owner": d["owner"], "sequencer": seqs[i], "nameHash": fleet.name_hash(d["name"]), "epoch": d["head"]["epoch"],
+                        "admittedAt": 1800000000, "retired": False} for i, d in enumerate(dbs)}
+    recs[dbs[1]["dbId"]]["sequencer"] = eth.address(key(2)).lower() if seqs[1] != eth.address(key(2)).lower() else eth.address(key(0)).lower()
+    recs[dbs[2]["dbId"]]["epoch"] = dbs[2]["head"]["epoch"] + 1
+    recs[gone] = {"owner": owners[0], "sequencer": seqs[0], "nameHash": fleet.name_hash("gone"), "epoch": 4, "admittedAt": 1800000000, "retired": True}
+    bheads = {d["dbId"]: {"head": d["head"], "signature": d["signature"], "admittedAt": 1800000000} for d in dbs}
+    bheld = {dbs[3]["dbId"]: dbs[3]["headDigest"]}
+    _, bentries, broot, _, bdigest, bleft = fleet.build_root(chain_id, rollup, 8, recs, bheads, bheld)
+    jrec = lambda r: {k: (hx(v) if isinstance(v, bytes) else v) for k, v in r.items()}
+    builder = {"seq": 8,
+               "records": {hx(d): jrec(r) for d, r in recs.items()},
+               "heads": {hx(d): {"head": {k: (hx(v) if isinstance(v, bytes) else v) for k, v in h["head"].items()},
+                                 "signature": hx(h["signature"]), "admittedAt": h["admittedAt"]} for d, h in bheads.items()},
+               "held": {hx(d): hx(v) for d, v in bheld.items()},
+               "expect": {"leaves": [hx(d) for d, _ in sorted(bentries, key=lambda e: int.from_bytes(e[0], "big"))],
+                          "left": {hx(d): why for d, why in bleft.items()}, "root": hx(broot), "manifestDigest": hx(bdigest)}}
     # a batch's name at the store, by its admission (#318): a re-admission (Admitted after Retired) starts a new life
     names = [{"dbId": hx(dbs[0]["dbId"]), "admittedAt": a, "height": h, "name": fleet.store_name(dbs[0]["dbId"], a, h)}
              for a, h in ((1800000000, 1), (1800000000, 2), (1800000900, 1))]
-    return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup, "batchHeads": batch_heads, "names": names,
+    return {"protocol": fleet.PROTOCOL, "chainId": chain_id, "rollup": rollup, "batchHeads": batch_heads, "names": names, "builder": builder,
             "databases": [{"name": d["name"], "owner": d["owner"], "dbId": hx(d["dbId"]), "nameHash": hx(fleet.name_hash(d["name"])),
                            "head": {k: (hx(x) if isinstance(x, bytes) else x) for k, x in d["head"].items()},
                            "headDigest": hx(d["headDigest"]), "key": d["key"], "signature": hx(d["signature"]), "leaf": hx(d["leaf"])}

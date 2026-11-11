@@ -80,6 +80,37 @@ under that CID as a range's manifest is:
 with `leaves` ordered by `dbId`. Anyone can cut a database's path from it; it
 carries no database's content and names only as hashes.
 
+## Building a root
+
+The fleet's anchor builds root `seq = rootSeq + 1` from three inputs, and two
+builders given the same inputs build the same root (`fleet.build_root`,
+vectors `fleet.builder`):
+
+- **the records** - every database's `db(dbId)` read at one block `B`, the
+  block the build starts from (owner, sequencer, nameHash, epoch, admittedAt,
+  retired);
+- **the heads** - the store's latest head of each database
+  (`GET /fleet/<fleet>/heads`, or `GET .../db/<db>`'s `latestHead`), with the
+  admission it was written under;
+- **what the latest roots hold** - each database's head digest in its latest
+  root (the store's `anchored`, checked by its path).
+
+A database's leaf goes in when none of these holds, checked in this order: its
+record is retired (or there is none); it has no head; the head is of another
+admission than the record's; the head's epoch is not the record's epoch at `B`
+(a fence raced the build: the database keeps the leaf of its latest root, and
+its new head goes in the next); the head's signature does not recover to the
+record's sequencer; the head is the one its latest root holds (nothing moved).
+A head of an older epoch is never put over a newer one: the store takes only
+the lease's epoch, and the builder only the record's at `B`. Leaves by `dbId`
+ascending; the manifest and the root as above. No leaf, no root.
+
+When: a root is built `anchor` after the last root on chain (`RootPosted`'s
+block time; for a fleet's first root, after its first head) and only when the
+rule gives a leaf - the rule a rollup's anchor follows (#308, #309); an idle
+fleet sends nothing. The interval is the operator's (24 h by default for the
+reference `hpplite-anchor`; somarod's own setting).
+
 ## Finding a database's latest root, and its epoch there
 
 - The store keeps, per fleet and `dbId`, the sequence of the latest root that
