@@ -42,6 +42,7 @@ static struct cJSON *node_snapshot_index(HppliteNode *node, const char *zIndex, 
 static void node_cap_batch_limit(HppliteNode *node);
 static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
 static int node_check_rollup(HppliteNode *node);
+#include <sys/stat.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -169,6 +170,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         node->config.admitIssuedAt = config->admitIssuedAt;
         memcpy(node->config.admitSig, config->admitSig, 65);
         node->config.hasAdmit = config->hasAdmit;
+        node->config.onForeign = config->onForeign;
         node->config.anchorIntervalMs = 0;
         node->config.snapshotIntervalMs = 0;
         node->config.keepLease = 1;
@@ -429,7 +431,13 @@ static void node_pages_decide_snapshot(HppliteNode *node) {
     unsigned char have[32];
     if (!node->pm || node->pagesSnapshotDecided || node->config.verifyOnly || node->follower) return;
     hpplite_pagemode_root(node->pm, have);
-    if (node->ctx->blockHeight <= 1 || memcmp(have, node->ctx->stateRoot, 32) != 0) hpplite_pagemode_snapshot(node->pm);
+    if (node->ctx->blockHeight <= 1 || memcmp(have, node->ctx->stateRoot, 32) != 0) {
+        /* somaro#93, case 1: a fleet database's file that is not what its bookkeeping last sent goes whole, said once */
+        if (node->config.hasFleet && node->ctx->blockHeight > 1 && !node->fleetForeignFile)
+            fprintf(stderr, "hpplite: %s is not the state of height %llu it last sent: the file goes whole as height %llu\n",
+                    sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1), (unsigned long long)node->ctx->blockHeight);
+        hpplite_pagemode_snapshot(node->pm);
+    }
     node->pagesSnapshotDecided = 1;
 }
 
@@ -466,6 +474,17 @@ static int node_file_has_log(sqlite3 *db) {
     return sqlite3_table_column_metadata(db, "main", "_hpplite_meta", "next_height", NULL, NULL, NULL, NULL, NULL) == SQLITE_OK;
 }
 
+/* somaro#93: the file holds a database - a schema, or more than the one page an empty file switched to WAL has; a
+** fresh file (absent, or opened and empty) is not one */
+static int node_file_has_pages(sqlite3 *db) {
+    sqlite3_stmt *q = NULL;
+    int has = 0;
+    if (sqlite3_prepare_v2(db, "SELECT (SELECT count(*) FROM sqlite_master) > 0 OR (SELECT page_count FROM pragma_page_count()) > 1", -1, &q, NULL) == SQLITE_OK
+        && sqlite3_step(q) == SQLITE_ROW) has = sqlite3_column_int(q, 0);
+    sqlite3_finalize(q);
+    return has;
+}
+
 /* Page capture is the one capture (#253): the pages each commit wrote, read from the WAL, the bookkeeping in a
 ** sidecar. It needs a file: an in-memory database has no WAL and no path */
 static int node_init_tracking(HppliteNode *node) {
@@ -484,6 +503,26 @@ static int node_init_tracking(HppliteNode *node) {
         return SQLITE_ERROR;
     }
     sqlite3_busy_timeout(node->db, 5000);
+    if (node->config.hasFleet && node->store && !node->config.verifyOnly && !node->config.onForeign) {
+        /* somaro#93, case 2 with no onforeign=: a file with pages and no bookkeeping beside it, against a history at the
+        ** store - refused before the sidecar or the page capture touch anything (the switch to WAL alone rewrites the
+        ** header), and before any claim */
+        char *zSide = sqlite3_mprintf("%s-hpplite.db", zFile);
+        struct stat sst;
+        HppliteFleetView v;
+        int pages = node_file_has_pages(node->db), side = zSide && stat(zSide, &sst) == 0;
+        sqlite3_free(zSide);
+        if (pages && !side && hpplite_store_fleet_view(node->store, node->config.fleet, hpplite_l1_default_chain_id(), node->config.dbId, &v) == 0
+            && v.hasHead && v.toHeight > 0) {
+            static char why[PATH_MAX + 300];                  /* the init error is a static string */
+            snprintf(why, sizeof why, "%s has pages and no bookkeeping, and the fleet's history of this database is at height %llu: refused; "
+                     "onforeign=history rebuilds the file from the history, onforeign=file sends the file as height %llu",
+                     zFile, (unsigned long long)v.toHeight, (unsigned long long)v.toHeight + 1);
+            hpplite_set_init_error(why);
+            fprintf(stderr, "hpplite: %s\n", hpplite_init_error());
+            return SQLITE_ERROR;
+        }
+    }
     rc = node_init_pages(node, zFile);
     if (rc != SQLITE_OK) return rc;
 
@@ -780,6 +819,17 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
         }
         if (v.hasHead && v.toHeight + 1 > node->ctx->blockHeight) {
             int i, atEpoch = 0;
+            const char *zFile = sqlite3_db_filename(node->db, "main");
+            /* somaro#93, case 2: pages and no bookkeeping against a history at the store - which is true is not known
+            ** here, so onforeign= decides; unset, nothing is touched, no claim (an empty or absent file is case 3) */
+            int foreign = node->ctx->blockHeight <= 1 && zFile && zFile[0] && node_file_has_pages(node->db);
+            if (foreign && !node->config.onForeign) {
+                hpplite_error(node->ctx, "%s has pages and no bookkeeping, and the fleet's history of this database is at height %llu: refused; "
+                              "onforeign=history rebuilds the file from the history, onforeign=file sends the file as height %llu",
+                              zFile, (unsigned long long)v.toHeight, (unsigned long long)v.toHeight + 1);
+                node->state = HPPLITE_STATE_ERROR;
+                return;
+            }
             node_learn_batch_limit(node);                     /* the relay, before the claim */
             node->leaseRecheckAt = 0;
             if (!node_ensure_lease(node)) {
@@ -800,14 +850,57 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                 node->state = HPPLITE_STATE_ERROR;
                 return;
             }
-            fprintf(stderr, "hpplite: fleet database behind the store: rebuilding heights %llu to %llu from it\n",
-                    (unsigned long long)node->ctx->blockHeight, (unsigned long long)v.toHeight);
+            if (foreign && node->config.onForeign == 2) {
+                /* onforeign=file: the bookkeeping as of the history's height N - batch N's hash, the signed head's
+                ** rolling hash and root - and the file, not that root, goes whole as N+1 (case 1's path) */
+                size_t n = 0;
+                unsigned char blk[32];
+                uint8_t *raw = hpplite_store_get_fleet_name(node->store, node->config.fleet, node->config.dbId, v.toHeight, &n);
+                unsigned char me[20];
+                if (!raw || (hpplite_l1_get_my_address(node->l1, me) == 0 && memcmp(me, v.headSigner, 20) != 0)) {
+                    free(raw);
+                    hpplite_error(node->ctx, "onforeign=file: the store's height %llu could not be read or is not this database's key's: %s",
+                                  (unsigned long long)v.toHeight, hpplite_store_error(node->store));
+                    node->state = HPPLITE_STATE_ERROR;
+                    return;
+                }
+                hpplite_sha256(raw, n, blk);
+                free(raw);
+                if (hppliteSetMetaAt(node->ctx, v.toHeight, blk, v.chainAfter, v.stateRoot) != SQLITE_OK) {
+                    hpplite_error(node->ctx, "onforeign=file: the bookkeeping could not be set to height %llu", (unsigned long long)v.toHeight);
+                    node->state = HPPLITE_STATE_ERROR;
+                    return;
+                }
+                node->fleetForeignFile = 1;
+                fprintf(stderr, "hpplite: %s sent whole as height %llu over the fleet's history (onforeign=file)\n", zFile, (unsigned long long)v.toHeight + 1);
+            } else {
+                if (foreign) {
+                    /* onforeign=history: the batches are page diffs from an empty file, so the file is emptied first - only
+                    ** now, the lease this run's and the store at its epoch, so a refused claim never costs the file */
+                    char *zWal = sqlite3_mprintf("%s-wal", zFile);
+                    if (truncate(zFile, 0) != 0 || (zWal && access(zWal, F_OK) == 0 && truncate(zWal, 0) != 0)) {
+                        sqlite3_free(zWal);
+                        hpplite_error(node->ctx, "onforeign=history: %s could not be emptied for the rebuild", zFile);
+                        node->state = HPPLITE_STATE_ERROR;
+                        return;
+                    }
+                    sqlite3_free(zWal);
+                    node->fleetForeignHistory = v.toHeight;
+                }
+                fprintf(stderr, "hpplite: fleet database behind the store: rebuilding heights %llu to %llu from it\n",
+                        (unsigned long long)node->ctx->blockHeight, (unsigned long long)v.toHeight);
+            }
         }
     }
     if (node->l1) {
         node_learn_batch_limit(node);
         if (hpplite_node_sync_from_l1(node, 1) < 0) {
             node->state = HPPLITE_STATE_ERROR;
+        } else if (node->fleetForeignHistory && node->ctx->blockHeight == node->fleetForeignHistory + 1 && (node->fleetForeignHistory = 0, 1)) {
+            /* somaro#93: onforeign=history - the file is now the history's state, as a rebuild of an empty file */
+            fprintf(stderr, "hpplite: %s replaced by the fleet's history at height %llu (onforeign=history)\n",
+                    sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1));
+            if (!node->follower && !node->config.verifyOnly && (node->cipher || node->config.noEncrypt)) node_ensure_lease(node);
         } else if (!node->follower && !node->config.verifyOnly && (node->cipher || node->config.noEncrypt)) {
             node_ensure_lease(node);          /* an audit never takes it (#5) */
         }

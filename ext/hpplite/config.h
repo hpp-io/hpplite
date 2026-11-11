@@ -180,6 +180,8 @@ typedef struct HppliteConfig {
     uint64_t admitIssuedAt;          /* admit=<issuedAt>:0x<signature>: the fleet's Admit, for a database with no live record */
     unsigned char admitSig[65];
     int hasAdmit;
+    int onForeign;                   /* onforeign= / HPPLITE_ON_FOREIGN (somaro#93): 0 unset (refuse), 1 history, 2 file */
+    char onForeignBad[48];           /* a value that is neither, refused with fleet= */
     unsigned char funder[20];        /* funder= (#272): the external funding wallet the bucket must be bound to */
     int hasFunder;
     int64_t keepSeconds;             /* keep= (#223): how long the store keeps the history behind the latest snapshot; 0: all of it */

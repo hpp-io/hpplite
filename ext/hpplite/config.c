@@ -155,6 +155,11 @@ static void fleet_param(HppliteConfig *cfg, const char *name, const char *val) {
                                       else snprintf(gConfigError, sizeof(gConfigError), "fleet=%.48s: not an address", val); }
     else if (strcmp(name, "owner") == 0) { if (hex_to_bytes(val, cfg->fleetOwner, 20) == 0) cfg->hasFleetOwner = 1;
                                            else snprintf(gConfigError, sizeof(gConfigError), "owner=%.48s: not an address", val); }
+    else if (strcmp(name, "onforeign") == 0) {
+        if (strcasecmp(val, "history") == 0) cfg->onForeign = 1;
+        else if (strcasecmp(val, "file") == 0) cfg->onForeign = 2;
+        else snprintf(cfg->onForeignBad, sizeof cfg->onForeignBad, "onforeign=%.32s", val);
+    }
     else if (strcmp(name, "admit") == 0) {
         const char *colon = strchr(val, ':');
         cfg->admitIssuedAt = strtoull(val, NULL, 10);
@@ -179,6 +184,15 @@ static void fleet_check(HppliteConfig *cfg, const int uri[7]) {
     if (!cfg->dbName || !cfg->dbName[0]) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: dbname= is required (with owner= it names the database)"); return; }
     if (!cfg->storeUrl) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: store= is required: a fleet's batches live at a store"); return; }
     if (!cfg->relayUrl) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: relay= is required: a fleet database joins and claims through a relay"); return; }
+    if (!cfg->onForeign && !cfg->onForeignBad[0]) {          /* the parameter wins over HPPLITE_ON_FOREIGN (somaro#93) */
+        const char *ev = getenv("HPPLITE_ON_FOREIGN");
+        if (ev && ev[0]) {
+            if (strcasecmp(ev, "history") == 0) cfg->onForeign = 1;
+            else if (strcasecmp(ev, "file") == 0) cfg->onForeign = 2;
+            else snprintf(cfg->onForeignBad, sizeof cfg->onForeignBad, "HPPLITE_ON_FOREIGN=%.24s", ev);
+        }
+    }
+    if (cfg->onForeignBad[0]) { snprintf(gConfigError, sizeof(gConfigError), "%s: onforeign takes history or file", cfg->onForeignBad); return; }
     for (i = 0; i < 7; i++) {
         const char *ev = getenv(k[i].env);
         int env = ev != NULL && ev[0];
@@ -631,8 +645,8 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     }
 
     {   /* fleet= (#316): params only */
-        static const char *names[] = { "fleet", "owner", "admit" };
-        for (int i = 0; i < 3; i++) if (get_uri_param(uri, names[i], buf, sizeof(buf))) fleet_param(cfg, names[i], buf);
+        static const char *names[] = { "fleet", "owner", "admit", "onforeign" };
+        for (int i = 0; i < 4; i++) if (get_uri_param(uri, names[i], buf, sizeof(buf))) fleet_param(cfg, names[i], buf);
         static const char *given[7] = { HPPLITE_URI_CONTRACT, HPPLITE_URI_FACTORY, "anchor", HPPLITE_URI_CHECKPOINT, HPPLITE_URI_KEEP,
                                         HPPLITE_URI_SNAPSHOT, "anchorclose" };
         int uriGiven[7];
@@ -829,8 +843,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (cfg->aliasIntervalMs && cfg->storeUrl) { if (!cfg->anchorGiven) cfg->anchorIntervalMs = cfg->aliasIntervalMs; }
     else if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;
     {   /* fleet= (#316): params only */
-        static const char *names[] = { "fleet", "owner", "admit" };
-        for (int i = 0; i < 3; i++) fleet_param(cfg, names[i], sqlite3_uri_parameter(filename, names[i]));
+        static const char *names[] = { "fleet", "owner", "admit", "onforeign" };
+        for (int i = 0; i < 4; i++) fleet_param(cfg, names[i], sqlite3_uri_parameter(filename, names[i]));
         static const char *given[7] = { HPPLITE_URI_CONTRACT, HPPLITE_URI_FACTORY, "anchor", HPPLITE_URI_CHECKPOINT, HPPLITE_URI_KEEP,
                                         HPPLITE_URI_SNAPSHOT, "anchorclose" };
         int uriGiven[7];

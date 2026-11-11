@@ -434,6 +434,35 @@ static void test_fleet_params(void) {
     PASS();
 }
 
+/* somaro#93: onforeign= (history|file) or HPPLITE_ON_FOREIGN with fleet=, the parameter winning; any other value refuses */
+static void test_fleet_onforeign_param(void) {
+    TEST("fleet=: onforeign=history|file, HPPLITE_ON_FOREIGN when no parameter, the parameter winning; another value refuses the open naming it (somaro#93)");
+    static const char *base = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+                              "&store=http://127.0.0.1:1&relay=http://127.0.0.1:2&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes";
+    char uri[600];
+    HppliteConfig *c;
+    int got[5];
+    unsetenv("HPPLITE_ON_FOREIGN");
+    c = hpplite_config_load(base); got[0] = c && !hpplite_config_error() ? c->onForeign : -1; if (c) hpplite_config_free(c);
+    snprintf(uri, sizeof uri, "%s&onforeign=history", base);
+    c = hpplite_config_load(uri); got[1] = c && !hpplite_config_error() ? c->onForeign : -1; if (c) hpplite_config_free(c);
+    setenv("HPPLITE_ON_FOREIGN", "file", 1);
+    c = hpplite_config_load(base); got[2] = c && !hpplite_config_error() ? c->onForeign : -1; if (c) hpplite_config_free(c);
+    c = hpplite_config_load(uri); got[3] = c && !hpplite_config_error() ? c->onForeign : -1; if (c) hpplite_config_free(c);
+    setenv("HPPLITE_ON_FOREIGN", "both", 1);
+    c = hpplite_config_load(base);
+    int envBad = hpplite_config_error() && strstr(hpplite_config_error(), "HPPLITE_ON_FOREIGN=both: onforeign takes history or file") != NULL;
+    if (c) hpplite_config_free(c);
+    unsetenv("HPPLITE_ON_FOREIGN");
+    snprintf(uri, sizeof uri, "%s&onforeign=keep", base);
+    c = hpplite_config_load(uri);
+    int uriBad = hpplite_config_error() && strstr(hpplite_config_error(), "onforeign=keep: onforeign takes history or file") != NULL;
+    if (c) hpplite_config_free(c);
+    printf("  unset %d, onforeign=history %d, HPPLITE_ON_FOREIGN=file %d, both %d; bad env %d, bad parameter %d\n", got[0], got[1], got[2], got[3], envBad, uriBad);
+    if (got[0] != 0 || got[1] != 1 || got[2] != 2 || got[3] != 1 || !envBad || !uriBad) { FAIL("onforeign: unset 0, history 1, file 2, the parameter winning, another value refused"); }
+    PASS();
+}
+
 /* #254: the money knobs are the deployment's, not the connection string's. Each in a URI refuses the open naming
 ** its environment variable; the variable is honoured; storefallback gets the twin it never had */
 static void test_money_knobs_env_only(void) {
@@ -515,6 +544,7 @@ int main(void) {
     test_keep_not_capped();
     test_relay_exact_only();
     test_fleet_params();
+    test_fleet_onforeign_param();
     test_money_knobs_env_only();
     test_from_soft_gone();
 

@@ -285,6 +285,30 @@ and checks the rolling hash after the last against the latest head's
 on. While another instance holds the lease, such a file is not opened as the
 sequencer.
 
+**What the file is at open (somaro decision 0018).** Before any claim:
+1. Bookkeeping beside the file, but the file is not what it last sent (the app
+   deleted its database and made another at the same path, or wrote with no
+   sequencer running): the file goes whole as the next height N+1, whatever
+   is set; said once, `hpplite: <file> is not the state of height N it last
+   sent: the file goes whole as height N+1`.
+2. No bookkeeping, a file with pages (a schema, or more than an empty file's
+   page), and a history at the store at N > 0: which is true is not known
+   here, so `onforeign=` (or `HPPLITE_ON_FOREIGN`; the parameter wins) decides.
+   Unset, the open fails before the sidecar or the page capture touch the file
+   and before any claim: `<file> has pages and no bookkeeping, and the fleet's
+   history of this database is at height N: refused; onforeign=history rebuilds
+   the file from the history, onforeign=file sends the file as height N+1`.
+   `history`: the lease, the store at this run's epoch, then the file emptied
+   and rebuilt - byte for byte what a rebuild of an empty file gives (the
+   batches are page diffs from an empty file); `<file> replaced by the fleet's
+   history at height N (onforeign=history)`. `file`: the lease, then the
+   bookkeeping as of N (batch N's hash, the signed head's rolling hash and
+   root) and the file whole as N+1; `<file> sent whole as height N+1 over the
+   fleet's history (onforeign=file)`. Another value refuses the open.
+3. An empty or absent file with a history rebuilds (above); a file the
+   bookkeeping last sent opens; a database with no history and a file with
+   pages is a first open (the file as batch 1). `onforeign=` plays no part.
+
 ## Not decided here
 
 The contract (`contracts/src/HPPLiteFleet.sol`, `HPPLiteFleetFactory.sol`,

@@ -86,6 +86,7 @@ typedef struct HppliteNodeConfig {
     uint64_t admitIssuedAt;
     unsigned char admitSig[65];
     int hasAdmit;
+    int onForeign;                  /* somaro#93: a file with pages, no bookkeeping, history at the store - 0 refuse, 1 history, 2 file */
     int hasFunder;
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
     int fromSnapshot;               /* a new replica (no role=verify, an empty file) starts from the latest snapshot (#222); a verifier
@@ -123,6 +124,8 @@ typedef struct HppliteNode {
     int warnedForeignLease;         /* "someone else holds the lease" said once */
     int warnedClaim;                /* fleet= (#316 d): why the claim failed, said once per episode */
     int warnedFenced;               /* fleet= (#316 d): "fenced" said once */
+    int fleetForeignFile;           /* somaro#93: onforeign=file took the file over the history (its own line said) */
+    uint64_t fleetForeignHistory;   /* somaro#93: onforeign=history replaces the file with the history at this height */
     int leaseHeldElsewhere;         /* The last look found another instance's lease (hpplite_status.state = waiting) */
     int lastFetchForeign;           /* The last fetch found a batch that fails our authentication */
     int failStreak;                 /* Consecutive flushes that did not reach L1 */

@@ -2509,6 +2509,181 @@ static void test_fleet_fence(void) {
     PASS();
 }
 
+/* 45. fleet= (somaro decision 0018, somaro#93): what the node finds at open decides. Case 1 - the file replaced beside its
+** bookkeeping: it goes whole as the next height, said once. Case 2 - pages and no bookkeeping against a history at the
+** store: unset onforeign= refuses, nothing touched, no call; onforeign=history replaces the file with the history;
+** onforeign=file sends the file whole as N+1. A fresh file rebuilt from the store is the check of what the store holds. */
+static void file_sha(const char *path, char out[80]) {
+    char cmd[400];
+    snprintf(cmd, sizeof cmd, "shasum -a 256 %s | cut -c1-64", path);
+    if (run_cmd(cmd, out, 80) != 0) out[0] = 0;
+    out[strcspn(out, "\r\n")] = 0;
+}
+static void plain_db(const char *path, const char *sql) {
+    sqlite3 *p = NULL;
+    char cmd[400];
+    snprintf(cmd, sizeof cmd, "rm -f %s %s-wal %s-shm %s-hpplite*", path, path, path, path);
+    (void)!system(cmd);
+    if (sqlite3_open(path, &p) == SQLITE_OK) sqlite3_exec(p, sql, NULL, NULL, NULL);
+    sqlite3_close(p);
+}
+static char *dump_of(const char *path) {
+    char cmd[400];
+    static char out[8000];
+    snprintf(cmd, sizeof cmd, "sqlite3 'file:%s?mode=ro' .dump 2>/dev/null | grep -v '^PRAGMA\\|_hpplite'", path);
+    if (run_cmd(cmd, out, sizeof out) != 0) out[0] = 0;
+    return out;
+}
+static void test_fleet_onforeign(void) {
+    TEST("fleet= (somaro#93): a file replaced beside its bookkeeping goes whole as N+1; pages and no bookkeeping against the store's history: unset refuses with no call and the file untouched, onforeign=history makes it the history, onforeign=file sends it as N+1");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000];
+    char dbHex[70], nhHex[70], sigHex[140], want[64];
+    unsigned long long issued = 0;
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s recreate", ownerAddr, seqAddr, fl, KEY0);
+    if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex, nhHex, &issued, sigHex) != 4)
+        FAIL("the Admit (scenario 42's helper)");
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/fleet_c.db* " DIR "/fleet_d.db* " DIR "/fleet_f.db* " DIR "/fleet_g.db* " DIR "/fleet_h.db* " DIR "/fleet_err.log");
+    store = start_pin_service_free(svc, sport);
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+#define FO_FAIL(why) do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); FAIL(why); } while (0)
+    if (relay < 0) FO_FAIL("the relay did not come up");
+    const char *fmt = "file:" DIR "/%s?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=0&fleet=%s&owner=%s&dbname=recreate"
+                      "&admit=%llu:0x%s&store=%s&relay=%s%s";
+#define FO_URI(file, extra) snprintf(uri, sizeof uri, fmt, file, RPC, SKEY, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl, extra)
+#define FO_HEAD() (snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex), run_cmd(cmd, out, sizeof out), out)
+#define FO_EXPIRE() do { snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'forceExpire(bytes32)' 0x%s --rpc-url %s >/dev/null", KEY1, fl, dbHex, RPC); \
+                         if (run_cmd(cmd, out, sizeof out) != 0) FO_FAIL("forceExpire"); } while (0)
+    /* the first writer: heights 1 and 2 */
+    sqlite3 *w = NULL;
+    FO_URI("fleet_c.db", "");
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(w); FO_FAIL("open"); }
+    sqlite3_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('one')", NULL, NULL, NULL);
+    long long a1 = scalar(w, "SELECT hpplite_flush()");
+    sqlite3_exec(w, "INSERT INTO t(v) VALUES('two')", NULL, NULL, NULL);
+    long long a2 = scalar(w, "SELECT hpplite_flush()");
+    sqlite3_close(w);
+    if (a1 != 1 || a2 != 2) { printf("(flushes %lld %lld) ", a1, a2); FO_FAIL("the first writer's two heights"); }
+    /* (i) case 1: the app deletes its database and makes another at the same path, the bookkeeping beside it */
+    (void)!system("rm -f " DIR "/fleet_c.db " DIR "/fleet_c.db-wal " DIR "/fleet_c.db-shm");
+    { sqlite3 *p = NULL; sqlite3_open(DIR "/fleet_c.db", &p);
+      sqlite3_exec(p, "CREATE TABLE other(x); INSERT INTO other VALUES('a new database'), ('at the same path')", NULL, NULL, NULL); sqlite3_close(p); }
+    fflush(stderr);
+    int saved = dup(2), efd = open(DIR "/fleet_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { fflush(stderr); dup2(saved, 2); sqlite3_close(w); FO_FAIL("reopen the replaced file"); }
+    long long c1 = scalar(w, "SELECT hpplite_flush()");
+    long long c1b = scalar(w, "SELECT hpplite_flush()");
+    sqlite3_close(w);
+    fflush(stderr); dup2(saved, 2);
+    long said1 = count_in_file(DIR "/fleet_err.log", "is not the state of height 2 it last sent: the file goes whole as height 3");
+    snprintf(want, sizeof want, "\"toHeight\": 3");
+    printf("(case 1: flush %lld then %lld, said %ld, the store %s) ", c1, c1b, said1, strstr(FO_HEAD(), want) ? "at 3" : out);
+    if (c1 != 3 || said1 != 1 || !strstr(out, want)) FO_FAIL("a file replaced beside its bookkeeping goes whole as height 3, said once");
+    long posts0 = fleet_relay_posts();
+    /* (ii) case 2, no setting: refused, nothing written, no call, the file untouched */
+    plain_db(DIR "/fleet_d.db", "CREATE TABLE stray(y); INSERT INTO stray VALUES('pages, no bookkeeping')");
+    char before[80], after[80];
+    file_sha(DIR "/fleet_d.db", before);
+    FO_URI("fleet_d.db", "");
+    sqlite3 *d = NULL;
+    int drc = sqlite3_open_v2(uri, &d, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL);
+    char why[500] = "";
+    snprintf(why, sizeof why, "%s", drc != SQLITE_OK ? sqlite3_errmsg(d) : "the open succeeded");
+    sqlite3_close(d);
+    file_sha(DIR "/fleet_d.db", after);
+    long posts1 = fleet_relay_posts();
+    printf("(case 2 unset: '%.150s', the relay's calls %ld -> %ld, the file %s) ", why, posts0, posts1, strcmp(before, after) == 0 ? "untouched" : "CHANGED");
+    if (!strstr(why, "has pages and no bookkeeping, and the fleet's history of this database is at height 3: refused") || posts1 != posts0 || strcmp(before, after) != 0)
+        FO_FAIL("pages and no bookkeeping, no onforeign=: refused, no call, the file untouched");
+    /* (iii) onforeign=history: the lease (the owner ended the first writer's), then the file is the history's at 3 */
+    FO_EXPIRE();
+    (void)!system("rm -f " DIR "/fleet_d.db-hpplite*");
+    FO_URI("fleet_d.db", "&onforeign=history");
+    fflush(stderr);
+    efd = open(DIR "/fleet_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+    if (sqlite3_open_v2(uri, &d, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { fflush(stderr); dup2(saved, 2); sqlite3_close(d); FO_FAIL("open with onforeign=history"); }
+    long long hd = scalar(d, "SELECT height FROM hpplite_status");
+    char herr[300];
+    snprintf(herr, sizeof herr, "%s", status_text(d, "last_error"));
+    sqlite3_close(d);
+    fflush(stderr); dup2(saved, 2);
+    long saidH = count_in_file(DIR "/fleet_err.log", "history at height 3 (onforeign=history)");
+    /* byte for byte what a rebuild of an empty file gives: a fresh file rebuilt to the same height */
+    FO_EXPIRE();
+    FO_URI("fleet_h.db", "");
+    sqlite3 *h = NULL;
+    if (sqlite3_open_v2(uri, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(h); FO_FAIL("open a fresh file at 3"); }
+    long long hh = scalar(h, "SELECT height FROM hpplite_status");
+    sqlite3_close(h);
+    char hSha[80], eSha[80];
+    file_sha(DIR "/fleet_d.db", hSha);
+    file_sha(DIR "/fleet_h.db", eSha);
+    printf("(a fresh file rebuilt to %lld: the onforeign=history file %s it byte for byte) ", hh - 1, hSha[0] && strcmp(hSha, eSha) == 0 ? "equals" : "DIFFERS from");
+    if (hh != 4 || !hSha[0] || strcmp(hSha, eSha) != 0) FO_FAIL("onforeign=history gives byte for byte what a rebuild of an empty file gives");
+    char hDump[8000], cDump[8000];
+    snprintf(hDump, sizeof hDump, "%s", dump_of(DIR "/fleet_d.db"));
+    snprintf(cDump, sizeof cDump, "%s", dump_of(DIR "/fleet_c.db"));
+    printf("(onforeign=history: height %lld, '%s', said %ld, the file %s the history's) ", hd, herr[0] ? herr : "no error", saidH,
+           strcmp(hDump, cDump) == 0 && strstr(hDump, "a new database") ? "is" : "is NOT");
+    if (hd != 4 || saidH != 1 || strcmp(hDump, cDump) != 0 || !strstr(hDump, "a new database") || strstr(hDump, "stray"))
+        FO_FAIL("onforeign=history: the file replaced by the history at height 3");
+    /* (iv) onforeign=file: the lease again, then the file whole as height 4 */
+    FO_EXPIRE();
+    plain_db(DIR "/fleet_f.db", "CREATE TABLE kept(z); INSERT INTO kept VALUES('the file wins'), ('as height four')");
+    FO_URI("fleet_f.db", "&onforeign=file");
+    fflush(stderr);
+    efd = open(DIR "/fleet_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+    sqlite3 *f = NULL;
+    if (sqlite3_open_v2(uri, &f, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { fflush(stderr); dup2(saved, 2); sqlite3_close(f); FO_FAIL("open with onforeign=file"); }
+    long long ff4 = scalar(f, "SELECT hpplite_flush()");
+    char ferr[300];
+    snprintf(ferr, sizeof ferr, "%s", status_text(f, "last_error"));
+    sqlite3_close(f);
+    fflush(stderr); dup2(saved, 2);
+    long saidF = count_in_file(DIR "/fleet_err.log", "sent whole as height 4 over the fleet.s history (onforeign=file)");
+    long saidF1 = count_in_file(DIR "/fleet_err.log", "is not the state of height");
+    snprintf(want, sizeof want, "\"toHeight\": 4");
+    printf("(onforeign=file: flush %lld, '%s', said %ld (case 1's line %ld), the store %s) ", ff4, ferr[0] ? ferr : "no error", saidF, saidF1, strstr(FO_HEAD(), want) ? "at 4" : out);
+    if (ff4 != 4 || saidF != 1 || saidF1 != 0 || !strstr(out, want)) FO_FAIL("onforeign=file: the file whole as height 4");
+    /* what the store holds at 4 is the file: a fresh file rebuilt from it */
+    FO_EXPIRE();
+    FO_URI("fleet_g.db", "");
+    sqlite3 *g = NULL;
+    if (sqlite3_open_v2(uri, &g, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(g); FO_FAIL("open a fresh file"); }
+    long long hg = scalar(g, "SELECT height FROM hpplite_status");
+    sqlite3_close(g);
+    char gDump[8000], fDump[8000];
+    snprintf(gDump, sizeof gDump, "%s", dump_of(DIR "/fleet_g.db"));
+    snprintf(fDump, sizeof fDump, "%s", dump_of(DIR "/fleet_f.db"));
+    printf("(a fresh file rebuilt: height %lld, %s the file sent) ", hg, strcmp(gDump, fDump) == 0 ? "equal to" : "NOT equal to");
+    if (hg != 5 || strcmp(gDump, fDump) != 0 || !strstr(gDump, "the file wins")) FO_FAIL("the store's height 4 is the file sent");
+    close(saved);
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0);
+#undef FO_URI
+#undef FO_HEAD
+#undef FO_EXPIRE
+#undef FO_FAIL
+    PASS();
+}
+
 static void test_relay_no_eth(void) {
     TEST("a wallet with USDC.e and no ETH (#126): its rollup, lease and anchors through the relay, paid in USDC.e; a replica rebuilds; its ETH stays 0");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
@@ -3707,6 +3882,7 @@ int main(void) {
     if (wanted(42)) test_fleet_lease();
     if (wanted(43)) test_fleet_node_writes();
     if (wanted(44)) test_fleet_fence();
+    if (wanted(45)) test_fleet_onforeign();
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

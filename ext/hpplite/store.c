@@ -1220,6 +1220,7 @@ int hpplite_store_fleet_view(HppliteStore *s, const unsigned char fleet[20], uin
         }
         out->toHeight = jnum(head, "toHeight");
         memcpy(out->chainAfter, after, 32);
+        memcpy(out->stateRoot, sr, 32);
         hpplite_store_fleet_head_digest(fleet, chainId, dbId, inst, jnum(head, "fromHeight"), out->toHeight, after, sr, md, jnum(head, "epoch"), digest);
         memcpy(hs.sig, sig, 64);
         hs.recid = sig[64] >= 27 ? sig[64] - 27 : sig[64];

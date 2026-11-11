@@ -691,6 +691,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->admitIssuedAt = cfg->admitIssuedAt;
     memcpy(nc->admitSig, cfg->admitSig, 65);
     nc->hasAdmit = cfg->hasAdmit;
+    nc->onForeign = cfg->onForeign;
     nc->syncTo = nc->verifyOnly ? cfg->syncTo : 0;      /* a stop for a verifier only: a sequencer must replay all (#206) */
     nc->keepSeconds = cfg->keepSeconds;                /* pruning behind a snapshot (#223) */
     nc->fromSnapshot = !nc->verifyOnly;                /* a new replica starts from the latest snapshot (#222); a verifier from batch 1, else the oldest kept (#224, #255) */
