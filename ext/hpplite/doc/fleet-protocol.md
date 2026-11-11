@@ -189,6 +189,13 @@ another funder rebinds, as Bind does, and the cap goes with the old funder);
 (ReleaseDb, or DeleteDb with `delete`). The reference store serves them
 (#311).
 
+A released (parked) database's content is not served, as a parked rollup
+bucket's: `GET /get/<cid>` of its batches answers `410 bucket_parked` (#323;
+data nobody pays for is not served). After DeleteDb its bytes are gone - `GET`
+of its names answers 404 - while its view keeps `latestHead`, the record of
+what it held. On a free store a fleet database's writes need no bucket; with
+none they are not counted in the store's quotas, and they are served.
+
 A bucket bound before the record costs its funder nothing until bytes come,
 and bytes come only with a head the fleet's record accepts; the record's owner
 is the binding's (#307). The fleet's own bucket (its manifests) is a rollup

@@ -696,8 +696,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = self.service.disk.read("c/%s" % cid) if refs else None
             if data is None:
                 return self.reply(404, {"error": "not held here", "cid": cid})
-            states = [(self.L.bucket(da) or {}).get("state") for da in refs if ADDR_RE.match(da)]
-            if "covered" not in states and not any(not ADDR_RE.match(k) or (self.service.fleets and k in self.service.fleets.known()) for k in refs):
+            def readable(k):
+                if k.startswith("fd-"):                 # a fleet database's: its bucket's state, as a rollup's (#323); none, a free store's write
+                    b = self.L.bucket(k)
+                    return b is None or b.get("state") == "covered"
+                if ADDR_RE.match(k):                    # a rollup's bucket, or a fleet's own (its manifests)
+                    return (self.L.bucket(k) or {}).get("state") == "covered" or bool(self.service.fleets and k in self.service.fleets.known())
+                return True
+            if not any(readable(k) for k in refs):
                 return self.reply(410, {"error": "bucket_parked", "cid": cid})
             return self.reply_bytes(data)
         return self.reply(404, {"error": "no such endpoint"})
