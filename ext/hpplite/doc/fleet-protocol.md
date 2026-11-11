@@ -155,7 +155,7 @@ bucket is deleted; DeleteDb deletes every life's bytes. `<fleet>` is the shared 
 | `GET /fleet/<fleet>/name/<db>-<admittedAt>-<height>` | - | the bytes, the instance and the signature, of any admission (an old life stays readable for verify) |
 | `GET /fleet/<fleet>/heads?after=<dbId>&limit=<n>` | the anchor | every database whose latest head is not the head in its latest indexed root, by `dbId` ascending (the leaf order), paged: what the next root is built from. Defined by state: a head that moved between the anchor's read and the root is listed again by itself |
 | `GET /fleet/<fleet>/db/<db>` | - | `{dbId, epoch, sequencer, instance, retired, admittedAt, latestHead, latestRoot}`, `latestHead` the current admission's; `latestRoot` is a hint, the path proves it |
-| `POST /fleet/<fleet>/manifest`, the body the manifest; `X-HPPLite-Signature` the fleet's anchor's `Content(address da = <fleet>, uint256 height = <seq>, bytes32 hash = keccak256(body))` in the store's domain | the anchor, before `postRootFor` | the manifest kept under its CID (`GET /get/<cid>`) |
+| `POST /fleet/<fleet>/manifest`, the body the manifest; `X-HPPLite-Signature` the fleet's anchor's `Content(address da = <fleet>, uint256 height = <seq>, bytes32 hash = keccak256(body))` in the store's domain | the anchor, before `postRootFor` | the manifest kept under its CID (`GET /get/<cid>`). Free (somaro), so bounded: only the fleet's anchor's signature (`401` otherwise), only for a root not yet posted (`409` for `seq <= rootSeq`, but for a posted root's own manifest put late - its sha-256 the digest the root names - while the store holds the root as "manifest missing"), one per such root (a newer one for the same `seq` replaces it: an anchor whose `postRootFor` failed rebuilds), and one no root on chain names is swept after the store's sweep age, as bytes in no bucket |
 | `POST /fleet/<fleet>/root` | anyone | a hint to read the chain now; its body is trusted for nothing |
 
 **The chain's side comes from the fleet's events.** The store reads
@@ -239,10 +239,9 @@ none they are not counted in the store's quotas, and they are served.
 
 A bucket bound before the record costs its funder nothing until bytes come,
 and bytes come only with a head the fleet's record accepts; the record's owner
-is the binding's (#307). The fleet's own bucket (its manifests) is a rollup
-bucket with the fleet in `da`, bound by the fleet's funder with `Bind`; the
-anchor's manifest is `Content` with the fleet in `da` and the root's sequence
-as its height (both with vectors). The listing: `GET /account/<funder>` names
+is the binding's (#307). The anchor's manifest is signed as `Content` with
+the fleet in `da` and the root's sequence as its height (with a vector); it is
+free and needs no bucket. The listing: `GET /account/<funder>` names
 fleet databases apart, `databases: [{fleet, dbId}]`, `buckets` staying
 addresses; one database's bucket is `GET /fleet/<fleet>/db/<dbId>/bucket`,
 today's bucket body with `fleet` and `dbId` in place of `da`. The database's
@@ -257,8 +256,9 @@ held it, never moved back, and a root indexed late never replaces a newer one.
 One BindDb per database, the fleet's treasury (or a database's own funder in a
 common fleet) as funder, a cap per database; the name write is charged to
 that bucket. Admission and payment stay two decisions by two keys. The
-manifest's bytes are charged to the fleet's own bucket, bound once by the
-fleet's funder when the fleet is made.
+anchor's manifests are free (somaro's decision), bounded as the manifest row
+says: one per root not yet posted, the anchor's alone, swept when no root
+names them.
 
 **Limits.** Every fleet call is counted per `dbId` (the signed head names
 it), the per-address guard far above it: a platform's apps write from one

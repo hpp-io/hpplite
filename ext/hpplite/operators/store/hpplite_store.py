@@ -512,6 +512,11 @@ class Service:
                     self.ledger.tick()
                 except (OSError, ValueError) as e:
                     self.ledger.warn("tick", str(e))
+                if self.fleets:                          # a fleet's manifests no root on chain names, after --sweep-age (somaro)
+                    try:
+                        self.fleets.sweep_manifests(int(time.time()), self.args.sweep_age)
+                    except (OSError, ValueError) as e:
+                        self.ledger.warn("fleet", "manifest sweep: %s" % e)
                 for fleet in (self.fleets.known() if self.fleets else []):     # the fleets' events, polled (#297)
                     try:
                         self.fleets.follow(fleet)

@@ -72,7 +72,31 @@ def http(method, url, body=None, headers=None):
             return e.code, data
 
 
+def unit_manifest_sweep():
+    """somaro's condition for free manifests: one no root on chain names is swept after --sweep-age, one a root names kept"""
+    import hpplite_store
+    work = tempfile.mkdtemp(prefix="fleet-sweep-")
+    book = fleet_store.FleetBook(None, hpplite_store.Disk(work), 181228)
+    fl = "0x" + "f2" * 20
+    kept, orphan, fresh = b'{"seq":1}', b'{"seq":2}', b'{"seq":3}'
+    cids = {}
+    for name, body in (("kept", kept), ("orphan", orphan), ("fresh", fresh)):
+        cids[name] = fleet_store._cid(hashlib.sha256(body).digest())
+        book.disk.write("c/%s" % cids[name], body)
+        book.disk.set_json("c/%s.refs" % cids[name], {fl: 1})
+    book.disk.set_json(book._key(fl), {"fleet": fl, "block": 1, "dbs": {},
+                                       "roots": {"1": {"root": "0x" + "00" * 32, "manifest": "0x" + hashlib.sha256(kept).hexdigest(), "state": "ok"}}})
+    now = int(time.time())
+    book.disk.set_json("f/%s/manifests.json" % fl, {"1": {"cid": cids["kept"], "at": now - 7200}, "2": {"cid": cids["orphan"], "at": now - 7200},
+                                                    "3": {"cid": cids["fresh"], "at": now - 10}})
+    book.sweep_manifests(now, 3600)
+    have = {n: book.disk.read("c/%s" % c) is not None for n, c in cids.items()}
+    check(have == {"kept": True, "orphan": False, "fresh": True},
+          "free manifests: one its root names kept, one no root names swept after --sweep-age, a newer one kept (%s)" % have)
+
+
 def main():
+    unit_manifest_sweep()
     chain_id = int(cast("chain-id"))
     owner, anchor, dbowner, seq = (eth.address(kb(k)).lower() for k in (KEY0, KEY2, KEY1, KEY3))
     out = subprocess.run(["forge", "create", "--root", CONTRACTS, "src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory", "--rpc-url", RPC,
@@ -295,6 +319,8 @@ def run(chain_id, fl, url, owner, dbowner, seq):
     rsig = eth.sign(kb(KEY2), eth.typed_digest(dom, F.ROOT_TYPE, 1, root, mdigest, deadline))
     cast("send", "--private-key", KEY0, fl, "postRootFor(uint256,bytes32,bytes32,uint256,bytes)", "1", hx(root), hx(mdigest), str(deadline), hx(rsig))
     st, roots = http("POST", url + "/fleet/%s/root" % fl, b"")
+    st, body = http("POST", url + "/fleet/%s/manifest" % fl, mdata, {"X-HPPLite-Signature": hx(csig)})
+    check(st == 409 and body.get("rootSeq") == 1, "a manifest for a root already posted: 409, one per root (somaro) (%s %s)" % (st, body))
     st, view = http("GET", url + "/fleet/%s/db/%s" % (fl, dbx))
     anch = view.get("anchored") or {}
     check(anch.get("seq") == 1 and anch.get("toHeight") == 3 and isinstance(anch.get("time"), int) and anch["time"] > 0,
@@ -341,6 +367,28 @@ def run(chain_id, fl, url, owner, dbowner, seq):
           "a database absent from root 2 keeps root 1's anchored, never moved back (%s)" % {k: an1b.get(k) for k in ("seq", "toHeight")})
     check(an2.get("seq") == 2 and an2.get("toHeight") == 1 and an2.get("root") == hx(root2) and an2.get("path") == [],
           "the database in root 2: anchored seq 2, its one leaf the root, an empty path (%s)" % {k: an2.get(k) for k in ("seq", "toHeight", "path")})
+    # root 3 posted before its manifest reached the store: kept "manifest missing"; its own manifest put late is taken
+    # and indexed - any other manifest for a posted root is 409 (free manifests, bounded: somaro)
+    ohead2 = dict(ohead, fromHeight=2, toHeight=2, chainHashAfter=fleet_store.chain_hash_next(ohead["chainHashAfter"], 2, eth.keccak256(b"order 2")),
+                  stateRoot=eth.keccak256(b"orders-root-2"), manifestDigest=hashlib.sha256(b"order 2").digest())
+    osig2 = eth.sign(kb(KEY3), F.head_digest(dom, ohead2))
+    st, body = http("POST", url + "/fleet/%s/name/%s" % (fl, F.store_name(odb, oissued, 2)), b"order 2" + oinst + osig2,
+                    {"X-HPPLite-Head": json.dumps({k: (hx(v) if isinstance(v, bytes) else v) for k, v in ohead2.items()})})
+    oitems3 = [{"dbId": odbx, "owner": dbowner, "nameHash": hx(onh), "head": {k: (hx(v) if isinstance(v, bytes) else v) for k, v in ohead2.items()}, "signature": hx(osig2)}]
+    m3, d3 = F.manifest(chain_id, fl, 3, oitems3)
+    root3 = F.root([(odb, F.leaf(odb, dbowner, onh, F.head_digest(dom, ohead2)))])
+    cast("send", "--private-key", KEY0, fl, "postRootFor(uint256,bytes32,bytes32,uint256,bytes)", "3", hx(root3), hx(d3), str(deadline),
+         hx(eth.sign(kb(KEY2), eth.typed_digest(dom, F.ROOT_TYPE, 3, root3, d3, deadline))))
+    st, roots = http("POST", url + "/fleet/%s/root" % fl, b"")
+    check(roots.get("roots", {}).get("3", {}).get("state") == "manifest missing", "root 3 posted first: manifest missing (%s)" % roots.get("roots", {}).get("3"))
+    other3 = m2.replace(b'"seq":2', b'"seq":3')
+    csig3 = eth.sign(kb(KEY2), eth.typed_digest(sdom, "Content(address da,uint256 height,bytes32 hash)", fl, 3, eth.keccak256(other3)))
+    st, body = http("POST", url + "/fleet/%s/manifest" % fl, other3, {"X-HPPLite-Signature": hx(csig3)})
+    check(st == 409, "another manifest for posted root 3, signed by the anchor: 409 (%s %s)" % (st, body))
+    csig3 = eth.sign(kb(KEY2), eth.typed_digest(sdom, "Content(address da,uint256 height,bytes32 hash)", fl, 3, eth.keccak256(m3)))
+    st, body = http("POST", url + "/fleet/%s/manifest" % fl, m3, {"X-HPPLite-Signature": hx(csig3)})
+    an3 = http("GET", url + "/fleet/%s/db/%s" % (fl, odbx))[1].get("anchored") or {}
+    check(st == 200 and an3.get("seq") == 3 and an3.get("toHeight") == 2, "root 3's own manifest put late: taken, root 3 indexed (%s %s)" % (st, an3.get("seq")))
     st, got = http("GET", url + "/get/" + fleet_store._cid(hashlib.sha256(mdata).digest()))
     check(st == 200 and got == mdata, "the manifest read back by its CID (%s)" % st)
     # a new life (#318): retired, then admitted again - names keyed by the admission, the view the new life's, heights from 1

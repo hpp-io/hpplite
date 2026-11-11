@@ -120,6 +120,33 @@ class FleetBook:
         return {"owner": "0x" + _w(r, 0)[-40:], "sequencer": "0x" + _w(r, 1)[-40:], "nameHash": "0x" + _w(r, 2), "instance": "0x" + _w(r, 3),
                 "epoch": int(_w(r, 5), 16), "epochSince": int(_w(r, 6), 16), "admittedAt": int(_w(r, 7), 16), "retired": int(_w(r, 8), 16) != 0}
 
+    def drop_manifest(self, fleet, cid):
+        """a manifest no root names: its ref goes, and its bytes with the last ref"""
+        refs = self.disk.json("c/%s.refs" % cid) or {}
+        refs.pop(fleet, None)
+        if refs:
+            self.disk.set_json("c/%s.refs" % cid, refs)
+        else:
+            self.disk.delete("c/%s.refs" % cid)
+            self.disk.delete("c/%s" % cid)
+
+    def sweep_manifests(self, now, age):
+        """manifests whose root never reached the chain, once older than age; one an indexed root names is kept"""
+        with self.lock:
+            for fleet in self.known():
+                pend = self.disk.json("f/%s/manifests.json" % fleet) or {}
+                if not pend:
+                    continue
+                st = self.state(fleet)
+                for seq in list(pend):
+                    r = st["roots"].get(seq)
+                    if r and r.get("state") == "ok" and _cid(bytes.fromhex(r["manifest"][2:])) == pend[seq]["cid"]:
+                        del pend[seq]                  # its root is on chain and indexed: kept as any root's
+                    elif now - pend[seq]["at"] >= age:
+                        self.drop_manifest(fleet, pend[seq]["cid"])
+                        del pend[seq]
+                self.disk.set_json("f/%s/manifests.json" % fleet, pend)
+
     def _check_roots(self, fleet, st):
         for seq in sorted((s for s, r in st["roots"].items() if r["state"] != "ok"), key=int):
             r = st["roots"][seq]
@@ -281,12 +308,39 @@ def _post_manifest(h, fleet, body):
         raise ChainUnreadable(str(e)[:200])
     if not signer or len(r) < 66 or not S.same(signer, "0x" + r[-40:]):
         return h.reply(401, {"error": "X-HPPLite-Signature: the fleet's anchor's Content signature"})
+    # manifests are free (somaro): so only one per root not yet posted - a seq the chain has posted is 409, and a newer
+    # manifest for an unposted seq replaces the one held (an anchor whose postRootFor failed rebuilds); one no root names
+    # is swept after --sweep-age
+    try:
+        posted = int(h.service.fleets.chain.call("eth_call", {"to": fleet, "data": "0x" + selector("rootSeq()")}, "latest") or "0x0", 16)
+    except (RpcError, OSError, ValueError) as e:
+        raise ChainUnreadable(str(e)[:200])
     import hashlib
     cid = _cid(hashlib.sha256(body).digest())
-    h.service.disk.write("c/%s" % cid, body)
-    refs = h.service.disk.json("c/%s.refs" % cid) or {}
-    refs[fleet] = seq
-    h.service.disk.set_json("c/%s.refs" % cid, refs)
+    book = h.service.fleets
+    if seq <= posted:
+        # a posted root's own manifest, put late, is still taken: the one whose sha-256 the root names, while it is missing
+        r = book.follow(fleet)["roots"].get(str(seq))
+        if not r or r.get("state") != "manifest missing" or r["manifest"] != "0x" + hashlib.sha256(body).hexdigest():
+            return h.reply(409, {"error": "root %d is posted already: a manifest is taken only for the next root, or as the posted root's own" % seq,
+                                 "rootSeq": posted})
+        h.service.disk.write("c/%s" % cid, body)
+        refs = h.service.disk.json("c/%s.refs" % cid) or {}
+        refs[fleet] = seq
+        h.service.disk.set_json("c/%s.refs" % cid, refs)
+        book.follow(fleet)                            # indexed now
+        return h.reply(200, {"cid": cid, "bytes": len(body)})
+    with book.lock:
+        pend = book.disk.json("f/%s/manifests.json" % fleet) or {}
+        old = pend.get(str(seq))
+        if old and old["cid"] != cid:
+            book.drop_manifest(fleet, old["cid"])
+        h.service.disk.write("c/%s" % cid, body)
+        refs = h.service.disk.json("c/%s.refs" % cid) or {}
+        refs[fleet] = seq
+        h.service.disk.set_json("c/%s.refs" % cid, refs)
+        pend[str(seq)] = {"cid": cid, "at": int(time.time())}
+        book.disk.set_json("f/%s/manifests.json" % fleet, pend)
     return h.reply(200, {"cid": cid, "bytes": len(body)})
 
 
