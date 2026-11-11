@@ -1183,22 +1183,78 @@ void hpplite_store_fleet_head_digest(const unsigned char fleet[20], uint64_t cha
 
 /* The store's latest head of a fleet database (#316): its toHeight in *pTo (0: the store holds none); 0, or -1 when the
 ** store did not answer */
-int hpplite_store_fleet_head_height(HppliteStore *s, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t *pTo) {
+static int hexField(cJSON *o, const char *k, unsigned char *out, size_t n) {
+    const char *z = jstr(o, k);
+    return z && strlen(z) == 2 + 2 * n && z[0] == '0' && z[1] == 'x' && hpplite_hex_to_bytes(z + 2, out, n) >= 0 ? 0 : -1;
+}
+
+/* A fleet database as the store sees it (#316 c, d): GET /fleet/<fleet>/db/<dbId> - the record's epoch and instance as the
+** store holds them, and its latest head: the height, the rolling hash after it, and who signed it (recovered here).
+** 0 (a 404: all zero, nothing held), or -1 with the reason in error */
+int hpplite_store_fleet_view(HppliteStore *s, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], HppliteFleetView *out) {
     char fl[43], db[67], path[200];
-    cJSON *v = NULL, *head, *h;
+    cJSON *v = NULL, *latest, *head, *ret;
+    unsigned char hDb[32], inst[32], after[32], sr[32], md[32], digest[32], sig[65], pub[33];
+    HppliteSignature hs;
     long status;
-    *pTo = 0;
+    memset(out, 0, sizeof *out);
     if (!s) return -1;
     lowerHex(fleet, 20, fl); lowerHex(dbId, 32, db);
     snprintf(path, sizeof path, "/fleet/%s/db/%s", fl, db);
     status = getJson(s, path, &v);
     if (status == 404) { cJSON_Delete(v); return 0; }                  /* the fleet has no record yet: nothing held */
-    if (status != 200 || !v) { cJSON_Delete(v); return -1; }
-    head = cJSON_GetObjectItem(v, "latestHead");
-    h = head && cJSON_IsObject(head) ? cJSON_GetObjectItem(cJSON_GetObjectItem(head, "head"), "toHeight") : NULL;
-    if (h && cJSON_IsNumber(h)) *pTo = (uint64_t)h->valuedouble;
+    if (status != 200 || !v) { cJSON_Delete(v); snprintf(s->error, sizeof s->error, "the store answered %ld to the database's view", status); return -1; }
+    out->epoch = jnum(v, "epoch");
+    if (hexField(v, "instance", out->instance, 32) != 0) memset(out->instance, 0, 32);
+    ret = cJSON_GetObjectItem(v, "retired");
+    out->retired = ret && cJSON_IsTrue(ret);
+    latest = cJSON_GetObjectItem(v, "latestHead");
+    head = latest && cJSON_IsObject(latest) ? cJSON_GetObjectItem(latest, "head") : NULL;
+    if (head) {
+        if (hexField(head, "dbId", hDb, 32) != 0 || memcmp(hDb, dbId, 32) != 0 || hexField(head, "instanceId", inst, 32) != 0
+            || hexField(head, "chainHashAfter", after, 32) != 0 || hexField(head, "stateRoot", sr, 32) != 0
+            || hexField(head, "manifestDigest", md, 32) != 0 || hexField(latest, "signature", sig, 65) != 0) {
+            cJSON_Delete(v);
+            snprintf(s->error, sizeof s->error, "the store's latest head of the database does not parse");
+            return -1;
+        }
+        out->toHeight = jnum(head, "toHeight");
+        memcpy(out->chainAfter, after, 32);
+        hpplite_store_fleet_head_digest(fleet, chainId, dbId, inst, jnum(head, "fromHeight"), out->toHeight, after, sr, md, jnum(head, "epoch"), digest);
+        memcpy(hs.sig, sig, 64);
+        hs.recid = sig[64] >= 27 ? sig[64] - 27 : sig[64];
+        if (hs.recid > 1 || hpplite_crypto_recover_pubkey(s->crypto, digest, &hs, pub) != 0 || eth_address_from_compressed_pubkey(pub, out->headSigner) != 0) {
+            cJSON_Delete(v);
+            snprintf(s->error, sizeof s->error, "the store's latest head of the database has no valid signature");
+            return -1;
+        }
+        out->hasHead = 1;
+    }
     cJSON_Delete(v);
     return 0;
+}
+
+/* A fleet name's batch bytes (#316 d): GET /fleet/<fleet>/name/<dbId>-<height>, the instance and signature after them cut.
+** malloc'd, terminated; NULL with the reason in error */
+uint8_t *hpplite_store_get_fleet_name(HppliteStore *s, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t height, size_t *pLen) {
+    char fl[43], db[67], path[200];
+    Buf out = {0};
+    long status;
+    uint8_t *data;
+    *pLen = 0;
+    if (!s) return NULL;
+    lowerHex(fleet, 20, fl); lowerHex(dbId, 32, db);
+    snprintf(path, sizeof path, "/fleet/%s/name/%s-%llu", fl, db, (unsigned long long)height);
+    status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+    if (status != 200 || out.n <= 97) {
+        snprintf(s->error, sizeof s->error, "the store answered %ld to the fleet name %llu", status, (unsigned long long)height);
+        free(out.p);
+        return NULL;
+    }
+    data = malloc(out.n - 97 + 1);
+    if (data) { memcpy(data, out.p, out.n - 97); data[out.n - 97] = 0; *pLen = out.n - 97; }
+    free(out.p);
+    return data;
 }
 
 /* A fleet database's batch and its signed head, one write (#316 c): POST /fleet/<fleet>/name/<dbId>-<height>, the body

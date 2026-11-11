@@ -126,7 +126,16 @@ int hpplite_store_put_named(HppliteStore *store, const char *zName, const unsign
 void hpplite_store_fleet_head_digest(const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], const unsigned char instance[32],
                                      uint64_t fromHeight, uint64_t toHeight, const unsigned char chainAfter[32], const unsigned char stateRoot[32],
                                      const unsigned char manifestDigest[32], uint64_t epoch, unsigned char digest[32]);
-int hpplite_store_fleet_head_height(HppliteStore *store, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t *pTo);
+typedef struct HppliteFleetView {
+    uint64_t epoch;                     /* the record as the store holds it */
+    unsigned char instance[32];
+    int retired;
+    int hasHead;                        /* the latest head: its height, the rolling hash after it, its recovered signer */
+    uint64_t toHeight;
+    unsigned char chainAfter[32], headSigner[20];
+} HppliteFleetView;
+int hpplite_store_fleet_view(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], HppliteFleetView *out);
+uint8_t *hpplite_store_get_fleet_name(HppliteStore *store, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t height, size_t *pLen);
 int hpplite_store_put_fleet_name(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t height,
                                  const unsigned char instance[32], const unsigned char chainAfter[32], const unsigned char stateRoot[32],
                                  uint64_t epoch, const uint8_t *data, size_t len);

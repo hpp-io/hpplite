@@ -274,9 +274,15 @@ lease's epoch) signed by the database's key in `X-HPPLite-Head`; the node
 posts no root and no anchor (the fleet's anchor does). A file that already
 has rows when first opened (written by the app or a migration before its
 sequencer) is a first open: the join, then its state as batch 1. A file
-behind the heads the store holds (a fresh or recreated file for a database
-with history) is refused before any claim until the node rebuilds from the
-store's heads (#316 d).
+behind the heads the store holds (a fresh or emptied file, a new volume) is
+rebuilt from them: the node takes the lease, waits until
+`GET /fleet/<fleet>/db/<dbId>` shows its epoch and instance (the fence: from
+then the store refuses the old holder), reads every name from the file's
+height to the latest head's, applies them (the seal is the database's key),
+and checks the rolling hash after the last against the latest head's
+`chainHashAfter`, whose signature must recover to its own key; then it writes
+on. While another instance holds the lease, such a file is not opened as the
+sequencer.
 
 ## Not decided here
 
