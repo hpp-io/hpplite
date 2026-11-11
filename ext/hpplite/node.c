@@ -898,6 +898,9 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
         node_learn_batch_limit(node);
         if (hpplite_node_sync_from_l1(node, 1) < 0) {
             node->state = HPPLITE_STATE_ERROR;
+            /* fleet= (somaro): a history that does not rebuild - a root that differs, a rolling hash or signer that
+            ** does not match - fails the open: no write, no lease used, and nothing a platform could take as ready */
+            if (node->config.hasFleet) node->fleetOpenRefused = 1;
         } else if (node->fleetForeignHistory && node->ctx->blockHeight == node->fleetForeignHistory + 1 && (node->fleetForeignHistory = 0, 1)) {
             /* somaro#93: onforeign=history - the file is now the history's state, as a rebuild of an empty file */
             fprintf(stderr, "hpplite: %s replaced by the fleet's history at height %llu (onforeign=history)\n",
@@ -957,6 +960,18 @@ static int node_try_promote(HppliteNode *node) {
     return 1;
 }
 
+/* fleet= (somaro): the open fails when the store's history did not rebuild - the reason as the open's error and on
+** stderr, once */
+static int node_fleet_refuse_open(HppliteNode *node) {
+    static char why[700];
+    if (!node->fleetOpenRefused) return 0;
+    snprintf(why, sizeof why, "the fleet database could not be rebuilt from the store's history: %s; nothing was written and it is not "
+             "opened as its sequencer", node->ctx && node->ctx->zLastError[0] ? node->ctx->zLastError : "the sync stopped");
+    fprintf(stderr, "hpplite: %s\n", why);
+    hpplite_set_init_error(why);
+    return 1;
+}
+
 /*
 ** Initialize a node with configuration.
 */
@@ -993,6 +1008,7 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
 
     /* Auto-connect to L1 */
     node_auto_connect_l1(node, config);
+    if (node_fleet_refuse_open(node)) { hpplite_node_destroy(node); return NULL; }
 
     /* Register node with global registry */
     hpplite_register_node(node->db, node);
@@ -1029,6 +1045,7 @@ HppliteNode *hpplite_node_create_with_db(sqlite3 *db, const HppliteNodeConfig *c
 
     /* Auto-connect to L1 */
     node_auto_connect_l1(node, config);
+    if (node_fleet_refuse_open(node)) { hpplite_node_destroy(node); return NULL; }
 
     /* Register node with global registry */
     hpplite_register_node(node->db, node);
@@ -1897,7 +1914,12 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     if (!b->bMore) node->ctx->nRootsCompared++;
     if (!b->bMore && memcmp(root, b->root, 32) != 0) {
         node->ctx->nRootMismatches++;
-        hpplite_error(node->ctx, "batch %llu: the root after applying it differs from the posted one", (unsigned long long)batch->height);
+        {
+            char hr[65], hb[65];
+            hpplite_bytes_to_hex(root, 32, hr); hpplite_bytes_to_hex(b->root, 32, hb);
+            hpplite_error(node->ctx, "batch %llu: the root after applying it differs from the posted one (applied 0x%.16s.., posted 0x%.16s..)",
+                          (unsigned long long)batch->height, hr, hb);
+        }
         hpplite_pagebatch_free(b);
         return SQLITE_MISMATCH;
     }

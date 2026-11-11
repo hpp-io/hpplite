@@ -124,6 +124,7 @@ typedef struct HppliteNode {
     int warnedForeignLease;         /* "someone else holds the lease" said once */
     int warnedClaim;                /* fleet= (#316 d): why the claim failed, said once per episode */
     int warnedFenced;               /* fleet= (#316 d): "fenced" said once */
+    int fleetOpenRefused;           /* fleet= (somaro): the history at the store could not be rebuilt - the open fails, nothing written */
     int fleetForeignFile;           /* somaro#93: onforeign=file took the file over the history (its own line said) */
     uint64_t fleetForeignHistory;   /* somaro#93: onforeign=history replaces the file with the history at this height */
     int leaseHeldElsewhere;         /* The last look found another instance's lease (hpplite_status.state = waiting) */
