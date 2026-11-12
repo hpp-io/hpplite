@@ -940,6 +940,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                               "onforeign=history rebuilds the file from the history, onforeign=file sends the file as height %llu",
                               zFile, (unsigned long long)v.toHeight, (unsigned long long)v.toHeight + 1);
                 node->state = HPPLITE_STATE_ERROR;
+                node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
                 return;
             }
             node_learn_batch_limit(node);                     /* the relay, before the claim */
@@ -949,6 +950,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                               "holder, and the lease is not this run's (%s); not opened as its sequencer", (unsigned long long)v.toHeight,
                               (unsigned long long)(node->ctx->blockHeight - 1), node->ctx->zLastError[0] ? node->ctx->zLastError : "held elsewhere");
                 node->state = HPPLITE_STATE_ERROR;
+                node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
                 return;
             }
             for (i = 0; i < 60 && !atEpoch; i++) {
@@ -961,6 +963,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                 hpplite_error(node->ctx, "the store does not show this run's lease (epoch %llu) after 30 s: the rebuild waits for it (the fence); not opened as its sequencer",
                               (unsigned long long)hpplite_l1_fleet_epoch(node->l1));
                 node->state = HPPLITE_STATE_ERROR;
+                node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
                 return;
             }
             if (foreign && node->config.onForeign == 2) {
@@ -975,6 +978,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                     hpplite_error(node->ctx, "onforeign=file: the store's height %llu could not be read or is not this database's key's: %s",
                                   (unsigned long long)v.toHeight, hpplite_store_error(node->store));
                     node->state = HPPLITE_STATE_ERROR;
+                    node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
                     return;
                 }
                 hpplite_sha256(raw, n, blk);
@@ -982,6 +986,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                 if (hppliteSetMetaAt(node->ctx, v.toHeight, blk, v.chainAfter, v.stateRoot) != SQLITE_OK) {
                     hpplite_error(node->ctx, "onforeign=file: the bookkeeping could not be set to height %llu", (unsigned long long)v.toHeight);
                     node->state = HPPLITE_STATE_ERROR;
+                    node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
                     return;
                 }
                 node->fleetForeignFile = 1;
@@ -995,6 +1000,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                         sqlite3_free(zWal);
                         hpplite_error(node->ctx, "onforeign=history: %s could not be emptied for the rebuild", zFile);
                         node->state = HPPLITE_STATE_ERROR;
+                        node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
                         return;
                     }
                     sqlite3_free(zWal);

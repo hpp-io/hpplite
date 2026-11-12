@@ -2305,13 +2305,13 @@ static void test_fleet_node_writes(void) {
     /* a fresh file for the same database: behind the store's history, refused before any claim */
     snprintf(uri, sizeof uri, fmt, "fleet_m.db", RPC, SKEY, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
     sqlite3 *m = NULL;
-    sqlite3_open_v2(uri, &m, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    int mrc = sqlite3_open_v2(uri, &m, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
     char why[400] = "";
-    snprintf(why, sizeof why, "%s", m ? status_text(m, "last_error") : "");
+    snprintf(why, sizeof why, "%s", m ? sqlite3_errmsg(m) : "");  /* the open fails with the reason (#338) */
     long posts3 = fleet_relay_posts();
     sqlite3_close(m);
-    printf("(a fresh file: '%.120s', the relay's calls %ld) ", why, posts3);
-    if (!strstr(why, "the lease is not this run's") || posts3 != 1) FN_FAIL("a fresh file behind the store's history, the lease another instance's, is refused before any claim");
+    printf("(a fresh file: open rc %d, '%.120s', the relay's calls %ld) ", mrc, why, posts3);
+    if (mrc == SQLITE_OK || !strstr(why, "the lease is not this run's") || posts3 != 1) FN_FAIL("a fresh file behind the store's history, the lease another instance's, is refused before any claim");
     /* the lease ended by the owner (the old volume lost): the same fresh file takes it and is rebuilt - every batch */
     snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'forceExpire(bytes32)' 0x%s --rpc-url %s >/dev/null", KEY1, fl, dbHex, RPC);
     if (run_cmd(cmd, out, sizeof out) != 0) FN_FAIL("forceExpire");
@@ -4778,6 +4778,76 @@ static void test_paid_in_chip(void) {
     PASS();
 }
 
+/* 56. hpplite#338: a fleet open that does not open as the sequencer fails the open - not "synced height" said over a
+** file the store's history is ahead of. A fresh file while another instance holds the lease (a new volume while the
+** old host's lease runs: somaro#126's second door), and a file with pages and no bookkeeping with onforeign unset */
+static void test_fleet_refusals_fail_the_open(void) {
+    TEST("fleet= (#338): a fresh file while another instance holds the lease, and pages with no bookkeeping and onforeign unset, fail the open - no node left open unsequenced");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x5656565656565656565656565656565656565656565656565656565656565656";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000], nh[70], dbHex[70], sigHex[140];
+    unsigned long long issued;
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    sqlite3 *a = NULL, *b = NULL, *c = NULL;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+#define FR_FAIL(why) do { if (a) sqlite3_close(a); if (b) sqlite3_close(b); if (c) sqlite3_close(c); unsetenv("HPPLITE_HOST_NAME"); \
+                          if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } FAIL(why); } while (0)
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FR_FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FR_FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s refuse-0", ownerAddr, seqAddr, fl, KEY0);
+    if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex, nh, &issued, sigHex) != 4)
+        FR_FAIL("the Admit (scenario 42's helper)");
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/refuse_*.db* " DIR "/refuse_b " DIR "/refuse_c " DIR "/store_pins && mkdir -p " DIR "/refuse_b " DIR "/refuse_c");
+    store = start_pin_service_free(svc, sport);
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    if (store < 0 || relay < 0) FR_FAIL("the store or the relay did not come up");
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    const char *fmt = "file:%s?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=%s&interval=1s&fleet=%s&owner=%s&dbname=refuse-0"
+                      "&admit=%llu:0x%s&store=%s&relay=%s";
+    /* A: the sequencer, its lease held while open */
+    setenv("HPPLITE_HOST_NAME", "host-a", 1);
+    snprintf(uri, sizeof uri, fmt, DIR "/refuse_a.db", RPC, SKEY, DIR, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    if (sqlite3_open_v2(uri, &a, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FR_FAIL("open A");
+    sqlite3_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('on host a')", NULL, NULL, NULL);
+    long long fa = scalar(a, "SELECT hpplite_flush()");
+    /* (1) B: a new volume (a fresh file) under another host name, A's lease running */
+    setenv("HPPLITE_HOST_NAME", "host-b", 1);
+    snprintf(uri, sizeof uri, fmt, DIR "/refuse_b/app.db", RPC, SKEY, DIR "/refuse_b", fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    int rcB = sqlite3_open_v2(uri, &b, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    char stateB[40] = "";
+    if (rcB == SQLITE_OK && b) snprintf(stateB, sizeof stateB, "%s", status_text(b, "state"));
+    if (b) { sqlite3_close(b); b = NULL; }
+    /* (2) A closes (its lease released); C: a file the app made, pages and no bookkeeping, onforeign unset */
+    sqlite3_close(a); a = NULL;
+    unsetenv("HPPLITE_HOST_NAME");
+    sqlite3 *plain = NULL;
+    if (sqlite3_open(DIR "/refuse_c/app.db", &plain) != SQLITE_OK) FR_FAIL("the app's own file");
+    sqlite3_exec(plain, "PRAGMA journal_mode=WAL; CREATE TABLE mine(x); INSERT INTO mine VALUES(1)", NULL, NULL, NULL);
+    sqlite3_close(plain);
+    snprintf(uri, sizeof uri, fmt, DIR "/refuse_c/app.db", RPC, SKEY, DIR "/refuse_c", fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    int rcC = sqlite3_open_v2(uri, &c, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL);
+    char stateC[40] = "";
+    if (rcC == SQLITE_OK && c) snprintf(stateC, sizeof stateC, "%s", status_text(c, "state"));
+    if (c) { sqlite3_close(c); c = NULL; }
+    printf("(A flushed %lld; B, a fresh file while A holds the lease: open rc %d, state '%s'; C, pages and no bookkeeping: open rc %d, state '%s') ",
+           fa, rcB, stateB, rcC, stateC);
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); relay = -1; kill(store, SIGTERM); waitpid(store, NULL, 0); store = -1;
+    if (fa < 1) FR_FAIL("A sequences");
+    if (rcB == SQLITE_OK) FR_FAIL("a fresh file while another instance holds the lease fails the open (no ready line over a file the store is ahead of)");
+    if (rcC == SQLITE_OK) FR_FAIL("pages with no bookkeeping and onforeign unset fail the open");
+#undef FR_FAIL
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -4843,6 +4913,7 @@ int main(void) {
     if (wanted(52)) test_fleet_empty_file_rebuilt();
     if (wanted(53)) test_fleet_relay_queue();
     if (wanted(55)) test_paid_in_chip();
+    if (wanted(56)) test_fleet_refusals_fail_the_open();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
