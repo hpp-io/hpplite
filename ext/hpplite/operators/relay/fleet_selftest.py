@@ -24,7 +24,11 @@ import fleet as F  # noqa: E402
 
 RPC = os.environ["HPPLITE_ANVIL_RPC"]
 FACTORY = os.environ["HPPLITE_ANVIL_FACTORY"]
-USDC = os.environ.get("HPPLITE_ANVIL_USDC", "")
+# HPPLITE_RELAY_ASSET=chip: the relay paid in the chain's CHIP (#346: the real one on a fork of HPP Mainnet), else USDC.e
+if os.environ.get("HPPLITE_RELAY_ASSET") == "chip":
+    USDC, ASSET_NAME, ASSET_VERSION = os.environ.get("HPPLITE_ANVIL_CHIP", ""), "House Chip", "1"
+else:
+    USDC, ASSET_NAME, ASSET_VERSION = os.environ.get("HPPLITE_ANVIL_USDC", ""), "Bridged USDC", "2"
 FACILITATOR = os.environ.get("HPPLITE_ANVIL_FACILITATOR", "")
 KEY0, KEY1, KEY2, KEY3 = (os.environ["HPPLITE_ANVIL_KEY%d" % i] for i in range(4))
 RELAY_KEY = os.environ["HPPLITE_ANVIL_KEY9"]
@@ -78,7 +82,7 @@ def calldata(sig, *args):
 
 def main():
     if not USDC or not FACILITATOR:
-        print("SKIP: no MockUSDC or facilitator on this chain")
+        print("SKIP: no token or facilitator on this chain")
         return 77
     chain_id = int(cast("chain-id"))
     out = subprocess.run(["forge", "create", "--root", CONTRACTS, "src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory", "--rpc-url", RPC,
@@ -96,7 +100,8 @@ def main():
     url = "http://127.0.0.1:%d" % port
     log = open(os.path.join(work, "relay.log"), "w")
     proc = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC, "--key-file", keyfile,
-                             "--factory", FACTORY, "--fleet-factory", ff, "--facilitator", FACILITATOR, "--asset", USDC, "--eth-usd", "3000",
+                             "--factory", FACTORY, "--fleet-factory", ff, "--facilitator", FACILITATOR, "--asset", USDC, "--asset-name", ASSET_NAME,
+                             "--asset-version", ASSET_VERSION, "--eth-usd", "3000",
                              "--dir", os.path.join(work, "relay")], stdout=log, stderr=log)
     try:
         for _ in range(100):
@@ -134,7 +139,7 @@ def run(chain_id, ff, url, owner, anchor):
         a = eth.address(k).lower()
         cast("send", "--private-key", KEY0, USDC, "transfer(address,uint256)", a, "5000000")
         nonce = int(cast("call", USDC, "nonces(address)(uint256)", a).split()[0])
-        pd = eth.typed_digest(eth.domain_separator("Bridged USDC", "2", chain_id, USDC),
+        pd = eth.typed_digest(eth.domain_separator(ASSET_NAME, ASSET_VERSION, chain_id, USDC),
                               "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)", a, spender, 3000000, nonce, deadline)
         code, _ = http("POST", url + "/account/%s/permit" % a, {"value": 3000000, "deadline": deadline, "signature": hx(eth.sign(k, pd))})
         return k, a, code

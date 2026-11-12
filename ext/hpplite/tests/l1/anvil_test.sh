@@ -3,6 +3,8 @@
 # factory with forge, run test_anvil (real-L1 build) against it, shut down.
 #   tests/l1/anvil_test.sh <path/to/test_anvil>
 # Exit 77 = skipped (anvil/forge/cast not installed). No network, no funds.
+# HPPLITE_ANVIL_FORK=https://mainnet.hpp.io: the same on a fork of that chain with its real CHIP (#346); the
+# network is read, nothing is sent to it. HPPLITE_RELAY_ASSET=chip runs the relay's fleet selftest in CHIP.
 set -eu
 bin=$1
 here=$(cd "$(dirname "$0")" && pwd)
@@ -31,7 +33,11 @@ log=${TMPDIR:-/tmp}/hpplite-anvil-$$.log
 # HPPLITE_ANVIL_ARGS: extra anvil flags (the soak passes --prune-history: an
 # hour of blocks otherwise fills the runner's disk with state snapshots)
 # shellcheck disable=SC2086
-anvil --port "$port" --chain-id 31337 --silent --block-time 1 --gas-limit 1125899906842624 ${HPPLITE_ANVIL_ARGS:-} >"$log" 2>&1 &
+# HPPLITE_ANVIL_FORK=<rpc>: anvil forks that chain (#346, somaro#140: HPP Mainnet's real CHIP in place of the stand-in);
+# the chain id stays 31337, the one every scenario signs for
+fork=
+[ -n "${HPPLITE_ANVIL_FORK:-}" ] && fork="--fork-url $HPPLITE_ANVIL_FORK"
+anvil --port "$port" --chain-id 31337 --silent --block-time 1 --gas-limit 1125899906842624 $fork ${HPPLITE_ANVIL_ARGS:-} >"$log" 2>&1 &
 pid=$!
 trap 'kill -CONT $pid 2>/dev/null; kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -f "$log"' EXIT INT TERM
 for i in $(seq 1 50); do kill -0 $pid 2>/dev/null || break; cast chain-id --rpc-url "$rpc" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -49,8 +55,18 @@ echo "anvil on $rpc, factory $factory"
 usdc=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --broadcast --json src/test/MockUSDC.sol:MockUSDC --constructor-args 1000000000000000 2>/dev/null | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' | head -1)
 [ -n "$usdc" ] && echo "MockUSDC $usdc" || echo "MockUSDC not deployed: the paid store scenarios will be skipped"
 # a stand-in for CHIP (somaro#128): another token, another EIP-712 domain ("House Chip", "1")
-chip=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --broadcast --json src/test/MockToken.sol:MockToken --constructor-args "House Chip" CHIP 1 1000000000000000 2>/dev/null | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' | head -1)
-[ -n "$chip" ] && echo "MockToken (CHIP) $chip" || echo "MockToken (CHIP) not deployed: the CHIP scenario will be skipped"
+if [ -n "$fork" ]; then
+    # the real CHIP (HPP Mainnet), its balances a mapping at slot 0: key0 given the stand-in's supply on the fork
+    chip=${HPPLITE_ANVIL_FORK_CHIP:-0xEDFC8E6658561C97A3FFc966923d16C1c626083A}
+    addr0=$(cast wallet address "$key0")
+    cast rpc --rpc-url "$rpc" anvil_setStorageAt "$chip" "$(cast index address "$addr0" 0)" "$(cast to-uint256 1000000000000000)" >/dev/null
+    [ "$(cast call "$chip" 'balanceOf(address)(uint256)' "$addr0" --rpc-url "$rpc" | cut -d' ' -f1)" = 1000000000000000 ] \
+        || { echo "the fork's CHIP at $chip: key0's balance not set (its balances not at slot 0?)"; exit 1; }
+    echo "fork of $HPPLITE_ANVIL_FORK at block $(cast block-number --rpc-url "$rpc"), CHIP $chip ($(cast call "$chip" 'name()(string)' --rpc-url "$rpc"))"
+else
+    chip=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --broadcast --json src/test/MockToken.sol:MockToken --constructor-args "House Chip" CHIP 1 1000000000000000 2>/dev/null | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' | head -1)
+fi
+[ -n "$fork" ] || { [ -n "$chip" ] && echo "MockToken (CHIP) $chip" || echo "MockToken (CHIP) not deployed: the CHIP scenario will be skipped"; }
 # the x402 facilitator the services pay through on this chain (#183), with a key of its own that no test uses
 fkey=0x0fac11177a70f0fac11177a70f0fac11177a70f0fac11177a70f0fac11177a70
 faddr=$(cast wallet address "$fkey")
