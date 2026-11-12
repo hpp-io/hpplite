@@ -71,6 +71,12 @@ class Facilitator:
                  bytes.fromhex(auth["nonce"][2:]), eth.word(sig[64]), sig[:32], sig[32:64]]
         return "0x" + selector(TRANSFER_SIG) + b"".join(words).hex()
 
+    def chain_now(self):
+        try:
+            return int(self.chain.call("eth_getBlockByNumber", "latest", False)["timestamp"], 16)
+        except (RpcError, OSError, ValueError, KeyError, TypeError):
+            return int(time.time())
+
     def verify_exact(self, payload, req):
         auth = payload["payload"]["authorization"]
         acc = payload.get("accepted", {})
@@ -78,7 +84,7 @@ class Facilitator:
             return {"isValid": False, "invalidReason": "unsupported_scheme"}
         if auth["to"].lower() != req["payTo"].lower() or int(auth["value"]) < int(req["amount"]):
             return {"isValid": False, "invalidReason": "invalid_exact_evm_payload_recipient_mismatch"}
-        now = int(time.time())
+        now = self.chain_now()                       # the chain's time, as a facilitator's simulation sees it: not this host's
         if not (int(auth["validAfter"]) < now < int(auth["validBefore"])):
             return {"isValid": False, "invalidReason": "invalid_exact_evm_payload_authorization_valid_before"}
         if auth["nonce"].lower() in self.spent:

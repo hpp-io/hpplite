@@ -109,6 +109,15 @@ int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
     return l1 ? l1->ops->get_addresses(l1, contractHex, daHex) : -1;
 }
 
+uint64_t hpplite_l1_chain_time(HppliteL1 *l1) {
+    return l1 && l1->ops->chain_time ? l1->ops->chain_time(l1) : 0;
+}
+
+uint64_t hpplite_l1_rpc_chain_time(const char *rpc_url) {
+    const HppliteL1Ops *ops = rpc_url ? backendFor(rpc_url) : NULL;
+    return ops && ops->rpc_chain_time ? ops->rpc_chain_time(rpc_url) : 0;
+}
+
 int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
     return l1 ? l1->ops->get_my_address(l1, out) : -1;
 }

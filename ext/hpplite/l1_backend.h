@@ -48,6 +48,8 @@ struct HppliteL1Ops {
     int (*is_lease_active)(HppliteL1 *l1);
     int (*get_addresses)(HppliteL1 *l1, char contractHex[43], char daHex[43]);
     int (*get_my_address)(HppliteL1 *l1, unsigned char out[20]);
+    uint64_t (*chain_time)(HppliteL1 *l1);
+    uint64_t (*rpc_chain_time)(const char *rpc_url);   /* the same before an L1 is connected (a rollup created at the open) */     /* the latest block's timestamp; 0: not read (a backend without one: the host's clock is its chain's) */
     uint64_t (*get_lease_time_remaining)(HppliteL1 *l1);
     char *(*submit_checkpoint)(HppliteL1 *l1, const HppliteCheckpoint *checkpoint, const unsigned char instanceId[32]);
     void (*set_callback)(HppliteL1 *l1, HppliteL1Callback callback, void *arg);

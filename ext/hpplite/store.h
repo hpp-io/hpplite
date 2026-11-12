@@ -141,6 +141,9 @@ typedef struct HppliteFleetView {
     uint64_t prunedBelow;               /* the history below this height is gone from the store (0: nothing pruned) */
 } HppliteFleetView;
 int hpplite_store_retry_after(HppliteStore *store);
+/* the chain's time for a payment's validity window (validAfter, validBefore): what the chain checks it against; a
+** function returning 0 (not read) falls back to the host's clock, said once */
+void hpplite_store_set_chain_time(HppliteStore *store, uint64_t (*xChainTime)(void *), void *pArg);
 int hpplite_store_fleet_view(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], HppliteFleetView *out);
 uint8_t *hpplite_store_get_fleet_name(HppliteStore *store, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t admittedAt, uint64_t height, size_t *pLen);
 int hpplite_store_put_fleet_name(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t admittedAt, uint64_t height,

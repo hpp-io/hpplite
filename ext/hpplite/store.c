@@ -62,6 +62,9 @@ struct HppliteStore {
     int hasFund;                    /* the funding key: derived from the node's key */
     int external;                   /* funder= (#272): fundAddr is another's wallet; no key, no binding, no permit from here */
     int retryAfter;                 /* the last answer's Retry-After on a 429 or 503, seconds (somaro#48); 0: none */
+    uint64_t (*xChainTime)(void *); /* the chain's time for a payment's validity window (somaro: a host clock stepped back); 0: not read */
+    void *pChainTimeArg;
+    int clockSaid;                  /* the host's clock off the chain's (or the chain's unread), said once */
     int funderWait;                 /* the last refusal is the funder's to lift: not bound, not covered (#272), its daily cap (#288) */
     HppliteKeypair fundKp;
     unsigned char fundAddr[20];
@@ -347,7 +350,17 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         if (wordAddress(asset->valuestring, w + 128) != 0) { snprintf(s->error, sizeof s->error, "bad asset address in the 402"); cJSON_Delete(req); return NULL; }
         hpplite_keccak256(w, 160, domain);
 
-        uint64_t now = (uint64_t)time(NULL), validAfter = now - 60, validBefore = now + s->validFor;
+        /* the window the chain checks the authorization against is the chain's time, not this host's: a host clock off
+        ** by minutes (stepped back, never synced) would have every payment refused with nothing pointing at the clock */
+        uint64_t host = (uint64_t)time(NULL), chainNow = s->xChainTime ? s->xChainTime(s->pChainTimeArg) : 0;
+        uint64_t now = chainNow ? chainNow : host, validAfter = now - 60, validBefore = now + s->validFor;
+        if (!s->clockSaid && s->xChainTime && !chainNow) {
+            fprintf(stderr, "hpplite: the chain's time could not be read for a payment to %s: its validity window is from this host's clock\n", s->url);
+            s->clockSaid = 1;
+        } else if (!s->clockSaid && chainNow && (host > chainNow + 30 || chainNow > host + 30)) {
+            fprintf(stderr, "hpplite: this host's clock is %lld s off the chain's: payments to %s take the chain's time\n", (long long)host - (long long)chainNow, s->url);
+            s->clockSaid = 1;
+        }
         {
             /* a nonce used once: time, the address, a counter and this store's identity, hashed (uniqueness, not secrecy) */
             unsigned char seed[84];
@@ -589,6 +602,7 @@ void hpplite_store_close(HppliteStore *s) {
 }
 
 void hpplite_store_set_valid_for(HppliteStore *s, uint64_t seconds) { if (s && seconds) s->validFor = seconds; }
+void hpplite_store_set_chain_time(HppliteStore *s, uint64_t (*xChainTime)(void *), void *pArg) { if (s) { s->xChainTime = xChainTime; s->pChainTimeArg = pArg; } }
 
 /* === hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket and its funding wallet ===
 ** The funding key is derived from the node's (keccak256("hpplite funding key" || key)): backing up

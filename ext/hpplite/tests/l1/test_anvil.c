@@ -4651,6 +4651,53 @@ static void test_fleet_relay_queue(void) {
     PASS();
 }
 
+/* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
+** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
+** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
+** stretches the window; runs last, the chain's clock staying ahead */
+static void test_payment_on_chain_time(void) {
+    TEST("the chain's clock 10 min ahead of this host's: a wallet with USDC.e and no ETH takes its lease and posts through the paid relay and store, the windows on the chain's time");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    static const char ZKEY[] = "0x5454545454545454545454545454545454545454545454545454545454545454";
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
+    char cmd[2400], wallet[80], out[400], extra[400];
+    int sport = test_free_port(), rport = test_free_port();
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", ZKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 1000000000 >/dev/null", RPC, KEY0, usdc, wallet);
+    if (run_cmd(cmd, out, sizeof out) != 0) FAIL("fund the wallet with MockUSDC");
+    /* the chain 10 minutes ahead of where this host's clock is now (the suite's lease scenarios may have moved it already) */
+    snprintf(cmd, sizeof cmd, "now=$(date +%%s); b=$(cast block latest -f timestamp --rpc-url %s); d=$(( now + 600 - b )); "
+             "[ $d -gt 0 ] && cast rpc evm_increaseTime $d --rpc-url %s >/dev/null; cast rpc evm_mine --rpc-url %s >/dev/null; echo $(( $(cast block latest -f timestamp --rpc-url %s) - $(date +%%s) ))",
+             RPC, RPC, RPC, RPC);
+    if (run_cmd(cmd, out, sizeof out) != 0) FAIL("move the chain's clock");
+    long ahead = atol(out);
+    unsetenv("HPPLITE_STORE_VALID_FOR");
+    pid_t store = start_pin_service_free(svc, sport);
+    pid_t relay = store > 0 ? start_relay(svc, usdc, rport) : -1;
+#define STOP54() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } } while (0)
+    if (store < 0 || relay < 0) { STOP54(); FAIL("the store or the relay did not come up"); }
+    money_env(NULL, NULL, NULL, NULL, "200000000", NULL);
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", sport, rport);
+    sqlite3 *w = open_db("ct_writer.db", ZKEY, extra);
+    long long lease = w ? status_int(w, "lease") : -1, flushed = -1, spent = -1;
+    char err[300] = "";
+    if (w) {
+        sqlite3_exec(w, "CREATE TABLE z(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO z(v) VALUES('on the chain''s time')", NULL, NULL, NULL);
+        flushed = scalar(w, "SELECT hpplite_flush()");
+        spent = status_int(w, "relay_spent");
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+        sqlite3_close(w);
+    }
+    STOP54();
+#undef STOP54
+    printf("(the chain %ld s ahead; lease %lld, flush %lld, relay_spent %lld%s%.120s) ", ahead, lease, flushed, spent, err[0] ? ", " : "", err);
+    if (ahead < 590) FAIL("the chain's clock 10 min ahead");
+    if (lease != 1 || flushed <= 0 || spent <= 0) FAIL("payments on the chain's time: the lease taken and the batch posted, paid");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -4714,7 +4761,8 @@ int main(void) {
     if (getenv("HPPLITE_ANVIL_TESTS") && wanted(50)) test_fleet_herd();
     if (wanted(51)) test_fleet_open_store_down();
     if (wanted(52)) test_fleet_empty_file_rebuilt();
-    if (wanted(53)) test_fleet_relay_queue();     /* a measurement, minutes long: when named only */
+    if (wanted(53)) test_fleet_relay_queue();
+    if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

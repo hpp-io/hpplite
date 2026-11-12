@@ -72,6 +72,14 @@ static char *node_strdup(const char *s) {
 /*
 ** Helper: get current time in milliseconds
 */
+/* the chain's time, for what the chain checks against it (a payment's validity window): its latest block; 0 unread */
+static uint64_t node_chain_time(void *pArg) {
+    HppliteNode *node = pArg;
+    if (!node) return 0;
+    if (node->l1) return hpplite_l1_chain_time(node->l1);
+    return node->config.rpcUrl ? hpplite_l1_rpc_chain_time(node->config.rpcUrl) : 0;    /* before the L1: a rollup made at the open */
+}
+
 static int64_t node_current_time_ms(void) {
     /* Monotonic: a wall-clock step must not delay or double a flush */
     struct timespec ts;
@@ -187,7 +195,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         /* the relay (#126): an x402-paid service like the store, its /commit takes the signed forms */
         if (strncmp(node->config.relayUrl, "http://", 7) != 0 && strncmp(node->config.relayUrl, "https://", 8) != 0) node->relay = NULL;
         else node->relay = hpplite_store_open(node->config.relayUrl, config->hasPrivkey ? config->privkey : NULL, config->relayCap);
-        if (node->relay) hpplite_store_set_relay(node->relay);
+        if (node->relay) { hpplite_store_set_relay(node->relay); hpplite_store_set_chain_time(node->relay, node_chain_time, node); }
         if (!node->relay) {
             fprintf(stderr, "hpplite: relay=%s: not a relay URL (http://host:port of operators/relay or a service like it)\n", node->config.relayUrl);
             return -1;
@@ -197,6 +205,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         /* the batch bytes' store (#11): the chain will hold commitments only */
         node->store = hpplite_store_open(node->config.storeUrl, config->hasPrivkey ? config->privkey : NULL, config->storeCap);
         if (node->store && config->hasFunder) hpplite_store_set_funder(node->store, config->funder);   /* an external account (#272) */
+        if (node->store) hpplite_store_set_chain_time(node->store, node_chain_time, node);
         if (!node->store) {
             fprintf(stderr, "hpplite: store=%s: not a store HPPLite knows: store=on for the network's canonical store, or http(s)://host[:port] of an hpplite-store/2 store (operators/store/hpplite_store.py in front of your own disk; kubo:// and s3:// were removed in v0.8, #250)\n", node->config.storeUrl);
             return -1;

@@ -206,6 +206,10 @@ int hpplite_l1_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
 
 /* The wallet this connection signs with (needs a private key). 0 on success. */
 int hpplite_l1_get_my_address(HppliteL1 *l1, unsigned char out[20]);
+/* the chain's time: its latest block's timestamp, for what the chain will check against it (a payment's validity window);
+** 0 when it could not be read, or the backend has no chain clock of its own */
+uint64_t hpplite_l1_chain_time(HppliteL1 *l1);
+uint64_t hpplite_l1_rpc_chain_time(const char *rpc_url);   /* the same from an RPC URL alone, before the L1 is connected */
 
 /* The chain this connection is on (0 when the backend is on none: mock, directory) */
 uint64_t hpplite_l1_chain_id(HppliteL1 *l1);

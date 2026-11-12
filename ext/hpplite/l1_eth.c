@@ -880,6 +880,21 @@ static int eth_get_addresses(HppliteL1 *l1, char contractHex[43], char daHex[43]
     return 0;
 }
 
+static uint64_t eth_chain_time(HppliteL1 *l1) {
+    uint64_t number = 0, ts = 0;
+    if (!l1 || !self->eth || eth_client_latest_block(self->eth, &number, &ts) != 0) return 0;
+    return ts;
+}
+
+static uint64_t eth_rpc_chain_time(const char *rpc_url) {
+    uint64_t number = 0, ts = 0;
+    EthClient *c = eth_client_create(rpc_url, 0);
+    if (!c) return 0;
+    if (eth_client_latest_block(c, &number, &ts) != 0) ts = 0;
+    eth_client_destroy(c);
+    return ts;
+}
+
 static int eth_get_my_address(HppliteL1 *l1, unsigned char out[20]) {
     if (!l1 || !self->has_privkey) return -1;
     memcpy(out, self->address, 20);
@@ -1996,6 +2011,8 @@ const HppliteL1Ops hppliteL1EthOps = {
     .is_lease_active = eth_is_lease_active,
     .get_addresses = eth_get_addresses,
     .get_my_address = eth_get_my_address,
+    .chain_time = eth_chain_time,
+    .rpc_chain_time = eth_rpc_chain_time,
     .get_lease_time_remaining = eth_get_lease_time_remaining,
     .submit_checkpoint = eth_submit_checkpoint,
     .set_callback = eth_set_callback,
