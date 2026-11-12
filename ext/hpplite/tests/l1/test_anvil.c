@@ -2789,7 +2789,10 @@ static void test_fleet_many(void) {
     if (store < 0 || relay < 0) FM_FAIL("the store or the relay did not come up");
     const char *fmt = "file:" DIR "/many_%d.db?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=1s&fleet=%s&owner=%s&dbname=many-%d"
                       "&admit=%llu:0x%s&store=%s&relay=%s";
-    /* (1) a replaced host starting every app at once */
+    /* (1) a replaced host starting every app at once; what the refused ones say, kept */
+    fflush(stderr);
+    int saved1 = dup(2), efd1 = open(DIR "/many_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd1, 2); close(efd1);
     time_t t0 = time(NULL);
     for (int i = 0; i < MANY; i++) {
         snprintf(uri, sizeof uri, fmt, i, RPC, SKEY, fl, ownerAddr, i, issued[i], sigHex[i], storeUrl, relayUrl);
@@ -2806,9 +2809,12 @@ static void test_fleet_many(void) {
         sleep(1);
     }
     long took = (long)(time(NULL) - t0);
+    fflush(stderr); dup2(saved1, 2); close(saved1);
     long r429 = count_in_file(DIR "/relay_fleet.log", "POST /commit HTTP/1.1. 429"), r200 = count_in_file(DIR "/relay_fleet.log", "POST /commit HTTP/1.1. 200");
     long s429 = count_in_file(DIR "/store_service.log", "/name/.* 429"), sPosts = count_in_file(DIR "/store_service.log", "POST /fleet/.*/name/");
-    printf("(20 at once: %d landed in %ld s; the relay 429 %ld, joins %ld; the store 429 %ld, name writes %ld) ", landed, took, r429, r200, s429, sPosts);
+    long saidLimit = count_in_file(DIR "/many_err.log", "waits on the relay.s rate limit .* tried again in [0-9][0-9]* s .its Retry-After, and a jitter.");
+    printf("(20 at once: %d landed in %ld s; the relay 429 %ld, joins %ld; the store 429 %ld, name writes %ld; said the relay's limit %ld) ", landed, took, r429, r200, s429, sPosts, saidLimit);
+    if (saidLimit != r429) FM_FAIL("each refused node says once that it waits on the relay's rate limit, and when it tries again");
     if (landed != MANY || took >= 30 || r429 != 3 || r200 != MANY || s429 != 1 || sPosts != MANY + 1)    /* the 8 s Retry-After, not a 30 s retry */
         FM_FAIL("every join lands; each 429 tried again once, after its Retry-After");
     for (int i = 0; i < MANY; i++) { sqlite3_close(w[i]); w[i] = NULL; }
@@ -4328,6 +4334,79 @@ static void test_platform_sidecar(void) {
 }
 
 
+/* 50. somaro#48, measured (opt-in: HPPLITE_ANVIL_TESTS=42,50; HPPLITE_HERD_N, default 60): a replaced host starts every
+** database at once against a relay that takes 30 POSTs a minute from one address and counts the refused ones, as the
+** canonical relay does (Retry-After: 60). Each refused join waits its Retry-After and a jitter; the time until every
+** database has its first batch at the store is the measurement */
+static void test_fleet_herd(void) {
+    const char *zN = getenv("HPPLITE_HERD_N");
+    int N = zN && atoi(zN) > 0 ? atoi(zN) : 60;
+    char title[200];
+    snprintf(title, sizeof title, "fleet= (somaro#48): %d databases start at once against a relay's 30 POSTs a minute; every one joins, each refused join after its Retry-After", N);
+    TEST(title);
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000], nh[70];
+    char (*dbHex)[70] = calloc((size_t)N, 70), (*sigHex)[140] = calloc((size_t)N, 140);
+    unsigned long long *issued = calloc((size_t)N, sizeof *issued);
+    sqlite3 **w = calloc((size_t)N, sizeof *w);
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+#define FH_FAIL(why) do { for (int j = 0; j < N; j++) if (w[j]) sqlite3_close(w[j]); if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } \
+                          if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } free(dbHex); free(sigHex); free(issued); free(w); FAIL(why); } while (0)
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FH_FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FH_FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    for (int i = 0; i < N; i++) {
+        snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s herd-%d", ownerAddr, seqAddr, fl, KEY0, i);
+        if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex[i], nh, &issued[i], sigHex[i]) != 4)
+            FH_FAIL("the Admits (scenario 42's helper)");
+    }
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/herd_*.db*");
+    store = start_pin_service_free(svc, sport);
+    gRelayBusy[0] = "--per-minute"; gRelayBusy[1] = "30"; gRelayBusy[2] = "--busy-commits"; gRelayBusy[3] = "0";
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    memset(gRelayBusy, 0, sizeof gRelayBusy);
+    if (store < 0 || relay < 0) FH_FAIL("the store or the relay did not come up");
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    const char *fmt = "file:" DIR "/herd_%d.db?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=1s&fleet=%s&owner=%s&dbname=herd-%d"
+                      "&admit=%llu:0x%s&store=%s&relay=%s";
+    time_t t0 = time(NULL);
+    for (int i = 0; i < N; i++) {
+        snprintf(uri, sizeof uri, fmt, i, RPC, SKEY, fl, ownerAddr, i, issued[i], sigHex[i], storeUrl, relayUrl);
+        if (sqlite3_open_v2(uri, &w[i], SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FH_FAIL("open one of them");
+        char sql[120];
+        snprintf(sql, sizeof sql, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('app %d')", i);
+        sqlite3_exec(w[i], sql, NULL, NULL, NULL);
+    }
+    int landed = 0, half = -1;
+    long limit = 120 + 75L * (N / 30 + 1);                            /* a minute and its jitter per 30 refused, and slack */
+    while (time(NULL) - t0 < limit) {
+        landed = 0;
+        for (int i = 0; i < N; i++) landed += store_head_of(storeUrl, fl, dbHex[i]) >= 1;
+        if (half < 0 && landed * 2 >= N) half = (int)(time(NULL) - t0);
+        if (landed == N) break;
+        sleep(2);
+    }
+    long took = (long)(time(NULL) - t0);
+    long r429 = count_in_file(DIR "/relay_fleet.log", "POST /commit HTTP/1.1. 429"), r200 = count_in_file(DIR "/relay_fleet.log", "POST /commit HTTP/1.1. 200");
+    printf("(%d at once: %d joined in %ld s, half by %d s; the relay 200 %ld, 429 %ld) ", N, landed, took, half, r200, r429);
+    if (landed != N) FH_FAIL("every database joins");
+    for (int i = 0; i < N; i++) { sqlite3_close(w[i]); w[i] = NULL; }
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0);
+    free(dbHex); free(sigHex); free(issued); free(w);
+#undef FH_FAIL
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -4388,6 +4467,7 @@ int main(void) {
     if (wanted(47)) test_fleet_big_first_state();
     if (wanted(48)) test_fleet_rebuild_other_writer();
     if (wanted(49)) test_fleet_snapshots();
+    if (getenv("HPPLITE_ANVIL_TESTS") && wanted(50)) test_fleet_herd();     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

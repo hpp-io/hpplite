@@ -1788,15 +1788,24 @@ static int node_ensure_lease(HppliteNode *node) {
                 /* fleet= (#316 d): fenced, or refused (the relay's 402, a retired record...): rows stay pending; the claim
                 ** is tried again every 30 s, the reason said once per episode */
                 const char *why = hpplite_l1_relay_error(node->l1);
+                int ra = node->relay ? hpplite_store_retry_after(node->relay) : 0;
+                int limited = ra > 0 || (why && strstr(why, "answered 429"));
+                int64_t wait = ra > 0 ? ra * 1000LL : 30000, jitter;
                 if (hpplite_l1_fleet_fenced(node->l1)) { node_say_fenced(node); node->leaseRecheckAt = INT64_MAX; return 0; }
+                /* the relay's 429 says when (somaro#48); a jitter of up to a quarter of the wait on top, drawn from the
+                ** instance, so a host's refused claims come back spread over the relay's next window, not all at its edge */
+                jitter = wait / 4;
+                wait += (int64_t)((((uint64_t)node->instanceId[2] << 8) | node->instanceId[3]) % (uint64_t)jitter);
                 if (!node->warnedClaim) {
-                    hpplite_error(node->ctx, "the fleet's lease could not be taken: %s; batches are kept pending, tried again every 30 s",
-                                  why && why[0] ? why : "no reason given");
+                    if (limited)
+                        hpplite_error(node->ctx, "the fleet's lease waits on the relay's rate limit (%s): batches are kept pending, the claim tried again in %lld s%s",
+                                      why && why[0] ? why : "429", (long long)(wait / 1000), ra > 0 ? " (its Retry-After, and a jitter)" : "");
+                    else
+                        hpplite_error(node->ctx, "the fleet's lease could not be taken: %s; batches are kept pending, tried again every 30 s",
+                                      why && why[0] ? why : "no reason given");
                     node->warnedClaim = 1;
                 }
-                node->leaseRecheckAt = now + 30000;
-                if (node->relay && hpplite_store_retry_after(node->relay) > 0)           /* the relay's 429 says when (somaro#48) */
-                    node->leaseRecheckAt = now + hpplite_store_retry_after(node->relay) * 1000LL;
+                node->leaseRecheckAt = now + (limited ? wait : 30000);
             }
             return 0;
         }

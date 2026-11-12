@@ -350,6 +350,9 @@ class Relay:
         self.factory = args.factory.lower()
         self.fleet_factory = (args.fleet_factory or "").lower() or None   # VERSION 11 (#313); none: no fleet calls
         self.busy_commits = getattr(args, "busy_commits", 0)             # the test hook's count left
+        self.per_minute = getattr(args, "per_minute", 0)                 # POSTs a minute from one address (0: no limit)
+        self.posts = {}                                                   # address -> the times of its POSTs in the last minute
+        self.posts_lock = threading.Lock()
         pay_to = args.pay_to or self.address
         self.payments = Payments(args.facilitator, "eip155:%d" % self.chain_id, args.asset, pay_to,
                                  args.asset_name, args.asset_version, args.rpc)
@@ -686,6 +689,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if self.relay.per_minute > 0:
+            # the canonical relay's limit per address (somaro#48): every POST counts, a refused one too; over it, a 429
+            # with Retry-After: 60
+            now, who = time.time(), self.client_address[0]
+            with self.relay.posts_lock:
+                seen = [t for t in self.relay.posts.get(who, []) if t > now - 60] + [now]
+                self.relay.posts[who] = seen
+            if len(seen) > self.relay.per_minute:
+                return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": "60"})
         if re.match(r"^/(account|sponsor|fleet)/", u.path) and not self.relay.payments.enabled:
             return self.reply(404, {"error": "a free relay keeps no accounts"})
         m = re.match(r"^/account/(0x[0-9a-fA-F]{40})/(permit|pay)$", u.path)
@@ -806,6 +818,7 @@ def main():
     ap.add_argument("--factory", required=True, help="the HPPLite factory whose rollups the relay serves (VERSION 10)")
     ap.add_argument("--busy-commits", type=int, default=0, help=argparse.SUPPRESS)    # a test hook: the first k commits answer 429
     ap.add_argument("--busy-retry-after", type=int, default=60, help=argparse.SUPPRESS)  # ...with this Retry-After (somaro#48)
+    ap.add_argument("--per-minute", type=int, default=0, help="POSTs a minute from one address, as the canonical relay limits them (0: no limit)")
     ap.add_argument("--fleet-factory", default=None, help="the VERSION 11 fleet factory whose fleets the relay serves (#313); none: no fleets")
     ap.add_argument("--pay-to", default=None, help="where payments land (default: the relay's own address)")
     ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, or none: free")
