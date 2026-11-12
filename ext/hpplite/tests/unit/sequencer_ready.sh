@@ -9,13 +9,13 @@ bin=$1
 d=$(mktemp -d "${TMPDIR:-/tmp}/hpplite-seqready.XXXXXX")
 pid=
 trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; rm -rf "$d"' EXIT
-fail() { echo "sequencer_ready: FAIL: $1"; echo "--- stdout"; cat "$d/out" 2>/dev/null; echo "--- stderr"; cat "$d/err" 2>/dev/null; exit 1; }
+fail() { echo "sequencer_ready: FAIL: $1"; echo "--- stdout"; cat "$d/out" 2>/dev/null; echo "--- stderr"; cat "$d/err" 2>/dev/null; echo "--- chain after the stop"; cat "$d/chain_after_stop" 2>/dev/null; echo "--- chain now"; ls -laR "$d/chain" 2>/dev/null | head -40; sqlite3 --version; exit 1; }
 # a key, so the batches are posted (without one they stay pending); the timer posts the plain write
 export HPPLITE_PARAMS="l1=file://$d/chain&interval=200ms&datadir=$d&privkey=0x0101010101010101010101010101010101010101010101010101010101010101"
 
 # starts: the sequencer on a fresh file; the line must appear while it runs
 start() {
-    "$bin" "$d/app.db" >"$d/out" 2>"$d/err" &
+    "$bin" "$d/app.db" >"$d/out" 2>>"$d/err" &
     pid=$!
     i=0
     while [ $i -lt 150 ]; do
@@ -36,6 +36,7 @@ if command -v sqlite3 >/dev/null 2>&1; then
     sqlite3 "$d/app.db" "BEGIN; CREATE TABLE t(x); INSERT INTO t VALUES(1); COMMIT" || fail "a plain connection's write"   # one commit, one batch (#334)
     sleep 1                                # the timer posts what the plain connection wrote: one more batch
     stop
+    ls -laR "$d/chain" > "$d/chain_after_stop" 2>&1
     start
     h1=$(height)
     [ "$h1" = "$((h0 + 1))" ] || fail "after a posted write the line should say height $((h0 + 1)) (what hpplite_status says), not '$h1'"
