@@ -38,7 +38,11 @@ if command -v sqlite3 >/dev/null 2>&1; then
     stop
     start
     h1=$(height)
-    [ "$h1" = "$((h0 + 1))" ] || fail "after a posted write the line should say height $((h0 + 1)) (what hpplite_status says), not '$h1'"
+    # the chain's own count: the new file's first batch goes before or after the first run's ready line, alone or with
+    # the plain write - whichever, the line after the restart says what the chain holds (#334)
+    posted=$(ls "$d/chain" | grep -c '^batch-[0-9]*\.bin$')
+    [ "$posted" -ge 1 ] || fail "the plain write should have been posted (the chain holds no batch)"
+    [ "$h1" = "$((posted + 1))" ] || fail "after a posted write the line should say height $((posted + 1)) (the chain holds $posted batches; what hpplite_status says), not '$h1'"
 fi
 stop
 echo "sequencer_ready: ok"
