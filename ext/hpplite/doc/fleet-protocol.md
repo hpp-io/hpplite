@@ -422,6 +422,12 @@ sequencer.
    `HPPLITE_FILE_CHECK_SECONDS` (60) when the file's stat changed, once its
    own checkpoint put the whole WAL in the file with nothing pending; the
    same line, the file whole as the next height.
+   An empty file (no table: one page or none) beside bookkeeping at N >= 1
+   is never that (hpplite#330): at the open, with the store's view read, it
+   is rebuilt from the store's history as case 3 is, said once (`<file> is
+   empty and its bookkeeping says the history has N heights: rebuilt from
+   the store`); emptied under a running node, it is refused and not sent,
+   the next start rebuilding it.
 2. No bookkeeping, a file with pages (a schema, or more than an empty file's
    page), and a history at the store at N > 0: which is true is not known
    here, so `onforeign=` (or `HPPLITE_ON_FOREIGN`; the parameter wins) decides.

@@ -396,6 +396,43 @@ static void test_file_changed_under_node(void) {
     PASS();
 }
 
+/* The file emptied under a running sequencer (#330): an empty database is never its newest state - the file check
+** refuses it, says so, and sends nothing; the next start rebuilds it (a fleet database's) or it is restored */
+static void test_file_emptied_under_node(void) {
+    TEST("the file replaced by an empty database under a running sequencer: refused by the file check, said, nothing sent");
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR);
+    setenv("HPPLITE_FILE_CHECK_SECONDS", "1", 1);
+    TestNodeOpts o = NODE;
+    o.intervalMs = 200;
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
+    HppliteNode *n = test_open_node(DIR "/fe.db", l1, &o);
+    if (!n) { unsetenv("HPPLITE_FILE_CHECK_SECONDS"); FAIL("open"); }
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k); INSERT INTO t(who, k) VALUES('node', 1)", NULL);
+    hpplite_node_start_timer(n);
+    sqlite3_int64 h1 = -1;
+    for (int i = 0; i < 100 && (h1 = status_int(n->db, "height")) < 2; i++) usleep(100000);
+    usleep(1500000);
+    h1 = status_int(n->db, "height");
+    int wrote = system("python3 -c \"import sqlite3, os; e = '" DIR "/empty.db'; c = sqlite3.connect(e); c.execute('PRAGMA user_version=1'); c.commit(); c.close(); "
+                       "b = open(e, 'rb').read(); f = open('" DIR "/fe.db', 'r+b'); f.truncate(0); f.write(b); f.close()\"");
+    usleep(5000000);
+    sqlite3_int64 h2 = status_int(n->db, "height");
+    char err[300] = "";
+    { sqlite3_stmt *q; if (sqlite3_prepare_v2(n->db, "SELECT last_error FROM hpplite_status", -1, &q, NULL) == SQLITE_OK) {
+        if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_text(q, 0)) snprintf(err, sizeof err, "%s", (const char *)sqlite3_column_text(q, 0));
+        sqlite3_finalize(q); } }
+    hpplite_node_stop_timer(n);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    unsetenv("HPPLITE_FILE_CHECK_SECONDS");
+    if (h1 < 2) FAIL("the first batch");
+    if (wrote != 0) FAIL("the empty file put in place (python3 needed)");
+    if (h2 != h1) FAILF("an empty file was sent (height %lld -> %lld)", (long long)h1, (long long)h2);
+    if (!strstr(err, "is empty and its bookkeeping says the history has")) FAILF("the refusal is not said (last error: '%s')", err);
+    PASS();
+}
+
 /* The election across processes: the first full node on a file sequences;
 ** one opened by another process meanwhile is a follower - it captures, it does
 ** not post - and has the same instance id (the file's): when the sequencer
@@ -620,6 +657,7 @@ int main(int argc, char **argv) {
     test_connection_per_request();
     test_close_at_stop();
     test_file_changed_under_node();
+    test_file_emptied_under_node();
     test_lease_on_close();
     test_keep_lease_on_close();
     test_rerun_after_foreign_schema_change();

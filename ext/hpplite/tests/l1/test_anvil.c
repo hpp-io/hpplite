@@ -4496,6 +4496,76 @@ static void test_fleet_open_store_down(void) {
     PASS();
 }
 
+/* 52. hpplite#330: a fleet database's file lost - emptied, the bookkeeping beside it kept (a restore that copied the
+** sidecars and not the file) - is rebuilt from the store's history at its open, said once, and the next write is N+1 on
+** top of it: an empty file is never sent as the database's newest state */
+static void test_fleet_empty_file_rebuilt(void) {
+    TEST("fleet= (#330): an emptied file beside its bookkeeping at N is rebuilt from the store at the open, said once; the next write is N+1 on the rebuilt rows");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000], nh[70], dbHex[70], sigHex[140];
+    unsigned long long issued;
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    sqlite3 *w = NULL;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+#define FE_FAIL(why) do { if (w) sqlite3_close(w); if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } \
+                          if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } FAIL(why); } while (0)
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FE_FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FE_FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s lost-0", ownerAddr, seqAddr, fl, KEY0);
+    if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex, nh, &issued, sigHex) != 4)
+        FE_FAIL("the Admit (scenario 42's helper)");
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/lost_*.db* " DIR "/store_pins " DIR "/lost_err.log");
+    store = start_pin_service_free(svc, sport);
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    if (store < 0 || relay < 0) FE_FAIL("the store or the relay did not come up");
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    snprintf(uri, sizeof uri, "file:" DIR "/lost_0.db?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=1s&fleet=%s&owner=%s&dbname=lost-0"
+             "&admit=%llu:0x%s&store=%s&relay=%s", RPC, SKEY, fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) FE_FAIL("open");
+    sqlite3_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    scalar(w, "SELECT hpplite_flush()");
+    for (int i = 0; i < 3; i++) { sqlite3_exec(w, "INSERT INTO t(v) VALUES('kept')", NULL, NULL, NULL); scalar(w, "SELECT hpplite_flush()"); }
+    long n0 = store_head_of(storeUrl, fl, dbHex);
+    sqlite3_close(w); w = NULL;
+    /* the file lost, its bookkeeping kept */
+    (void)!system("rm -f " DIR "/lost_0.db " DIR "/lost_0.db-wal " DIR "/lost_0.db-shm && : > " DIR "/lost_0.db");
+    fflush(stderr);
+    int saved = dup(2), efd = open(DIR "/lost_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+    int rc = sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL);
+    long long rows = rc == SQLITE_OK ? scalar(w, "SELECT count(*) FROM t") : -1;
+    if (rc == SQLITE_OK) { sqlite3_exec(w, "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('after')", NULL, NULL, NULL); scalar(w, "SELECT hpplite_flush()"); }
+    long long rowsAfter = rc == SQLITE_OK ? scalar(w, "SELECT count(*) FROM t") : -1;
+    long n1 = store_head_of(storeUrl, fl, dbHex);
+    if (w) { sqlite3_close(w); w = NULL; }
+    fflush(stderr); dup2(saved, 2); close(saved);
+    long said = count_in_file(DIR "/lost_err.log", "is empty and its bookkeeping says the history has [0-9]* heights: rebuilt from the store");
+    /* a fresh file and bookkeeping (the instance's seed kept: the same instance), rebuilt from the store: the rows the
+    ** reopened file has */
+    (void)!system("rm -f " DIR "/lost_0.db " DIR "/lost_0.db-wal " DIR "/lost_0.db-shm " DIR "/lost_0.db-hpplite.db*");
+    long long fresh = -1;
+    if (sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK) fresh = scalar(w, "SELECT count(*) FROM t");
+    if (w) { sqlite3_close(w); w = NULL; }
+    printf("(store at %ld; reopened on the emptied file: rc %d, rows %lld, after a write %lld, the store %ld, said %ld; a fresh rebuild has %lld rows) ",
+           n0, rc, rows, rowsAfter, n1, said, fresh);
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); relay = -1; kill(store, SIGTERM); waitpid(store, NULL, 0); store = -1;
+    if (rc != SQLITE_OK || rows != 3) FE_FAIL("the emptied file is rebuilt from the store at the open: its 3 rows back");
+    if (rowsAfter != 4 || n1 != n0 + 1 || fresh != 4) FE_FAIL("the next write is N+1 on the rebuilt rows, and the store's history rebuilds to them");
+    if (said != 1) FE_FAIL("the rebuild of an emptied file is said once");
+#undef FE_FAIL
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -4557,7 +4627,8 @@ int main(void) {
     if (wanted(48)) test_fleet_rebuild_other_writer();
     if (wanted(49)) test_fleet_snapshots();
     if (getenv("HPPLITE_ANVIL_TESTS") && wanted(50)) test_fleet_herd();
-    if (wanted(51)) test_fleet_open_store_down();     /* a measurement, minutes long: when named only */
+    if (wanted(51)) test_fleet_open_store_down();
+    if (wanted(52)) test_fleet_empty_file_rebuilt();     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }

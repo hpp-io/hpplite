@@ -176,6 +176,24 @@ int hppliteSetMetaAt(HppliteCtx *pCtx, uint64_t height, const unsigned char *blo
   return SQLITE_OK;
 }
 
+/* The bookkeeping as a fresh file's (#330): the file it described is gone (emptied), so the history is rebuilt into
+** it from height 1, as into a new volume */
+int hppliteResetMeta(HppliteCtx *pCtx) {
+  int rc, saved;
+  if (!pCtx) return SQLITE_MISUSE;
+  rc = hppliteBkBegin(pCtx, 1);
+  if (rc != SQLITE_OK) return rc;
+  saved = hppliteBkEnter(pCtx);
+  rc = sqlite3_exec(pCtx->bkDb,
+      "UPDATE _hpplite_meta SET next_height=1, prev_block_hash=zeroblob(32), state_root=zeroblob(32), last_checkpoint_height=0,"
+      " last_checkpoint_root=NULL, open_txn=0, frag_id=0, frag_off=0, chain_hash=NULL, inflight_height=0, inflight_root=NULL WHERE id=1;"
+      "DELETE FROM _hpplite_posted; DELETE FROM _hpplite_carry; DELETE FROM _hpplite_pending;", NULL, NULL, NULL);
+  hppliteBkLeave(pCtx, saved);
+  rc = hppliteBkEnd(pCtx, rc);
+  hppliteLoadMeta(pCtx);
+  return rc;
+}
+
 int hppliteMarkInflightPages(HppliteCtx *pCtx, uint64_t height, const unsigned char *root) {
   sqlite3_stmt *pStmt = NULL;
   int rc, saved;

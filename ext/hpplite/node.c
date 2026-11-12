@@ -478,7 +478,19 @@ static void node_check_file(HppliteNode *node) {
     if (hpplite_pagemode_pending(node->pm) || hpplite_pagemode_piece_open(node->pm)) return;     /* the next flush first */
     if (sqlite3_wal_checkpoint_v2(node->ckDb, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt) != SQLITE_OK || nLog < 0 || nCkpt != nLog) return;
     node_stat_key(zFile, key, &ok);
-    if (!ok || !(pr = hpplite_pageroot_from_file(zFile, NULL))) return;
+    if (!ok) return;
+    pr = key[2] ? hpplite_pageroot_from_file(zFile, NULL) : NULL;
+    if (key[2] && !pr) return;
+    if (node->ctx->blockHeight > 1 && (!pr || hpplite_pageroot_pages(pr) <= 1)) {
+        /* #330: emptied under the node (no table needs fewer than two pages) - never the database's newest state */
+        hpplite_pageroot_free(pr);
+        memcpy(node->fileKey, key, sizeof key);
+        node->fileMatched = 1;                                   /* said once for this file; a file changed again is looked at again */
+        hpplite_error(node->ctx, "%s is empty and its bookkeeping says the history has %llu heights: not sent; %s",
+                      sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1),
+                      node->config.hasFleet ? "the next start rebuilds it from the store" : "restore the file");
+        return;
+    }
     hpplite_pageroot_get(pr, file);
     hpplite_pageroot_free(pr);
     hpplite_walread_poll(zFile, 0);
@@ -885,6 +897,28 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                         hpplite_store_error(node->store), (long long)(waitMs / 1000));
             usleep((useconds_t)(pause * 1000));
             backoff = backoff * 2 < 30000 ? backoff * 2 : 30000;
+        }
+        /* #330: the file emptied beside its bookkeeping at N (a restore that brought the sidecars back and not the file)
+        ** is a lost file, never the database's newest state: rebuilt from the store's history, as a new volume is */
+        if (node->ctx->blockHeight > 1 && !node_file_has_pages(node->db)) {
+            const char *zLost = sqlite3_db_filename(node->db, "main");
+            unsigned long long n = (unsigned long long)(node->ctx->blockHeight - 1);
+            if (!v.hasHead) {
+                hpplite_error(node->ctx, "%s is empty and its bookkeeping says the history has %llu heights, and the store holds none of it: not sent; "
+                              "restore the file, or retire the database", zLost, n);
+                node->state = HPPLITE_STATE_ERROR;
+                node->fleetOpenRefused = 2;
+                return;
+            }
+            if (hppliteResetMeta(node->ctx) != SQLITE_OK) {
+                hpplite_error(node->ctx, "%s is empty and its bookkeeping says the history has %llu heights: the bookkeeping could not be reset for the rebuild", zLost, n);
+                node->state = HPPLITE_STATE_ERROR;
+                node->fleetOpenRefused = 2;
+                return;
+            }
+            node->lastCheckpointHeight = 0;
+            node->batchesSinceCheckpoint = 0;
+            fprintf(stderr, "hpplite: %s is empty and its bookkeeping says the history has %llu heights: rebuilt from the store\n", zLost, n);
         }
         if (v.hasHead && v.toHeight + 1 > node->ctx->blockHeight) {
             int i, atEpoch = 0;
