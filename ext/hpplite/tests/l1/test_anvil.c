@@ -2941,7 +2941,7 @@ static void test_fleet_big_first_state(void) {
     /* byte for byte but SQLite's file change counter and version-valid-for (header bytes 25-28 and 93-96, 1-based), which
     ** every write transaction moves and the rebuild moves on purpose so readers notice */
     run_cmd("cmp -l " DIR "/big_a.db " DIR "/big_b.db | awk '$1 < 25 || ($1 > 28 && $1 < 93) || $1 > 96' | wc -l | tr -d ' '; "
-            "[ $(stat -f %z " DIR "/big_a.db) = $(stat -f %z " DIR "/big_b.db) ] && echo same-size || echo other-size", diff, sizeof diff);
+            "[ $(wc -c < " DIR "/big_a.db) = $(wc -c < " DIR "/big_b.db) ] && echo same-size || echo other-size", diff, sizeof diff);
     int sameBytes = strncmp(diff, "0\nsame-size", 11) == 0;
     b = NULL;
     if (sqlite3_open_v2(uri, &b, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(b); FB_FAIL("reopen the rebuilt file"); }
@@ -2968,7 +2968,7 @@ static void test_fleet_big_first_state(void) {
     sqlite3_close(c);
     char diff2[400] = "";
     run_cmd("cmp -l " DIR "/big_b.db " DIR "/big_c.db | awk '$1 < 25 || ($1 > 28 && $1 < 93) || $1 > 96' | wc -l | tr -d ' '; "
-            "[ $(stat -f %z " DIR "/big_b.db) = $(stat -f %z " DIR "/big_c.db) ] && echo same-size || echo other-size", diff2, sizeof diff2);
+            "[ $(wc -c < " DIR "/big_b.db) = $(wc -c < " DIR "/big_c.db) ] && echo same-size || echo other-size", diff2, sizeof diff2);
     printf("(a second restore: height %lld, state %s, rows %lld, '%.200s', the bytes %s the first restored file's) ", hc, cstate, rowsC,
            cerr[0] ? cerr : "no error", strncmp(diff2, "0\nsame-size", 11) == 0 ? "equal to" : "NOT equal to");
     if (hc != height + 1 || rowsC != 1501 || strncmp(diff2, "0\nsame-size", 11) != 0)
@@ -3073,7 +3073,7 @@ static long long dir_bytes(const char *dir) {
 static int same_but_counter(const char *a, const char *b) {
     char cmd[600], out[64] = "";
     snprintf(cmd, sizeof cmd, "cmp -l %s %s | awk '$1 < 25 || ($1 > 28 && $1 < 93) || $1 > 96' | wc -l | tr -d ' '; "
-             "[ $(stat -f %%z %s) = $(stat -f %%z %s) ] && echo same-size || echo other-size", a, b, a, b);
+             "[ $(wc -c < %s) = $(wc -c < %s) ] && echo same-size || echo other-size", a, b, a, b);
     run_cmd(cmd, out, sizeof out);
     return strncmp(out, "0\nsame-size", 11) == 0;
 }
