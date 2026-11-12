@@ -46,6 +46,13 @@ relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file relay.key \
    transaction succeeded. A call that reverts on chain after all, for
    example because another got in first, gets `409` and isn't charged.
    Success gets `200 {tx, block, gasUsed, call}` with `PAYMENT-RESPONSE`.
+5. **One send at a time.** The relay's key sends one transaction at a time
+   and waits for its receipt, so calls queue for their turn. A call that
+   waits past `--queue-wait` (45 s) gets `503` with `Retry-After`
+   (`--queue-retry`, 30 s): nothing is sent or charged, rather than sending
+   it after its caller gave up (hpplite-operators#45). `--per-minute N`
+   limits POSTs a minute from one address as the canonical relay does
+   (`429`, `Retry-After: 60`); off by default.
 
 `GET /status`: the relay's address and ETH balance, the chain, the factory,
 the calls it takes and the prices.

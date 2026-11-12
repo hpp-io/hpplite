@@ -1842,7 +1842,7 @@ static int node_ensure_lease(HppliteNode *node) {
                 ** is tried again every 30 s, the reason said once per episode */
                 const char *why = hpplite_l1_relay_error(node->l1);
                 int ra = node->relay ? hpplite_store_retry_after(node->relay) : 0;
-                int limited = ra > 0 || (why && strstr(why, "answered 429"));
+                int limited = ra > 0 || (why && strstr(why, "answered 429")), queued = why && strstr(why, "answered 503");
                 int64_t wait = ra > 0 ? ra * 1000LL : 30000, jitter;
                 if (hpplite_l1_fleet_fenced(node->l1)) { node_say_fenced(node); node->leaseRecheckAt = INT64_MAX; return 0; }
                 /* the relay's 429 says when (somaro#48); a jitter of up to a quarter of the wait on top, drawn from the
@@ -1851,8 +1851,8 @@ static int node_ensure_lease(HppliteNode *node) {
                 wait += (int64_t)((((uint64_t)node->instanceId[2] << 8) | node->instanceId[3]) % (uint64_t)jitter);
                 if (!node->warnedClaim) {
                     if (limited)
-                        hpplite_error(node->ctx, "the fleet's lease waits on the relay's rate limit (%s): batches are kept pending, the claim tried again in %lld s%s",
-                                      why && why[0] ? why : "429", (long long)(wait / 1000), ra > 0 ? " (its Retry-After, and a jitter)" : "");
+                        hpplite_error(node->ctx, "the fleet's lease waits on the relay's %s (%s): batches are kept pending, the claim tried again in %lld s%s",
+                                      queued ? "send queue" : "rate limit", why && why[0] ? why : "429", (long long)(wait / 1000), ra > 0 ? " (its Retry-After, and a jitter)" : "");
                     else
                         hpplite_error(node->ctx, "the fleet's lease could not be taken: %s; batches are kept pending, tried again every 30 s",
                                       why && why[0] ? why : "no reason given");

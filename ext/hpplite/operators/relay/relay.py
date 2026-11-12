@@ -339,6 +339,18 @@ def call_price(gas, fee, margin, eth_usd, min_fee) -> int:
 
 # ============ The relay ============
 
+class LockHeld:
+    """a lock already acquired, released at the block's end"""
+    def __init__(self, lock):
+        self.lock = lock
+
+    def __enter__(self):
+        return self.lock
+
+    def __exit__(self, *exc):
+        self.lock.release()
+
+
 class Relay:
     def __init__(self, args):
         self.args = args
@@ -457,6 +469,8 @@ class Relay:
     # --- doing it ---
     def submit(self, to, data, gas):
         """Under the lock: send, wait for the receipt. (receipt or None, error)."""
+        if getattr(self.args, "slow_submit", 0):
+            time.sleep(self.args.slow_submit)            # a test hook: a slow chain's turn (operators#45)
         tip, max_fee, _ = self.fees()
         nonce = int(self.chain.call("eth_getTransactionCount", self.address, "pending"), 16)
         raw = signed_tx(self.key, self.chain_id, nonce, tip, max_fee, gas, to, bytes.fromhex(data[2:]))
@@ -504,6 +518,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         if self.relay.args.verbose:
             sys.stderr.write("relay: " + fmt % args + "\n")
+
+    def queue_full(self):
+        """operators#45: a call that waited --queue-wait for its turn on the relay's key is not sent late (its caller has
+        likely given up and tries again); 503 with a Retry-After, nothing sent or charged"""
+        return self.reply(503, {"error": "the relay's send queue is long: try again in %d s" % self.relay.args.queue_retry},
+                          {"Retry-After": str(self.relay.args.queue_retry)})
 
     def reply(self, status, obj, headers=None):
         body = json.dumps(obj).encode()
@@ -752,12 +772,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sponsor, sponsor_why = (r.accounts.cover(rollup, amount, counted=(name not in ("retireFor", "expireFor")))   # charged, outside the cap (#313, #321)
                                 if (rollup and p.enabled and not header) else (None, None))
         if sponsor and not sponsor_why:
+            if not r.lock.acquire(timeout=r.args.queue_wait if r.args.queue_wait > 0 else -1):
+                r.accounts.refund(rollup, sponsor, amount)
+                return self.queue_full()
             try:
-                with r.lock:
-                    rcpt, err = r.submit(to, data, gas)
+                rcpt, err = r.submit(to, data, gas)
             except Exception:
                 r.accounts.refund(rollup, sponsor, amount)
                 raise
+            finally:
+                r.lock.release()
             if err or int(rcpt.get("status") or "0x0", 16) != 1:
                 r.accounts.refund(rollup, sponsor, amount)
                 tx = rcpt.get("transactionHash") if rcpt else None
@@ -783,7 +807,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 requirements["error"] = v.get("invalidReason", "invalid payment") + (
                     ": " + str(v["invalidMessage"])[:200] if v.get("invalidMessage") else "")
                 return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
-        with r.lock:
+        if not r.lock.acquire(timeout=r.args.queue_wait if r.args.queue_wait > 0 else -1):
+            return self.queue_full()                       # nothing charged: the payment is settled only after a send
+        with LockHeld(r.lock):
             rcpt, err = r.submit(to, data, gas)
             if err or int(rcpt.get("status") or "0x0", 16) != 1:
                 tx = rcpt.get("transactionHash") if rcpt else None
@@ -818,6 +844,9 @@ def main():
     ap.add_argument("--factory", required=True, help="the HPPLite factory whose rollups the relay serves (VERSION 10)")
     ap.add_argument("--busy-commits", type=int, default=0, help=argparse.SUPPRESS)    # a test hook: the first k commits answer 429
     ap.add_argument("--busy-retry-after", type=int, default=60, help=argparse.SUPPRESS)  # ...with this Retry-After (somaro#48)
+    ap.add_argument("--queue-wait", type=float, default=45, help="seconds a call waits for its turn on the relay's key before a 503 (operators#45); 0: no bound")
+    ap.add_argument("--slow-submit", type=float, default=0, help=argparse.SUPPRESS)   # a test hook: each send this much slower
+    ap.add_argument("--queue-retry", type=int, default=30, help="the Retry-After of that 503, seconds")
     ap.add_argument("--per-minute", type=int, default=0, help="POSTs a minute from one address, as the canonical relay limits them (0: no limit)")
     ap.add_argument("--fleet-factory", default=None, help="the VERSION 11 fleet factory whose fleets the relay serves (#313); none: no fleets")
     ap.add_argument("--pay-to", default=None, help="where payments land (default: the relay's own address)")

@@ -61,7 +61,7 @@ struct HppliteStore {
     time_t boundChecked;            /* when that was last asked */
     int hasFund;                    /* the funding key: derived from the node's key */
     int external;                   /* funder= (#272): fundAddr is another's wallet; no key, no binding, no permit from here */
-    int retryAfter;                 /* the last answer's Retry-After on a 429, seconds (somaro#48); 0: none */
+    int retryAfter;                 /* the last answer's Retry-After on a 429 or 503, seconds (somaro#48); 0: none */
     int funderWait;                 /* the last refusal is the funder's to lift: not bound, not covered (#272), its daily cap (#288) */
     HppliteKeypair fundKp;
     unsigned char fundAddr[20];
@@ -170,7 +170,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
                 const char *v = line + 17;
                 while (*v == ' ') v++;
                 *pzPaymentRequired = sqlite3_mprintf("%.*s", (int)(len - (v - line)), v);
-            } else if (status == 429 && len > 12 && strncasecmp(line, "Retry-After:", 12) == 0) {
+            } else if ((status == 429 || status == 503) && len > 12 && strncasecmp(line, "Retry-After:", 12) == 0) {   /* 503: a relay's send queue (operators#45) */
                 long ra = strtol(line + 12, NULL, 10);         /* seconds; an HTTP date is taken as none */
                 s->retryAfter = ra > 0 ? (int)(ra < 3600 ? ra : 3600) : 0;
             } else if (pzPaymentResponse && len > 17 && strncasecmp(line, "PAYMENT-RESPONSE:", 17) == 0) {

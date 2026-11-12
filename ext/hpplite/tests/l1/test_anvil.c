@@ -4566,6 +4566,91 @@ static void test_fleet_empty_file_rebuilt(void) {
     PASS();
 }
 
+static void *queue_open(void *arg) {
+    struct { char uri[2000]; sqlite3 **pw; } *a = arg;
+    if (sqlite3_open_v2(a->uri, a->pw, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK)
+        sqlite3_exec(*a->pw, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('one')", NULL, NULL, NULL);
+    return NULL;
+}
+/* 53. hpplite-operators#45: a relay whose turn on its key is slower than the node's patience - a call waits its turn
+** past --queue-wait and is answered 503 with a Retry-After, not sent after its caller gave up; the nodes wait that
+** and join, none seeing the relay not answer. HPPLITE_QUEUE_WAIT=0 runs it on an unbounded relay (the old one) */
+#define SLOW 12
+static void test_fleet_relay_queue(void) {
+    TEST("fleet= (operators#45): 12 joins against a relay 6 s a send: a call past --queue-wait is answered 503 + Retry-After, not sent late; every join lands, no node sees the relay not answer");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *zq = getenv("HPPLITE_QUEUE_WAIT");
+    static const char SKEY[] = "0x5353535353535353535353535353535353535353535353535353535353535353";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000], nh[70], qw[16];
+    static char dbHex[SLOW][70], sigHex[SLOW][140];
+    unsigned long long issued[SLOW];
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    sqlite3 *w[SLOW] = {0};
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+#define FQ_FAIL(why) do { for (int j = 0; j < SLOW; j++) if (w[j]) sqlite3_close(w[j]); if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } \
+                          if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } FAIL(why); } while (0)
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FQ_FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FQ_FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    for (int i = 0; i < SLOW; i++) {
+        snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s slow-%d", ownerAddr, seqAddr, fl, KEY0, i);
+        if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex[i], nh, &issued[i], sigHex[i]) != 4)
+            FQ_FAIL("the Admits (scenario 42's helper)");
+    }
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/slow_*.db* " DIR "/store_pins " DIR "/slow_err.log");
+    store = start_pin_service_free(svc, sport);
+    snprintf(qw, sizeof qw, "%s", zq && zq[0] ? zq : "20");
+    gRelayBusy[0] = "--slow-submit"; gRelayBusy[1] = "6"; gRelayBusy[2] = "--queue-wait"; gRelayBusy[3] = qw;
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    memset(gRelayBusy, 0, sizeof gRelayBusy);
+    if (store < 0 || relay < 0) FQ_FAIL("the store or the relay did not come up");
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    const char *fmt = "file:" DIR "/slow_%d.db?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=1s&fleet=%s&owner=%s&dbname=slow-%d"
+                      "&admit=%llu:0x%s&store=%s&relay=%s";
+    fflush(stderr);
+    int saved = dup(2), efd = open(DIR "/slow_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+    /* the opens at once, each in its own thread: a replaced host's sidecars */
+    pthread_t th[SLOW];
+    struct OpenArg { char uri[2000]; sqlite3 **pw; } args[SLOW];
+    for (int i = 0; i < SLOW; i++) {
+        snprintf(args[i].uri, sizeof args[i].uri, fmt, i, RPC, SKEY, fl, ownerAddr, i, issued[i], sigHex[i], storeUrl, relayUrl);
+        args[i].pw = &w[i];
+    }
+    void *(*opener)(void *) = NULL;
+    time_t t0 = time(NULL);
+    for (int i = 0; i < SLOW; i++) pthread_create(&th[i], NULL, opener = queue_open, &args[i]);
+    for (int i = 0; i < SLOW; i++) pthread_join(th[i], NULL);
+    (void)opener;
+    int landed = 0;
+    while (time(NULL) - t0 < 400) {
+        landed = 0;
+        for (int i = 0; i < SLOW; i++) landed += store_head_of(storeUrl, fl, dbHex[i]) >= 1;
+        if (landed == SLOW) break;
+        sleep(2);
+    }
+    long took = (long)(time(NULL) - t0);
+    for (int i = 0; i < SLOW; i++) if (w[i]) { sqlite3_close(w[i]); w[i] = NULL; }
+    fflush(stderr); dup2(saved, 2); close(saved);
+    long r503 = count_in_file(DIR "/relay_fleet.log", "POST /commit HTTP/1.1. 503"), r200 = count_in_file(DIR "/relay_fleet.log", "POST /commit HTTP/1.1. 200");
+    long silent = count_in_file(DIR "/slow_err.log", "does not answer"), saidQueue = count_in_file(DIR "/slow_err.log", "waits on the relay.s send queue");
+    printf("(queue-wait %s: %d of %d joined in %ld s; the relay 200 %ld, 503 %ld; the nodes: 'does not answer' %ld, said the queue %ld) ",
+           qw, landed, SLOW, took, r200, r503, silent, saidQueue);
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); relay = -1; kill(store, SIGTERM); waitpid(store, NULL, 0); store = -1;
+    if (landed != SLOW) FQ_FAIL("every join lands");
+    if (silent != 0) FQ_FAIL("no node sees the relay not answer: a call past its turn's wait is answered 503, not left to time out");
+    if (r200 != SLOW) FQ_FAIL("each database joined by one send, none sent after its caller gave up");
+#undef FQ_FAIL
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -4628,7 +4713,8 @@ int main(void) {
     if (wanted(49)) test_fleet_snapshots();
     if (getenv("HPPLITE_ANVIL_TESTS") && wanted(50)) test_fleet_herd();
     if (wanted(51)) test_fleet_open_store_down();
-    if (wanted(52)) test_fleet_empty_file_rebuilt();     /* a measurement, minutes long: when named only */
+    if (wanted(52)) test_fleet_empty_file_rebuilt();
+    if (wanted(53)) test_fleet_relay_queue();     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }
