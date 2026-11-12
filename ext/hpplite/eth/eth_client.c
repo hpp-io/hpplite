@@ -122,6 +122,8 @@ static cJSON *rpc_call(EthClient *client, const char *method, cJSON *params) {
     return r;
 }
 
+static int64_t mono_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (int64_t)t.tv_sec; }
+
 static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *params) {
     struct ResponseBuffer response = {0};
     struct curl_slist *headers = NULL;
@@ -130,7 +132,7 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
     ** calls, a flush and a close several more) fail at once instead of each
     ** waiting out its own timeout: a frozen endpoint costs one timeout, not
     ** one per call. The window is short; the node retries on its own schedule. */
-    if (client->downUntil && time(NULL) < client->downUntil) {
+    if (client->downUntil && mono_s() < client->downUntil) {
         snprintf(client->error, sizeof(client->error), "L1 RPC did not answer recently; not trying again yet");
         if (params) cJSON_Delete(params);
         return NULL;
@@ -180,7 +182,7 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
     curl_slist_free_all(headers);
     free(request_str);
     
-    if (res == CURLE_OPERATION_TIMEDOUT) client->downUntil = time(NULL) + 10;
+    if (res == CURLE_OPERATION_TIMEDOUT) client->downUntil = mono_s() + 10;      /* monotonic: a wall clock stepped back must not lengthen it */
     else client->downUntil = 0;
     if (res != CURLE_OK) {
         snprintf(client->error, sizeof(client->error), "curl error: %s", 
