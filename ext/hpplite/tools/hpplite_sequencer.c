@@ -55,7 +55,9 @@
 ** fleet database is anchored by the fleet's anchor, not here. One line on
 ** stdout, "<copy>: sent height N" or "<copy>: unchanged at height N", exit 0;
 ** exit 1 with the reason on stderr (the open refused, the send kept pending:
-** it goes at the next run); exit 3 when another process holds the copy.
+** it goes at the next run); exit 3 when another process holds the copy. A close
+** refused after the run says why on stderr, with the statements left open, and
+** closes again: the exit stays the run's.
 */
 
 #include "hpplite.h"
@@ -309,6 +311,24 @@ static void once_stat_key(const char *app, char *out, size_t n) {
              hw ? (unsigned long long)w.st_dev : 0ull, hw ? (unsigned long long)w.st_ino : 0ull, hw ? (long long)w.st_size : -1LL, wm);
 }
 
+/* The run's close (somaro#144: a third of the runs on dev exited 1 here, silently, after "sent height N"). This tool
+** keeps no statement open, so a close refused for one names HPPLite's own: said with its SQL, finalized, and the close
+** tried again. What was sent stays sent: the exit is the run's, 0, unless the second close fails too */
+static int once_close(sqlite3 *db, const char *copy) {
+    int rc = sqlite3_close(db);
+    if (rc == SQLITE_OK) return 0;
+    fprintf(stderr, "hpplite-sequencer: %s: the close failed after the run (%s: %s)", copy, sqlite3_errstr(rc), sqlite3_errmsg(db));
+    sqlite3_stmt *st;
+    while ((st = sqlite3_next_stmt(db, NULL)) != NULL) {
+        const char *sql = sqlite3_sql(st);
+        fprintf(stderr, "; open: %.200s", sql ? sql : "?");
+        sqlite3_finalize(st);
+    }
+    rc = sqlite3_close(db);
+    fprintf(stderr, "; closed again: %s\n", rc == SQLITE_OK ? "ok" : sqlite3_errstr(rc));
+    return rc == SQLITE_OK ? 0 : 1;
+}
+
 static int once_main(const char *copy, const char *app) {
     const char *params = getenv("HPPLITE_PARAMS");
     char keyPath[PATH_MAX + 8], key[256] = "", was[256] = "", why[512];
@@ -379,7 +399,7 @@ static int once_main(const char *copy, const char *app) {
     if (after > before) printf("%s: sent height %d\n", copy, after - 1);
     else printf("%s: unchanged at height %d\n", copy, after - 1);
     fflush(stdout);
-    return sqlite3_close(db) == SQLITE_OK ? 0 : 1;
+    return once_close(db, copy);
 }
 
 int main(int argc, char **argv) {

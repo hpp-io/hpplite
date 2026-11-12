@@ -4900,10 +4900,24 @@ static void test_sequencer_once(void) {
     /* 3: one row changed, the app still open: height 2 */
     sqlite3_exec(app, "UPDATE t SET v = 'changed' WHERE id = 50", NULL, NULL, NULL);
     int r3 = once_run(bin, params, DIR "/once_app/app.db", DIR "/once_copy/copy.db", o3, sizeof o3);
+    /* 3b (somaro#144): ten more runs, a row changed before each: every one sends its height and exits 0 */
+    int bad = 0, at = 2;
+    char badErr[400] = "";
+    for (int i = 0; i < 10; i++) {
+        char ob[300], sq[120], wantH[64];
+        snprintf(sq, sizeof sq, "UPDATE t SET v = 'run %d' WHERE id = %d", i, 60 + i);
+        sqlite3_exec(app, sq, NULL, NULL, NULL);
+        int r = once_run(bin, params, DIR "/once_app/app.db", DIR "/once_copy/copy.db", ob, sizeof ob);
+        snprintf(wantH, sizeof wantH, "sent height %d", at + 1);
+        if (r != 0 || !strstr(ob, wantH)) { if (!bad) { run_cmd("cat " DIR "/once_err.log", badErr, sizeof badErr); badErr[strcspn(badErr, "\n")] = 0; } bad++; }
+        if (strstr(ob, "sent height")) at = atoi(strstr(ob, "sent height") + 12);
+    }
+    printf("(10 more runs: %d not '0, sent the next height'%s%.200s) ", bad, bad ? "; the first's stderr: " : "", badErr);
+    if (bad) ON_FAIL("each run over a changed app's file sends the next height and exits 0");
     long posts = fleet_relay_posts();
     snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
     run_cmd(cmd, out, sizeof out);
-    snprintf(want, sizeof want, "\"toHeight\": 2");
+    snprintf(want, sizeof want, "\"toHeight\": %d", at);
     int storeAt2 = strstr(out, want) != NULL;
     long long inCopy = -1;
     { sqlite3 *c = NULL;
