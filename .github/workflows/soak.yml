@@ -35,6 +35,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4    # what the contracts' gas tests and the anvil scenarios are validated on (#335)
       - name: dependencies
         run: |
           sudo apt-get update
