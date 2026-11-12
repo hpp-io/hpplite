@@ -26,7 +26,7 @@ const HppliteNetworkAlias HPPLITE_NETWORKS[] = {
     /* the canonical operators (hpp-io/hpplite-operators): HPP's store and relay on the network, store=on / relay=on */
     {"hpp-sepolia", 181228, "https://sepolia.hpp.io", "0xbce61e56f84620bc4365e95126f82b51faed7b4e", 40000, 32000000, 30 * 60 * 1000,
      "https://store.sepolia.hpplite.hpp.io", "https://relay.sepolia.hpplite.hpp.io"},
-    {"hpp-mainnet", 181227, "https://mainnet.hpp.io", NULL, 40000, 32000000, 30 * 60 * 1000, NULL, NULL},  /* Not deployed yet */
+    {"hpp-mainnet", 190415, "https://mainnet.hpp.io", NULL, 40000, 32000000, 30 * 60 * 1000, NULL, NULL},  /* HPP Mainnet; its factory, store and relay once deployed (#337) */
     {"ethereum",    1,      "https://eth.llamarpc.com", NULL, 20000, 16777216, 0, NULL, NULL},
     {"sepolia",     11155111, "https://sepolia.drpc.org", NULL, 20000, 16777216, 0, NULL, NULL},
     {NULL, 0, NULL, NULL, 0, 0, 0, NULL, NULL}

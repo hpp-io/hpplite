@@ -57,6 +57,14 @@ static void test_network_alias(void) {
         FAIL("hpp-sepolia alias not resolved");
     }
 
+    /* hpp-mainnet: HPP Mainnet's chain id, 190415 (docs.hpp.io/x402/networks-and-token) */
+    if (hpplite_da_resolve_alias("hpp-mainnet") != 190415) {
+        FAIL("hpp-mainnet alias should be chain 190415");
+    }
+    if (!hpplite_da_get_rpc_url(190415) || strcmp(hpplite_da_get_rpc_url(190415), "https://mainnet.hpp.io") != 0) {
+        FAIL("chain 190415's RPC should be https://mainnet.hpp.io");
+    }
+
     /* Test unknown alias */
     if (hpplite_da_resolve_alias("unknown-network") != 0) {
         FAIL("unknown alias should return 0");
