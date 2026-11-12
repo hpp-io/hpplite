@@ -273,6 +273,8 @@ if(HPPLITE_BUILD_TESTS)
 
         add_executable(test_concurrency tests/unit/test_concurrency.c)
         target_link_libraries(test_concurrency hpplite_testlib)
+        add_executable(test_clock_step tests/unit/test_clock_step.c)
+        target_link_libraries(test_clock_step hpplite_testlib)
 
 
         add_executable(test_blob_io tests/unit/test_blob_io.c)
@@ -442,6 +444,8 @@ if(HPPLITE_BUILD_TESTS)
         add_test(NAME test_env_enable COMMAND test_env_enable)
         add_test(NAME test_reorg COMMAND test_reorg)
         add_test(NAME test_concurrency COMMAND test_concurrency)
+        # test_clock_step is built, not a ctest: it steps the wall clock (sudo date), so CI's "wall clock stepped back" job
+        # runs it on a throwaway runner with HPPLITE_CLOCK_STEP=1; anywhere else it skips
         add_test(NAME test_blob_io COMMAND test_blob_io)
         add_test(NAME test_crash COMMAND crash_hpplite)
         # a sequencer lost between a flush and an anchor, a successor recovering from the store by key (#167)

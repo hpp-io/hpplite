@@ -4122,13 +4122,24 @@ static void *node_timer_thread_func(void *arg) {
     pthread_mutex_t *wakeMutex = (pthread_mutex_t *)node->timerWakeMutex;
 
     while (node->timerRunning) {
-        struct timespec until;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_nsec += (long)sleepMs * 1000000L;
-        until.tv_sec += until.tv_nsec / 1000000000L;
-        until.tv_nsec %= 1000000000L;
+        /* the wait on the monotonic clock: a wall clock stepped back (a VM's guest agent, NTP) must not hold the
+        ** timer for the step, nor a step forward cut its waits short (somaro's v0.1 soak) */
         pthread_mutex_lock(wakeMutex);
-        if (node->timerRunning) pthread_cond_timedwait(wake, wakeMutex, &until);
+#ifdef __APPLE__
+        if (node->timerRunning) {
+            struct timespec rel = { sleepMs / 1000, (long)(sleepMs % 1000) * 1000000L };
+            pthread_cond_timedwait_relative_np(wake, wakeMutex, &rel);
+        }
+#else
+        if (node->timerRunning) {
+            struct timespec until;
+            clock_gettime(CLOCK_MONOTONIC, &until);
+            until.tv_nsec += (long)sleepMs * 1000000L;
+            until.tv_sec += until.tv_nsec / 1000000000L;
+            until.tv_nsec %= 1000000000L;
+            pthread_cond_timedwait(wake, wakeMutex, &until);
+        }
+#endif
         pthread_mutex_unlock(wakeMutex);
 
         if (!node->timerRunning) break;
@@ -4240,7 +4251,15 @@ void hpplite_node_start_timer(HppliteNode *node) {
         pthread_cond_t *c = sqlite3_malloc(sizeof(pthread_cond_t));
         pthread_mutex_t *m = sqlite3_malloc(sizeof(pthread_mutex_t));
         if (!c || !m) { sqlite3_free(c); sqlite3_free(m); sqlite3_free(thread); return; }
-        pthread_cond_init(c, NULL);
+#ifdef __APPLE__
+        pthread_cond_init(c, NULL);                   /* the timer waits with the relative wait, on no wall clock */
+#else
+        {   pthread_condattr_t at;                    /* the timer's waits on the monotonic clock */
+            pthread_condattr_init(&at);
+            pthread_condattr_setclock(&at, CLOCK_MONOTONIC);
+            pthread_cond_init(c, &at);
+            pthread_condattr_destroy(&at); }
+#endif
         pthread_mutex_init(m, NULL);
         node->timerWake = c;
         node->timerWakeMutex = m;

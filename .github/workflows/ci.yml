@@ -58,6 +58,32 @@ jobs:
             -DHPPLITE_USE_REAL_L1=ON -DCMAKE_C_FLAGS="-Wall -Wextra -Werror=implicit-function-declaration"
           cmake --build ext/hpplite/build_real -j"$(nproc)"
 
+  clock:
+    # the wall clock stepped back under a running node: a throwaway runner, so the test may set its clock (sudo date)
+    name: wall clock stepped back
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config tcl zlib1g-dev \
+            libsecp256k1-dev libcurl4-openssl-dev sqlite3 python3
+      - name: SQLite amalgamation
+        run: |
+          mkdir -p build && cd build
+          ../configure >/dev/null
+          make -s sqlite3.c sqlite3ext.h >/dev/null
+      - name: build
+        run: |
+          cmake -S ext/hpplite -B ext/hpplite/build -DHPPLITE_SQLITE_SRC=$PWD/build
+          cmake --build ext/hpplite/build -j"$(nproc)" --target test_clock_step
+      - name: test_clock_step
+        run: cd ext/hpplite/build && HPPLITE_CLOCK_STEP=1 ./test_clock_step
+      - name: the clock back on time
+        if: always()
+        run: sudo timedatectl set-ntp true || true
+
   anvil:
     name: real contracts on anvil
     runs-on: ubuntu-24.04
