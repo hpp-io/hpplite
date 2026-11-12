@@ -2038,6 +2038,7 @@ static long eth_balance_of(const char *addr) {
     return run_cmd(cmd, out, sizeof out) == 0 ? first_number(out) : -1;
 }
 /* the reference relay (#170) on port, paying with KEY9; -1 when it did not come up */
+static const char *gAssetArgs[4];        /* scenario 55: --asset-name N --asset-version V for start_relay (NULL: USDC.e's) */
 static pid_t start_relay(const char *svc, const char *usdc, int port) {
     char cmd[300], out[400], script[600];
     FILE *f = fopen(DIR "/relay.key", "w");
@@ -2053,7 +2054,8 @@ static pid_t start_relay(const char *svc, const char *usdc, int port) {
         int fd = open(DIR "/relay.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
         execlp("python3", "python3", "-I", script, "--port", portStr, "--rpc", RPC, "--key-file", DIR "/relay.key",
-               "--factory", FACTORY, "--facilitator", FACIL, "--asset", usdc, "--eth-usd", "30", "--dir", DIR "/relay_accounts", (char *)NULL);
+               "--factory", FACTORY, "--facilitator", FACIL, "--asset", usdc, "--eth-usd", "30", "--dir", DIR "/relay_accounts",
+               gAssetArgs[0], gAssetArgs[1], gAssetArgs[2], gAssetArgs[3], (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 50; i++) {
@@ -4698,6 +4700,84 @@ static void test_payment_on_chain_time(void) {
     PASS();
 }
 
+/* 55. somaro#128: a store and a relay priced in another token than USDC.e - CHIP's EIP-712 domain ("House Chip", "1"),
+** here a stand-in on anvil: a wallet holding only that token takes its lease and anchors through the paid relay, binds
+** a bucket with its permit and writes; the store pulls it. Whatever assumes USDC.e's domain fails here */
+static void test_paid_in_chip(void) {
+    TEST("priced in CHIP (somaro#128): a wallet with only CHIP pays the relay (lease, anchor) and the store (permit, writes, the pull), the token's own EIP-712 domain");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *chip = getenv("HPPLITE_ANVIL_CHIP");
+    static const char CKEY[] = "0x5555555555555555555555555555555555555555555555555555555555555555";
+    if (!svc || !chip || !chip[0]) { printf("SKIP (no pin service or MockToken in the environment) "); PASS(); return; }
+    char cmd[2400], wallet[80], payTo[80], out[400], extra[400];
+    int sport = test_free_port(), rport = test_free_port();
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", CKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    if (run_cmd(cmd, payTo, sizeof payTo) != 0) FAIL("cast wallet address");
+    payTo[strcspn(payTo, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 1000000000 >/dev/null", RPC, KEY0, chip, wallet);
+    if (run_cmd(cmd, out, sizeof out) != 0) FAIL("fund the wallet with the stand-in CHIP");
+    long long payBefore = anvil_usdc_of(chip, payTo);
+    FILE *f = fopen(DIR "/chip_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    (void)!system("rm -rf " DIR "/chip_pins");
+    pid_t store = fork();
+    if (store == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", sport);
+        snprintf(script, sizeof script, "%s/hpplite_store.py", svc);
+        int fd = open(DIR "/chip_store.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/chip_pins", "--signer-key", DIR "/chip_signer.key",
+               "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", chip, "--asset-name", "House Chip", "--asset-version", "1",
+               "--network", "eip155:31337", "--price-per-write", "1000", "--price-per-mib-month", "0", "--min-pay", "3000",
+               "--pull-threshold", "1500", "--tick-interval", "0.5", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        if (!test_child_alive(store)) break;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", sport);
+        up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
+        if (!up) usleep(200 * 1000);
+    }
+    gAssetArgs[0] = "--asset-name"; gAssetArgs[1] = "House Chip"; gAssetArgs[2] = "--asset-version"; gAssetArgs[3] = "1";
+    pid_t relay = up ? start_relay(svc, chip, rport) : -1;
+    memset(gAssetArgs, 0, sizeof gAssetArgs);
+#define STOP55() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } } while (0)
+    if (!up || relay < 0) { STOP55(); FAIL("the store or the relay did not come up"); }
+    money_env("100000", NULL, NULL, NULL, "200000000", NULL);
+    snprintf(extra, sizeof extra, "&dbname=chip&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", sport, rport);
+    sqlite3 *w = open_db("chip_writer.db", CKEY, extra);
+    long long lease = w ? status_int(w, "lease") : -1, f1 = -1, f2 = -1, anchored = -1, spent = -1;
+    char err[300] = "";
+    if (w) {
+        /* the store is paid from the node's funding wallet (#214): CHIP there too */
+        snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 50000 >/dev/null", RPC, KEY0, chip, status_text(w, "store_funder"));
+        if (system(cmd) != 0) printf("(could not fund the funding wallet) ");
+        sqlite3_exec(w, "CREATE TABLE c(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+        f1 = scalar(w, "SELECT hpplite_flush()");
+        sqlite3_exec(w, "INSERT INTO c(v) VALUES('paid in chip')", NULL, NULL, NULL);
+        f2 = scalar(w, "SELECT hpplite_flush()");
+        anchored = scalar(w, "SELECT hpplite_anchor()");
+        spent = status_int(w, "relay_spent");
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+    }
+    long long payAfter = payBefore;
+    for (int i = 0; i < 40 && payAfter <= payBefore; i++) { usleep(250 * 1000); payAfter = anvil_usdc_of(chip, payTo); }
+    if (w) sqlite3_close(w);
+    STOP55();
+#undef STOP55
+    printf("(lease %lld, flushes %lld %lld, anchored %lld, relay_spent %lld; the store's payee %lld -> %lld CHIP units%s%.120s) ",
+           lease, f1, f2, anchored, spent, payBefore, payAfter, err[0] ? "; " : "", err);
+    if (lease != 1 || anchored <= 0 || spent <= 0) FAIL("the relay paid in CHIP: the rollup, the lease and the anchor");
+    if (f1 <= 0 || f2 <= 0 || payAfter <= payBefore) FAIL("the store paid in CHIP: a bucket bound by its permit, the writes, the pull");
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -4762,6 +4842,7 @@ int main(void) {
     if (wanted(51)) test_fleet_open_store_down();
     if (wanted(52)) test_fleet_empty_file_rebuilt();
     if (wanted(53)) test_fleet_relay_queue();
+    if (wanted(55)) test_paid_in_chip();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
