@@ -4420,7 +4420,7 @@ static void *late_store(void *arg) {
 static void test_fleet_open_store_down(void) {
     TEST("fleet= (#329): opened while the store does not answer, the open waits for it, says so once, and opens synced when it answers; a store that never answers fails the open");
     const char *svc = getenv("HPPLITE_PIN_SERVICE");
-    static const char SKEY[] = "0x5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
+    static const char SKEY[] = "0x5151515151515151515151515151515151515151515151515151515151515151";
     char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000], nh[70];
     char dbHex[2][70], sigHex[2][140];
     unsigned long long issued[2];
@@ -4502,7 +4502,7 @@ static void test_fleet_open_store_down(void) {
 static void test_fleet_empty_file_rebuilt(void) {
     TEST("fleet= (#330): an emptied file beside its bookkeeping at N is rebuilt from the store at the open, said once; the next write is N+1 on the rebuilt rows");
     const char *svc = getenv("HPPLITE_PIN_SERVICE");
-    static const char SKEY[] = "0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c";
+    static const char SKEY[] = "0x5252525252525252525252525252525252525252525252525252525252525252";
     char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000], nh[70], dbHex[70], sigHex[140];
     unsigned long long issued;
     int rport = test_free_port(), sport = test_free_port();
