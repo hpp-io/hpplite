@@ -336,6 +336,22 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   and 21 open files per database - raise the file limit past ~45 databases
   (systemd `LimitNOFILE`) - and, at `interval=1s`, about 170 RPC requests per
   idle database a minute, scaling with 1/interval.
+- **One run over a copy** (#345, an experiment for somaro#144): `hpplite-sequencer
+  --once --from <app.db> <copy.db>` with the copy's `HPPLITE_PARAMS`, from a
+  schedule. Nothing of HPPLite touches the app's file. The run opens the copy
+  (its bookkeeping kept beside it between runs), writes the app's file into it
+  with SQLite's backup API on a read-only connection, sends what changed as one
+  height, and exits. A page rewritten as it was last sent carries no record, so
+  a run sends the changed pages only. When the stat of the app's file and its
+  `-wal` (kept in `<copy>-once`) is the same as at the last run, the run makes
+  no backup and sends no height. An app's file of fewer than two pages while
+  the history has heights is refused. One line on stdout, `<copy>: sent height
+  N` or `<copy>: unchanged at height N`, and exit 0; exit 1 with the reason on
+  stderr (what could not be sent waits in the copy for the next run); exit 3
+  when another process holds the copy. A fleet's lease is the copy's instance
+  (the seed beside it and the host name), so a run every few minutes makes no
+  lease call while over half the lease is left. Up to one interval of writes is
+  lost with the host.
 - **A connection opened without HPPLite** (`sqlite3 app.db` from a shell, a
   tool that opens the file plainly) is captured all the same while a
   sequencer is on the file: its commits are frames in the same WAL, read by

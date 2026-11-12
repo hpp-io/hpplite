@@ -4848,6 +4848,100 @@ static void test_fleet_refusals_fail_the_open(void) {
     PASS();
 }
 
+/* 57. hpplite-sequencer --once (#345, somaro#144): an app's database kept by runs over a copy of it. Each run opens
+** the copy (its bookkeeping kept beside it), writes the app's file into it with the backup API, sends what changed as
+** one height and exits; an unchanged app's file costs no height, an empty one is refused, a copy another process holds
+** is left alone; the relay sees the join and nothing after */
+static int once_run(const char *bin, const char *params, const char *app, const char *copy, char *out, size_t n) {
+    char cmd[4000];
+    snprintf(cmd, sizeof cmd, "HPPLITE_PARAMS='%s' %s --once --from %s %s 2>" DIR "/once_err.log", params, bin, app, copy);
+    return run_cmd(cmd, out, n);
+}
+static void test_sequencer_once(void) {
+    TEST("hpplite-sequencer --once (#345): runs over a kept copy of an app's file send what changed as one height each, nothing when unchanged; an empty app's file is refused, a held copy left alone; the relay sees only the join");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char SKEY[] = "0x5757575757575757575757575757575757575757575757575757575757575757";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], params[2000], nh[70], dbHex[70], sigHex[140];
+    char o1[300], o2[300], o3[300], o4[300], o5[300], want[64];
+    unsigned long long issued;
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1, store = -1;
+    sqlite3 *app = NULL, *held = NULL;
+    if (!svc || !bin || access(bin, X_OK) != 0) { printf("SKIP (no operators or no hpplite-sequencer in the environment) "); PASS(); return; }
+#define ON_FAIL(why) do { if (app) sqlite3_close(app); if (held) sqlite3_close(held); \
+                          if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } FAIL(why); } while (0)
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) ON_FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) ON_FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s once-0", ownerAddr, seqAddr, fl, KEY0);
+    if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex, nh, &issued, sigHex) != 4)
+        ON_FAIL("the Admit (scenario 42's helper)");
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/once_app " DIR "/once_copy " DIR "/store_pins && mkdir -p " DIR "/once_app " DIR "/once_copy");
+    store = start_pin_service_free(svc, sport);
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    if (store < 0 || relay < 0) ON_FAIL("the store or the relay did not come up");
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    snprintf(params, sizeof params, "rpc=%s&chainid=31337&privkey=%s&datadir=%s&interval=0&fleet=%s&owner=%s&dbname=once-0&admit=%llu:0x%s&store=%s&relay=%s",
+             RPC, SKEY, DIR "/once_copy", fl, ownerAddr, issued, sigHex, storeUrl, relayUrl);
+    /* the app's own file: plain SQLite, WAL, never opened with HPPLite */
+    if (sqlite3_open(DIR "/once_app/app.db", &app) != SQLITE_OK) ON_FAIL("the app's file");
+    sqlite3_exec(app, "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);"
+                      "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 100) INSERT INTO t(v) SELECT printf('%.1000c', 'a') FROM n", NULL, NULL, NULL);
+    /* 1: the first run joins and sends the file as height 1; 2: nothing changed, nothing sent */
+    int r1 = once_run(bin, params, DIR "/once_app/app.db", DIR "/once_copy/copy.db", o1, sizeof o1);
+    int r2 = once_run(bin, params, DIR "/once_app/app.db", DIR "/once_copy/copy.db", o2, sizeof o2);
+    /* 3: one row changed, the app still open: height 2 */
+    sqlite3_exec(app, "UPDATE t SET v = 'changed' WHERE id = 50", NULL, NULL, NULL);
+    int r3 = once_run(bin, params, DIR "/once_app/app.db", DIR "/once_copy/copy.db", o3, sizeof o3);
+    long posts = fleet_relay_posts();
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 %s/fleet/%s/db/0x%s", storeUrl, fl, dbHex);
+    run_cmd(cmd, out, sizeof out);
+    snprintf(want, sizeof want, "\"toHeight\": 2");
+    int storeAt2 = strstr(out, want) != NULL;
+    long long inCopy = -1;
+    { sqlite3 *c = NULL;
+      if (sqlite3_open_v2(DIR "/once_copy/copy.db", &c, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) inCopy = scalar(c, "SELECT count(*) FROM t WHERE v = 'changed'");
+      sqlite3_close(c); }
+    /* 4: a copy another process holds: left alone (exit 3) */
+    { char uri[2400];
+      snprintf(uri, sizeof uri, "file:%s?hpplite=on&%s", DIR "/once_copy/copy.db", params);
+      if (sqlite3_open_v2(uri, &held, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) ON_FAIL("hold the copy"); }
+    sqlite3_exec(app, "UPDATE t SET v = 'while held' WHERE id = 51", NULL, NULL, NULL);
+    pid_t pid = fork();
+    if (pid == 0) { char ob[300]; _exit(once_run(bin, params, DIR "/once_app/app.db", DIR "/once_copy/copy.db", ob, sizeof ob)); }
+    int st = 0; waitpid(pid, &st, 0);
+    int r4 = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    snprintf(o4, sizeof o4, "exit %d", r4);
+    sqlite3_close(held); held = NULL;
+    /* 5: the app's file emptied (an app started on an empty volume): refused, the history untouched */
+    sqlite3_close(app); app = NULL;
+    (void)!system("rm -f " DIR "/once_app/app.db-wal " DIR "/once_app/app.db-shm && : > " DIR "/once_app/app.db");
+    int r5 = once_run(bin, params, DIR "/once_app/app.db", DIR "/once_copy/copy.db", o5, sizeof o5);
+    char err5[400] = "";
+    run_cmd("cat " DIR "/once_err.log", err5, sizeof err5);
+    run_cmd(cmd, out, sizeof out);
+    int storeStill2 = strstr(out, want) != NULL;
+    o1[strcspn(o1, "\n")] = 0; o2[strcspn(o2, "\n")] = 0; o3[strcspn(o3, "\n")] = 0; o5[strcspn(o5, "\n")] = 0;
+    printf("(1: %d '%s'; 2: %d '%s'; 3: %d '%s', the store at 2 %d, the row in the copy %lld; 4, held: %s; 5, emptied: %d '%.100s', the store at 2 %d; the relay's calls %ld) ",
+           r1, o1, r2, o2, r3, o3, storeAt2, inCopy, o4, r5, err5, storeStill2, posts);
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); relay = -1; kill(store, SIGTERM); waitpid(store, NULL, 0); store = -1;
+    if (r1 != 0 || !strstr(o1, "sent height 1")) ON_FAIL("the first run sends the app's file as height 1");
+    if (r2 != 0 || !strstr(o2, "unchanged at height 1")) ON_FAIL("a run over an unchanged app's file sends nothing");
+    if (r3 != 0 || !strstr(o3, "sent height 2") || !storeAt2 || inCopy != 1) ON_FAIL("a run after a change sends it as the next height");
+    if (r4 != 3) ON_FAIL("a run over a copy another process holds exits 3, nothing done");
+    if (r5 != 1 || !strstr(err5, "is empty") || !storeStill2) ON_FAIL("an empty app's file is refused, the history untouched");
+    if (posts != 1) ON_FAIL("the relay sees the join and nothing after");
+#undef ON_FAIL
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -4914,6 +5008,7 @@ int main(void) {
     if (wanted(53)) test_fleet_relay_queue();
     if (wanted(55)) test_paid_in_chip();
     if (wanted(56)) test_fleet_refusals_fail_the_open();
+    if (wanted(57)) test_sequencer_once();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

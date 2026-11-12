@@ -38,11 +38,30 @@
 ** closes them all, each posting what is pending, within
 ** HPPLITE_STOP_SECONDS (default 30); a database not closed by then is named
 ** and keeps its pending pages in its file for the next start (exit 1).
+**
+** One run over a copy (#345, somaro#144):
+**
+**   HPPLITE_PARAMS="fleet=...&..." hpplite-sequencer --once [--from /path/to/app.db] /path/to/copy.db
+**
+** opens the copy as above (bookkeeping, the store's view, the lease), sends what
+** is pending as one height, closes and exits; nothing of HPPLite touches the
+** app's file. With --from, the app's file is first written into the copy by
+** SQLite's backup API, on a read-only connection to it: the copy kept between
+** runs, only the pages that changed go (a page rewritten as last sent carries no
+** record). The stat of the app's file and its -wal is kept in <copy>-once; both
+** unchanged since the last run, there is no backup, no read and no height. An
+** app's file of fewer than two pages while the history has heights (an app
+** started on an empty volume) is refused, never sent as the newest state. A
+** fleet database is anchored by the fleet's anchor, not here. One line on
+** stdout, "<copy>: sent height N" or "<copy>: unchanged at height N", exit 0;
+** exit 1 with the reason on stderr (the open refused, the send kept pending:
+** it goes at the next run); exit 3 when another process holds the copy.
 */
 
 #include "hpplite.h"
 #include "config.h"
 #include <dirent.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <pthread.h>
 #include <signal.h>
@@ -269,10 +288,108 @@ static int fleet_main(const char *dir) {
     return open ? 1 : 0;
 }
 
+/* ---- one run over a copy (#345) ---- */
+
+/* the app's file and its -wal as stat sees them: a write changes one of them */
+static void once_stat_key(const char *app, char *out, size_t n) {
+    char wal[PATH_MAX + 8];
+    struct stat a, w;
+    int ha = stat(app, &a) == 0, hw;
+    snprintf(wal, sizeof wal, "%s-wal", app);
+    hw = stat(wal, &w) == 0;
+#ifdef __APPLE__
+    long long am = ha ? (long long)a.st_mtimespec.tv_sec * 1000000000LL + a.st_mtimespec.tv_nsec : 0;
+    long long wm = hw ? (long long)w.st_mtimespec.tv_sec * 1000000000LL + w.st_mtimespec.tv_nsec : 0;
+#else
+    long long am = ha ? (long long)a.st_mtim.tv_sec * 1000000000LL + a.st_mtim.tv_nsec : 0;
+    long long wm = hw ? (long long)w.st_mtim.tv_sec * 1000000000LL + w.st_mtim.tv_nsec : 0;
+#endif
+    snprintf(out, n, "%llu %llu %lld %lld %llu %llu %lld %lld",
+             ha ? (unsigned long long)a.st_dev : 0ull, ha ? (unsigned long long)a.st_ino : 0ull, ha ? (long long)a.st_size : -1LL, am,
+             hw ? (unsigned long long)w.st_dev : 0ull, hw ? (unsigned long long)w.st_ino : 0ull, hw ? (long long)w.st_size : -1LL, wm);
+}
+
+static int once_main(const char *copy, const char *app) {
+    const char *params = getenv("HPPLITE_PARAMS");
+    char keyPath[PATH_MAX + 8], key[256] = "", was[256] = "", why[512];
+    char *uri = sqlite3_mprintf("file:%s?hpplite=on%s%s", copy, params && params[0] ? "&" : "", params ? params : "");
+    sqlite3 *db = uri ? hpplite_open(uri) : NULL;
+    sqlite3_free(uri);
+    if (!db) { fprintf(stderr, "hpplite-sequencer: cannot open %s with HPPLite (HPPLITE_PARAMS?)\n", copy); return 1; }
+    if (status_int(db, "sequencer") != 1) {
+        fprintf(stderr, "hpplite-sequencer: %s: another process sequences it; nothing done\n", copy);
+        sqlite3_close(db);
+        return 3;
+    }
+    int before = status_int(db, "height");
+    snprintf(keyPath, sizeof keyPath, "%s-once", copy);
+    if (app) {
+        FILE *f = fopen(keyPath, "r");
+        if (f) { if (!fgets(was, sizeof was, f)) was[0] = 0; fclose(f); was[strcspn(was, "\n")] = 0; }
+        once_stat_key(app, key, sizeof key);
+    }
+    if (app && strcmp(key, was) != 0) {
+        /* read-only: HPPLite never enables on it, HPPLITE_PARAMS or not, and the app's file is never written */
+        sqlite3 *src = NULL;
+        int rc = sqlite3_open_v2(app, &src, SQLITE_OPEN_READONLY, NULL);
+        long long pages = -1;
+        if (rc == SQLITE_OK) {
+            sqlite3_stmt *st;
+            if (sqlite3_prepare_v2(src, "PRAGMA page_count", -1, &st, NULL) == SQLITE_OK) {
+                if (sqlite3_step(st) == SQLITE_ROW) pages = sqlite3_column_int64(st, 0);
+                sqlite3_finalize(st);
+            }
+        }
+        if (rc != SQLITE_OK || pages < 0) {
+            fprintf(stderr, "hpplite-sequencer: %s: the app's file cannot be read: %s\n", app, sqlite3_errmsg(src));
+            sqlite3_close(src); sqlite3_close(db);
+            return 1;
+        }
+        if (pages < 2 && before > 1) {
+            /* no table needs fewer than two pages (#330): an app started on an empty volume, not the newest state */
+            fprintf(stderr, "hpplite-sequencer: %s is empty and the history has %d heights: not sent; restore it first\n", app, before - 1);
+            sqlite3_close(src); sqlite3_close(db);
+            return 1;
+        }
+        sqlite3_backup *bk = sqlite3_backup_init(db, "main", src, "main");
+        rc = bk ? sqlite3_backup_step(bk, -1) : SQLITE_ERROR;
+        int frc = bk ? sqlite3_backup_finish(bk) : sqlite3_errcode(db);
+        if (rc != SQLITE_DONE || frc != SQLITE_OK) {
+            fprintf(stderr, "hpplite-sequencer: %s: the backup into %s failed: %s\n", app, copy, sqlite3_errmsg(db));
+            sqlite3_close(src); sqlite3_close(db);
+            return 1;
+        }
+        sqlite3_close(src);
+    }
+    sqlite3_exec(db, "SELECT hpplite_flush()", NULL, NULL, NULL);
+    int after = status_int(db, "height"), pending = status_int(db, "pending");
+    status_text(db, "last_error", why, sizeof why);
+    if (pending != 0) {
+        fprintf(stderr, "hpplite-sequencer: %s: kept pending for the next run%s%s\n", copy, why[0] ? ": " : "", why);
+        sqlite3_close(db);
+        return 1;
+    }
+    if (app && strcmp(key, was) != 0) {
+        /* the copy holds the app's file now, sent: the next run with the same stat has nothing to do */
+        char tmp[PATH_MAX + 16];
+        snprintf(tmp, sizeof tmp, "%s.tmp", keyPath);
+        FILE *f = fopen(tmp, "w");
+        if (f) { fprintf(f, "%s\n", key); if (fclose(f) != 0 || rename(tmp, keyPath) != 0) unlink(tmp); }
+    }
+    if (after > before) printf("%s: sent height %d\n", copy, after - 1);
+    else printf("%s: unchanged at height %d\n", copy, after - 1);
+    fflush(stdout);
+    return sqlite3_close(db) == SQLITE_OK ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 3 && strcmp(argv[1], "--once") == 0) {
+        if (argc == 3) return once_main(argv[2], NULL);
+        if (argc == 5 && strcmp(argv[2], "--from") == 0) return once_main(argv[4], argv[3]);
+    }
     if (argc == 3 && strcmp(argv[1], "--dir") == 0) return fleet_main(argv[2]);
     if (argc != 2) {
-        fprintf(stderr, "usage: HPPLITE_PARAMS=... %s <database file>\n       %s --dir <directory of <name>.conf files>\n", argv[0], argv[0]);
+        fprintf(stderr, "usage: HPPLITE_PARAMS=... %s <database file>\n       %s --dir <directory of <name>.conf files>\n       %s --once [--from <app's database file>] <copy>\n", argv[0], argv[0], argv[0]);
         return 2;
     }
     const char *params = getenv("HPPLITE_PARAMS");
