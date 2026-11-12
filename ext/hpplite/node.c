@@ -863,10 +863,28 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
         ** holder, so nothing it writes after is missed), then the batches by the sync below. Not this run's lease: the
         ** file is not opened as the database's sequencer */
         HppliteFleetView v;
-        if (hpplite_store_fleet_view(node->store, node->config.fleet, node_fleet_chain_id(node), node->config.dbId, &v) != 0) {
-            hpplite_error(node->ctx, "the store's view of this fleet database could not be read: %s; not opened as its sequencer", hpplite_store_error(node->store));
-            node->state = HPPLITE_STATE_ERROR;
-            return;
+        /* the store not answering (a deploy, a herd of opens, #329): the open waits for it - with a backoff from 1 s to
+        ** 30 s, a 429's Retry-After, a jitter of up to a quarter from the instance - and says so once; after
+        ** HPPLITE_FLEET_OPEN_WAIT (120 s) it fails, loud: "synced height N" is not said of a file the store's history
+        ** may be ahead of, nor is the database left open and unsequenced */
+        const char *zWait = getenv("HPPLITE_FLEET_OPEN_WAIT");
+        int64_t waitMs = (zWait && atol(zWait) > 0 ? atol(zWait) : 120) * 1000, t0 = node_current_time_ms(), backoff = 1000;
+        int attempt = 0;
+        while (hpplite_store_fleet_view(node->store, node->config.fleet, node_fleet_chain_id(node), node->config.dbId, &v) != 0) {
+            int64_t now = node_current_time_ms(), pause = hpplite_store_retry_after(node->store) > 0 ? hpplite_store_retry_after(node->store) * 1000LL : backoff;
+            pause += (int64_t)(node->instanceId[4 + attempt % 8] * (uint64_t)(pause / 4) / 256);
+            if (now - t0 + pause > waitMs) {
+                hpplite_error(node->ctx, "the store's view of this fleet database could not be read after %lld s: %s; not opened as its sequencer",
+                              (long long)((now - t0) / 1000), hpplite_store_error(node->store));
+                node->state = HPPLITE_STATE_ERROR;
+                node->fleetOpenRefused = 2;
+                return;
+            }
+            if (attempt++ == 0)
+                fprintf(stderr, "hpplite: waiting for the store to read this fleet database's view: %s; tried again for up to %lld s (HPPLITE_FLEET_OPEN_WAIT)\n",
+                        hpplite_store_error(node->store), (long long)(waitMs / 1000));
+            usleep((useconds_t)(pause * 1000));
+            backoff = backoff * 2 < 30000 ? backoff * 2 : 30000;
         }
         if (v.hasHead && v.toHeight + 1 > node->ctx->blockHeight) {
             int i, atEpoch = 0;
@@ -1015,7 +1033,8 @@ static int node_try_promote(HppliteNode *node) {
 static int node_fleet_refuse_open(HppliteNode *node) {
     static char why[700];
     if (!node->fleetOpenRefused) return 0;
-    snprintf(why, sizeof why, "the fleet database could not be rebuilt from the store's history: %s; nothing was written and it is not "
+    if (node->fleetOpenRefused == 2) snprintf(why, sizeof why, "%s", node->ctx ? node->ctx->zLastError : "the store's view could not be read");   /* #329 */
+    else snprintf(why, sizeof why, "the fleet database could not be rebuilt from the store's history: %s; nothing was written and it is not "
              "opened as its sequencer", node->ctx && node->ctx->zLastError[0] ? node->ctx->zLastError : "the sync stopped");
     fprintf(stderr, "hpplite: %s\n", why);
     hpplite_set_init_error(why);

@@ -4407,6 +4407,95 @@ static void test_fleet_herd(void) {
     PASS();
 }
 
+/* 51. hpplite#329: a fleet database opened while its store does not answer (a replaced host starting its apps during a
+** store deploy). The open waits for the store, says so once, and opens synced once it answers, not as a database left
+** unsequenced until the app reopens it; a store that never answers within HPPLITE_FLEET_OPEN_WAIT fails the open, loud */
+typedef struct { const char *svc; int port; pid_t pid; } LateStore;
+static void *late_store(void *arg) {
+    LateStore *ls = arg;
+    sleep(6);
+    ls->pid = start_pin_service_free(ls->svc, ls->port);
+    return NULL;
+}
+static void test_fleet_open_store_down(void) {
+    TEST("fleet= (#329): opened while the store does not answer, the open waits for it, says so once, and opens synced when it answers; a store that never answers fails the open");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char SKEY[] = "0x5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
+    char cmd[3000], ff[64] = "", fl[64] = "", seqAddr[64], ownerAddr[64], out[3000], relayUrl[64], storeUrl[64], uri[2000], nh[70];
+    char dbHex[2][70], sigHex[2][140];
+    unsigned long long issued[2];
+    int rport = test_free_port(), sport = test_free_port();
+    pid_t relay = -1;
+    LateStore ls = { svc, sport, -1 };
+    sqlite3 *w = NULL;
+    if (!svc) { printf("SKIP (no operators in the environment) "); PASS(); return; }
+#define FS_FAIL(why) do { if (w) sqlite3_close(w); if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } \
+                          if (ls.pid > 0) { kill(ls.pid, SIGTERM); waitpid(ls.pid, NULL, 0); } unsetenv("HPPLITE_FLEET_OPEN_WAIT"); FAIL(why); } while (0)
+    snprintf(cmd, sizeof cmd, "cd %s/../../contracts && forge create src/HPPLiteFleetFactory.sol:HPPLiteFleetFactory --rpc-url %s --private-key %s --broadcast 2>/dev/null | awk '/Deployed to:/{print $3}'", svc, RPC, KEY0);
+    if (run_cmd(cmd, ff, sizeof ff) != 0 || strncmp(ff, "0x", 2) != 0) FS_FAIL("deploy the v11 factory");
+    ff[strcspn(ff, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --private-key %s %s 'createFleet(address,uint64)' $(cast wallet address %s) 0 --rpc-url %s >/dev/null && cast call %s 'fleets(uint256)(address)' 0 --rpc-url %s",
+             KEY0, ff, KEY3, RPC, ff, RPC);
+    if (run_cmd(cmd, fl, sizeof fl) != 0 || strncmp(fl, "0x", 2) != 0) FS_FAIL("create a fleet");
+    fl[strcspn(fl, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY); run_cmd(cmd, seqAddr, sizeof seqAddr); seqAddr[strcspn(seqAddr, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1); run_cmd(cmd, ownerAddr, sizeof ownerAddr); ownerAddr[strcspn(ownerAddr, "\r\n")] = 0;
+    for (int i = 0; i < 2; i++) {
+        snprintf(cmd, sizeof cmd, "python3 -I " DIR "/fleet_admit.py %s %s %s %s down-%d", ownerAddr, seqAddr, fl, KEY0, i);
+        if (access(DIR "/fleet_admit.py", R_OK) != 0 || run_cmd(cmd, out, sizeof out) != 0 || sscanf(out, "%66s %66s %llu %132s", dbHex[i], nh, &issued[i], sigHex[i]) != 4)
+            FS_FAIL("the Admits (scenario 42's helper)");
+    }
+    (void)!system("rm -rf " DIR "/relay_fleet " DIR "/relay_fleet.log " DIR "/down_*.db* " DIR "/store_pins " DIR "/down_err.log");
+    relay = start_fleet_relay(svc, ff, rport, NULL);
+    if (relay < 0) FS_FAIL("the relay did not come up");
+    snprintf(storeUrl, sizeof storeUrl, "http://127.0.0.1:%d", sport);
+    snprintf(relayUrl, sizeof relayUrl, "http://127.0.0.1:%d", rport);
+    const char *fmt = "file:" DIR "/down_%d.db?hpplite=on&rpc=%s&chainid=31337&privkey=%s&datadir=" DIR "&interval=1s&fleet=%s&owner=%s&dbname=down-%d"
+                      "&admit=%llu:0x%s&store=%s&relay=%s";
+    fflush(stderr);
+    int saved = dup(2), efd = open(DIR "/down_err.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(efd, 2); close(efd);
+    /* (1) the store answers 6 s after the open begins */
+    pthread_t th;
+    pthread_create(&th, NULL, late_store, &ls);
+    time_t t0 = time(NULL);
+    snprintf(uri, sizeof uri, fmt, 0, RPC, SKEY, fl, ownerAddr, 0, issued[0], sigHex[0], storeUrl, relayUrl);
+    int rc0 = sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    long opened = (long)(time(NULL) - t0);
+    pthread_join(th, NULL);
+    char state0[40] = "";
+    long head0 = 0;
+    if (rc0 == SQLITE_OK) {
+        sqlite3_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES('after the store came back')", NULL, NULL, NULL);
+        for (int i = 0; i < 30 && head0 < 1; i++) { sleep(1); head0 = store_head_of(storeUrl, fl, dbHex[0]); }
+        snprintf(state0, sizeof state0, "%s", status_text(w, "state"));
+    }
+    if (w) { sqlite3_close(w); w = NULL; }
+    long saidWait = count_in_file(DIR "/down_err.log", "waiting for the store");
+    /* (2) a store that never answers within the bound */
+    if (ls.pid > 0) { kill(ls.pid, SIGTERM); waitpid(ls.pid, NULL, 0); ls.pid = -1; }
+    setenv("HPPLITE_FLEET_OPEN_WAIT", "4", 1);
+    t0 = time(NULL);
+    snprintf(uri, sizeof uri, fmt, 1, RPC, SKEY, fl, ownerAddr, 1, issued[1], sigHex[1], storeUrl, relayUrl);
+    int rc1 = sqlite3_open_v2(uri, &w, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    long failedIn = (long)(time(NULL) - t0);
+    char state1[40] = "";
+    if (rc1 == SQLITE_OK && w) snprintf(state1, sizeof state1, "%s", status_text(w, "state"));
+    if (w) { sqlite3_close(w); w = NULL; }
+    unsetenv("HPPLITE_FLEET_OPEN_WAIT");
+    fflush(stderr); dup2(saved, 2); close(saved);
+    long saidGaveUp = count_in_file(DIR "/down_err.log", "could not be read after");
+    printf("(store late by 6 s: open rc %d in %ld s, state %s, the store's head %ld, said waiting %ld; never: open rc %d in %ld s, state '%s', said %ld) ",
+           rc0, opened, state0, head0, saidWait, rc1, failedIn, state1, saidGaveUp);
+    kill(relay, SIGTERM); waitpid(relay, NULL, 0); relay = -1;
+    if (rc0 != SQLITE_OK || head0 < 1 || strcmp(state0, "sequencing") != 0) FS_FAIL("opened while the store is down, the open waits and the database ships once it answers");
+    if (opened < 5) FS_FAIL("the open waited for the store");
+    if (saidWait != 1) FS_FAIL("the wait is said once");
+    if (rc1 == SQLITE_OK || saidGaveUp < 1 || failedIn > 30) FS_FAIL("a store that never answers within HPPLITE_FLEET_OPEN_WAIT fails the open, saying why");
+#undef FS_FAIL
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -4467,7 +4556,8 @@ int main(void) {
     if (wanted(47)) test_fleet_big_first_state();
     if (wanted(48)) test_fleet_rebuild_other_writer();
     if (wanted(49)) test_fleet_snapshots();
-    if (getenv("HPPLITE_ANVIL_TESTS") && wanted(50)) test_fleet_herd();     /* a measurement, minutes long: when named only */
+    if (getenv("HPPLITE_ANVIL_TESTS") && wanted(50)) test_fleet_herd();
+    if (wanted(51)) test_fleet_open_store_down();     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
 }
