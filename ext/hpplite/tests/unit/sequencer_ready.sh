@@ -33,7 +33,7 @@ start
 h0=$(height)
 [ -n "$h0" ] || fail "the first stdout line should be 'hpplite-sequencer: <file> synced height N'"
 if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$d/app.db" "CREATE TABLE t(x); INSERT INTO t VALUES(1)" || fail "a plain connection's write"
+    sqlite3 "$d/app.db" "BEGIN; CREATE TABLE t(x); INSERT INTO t VALUES(1); COMMIT" || fail "a plain connection's write"   # one commit, one batch (#334)
     sleep 1                                # the timer posts what the plain connection wrote: one more batch
     stop
     start
