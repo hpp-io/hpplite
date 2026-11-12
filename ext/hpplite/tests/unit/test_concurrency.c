@@ -355,6 +355,47 @@ static void test_close_at_stop(void) {
     PASS();
 }
 
+/* The file changed under a running sequencer, not through the WAL it reads
+** (frames it missed, as #327's were, or a bug of that shape): the node finds
+** it at its file check while it runs - not only at its next start, weeks
+** away for an always-on application - and the file goes whole as the next
+** height. The change here: the header's user_version, written into the file
+** by another process */
+static void test_file_changed_under_node(void) {
+    TEST("the file changed under a running sequencer, not through its WAL: found by the file check, the file goes whole as the next height, no restart");
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR);
+    setenv("HPPLITE_FILE_CHECK_SECONDS", "1", 1);
+    TestNodeOpts o = NODE;
+    o.intervalMs = 200;
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
+    HppliteNode *n = test_open_node(DIR "/fc.db", l1, &o);
+    if (!n) { unsetenv("HPPLITE_FILE_CHECK_SECONDS"); FAIL("open"); }
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, who, k); INSERT INTO t(who, k) VALUES('node', 1)", NULL);
+    hpplite_node_start_timer(n);
+    sqlite3_int64 h1 = -1;
+    for (int i = 0; i < 100 && (h1 = status_int(n->db, "height")) < 2; i++) usleep(100000);
+    usleep(3000000);                                              /* checks on the file as sent: nothing to ship */
+    sqlite3_int64 hQuiet = status_int(n->db, "height");
+    int wrote = system("python3 -c \"import struct; f = open('" DIR "/fc.db', 'r+b'); f.seek(60); f.write(struct.pack('>I', 7)); f.close()\"");
+    sqlite3_int64 h2 = hQuiet;
+    for (int i = 0; i < 100 && (h2 = status_int(n->db, "height")) <= hQuiet; i++) usleep(100000);
+    hpplite_node_stop_timer(n);
+    const char *why = replica_differs(n, l1, DIR "/fc_replica.db");
+    sqlite3 *r = NULL; sqlite3_int64 uv = -1;
+    if (sqlite3_open(DIR "/fc_replica.db", &r) == SQLITE_OK) { uv = scalar(r, "PRAGMA user_version"); sqlite3_close(r); }
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    unsetenv("HPPLITE_FILE_CHECK_SECONDS");
+    if (h1 < 2) FAIL("the first batch");
+    if (hQuiet != h1) FAILF("a file as sent made a batch (height %lld -> %lld)", (long long)h1, (long long)hQuiet);
+    if (wrote != 0) FAIL("the change to the file (python3 needed)");
+    if (h2 <= hQuiet) FAILF("no batch within 10 s of the file's change (height %lld): the divergence waits for a restart", (long long)h2);
+    if (uv != 7) FAILF("the replica's user_version is %lld, the file's 7: the batch was not the file whole", (long long)uv);
+    if (why) FAIL(why);
+    PASS();
+}
+
 /* The election across processes: the first full node on a file sequences;
 ** one opened by another process meanwhile is a follower - it captures, it does
 ** not post - and has the same instance id (the file's): when the sequencer
@@ -578,6 +619,7 @@ int main(int argc, char **argv) {
     test_sequencer_across_processes();
     test_connection_per_request();
     test_close_at_stop();
+    test_file_changed_under_node();
     test_lease_on_close();
     test_keep_lease_on_close();
     test_rerun_after_foreign_schema_change();

@@ -149,6 +149,9 @@ typedef struct HppliteNode {
     struct HpplitePageMode *pm;     /* page mode (#146): the commits queued and the batches built from them */
     unsigned pageDeflateRatio;      /* raw page bytes per posted byte seen on the last page batch: the next build's budget */
     int pagesSnapshotDecided;       /* the first flush decided whether the file goes whole first */
+    int64_t fileCheckAt;            /* the next check of the file against what was last sent, while running (ms) */
+    uint64_t fileKey[4];            /* ...the file's stat (dev, inode, size, mtime ns) when it last matched */
+    int fileMatched;                /* ...and whether fileKey is set */
     sqlite3 *pieceDb;               /* a commit cut over batches (#152): the connection holding the exclusive lock from the first piece to the last */
     sqlite3_file *piecePf;
     int pagesWalSuspended;          /* a WAL node in rollback-journal mode while chain pages are applied */

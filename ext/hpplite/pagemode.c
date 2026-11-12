@@ -149,6 +149,30 @@ int hpplite_pagemode_snapshot(HpplitePageMode *pm) {
   return SQLITE_OK;
 }
 
+int hpplite_pagemode_resync(HpplitePageMode *pm) {
+  HppliteDbFile *f;
+  unsigned char hdr[100];
+  unsigned i, n;
+  int pageSize;
+  if (!pm || !pm->pRoot || !pm->zPath || pm->pageSize <= 0 || hpplite_pagemode_pending(pm)) return SQLITE_MISUSE;
+  f = hpplite_dbfile_open(pm->zPath);
+  if (!f) return SQLITE_CANTOPEN;
+  if (hpplite_dbfile_read(f, hdr, 100, 0) != 100) { hpplite_dbfile_close(f); return SQLITE_CORRUPT; }
+  pageSize = (hdr[16] << 8) | hdr[17];
+  if (pageSize == 1) pageSize = 65536;
+  n = ((unsigned)hdr[28] << 24) | ((unsigned)hdr[29] << 16) | ((unsigned)hdr[30] << 8) | hdr[31];
+  if (pageSize != pm->pageSize || ensurePrev(pm, n) != SQLITE_OK) { hpplite_dbfile_close(f); return SQLITE_MISMATCH; }
+  for (i = 0; i < pm->nPrev; i++) { sqlite3_free(pm->aPrev[i]); pm->aPrev[i] = NULL; }
+  for (i = 1; i <= n; i++) {
+    unsigned char *img = sqlite3_malloc64((sqlite3_uint64)pageSize);
+    if (!img || hpplite_dbfile_read(f, img, (size_t)pageSize, (int64_t)(i - 1) * pageSize) != (size_t)pageSize) { sqlite3_free(img); break; }
+    pm->aPrev[i - 1] = img;
+  }
+  hpplite_dbfile_close(f);
+  pm->sizeThen = i - 1;
+  return hpplite_pagemode_snapshot(pm);
+}
+
 int hpplite_pagemode_applied(HpplitePageMode *pm, unsigned pgno, const unsigned char *page) {
   if (!pm || !pm->pRoot) return SQLITE_MISUSE;
   if (pm->pageSize == 0 && pgno == 1) { pm->pageSize = (page[16] << 8) | page[17]; if (pm->pageSize == 1) pm->pageSize = 65536; hpplite_pageroot_free(pm->pRoot); pm->pRoot = hpplite_pageroot_new(pm->pageSize); }

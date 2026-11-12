@@ -23,6 +23,10 @@ void hpplite_pagemode_resume(HpplitePageMode *pm);
 /* The file as it is, whole, as the next batch (every page full): a new rollup's
 ** first batch, or a sequencer back on a file the chain does not have all of */
 int hpplite_pagemode_snapshot(HpplitePageMode *pm);
+/* The same while the node runs: the page images read again from the file (its
+** state differs from the one this page mode holds, a divergence the WAL never
+** showed), then the file whole as the next batch. Nothing may be pending */
+int hpplite_pagemode_resync(HpplitePageMode *pm);
 /* commits waiting to be posted (queued, or in the batch being settled) */
 unsigned hpplite_pagemode_pending(HpplitePageMode *pm);
 uint64_t hpplite_pagemode_captured(HpplitePageMode *pm);   /* commits the sink saw since the start (the file as opened not among them) */

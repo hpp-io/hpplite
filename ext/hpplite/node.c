@@ -446,6 +446,52 @@ static void node_pages_decide_snapshot(HppliteNode *node) {
     node->pagesSnapshotDecided = 1;
 }
 
+/* The file against what this sequencer last sent, while it runs (after #327): the check its start makes, so a
+** divergence the WAL never showed (frames missed, a write past SQLite) goes whole as the next height without waiting
+** for a restart, weeks away for an always-on application. From the timer every HPPLITE_FILE_CHECK_SECONDS (60), and
+** sound only when the node's state is the file's: nothing pending, its own passive checkpoint put the whole WAL in
+** the file, and no commit arrived while the file was read (the WAL polled again after). A file whose stat is the one
+** last found matching is not read again: an idle database costs a stat */
+static void node_stat_key(const char *zFile, uint64_t key[4], int *pOk) {
+    struct stat st;
+    *pOk = stat(zFile, &st) == 0;
+    if (!*pOk) return;
+    key[0] = (uint64_t)st.st_dev; key[1] = (uint64_t)st.st_ino; key[2] = (uint64_t)st.st_size;
+#ifdef __APPLE__
+    key[3] = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull + (uint64_t)st.st_mtimespec.tv_nsec;
+#else
+    key[3] = (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
+#endif
+}
+static void node_check_file(HppliteNode *node) {
+    const char *zFile;
+    uint64_t key[4];
+    unsigned char have[32], file[32];
+    HpplitePageRoot *pr;
+    int nLog = -1, nCkpt = -1, ok, rc;
+    if (!node->pm || node->follower || node->config.verifyOnly || !node->hasLease || !node->pagesSnapshotDecided || !node->ckDb
+        || node->state != HPPLITE_STATE_RUNNING || !node->ctx || !node->ctx->zWalKey || node->ctx->openTxnId) return;
+    zFile = node->ctx->zWalKey;
+    node_stat_key(zFile, key, &ok);
+    if (!ok || (node->fileMatched && memcmp(key, node->fileKey, sizeof key) == 0)) return;
+    hpplite_walread_poll(zFile, 0);
+    if (hpplite_pagemode_pending(node->pm) || hpplite_pagemode_piece_open(node->pm)) return;     /* the next flush first */
+    if (sqlite3_wal_checkpoint_v2(node->ckDb, "main", SQLITE_CHECKPOINT_PASSIVE, &nLog, &nCkpt) != SQLITE_OK || nLog < 0 || nCkpt != nLog) return;
+    node_stat_key(zFile, key, &ok);
+    if (!ok || !(pr = hpplite_pageroot_from_file(zFile, NULL))) return;
+    hpplite_pageroot_get(pr, file);
+    hpplite_pageroot_free(pr);
+    hpplite_walread_poll(zFile, 0);
+    if (hpplite_pagemode_pending(node->pm)) return;                                              /* a commit meanwhile: the next check */
+    hpplite_pagemode_root(node->pm, have);
+    if (memcmp(have, file, 32) == 0) { memcpy(node->fileKey, key, sizeof key); node->fileMatched = 1; return; }
+    node->fileMatched = 0;
+    fprintf(stderr, "hpplite: %s is not the state of height %llu it last sent: the file goes whole as height %llu\n",
+            sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1), (unsigned long long)node->ctx->blockHeight);
+    if ((rc = hpplite_pagemode_resync(node->pm)) != SQLITE_OK)
+        hpplite_error(node->ctx, "the file could not be read again to go whole (rc=%d): it goes whole at the next start", rc);
+}
+
 /* The page mode on this node's file: a sequencer's (its commits watched), or
 ** a verifier's (applying what it is sent). A follower has none: its commits
 ** go through the same VFS to the same file, and the sequencer's watch sees
@@ -4079,6 +4125,17 @@ static void *node_timer_thread_func(void *arg) {
                 }
                 pthread_mutex_unlock(mutex);
             }
+        }
+        /* the file against what was last sent (after #327) */
+        if (node->pm && now >= node->fileCheckAt) {
+            const char *zEvery = getenv("HPPLITE_FILE_CHECK_SECONDS");
+            pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;
+            if (mutex) {
+                pthread_mutex_lock(mutex);
+                if (node->timerRunning) node_check_file(node);
+                pthread_mutex_unlock(mutex);
+            }
+            node->fileCheckAt = now + (zEvery && atol(zEvery) > 0 ? atol(zEvery) : 60) * 1000;
         }
         /* the anchor, on the chain's cadence (#164); a refused one is tried again within a minute. Nothing at the store
         ** above the anchored height: no attempt and no chain read, and the deadline stays armed - the next batch is

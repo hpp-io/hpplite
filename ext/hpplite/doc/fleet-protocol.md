@@ -417,6 +417,11 @@ sequencer.
    sequencer running): the file goes whole as the next height N+1, whatever
    is set; said once, `hpplite: <file> is not the state of height N it last
    sent: the file goes whole as height N+1`.
+   The same check runs while the node holds the lease (hpplite#328), so a
+   divergence the WAL never showed is not left to the next start: every
+   `HPPLITE_FILE_CHECK_SECONDS` (60) when the file's stat changed, once its
+   own checkpoint put the whole WAL in the file with nothing pending; the
+   same line, the file whole as the next height.
 2. No bookkeeping, a file with pages (a schema, or more than an empty file's
    page), and a history at the store at N > 0: which is true is not known
    here, so `onforeign=` (or `HPPLITE_ON_FOREIGN`; the parameter wins) decides.
