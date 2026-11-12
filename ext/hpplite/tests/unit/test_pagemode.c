@@ -738,6 +738,61 @@ static void test_follower_reports_pages(void) {
     PASS();
 }
 
+/* #345: a copy of the app's database written into the node's file by the backup API rewrites every page, and the
+** batch carries only those that differ from what was last sent; a replica rebuilt from the chain equals the file */
+static void test_backup_into_the_file_sends_only_changed_pages(void) {
+    TEST("a backup written into the sequencer's file rewrites every page; the batch carries only the pages that changed, a commit that changes nothing sends no height, and a replica equals the file");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *s = open_pages(DIR "/bk.db", l1, 1, 1);
+    if (!s) FAIL("open the sequencer");
+    hpplite_node_exec(s, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 200) INSERT INTO t(v) SELECT printf('%.1000c', 'a') FROM n", NULL);
+    uint64_t h1 = hpplite_node_flush_batch(s);                                /* in pieces past the mock's limit */
+    if (h1 == 0) FAIL("flush 1");
+    exec_sql(s->db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    /* the app's file: a plain connection, no HPPLite, a copy of the sequencer's with one row changed */
+    sqlite3 *app = NULL;
+    if (sqlite3_open_v2(DIR "/app.db", &app, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix") != SQLITE_OK) FAIL("open the app's file");
+    sqlite3_backup *bk = sqlite3_backup_init(app, "main", s->db, "main");
+    if (!bk || sqlite3_backup_step(bk, -1) != SQLITE_DONE || sqlite3_backup_finish(bk) != SQLITE_OK) FAIL("the app's copy");
+    exec_sql(app, "UPDATE t SET v = 'changed' WHERE id = 100");
+    long long pages = scalar(app, "PRAGMA page_count");
+    /* the app's file backed up into the sequencer's: every page written */
+    bk = sqlite3_backup_init(s->db, "main", app, "main");
+    int brc = bk ? sqlite3_backup_step(bk, -1) : SQLITE_ERROR;
+    if (!bk || brc != SQLITE_DONE || sqlite3_backup_finish(bk) != SQLITE_OK) FAILF("the backup into the sequencer's file (rc %d: %s)", brc, sqlite3_errmsg(s->db));
+    sqlite3_close(app);
+    uint64_t h2 = hpplite_node_flush_batch(s);
+    if (h2 != h1 + 1) FAILF("the backup went as heights %llu to %llu, not one", (unsigned long long)h1 + 1, (unsigned long long)h2);
+    size_t len2 = 0;
+    uint8_t *b2 = hpplite_l1_get_batch(l1, h2, &len2);
+    HpplitePageBatch *p2 = b2 ? hpplite_pagebatch_decode(b2, len2) : NULL;
+    if (!p2) FAIL("the backup's batch is not a page batch");
+    unsigned recs = p2->nPages;
+    hpplite_pagebatch_free(p2); free(b2);
+    /* every row rewritten as it was: the pages written, none changed - no height */
+    hpplite_node_exec(s, "UPDATE t SET v = v", NULL);
+    uint64_t h3 = hpplite_node_flush_batch(s);
+    long long pend = scalar(s->db, "SELECT pending FROM hpplite_status");
+    size_t len3 = 0;
+    uint8_t *b3 = hpplite_l1_get_batch(l1, h2 + 1, &len3);
+    free(b3);
+    exec_sql(s->db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    HppliteNode *r = open_pages_role(DIR "/bkr.db", l1, 1, 1, 1);
+    if (!r) FAIL("open the replica");
+    int same = files_equal_masked(DIR "/bk.db", DIR "/bkr.db", NULL), rootSame = same_root(s, r);
+    long long changed = scalar(r->db, "SELECT count(*) FROM t WHERE v = 'changed'");
+    hpplite_node_destroy(r);
+    hpplite_node_destroy(s);
+    hpplite_l1_disconnect(l1);
+    printf("(a file of %lld pages, one row changed: its batch carries %u records, %zu bytes; every row rewritten as it was: flush %llu, pending %lld, a batch %d; the replica equal %d, its row %lld) ",
+           pages, recs, len2, (unsigned long long)h3, pend, b3 != NULL, same, changed);
+    if (recs > 3) FAILF("the backup's batch carries %u records for one row changed: the unchanged pages went too", recs);
+    if (h3 != 0 || b3 || pend != 0) FAIL("a commit that changed no page sent a height, or left it pending");
+    if (!same || !rootSame || changed != 1) FAIL("the replica does not equal the sequencer's file");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -763,6 +818,7 @@ int main(void) {
     test_foreign_checkpoint_and_restart_lose_nothing();
     test_pending_counts_foreign_commits();
     test_follower_reports_pages();
+    test_backup_into_the_file_sends_only_changed_pages();
     remove_dir();
     return test_report();
 }

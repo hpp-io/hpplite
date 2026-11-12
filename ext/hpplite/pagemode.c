@@ -45,7 +45,7 @@ struct HpplitePageMode {
   unsigned pieceOff;          /* a commit cut over batches (#152): records of it already posted, in page order */
   unsigned pieceNo;           /* ...and pieces posted */
   unsigned pieceMore;         /* the batch being built is a piece with more after it */
-  unsigned pieceEmitted;      /* records in the piece being built */
+  unsigned pieceEmitted;      /* pages taken in the piece being built (a record each, but those unchanged) */
 };
 
 static void qfree(QCommit *q) { while (q) { QCommit *n = q->pNext; sqlite3_free(q->aPgno); sqlite3_free(q->aImg); sqlite3_free(q); q = n; } }
@@ -343,7 +343,7 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
   /* one commit with more pages than fit is cut into pieces (#152): this
   ** build takes the records after those already posted, as many as fit;
   ** a replica holds its lock from the first piece to the last */
-  { unsigned cap = pm->maxRecords ? pm->maxRecords : (unsigned)budget, inOrder = 0, skipped = 0, highest = 0;
+  { unsigned cap = pm->maxRecords ? pm->maxRecords : (unsigned)budget, inOrder = 0, skipped = 0, highest = 0, used = 0;
     int piece = nTake == 1 && (pm->pieceOff > 0 || pm->nDirty > cap);
     pm->pieceMore = 0; pm->pieceEmitted = 0;
     for (pg = 1; pg <= maxPg; pg++) {
@@ -351,14 +351,19 @@ int hpplite_pagemode_build(HpplitePageMode *pm, size_t maxBytes, unsigned char *
       inOrder++;
       if (piece && skipped < pm->pieceOff) { skipped++; continue; }           /* posted in an earlier piece */
       if (piece && nRec >= cap) { pm->pieceMore = 1; break; }                /* the next piece's */
+      used++; highest = pg;
+      /* a page written as it was last sent (a backup into the file rewrites them all, #345) needs no record: every
+      ** replica has it, and the root's leaf is already its. Taken by this piece all the same, so the pieces' positions
+      ** hold; the cap stays on records, as an adoption rebuilds a piece from its record count */
+      if (pm->aPrev[pg - 1] && memcmp(pm->aLast[pg], pm->aPrev[pg - 1], ps) == 0) continue;
       { unsigned char *body = bodies + (size_t)nRec * ps, *cur = pm->aLast[pg], *old = pm->aPrev[pg - 1];
         if (old) { unsigned j; for (j = 0; j < ps; j++) body[j] = cur[j] ^ old[j]; recs[nRec].flags = HPPLITE_PAGE_DIFF; }
         else { memcpy(body, cur, ps); recs[nRec].flags = HPPLITE_PAGE_FULL; }
-        recs[nRec].pgno = pg; recs[nRec].body = body; nRec++; highest = pg;
+        recs[nRec].pgno = pg; recs[nRec].body = body; nRec++;
         hpplite_pageroot_set(pm->pRoot, pg, cur); }
     }
     (void)inOrder;
-    pm->pieceEmitted = nRec;
+    pm->pieceEmitted = used;
     memset(&b, 0, sizeof b);
     if (piece) {
       /* a piece's size: the file as it was, or as far as its pages reach; the

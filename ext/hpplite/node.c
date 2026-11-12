@@ -3198,6 +3198,13 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     for (tries = 0; ; tries++) {
         rc = hpplite_pagemode_build(node->pm, budget, &bytes, &len, root, pMore);
         if (rc != SQLITE_OK) { if (rc != SQLITE_DONE) hpplite_error(ctx, "page batch %llu could not be built (rc=%d)", (unsigned long long)height, rc); return 0; }
+        if (height > 1 && !*pMore && !hpplite_pagemode_piece_open(node->pm) && memcmp(root, ctx->stateRoot, 32) == 0) {
+            /* the commits leave the file as last sent (every page rewritten as it was, #345): no height to send. Not
+            ** a series' last piece, whose root the pieces before it already carried */
+            hpplite_pagemode_finalized(node->pm);
+            sqlite3_free(bytes);
+            return 0;
+        }
         payload = bytes; payloadLen = len; encoding = HPPLITE_ENCODING_NONE; packed = NULL;
         if (!node->config.noCompress) {
             size_t n = 0;
