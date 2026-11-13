@@ -203,7 +203,7 @@ batches; `workflow_dispatch` takes a duration.
 ## Future
 
 ### Cost Optimization
-- [ ] The shared rollup: many databases under one contract, one epoch root per anchor interval (#297, draft in doc/shared-rollup.md; somaro decision 0016)
+- [x] ~~The shared rollup: many databases under one contract, one epoch root per anchor interval (#297; somaro decision 0016)~~ - built, then set aside and removed (decision 0003, #352-#354; on the branch fleet-experiment)
 - [ ] Off-chain DA beyond S3 (IPFS, Arweave) with L1 commitment
 - [ ] Batch aggregation (multiple txs per batch)
 
