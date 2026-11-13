@@ -1,5 +1,7 @@
 # The fleet protocol, `hpplite-fleet/1` (draft)
 
+**Set aside (2026-11-13, [decision 0003](decisions/0003-fleet-mode-set-aside.md)):** fleet mode is an experiment found not useful. It stays as it is and gets no new work; use a standalone rollup.
+
 Status: draft, 2026-11-10 (#297, step 1: #299). The messages, the leaf, the tree and the
 manifest are fixed here with vectors (`operators/conformance/vectors.json`,
 section `fleet`; reference `operators/fleet/fleet.py`) so that the contract,

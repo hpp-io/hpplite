@@ -1,5 +1,7 @@
 # 0002. What the fleet supersedes, and what HPPLite keeps
 
+Superseded by [0003](0003-fleet-mode-set-aside.md) (2026-11-13): fleet mode is set aside and nothing below is deleted.
+
 2026-11-12. The user's decision, through somaro (its decision 0022 simplifies somaro the same day).
 Nothing is deleted before somaro's mainnet beta runs.
 

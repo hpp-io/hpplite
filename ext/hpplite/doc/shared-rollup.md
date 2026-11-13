@@ -1,5 +1,7 @@
 # The shared rollup (draft for decision, not built)
 
+**Set aside (2026-11-13, [decision 0003](decisions/0003-fleet-mode-set-aside.md)):** fleet mode is an experiment found not useful. It stays as it is and gets no new work; use a standalone rollup.
+
 Changed after somaro's reading (decision 0016): the anchor reads no database
 file and holds no database key - each database's sequencer signs its head at
 flush, the head rides with the batch's name write, and an anchor operator
