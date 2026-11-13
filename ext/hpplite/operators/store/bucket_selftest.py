@@ -397,12 +397,16 @@ def main():
 
         # --- the owner rotates the sequencer key (#208): the new key takes the bucket, the old one is refused ---
         rollup1 = cast("call", FACTORY, "getRollup(address)(address)", eth.address(k1))
-        k2 = key_bytes(KEY2)
+        # the new key is a key of its own (#355): KEY2 is the store's, which sends its pulls meanwhile - a claim from it
+        # raced them for the nonce
+        new_key = "0x" + secrets.token_hex(32)
+        k2 = key_bytes(new_key)
+        cast("send", "--private-key", KEY0, eth.address(k2), "--value", "1ether")
         send(KEY1, rollup1, "setSequencer(address)", eth.address(k2))
         code, out, _ = S.bind(da, k2, F)
         check(code == 200, "after setSequencer: the new key rebinds the bucket with its funder (%s %s)" % (code, out))
         inst_new = secrets.token_bytes(32)
-        send(KEY2, rollup1, "claimSequencer(bytes32)", "0x" + inst_new.hex())
+        send(new_key, rollup1, "claimSequencer(bytes32)", "0x" + inst_new.hex())
         code, _, _ = http("POST", "%s/name/%s-5" % (url, da[2:]), name_body(da, 5, b"by the new key", inst_new, k2))
         check(code == 200, "the new key's name at 5: 200 (%s)" % code)
         code, _, _ = http("POST", "%s/name/%s-6" % (url, da[2:]), name_body(da, 6, b"by the rotated-out key", instance, k1))
