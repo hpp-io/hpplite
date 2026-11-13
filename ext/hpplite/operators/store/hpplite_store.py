@@ -37,7 +37,6 @@ import threading
 import time
 import urllib.parse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # fleet_store (#297), under python3 -I
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from x402seller import eth  # noqa: E402
 from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_tx  # noqa: E402
@@ -57,11 +56,6 @@ PRUNE_TYPE = "Prune(address da,uint256 height,uint256 issuedAt)"
 CAP_TYPE = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"   # the funder's daily bound (#274)
 UNPIN_TYPE = "Unpin(address da,bytes32 cids,uint256 issuedAt)"      # a key's bucket lets go of CIDs (#349)
 UNPIN_MAX = 1000                                                    # CIDs an unpin, and a listing's page
-# a fleet database's bucket (hpplite-fleet/1, #297, #310): the same four over (fleet, dbId) instead of a rollup's DA
-BINDDB_TYPE = "BindDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
-RELEASEDB_TYPE = "ReleaseDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
-DELETEDB_TYPE = "DeleteDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
-CAPDB_TYPE = "CapDb(address fleet,bytes32 dbId,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"
 DAY = 86400
 STATEMENT_TYPE = "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
 BATCH_TYPE = "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)"
@@ -503,10 +497,6 @@ class Service:
                                  args.asset_name, args.asset_version, args.rpc)
         self.spender = eth.address(spender_key)
         self.started = int(time.time())
-        import fleet_store
-        self.fleets = fleet_store.FleetBook(chain, self.disk, self.chain_id, args.fleet_follow) if chain else None   # hpplite-fleet/1 (#297)
-        if self.fleets:
-            self.fleets.ledger = self.ledger            # a prune lets go of a database's bytes in its bucket (#314)
 
     def start(self):
         def loop():
@@ -516,16 +506,6 @@ class Service:
                     self.ledger.tick()
                 except (OSError, ValueError) as e:
                     self.ledger.warn("tick", str(e))
-                if self.fleets:                          # a fleet's manifests no root on chain names, after --sweep-age (somaro)
-                    try:
-                        self.fleets.sweep_manifests(int(time.time()), self.args.sweep_age)
-                    except (OSError, ValueError) as e:
-                        self.ledger.warn("fleet", "manifest sweep: %s" % e)
-                for fleet in (self.fleets.known() if self.fleets else []):     # the fleets' events, polled (#297)
-                    try:
-                        self.fleets.follow(fleet)
-                    except (ChainUnreadable, OSError, ValueError) as e:
-                        self.ledger.warn("fleet", "%s: %s" % (fleet, e))
         threading.Thread(target=loop, daemon=True).start()
 
     def status(self):
@@ -664,12 +644,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = url.path
         if path == "/status":
             return self.reply(200, self.service.status())
-        if path.startswith("/fleet/") and self.service.fleets and ADDR_RE.match(path.split("/")[2] if path.count("/") >= 2 else ""):
-            import fleet_store
-            try:
-                return fleet_store.fleet_get(self, path, urllib.parse.parse_qs(url.query))
-            except ChainUnreadable as e:
-                return self.reply(503, {"error": "the chain cannot be read to follow the fleet: %s" % e})
         m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})/objects$", path)
         if m:
             return self.get_objects(m.group(1).lower(), urllib.parse.parse_qs(url.query))
@@ -713,11 +687,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if data is None:
                 return self.reply(404, {"error": "not held here", "cid": cid})
             def readable(k):
-                if k.startswith("fd-"):                 # a fleet database's: its bucket's state, as a rollup's (#323); none, a free store's write
-                    b = self.L.bucket(k)
-                    return b is None or b.get("state") == "covered"
-                if ADDR_RE.match(k):                    # a rollup's bucket, or a fleet's own (its manifests)
-                    return (self.L.bucket(k) or {}).get("state") == "covered" or bool(self.service.fleets and k in self.service.fleets.known())
+                if ADDR_RE.match(k):                    # a rollup's bucket, or a key's
+                    return (self.L.bucket(k) or {}).get("state") == "covered"
                 return True
             if not any(readable(k) for k in refs):
                 return self.reply(410, {"error": "bucket_parked", "cid": cid})
@@ -755,7 +726,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "permitNonce": nonce,
                 "dailyCost": int(L.rate(a["funder"]) * 86400 + 0.999999), "coveredUntil": L.covered_until(a),
                 "buckets": [b["da"] for b in L.buckets_of(a["funder"]) if ADDR_RE.match(b["da"])],
-                "databases": [{"fleet": b["fleet"], "dbId": b["dbId"]} for b in L.buckets_of(a["funder"]) if b.get("fleet")],
                 "state": "uncovered" if a.get("uncovered") else "covered", "why": a.get("why", "")}
 
     # --- POST ---
@@ -767,14 +737,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(413, {"error": "too large", "max": self.service.args.max_bytes})
         body = self.rfile.read(n) if n else b""
         try:
-            if path.startswith("/fleet/") and self.service.fleets and ADDR_RE.match(path.split("/")[2] if path.count("/") >= 2 else ""):
-                import fleet_store
-                if "/name/" in path:                    # a fleet name is a put for the test hooks too
-                    self.service.puts += 1
-                    if self.service.args.busy_put and self.service.puts == self.service.args.busy_put:
-                        return self.reply(429, {"error": "too many requests from this address: try again later"},
-                                          {"Retry-After": str(self.service.args.busy_retry_after)})
-                return fleet_store.fleet_post(self, path, body)
             if path.startswith("/name/"):
                 return self.post_name(path[6:], body)
             if path == "/put":
@@ -1154,8 +1116,6 @@ def main():
     ap.add_argument("--retry-seconds", type=int, default=24 * 3600, help="how often an uncovered account's pull is tried again")
     ap.add_argument("--park-seconds", type=int, default=MONTH, help="a parked bucket is deleted after this long")
     ap.add_argument("--tick-interval", type=float, default=3600, help="seconds between ticks: accrue, pull, park, delete, sweep")
-    ap.add_argument("--fleet-follow", type=float, default=5, help="a fleet's events are read again when the store's view is older than this "
-                    "many seconds, before a head is checked or a database shown (#317)")
     ap.add_argument("--sweep-age", type=int, default=3600, help="bytes in no bucket older than this are swept")
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)

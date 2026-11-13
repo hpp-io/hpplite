@@ -4,7 +4,7 @@
 #   tests/l1/anvil_test.sh <path/to/test_anvil>
 # Exit 77 = skipped (anvil/forge/cast not installed). No network, no funds.
 # HPPLITE_ANVIL_FORK=https://mainnet.hpp.io: the same on a fork of that chain with its real CHIP (#346); the
-# network is read, nothing is sent to it. HPPLITE_RELAY_ASSET=chip runs the relay's fleet selftest in CHIP.
+# network is read, nothing is sent to it.
 set -eu
 bin=$1
 here=$(cd "$(dirname "$0")" && pwd)

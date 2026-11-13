@@ -58,13 +58,6 @@ from x402seller.token import ChainUnreadable, Token, sig_bytes  # noqa: E402
 
 
 FACTORY_CALLS = {selector("createRollupFor(address,uint256,uint256,uint256,bytes)"): "createRollupFor"}
-# VERSION 11 (hpplite-fleet/1, #297, #313): the fleet factory's signed create and a fleet's signed calls
-FLEET_FACTORY_CALLS = {selector("createFleetFor(address,address,uint64,uint256,uint256,bytes)"): "createFleetFor"}
-FLEET_DB_CALLS = {selector(s): s.split("(")[0] for s in (            # sponsored per database: the dbId is the first word
-    "joinFor(bytes32,address,address,bytes32,uint256,bytes,bytes32,uint256,uint256,bytes)",
-    "claimFor(bytes32,bytes32,uint256,uint256,bytes)", "retireFor(bytes32,uint256,bytes)",
-    "expireFor(bytes32,uint256,uint256,bytes)")}
-FLEET_ROOT_CALLS = {selector("postRootFor(uint256,bytes32,bytes32,uint256,bytes)"): "postRootFor"}   # sponsored per fleet
 ROLLUP_CALLS = {selector(s): s.split("(")[0] for s in (
     "claimSequencerFor(bytes32,uint256,uint256,bytes)",
     "renewLeaseFor(bytes32,uint256,uint256,bytes)",
@@ -82,11 +75,6 @@ PROTOCOL = "hpplite-relay/1"        # the version of doc/relay-protocol.md this 
 SPONSOR_TYPE = "Sponsor(address rollup,address funder,uint256 issuedAt)"
 UNSPONSOR_TYPE = "Unsponsor(address rollup,address funder,uint256 issuedAt)"
 CAP_TYPE = "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)"
-# a fleet database's sponsorship (hpplite-fleet/1, #297, #312): today's three over (fleet, dbId); a fleet's roots are
-# sponsored with Sponsor and Cap themselves, the fleet in place of the rollup
-SPONSORDB_TYPE = "SponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
-UNSPONSORDB_TYPE = "UnsponsorDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
-CAPDB_TYPE = "CapDb(address fleet,bytes32 dbId,uint256 callsPerDay,uint256 issuedAt)"
 PERMIT_TYPE = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 DAY = 86400
@@ -133,17 +121,8 @@ class Accounts:
         for name in sorted(os.listdir(os.path.join(self.dir, "s"))):
             if name.endswith(".json"):
                 s = self._load("s", name[:-5])
-                if s and same(s.get("funder"), funder) and not s.get("dbId"):
+                if s and same(s.get("funder"), funder):
                     out.append(s["rollup"])
-        return out
-
-    def databases_of(self, funder):
-        out = []
-        for name in sorted(os.listdir(os.path.join(self.dir, "s"))):
-            if name.endswith(".json"):
-                s = self._load("s", name[:-5])
-                if s and same(s.get("funder"), funder) and s.get("dbId"):
-                    out.append({"fleet": s["fleet"], "dbId": s["dbId"]})
         return out
 
     @staticmethod
@@ -301,23 +280,14 @@ class Accounts:
         p = a.get("permit")
         return {"funder": a["funder"], "credit": a["credit"], "balance": bal, "allowance": allow, "permitNonce": nonce,
                 "permit": {"value": p["value"], "deadline": p["deadline"], "sent": a.get("permitSent", False)} if p else None,
-                "rollups": self.rollups_of(funder), "databases": self.databases_of(funder), "state": "uncovered" if a.get("uncovered") else "covered", "why": a.get("why", "")}
+                "rollups": self.rollups_of(funder), "state": "uncovered" if a.get("uncovered") else "covered", "why": a.get("why", "")}
 
     def view_sponsor(self, rollup):
         s = self._load("s", rollup)
         if not s:
             return None
-        if s.get("dbId"):
-            return {"fleet": s["fleet"], "dbId": s["dbId"], "funder": s.get("funder"), "cap": s.get("cap"), "today": self.today(s),
-                    "state": "sponsored" if s.get("funder") else "released"}
         return {"rollup": s["rollup"], "da": s.get("da"), "funder": s.get("funder"), "cap": s.get("cap"), "today": self.today(s),
                 "state": "sponsored" if s.get("funder") else "released"}
-
-
-def db_key(fleet, db):
-    """the book's key for a fleet database's sponsorship (#313): apart from every rollup's and fleet's"""
-    return "%s-%s" % (fleet.lower(), db.lower())
-
 
 
 def quote_key(relay_key: bytes) -> bytes:
@@ -360,8 +330,6 @@ class Relay:
         self.address = eth.address(self.key)
         self.chain_id = int(self.chain.call("eth_chainId"), 16)
         self.factory = args.factory.lower()
-        self.fleet_factory = (args.fleet_factory or "").lower() or None   # VERSION 11 (#313); none: no fleet calls
-        self.busy_commits = getattr(args, "busy_commits", 0)             # the test hook's count left
         self.per_minute = getattr(args, "per_minute", 0)                 # POSTs a minute from one address (0: no limit)
         self.posts = {}                                                   # address -> the times of its POSTs in the last minute
         self.posts_lock = threading.Lock()
@@ -387,12 +355,6 @@ class Relay:
         sel = data[2:10]
         to = to.lower()
         try:
-            if self.fleet_factory and to == self.fleet_factory:
-                return FLEET_FACTORY_CALLS.get(sel), "not a call the relay takes on the fleet factory", None
-            if self.fleet_factory and (sel in FLEET_DB_CALLS or sel in FLEET_ROOT_CALLS) and self.is_fleet(to):
-                if sel in FLEET_ROOT_CALLS:
-                    return FLEET_ROOT_CALLS[sel], None, to                        # the fleet's sponsor: roots
-                return FLEET_DB_CALLS[sel], None, db_key(to, "0x" + data[10:74])  # the database's sponsor
             if to == self.factory:
                 return FACTORY_CALLS.get(sel), "not a call the relay takes on the factory", None
             if sel in ROLLUP_CALLS:
@@ -409,21 +371,6 @@ class Relay:
         except (RpcError, OSError, ValueError) as e:
             return None, "could not check the target: %s" % e, None
         return None, "not a call the relay takes", None
-
-    def is_fleet(self, to):
-        """a fleet of the v11 factory this relay serves, by the factory's own record (never by probing views)"""
-        if not self.fleet_factory:
-            return False
-        try:
-            return int(self.chain.view(self.fleet_factory, "isFleet(address)", to) or "0x0", 16) != 0
-        except (RpcError, OSError, ValueError):
-            return False
-
-    def fleet_record(self, fleet, db):
-        """a fleet database's (owner, sequencer) on chain, lowercase; (None, None) before its record exists"""
-        r = self.chain.view(fleet, "db(bytes32)", bytes.fromhex(db[2:]))[2:]
-        owner, seq = "0x" + r[24:64], "0x" + r[88:128]
-        return (None, None) if int(owner, 16) == 0 else (owner.lower(), seq.lower())
 
     def da_of(self, rollup):
         """the DA of a rollup of this factory, lowercase, or None"""
@@ -497,9 +444,6 @@ class Relay:
             "address": self.address, "chainId": self.chain_id,
             "factory": self.factory, "balanceWei": bal, "submitted": self.submitted, "settled": self.payments.settled,
             "calls": sorted(set(FACTORY_CALLS.values()) | set(ROLLUP_CALLS.values()) | set(DA_CALLS.values())),
-            "fleetFactory": self.fleet_factory,
-            "fleetCalls": sorted(set(FLEET_FACTORY_CALLS.values()) | set(FLEET_DB_CALLS.values()) | set(FLEET_ROOT_CALLS.values()))
-                          if self.fleet_factory else [],
             "payment": {"scheme": "exact", "network": self.payments.network, "asset": self.args.asset,
                         "payTo": self.payments.pay_to, "ethUsd": self.args.eth_usd, "margin": self.args.margin,
                         "minFee": self.args.min_fee, "facilitator": self.args.facilitator}
@@ -538,7 +482,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
             return self.reply(200, self.relay.status())
-        if re.match(r"^/(account|sponsor|fleet)/", self.path) and not self.relay.payments.enabled:
+        if re.match(r"^/(account|sponsor)/", self.path) and not self.relay.payments.enabled:
             return self.reply(404, {"error": "a free relay keeps no accounts"})
         m = re.match(r"^/account/(0x[0-9a-fA-F]{40})$", self.path)
         if m:
@@ -548,10 +492,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if m:
             s = self.relay.accounts.view_sponsor(m.group(1).lower())
             return self.reply(200, s) if s else self.reply(404, {"error": "not a sponsored rollup", "rollup": m.group(1).lower()})
-        m = re.match(r"^/fleet/(0x[0-9a-fA-F]{40})/db/(0x[0-9a-fA-F]{64})/sponsor$", self.path)
-        if m:
-            s = self.relay.accounts.view_sponsor(db_key(m.group(1), m.group(2)))
-            return self.reply(200, s) if s else self.reply(404, {"error": "not a sponsored database", "fleet": m.group(1).lower(), "dbId": m.group(2).lower()})
         return self.reply(404, {"error": "not found"})
 
     def body_json(self):
@@ -631,16 +571,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(*r.accounts.cap(rollup, funder, calls, issued))
         if action == "/release":
             return self.reply(*r.accounts.release(rollup, funder, issued))
-        if r.is_fleet(rollup):
-            # a fleet's roots (#313): its Sponsor's other side is the fleet's owner, alone
-            try:
-                fowner = ("0x" + r.chain.view(rollup, "owner()")[-40:]).lower()
-            except (RpcError, OSError, ValueError) as e:
-                return self.reply(503, {"error": "the chain cannot be read for the fleet's owner: %s" % e})
-            agreed = eth.recover(digest, sig_bytes(req.get("rollupSignature"))) if req.get("rollupSignature") is not None else funder
-            if not same(agreed, fowner):
-                return self.reply(401, {"error": "a fleet's Sponsor is signed beside the funder by the fleet's owner", "owner": fowner})
-            return self.reply(*r.accounts.sponsor(rollup, None, funder, issued, {"fleet": rollup}))
         da = r.da_of(rollup)
         if not da:
             return self.reply(404, {"error": "not a rollup of factory %s" % r.factory, "rollup": rollup})
@@ -663,50 +593,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "owner": owner, "sequencer": seq})
         return self.reply(*r.accounts.sponsor(rollup, da, funder, issued))
 
-    def post_sponsor_db(self, fleet, db, action):
-        """SponsorDb / UnsponsorDb / CapDb over (fleet, dbId) (#312, #313): the store's BindDb rules for the database's side"""
-        req = self.body_json() or {}
-        r = self.relay
-        if not r.is_fleet(fleet):
-            return self.reply(404, {"error": "not a fleet of factory %s" % r.fleet_factory, "fleet": fleet})
-        funder, issued = str(req.get("funder", "")).lower(), req.get("issuedAt")
-        if not ADDR_RE.match(funder) or not isinstance(issued, int):
-            return self.reply(400, {"error": "a database's sponsorship is {funder, issuedAt, ...}"})
-        key, dbb = db_key(fleet, db), bytes.fromhex(db[2:])
-        if action == "/cap":
-            calls, sig = req.get("callsPerDay"), sig_bytes(req.get("signature"))
-            if not isinstance(calls, int) or calls < 0 or not sig:
-                return self.reply(400, {"error": "a cap is {funder, callsPerDay, issuedAt, signature}"})
-            if not same(eth.recover(eth.typed_digest(r.domain, CAPDB_TYPE, fleet, dbb, calls, issued), sig), funder):
-                return self.reply(401, {"error": "the signature does not recover to the funder"})
-            return self.reply(*r.accounts.cap(key, funder, calls, issued))
-        if action == "/release":
-            sig = sig_bytes(req.get("signature"))
-            if not sig or not same(eth.recover(eth.typed_digest(r.domain, UNSPONSORDB_TYPE, fleet, dbb, funder, issued), sig), funder):
-                return self.reply(401, {"error": "the signature does not recover to the funder"})
-            return self.reply(*r.accounts.release(key, funder, issued))
-        digest = eth.typed_digest(r.domain, SPONSORDB_TYPE, fleet, dbb, funder, issued)
-        f_sig, d_sig = sig_bytes(req.get("funderSignature")), sig_bytes(req.get("dbSignature"))
-        if not f_sig or not same(eth.recover(digest, f_sig), funder):
-            return self.reply(401, {"error": "the funder's signature does not recover to the funder"})
-        signer = eth.recover(digest, d_sig) if d_sig else ""
-        try:
-            owner, seq = r.fleet_record(fleet, db)
-        except (RpcError, OSError, ValueError) as e:
-            return self.reply(503, {"error": "the chain cannot be read for the database's record: %s" % e})
-        if owner:
-            if not (same(signer, owner) or same(signer, seq)):
-                return self.reply(401, {"error": "the database's side: its owner or its sequencer must sign", "signer": signer})
-        else:
-            o, nh = str(req.get("owner", "")).lower(), str(req.get("nameHash", ""))
-            if not ADDR_RE.match(o) or not re.match(r"^0x[0-9a-fA-F]{64}$", nh):
-                return self.reply(400, {"error": "a database the fleet has no record of yet: name owner and nameHash beside the owner's signature"})
-            if "0x" + eth.keccak256(eth.word(o) + eth.word(bytes.fromhex(nh[2:]))).hex() != db:
-                return self.reply(400, {"error": "dbId is not keccak256(abi.encode(owner, nameHash))"})
-            if not same(signer, o):
-                return self.reply(401, {"error": "before its record, the database's owner alone sponsors it", "signer": signer})
-        return self.reply(*r.accounts.sponsor(key, None, funder, issued, {"fleet": fleet, "dbId": db}))
-
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         if self.relay.per_minute > 0:
@@ -718,7 +604,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.relay.posts[who] = seen
             if len(seen) > self.relay.per_minute:
                 return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": "60"})
-        if re.match(r"^/(account|sponsor|fleet)/", u.path) and not self.relay.payments.enabled:
+        if re.match(r"^/(account|sponsor)/", u.path) and not self.relay.payments.enabled:
             return self.reply(404, {"error": "a free relay keeps no accounts"})
         m = re.match(r"^/account/(0x[0-9a-fA-F]{40})/(permit|pay)$", u.path)
         if m:
@@ -726,15 +612,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/sponsor/(0x[0-9a-fA-F]{40})(/release|/cap)?$", u.path)
         if m:
             return self.post_sponsor(m.group(1).lower(), m.group(2) or "")
-        m = re.match(r"^/fleet/(0x[0-9a-fA-F]{40})/db/(0x[0-9a-fA-F]{64})/sponsor(/release|/cap)?$", u.path)
-        if m:
-            return self.post_sponsor_db(m.group(1).lower(), m.group(2).lower(), m.group(3) or "")
         if u.path != "/commit":
             return self.reply(404, {"error": "not found"})
-        if self.relay.busy_commits > 0:                 # a test hook: the first k calls answer 429 as an operator's rate limit does
-            self.relay.busy_commits -= 1
-            return self.reply(429, {"error": "too many requests from this address: try again later"},
-                              {"Retry-After": str(self.relay.args.busy_retry_after)})
         try:
             n = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(n) if n > 0 else b"{}")
@@ -769,7 +648,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # a sponsored rollup (#276): its sponsor's account pays, taken before the call is sent and given back when it
         # does not land, and the caller is asked nothing; when the account cannot pay, the 402 says why and the caller
         # may still pay itself. A caller that sends a payment pays
-        sponsor, sponsor_why = (r.accounts.cover(rollup, amount, counted=(name not in ("retireFor", "expireFor")))   # charged, outside the cap (#313, #321)
+        sponsor, sponsor_why = (r.accounts.cover(rollup, amount)
                                 if (rollup and p.enabled and not header) else (None, None))
         if sponsor and not sponsor_why:
             if not r.lock.acquire(timeout=r.args.queue_wait if r.args.queue_wait > 0 else -1):
@@ -842,13 +721,10 @@ def main():
     ap.add_argument("--rpc", required=True)
     ap.add_argument("--key-file", required=True, help="file with the hex key that pays the gas")
     ap.add_argument("--factory", required=True, help="the HPPLite factory whose rollups the relay serves (VERSION 10)")
-    ap.add_argument("--busy-commits", type=int, default=0, help=argparse.SUPPRESS)    # a test hook: the first k commits answer 429
-    ap.add_argument("--busy-retry-after", type=int, default=60, help=argparse.SUPPRESS)  # ...with this Retry-After (somaro#48)
     ap.add_argument("--queue-wait", type=float, default=45, help="seconds a call waits for its turn on the relay's key before a 503 (operators#45); 0: no bound")
     ap.add_argument("--slow-submit", type=float, default=0, help=argparse.SUPPRESS)   # a test hook: each send this much slower
     ap.add_argument("--queue-retry", type=int, default=30, help="the Retry-After of that 503, seconds")
     ap.add_argument("--per-minute", type=int, default=0, help="POSTs a minute from one address, as the canonical relay limits them (0: no limit)")
-    ap.add_argument("--fleet-factory", default=None, help="the VERSION 11 fleet factory whose fleets the relay serves (#313); none: no fleets")
     ap.add_argument("--pay-to", default=None, help="where payments land (default: the relay's own address)")
     ap.add_argument("--facilitator", default=None, help="x402 facilitator URL, or none: free")
     ap.add_argument("--asset", default="0x401eCb1D350407f13ba348573E5630B83638E30D", help="the EIP-3009 token (USDC.e on HPP)")

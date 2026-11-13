@@ -127,6 +127,59 @@ def start_relay(work, port, keyfile, log, eth_usd="30"):
     return p, None
 
 
+def queue_section(work, keyfile, chain_id):
+    """operators#45: a call that waits past --queue-wait for its turn on the relay's key is answered 503 with a
+    Retry-After, not sent after its caller gave up; tried again after it, it lands. Two creates at once against a free
+    relay whose sends take 3 s and whose queue waits 1 s. HPPLITE_QUEUE_WAIT=0 runs it on an unbounded relay (red)"""
+    import threading
+    port = free_port()
+    log = open(os.path.join(work, "relay_queue.log"), "w")
+    qw = os.environ.get("HPPLITE_QUEUE_WAIT", "1")
+    p = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC, "--key-file", keyfile,
+                          "--factory", FACTORY, "--dir", os.path.join(work, "relay_queue"), "--slow-submit", "3", "--queue-wait", qw,
+                          "--queue-retry", "7"], stdout=log, stderr=log)
+    url = "http://127.0.0.1:%d" % port
+    try:
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(url + "/status", timeout=2).read()
+                break
+            except OSError:
+                time.sleep(0.1)
+        deadline = int(chain.call("eth_getBlockByNumber", "latest", False)["timestamp"], 16) + 3600
+        fdomain = eth.domain_separator("HPPLiteFactory", "10", chain_id, FACTORY)
+        calls = []
+        for _ in range(2):
+            k = secrets.token_bytes(32)
+            w = eth.address(k)
+            sig = eth.sign(k, eth.typed_digest(fdomain, "CreateRollup(address owner,uint256 checkpointInterval,uint256 nonce,uint256 deadline)", w, 100, 0, deadline))
+            calls.append(json.dumps({"to": FACTORY, "data": encode("createRollupFor(address,uint256,uint256,uint256,bytes)", w, 100, 0, deadline, sig)}).encode())
+        got = [None, None]
+
+        def post(i):
+            req = urllib.request.Request(url + "/commit", data=calls[i], headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    got[i] = (r.status, r.headers.get("Retry-After"))
+            except urllib.error.HTTPError as e:
+                got[i] = (e.code, e.headers.get("Retry-After"))
+        ts = [threading.Thread(target=post, args=(i,)) for i in range(2)]
+        for t in ts:
+            t.start()
+            time.sleep(0.3)
+        for t in ts:
+            t.join()
+        late = [i for i in range(2) if got[i] and got[i][0] == 503]
+        check(sorted(g[0] for g in got if g) == [200, 503] and late and got[late[0]][1] == "7",
+              "two calls at once on a relay whose turn takes 3 s: one sent, the other answered 503 + Retry-After 7 past --queue-wait (%s)" % (got,))
+        if late:
+            post(late[0])
+        check(late and got[late[0]][0] == 200, "the refused call, tried again, lands (%s)" % (got[late[0]] if late else None,))
+    finally:
+        p.terminate()
+        p.wait()
+
+
 def main():
     if not USDC:
         print("SKIP: no MockUSDC on this chain")
@@ -341,6 +394,7 @@ def main():
         st, body = post_raw(url + "/account/%s/pay?amount=5" % wallet.lower(), {})
         check(st == 400 and body.get("minPull") == 1_000_000, "a top-up below minPull: 400 (%s)" % st)
         check(balance_eth(treasury) == 0, "the treasury holds no ETH")
+        queue_section(work, keyfile, chain_id)
     finally:
         proc.terminate()
         proc.wait()

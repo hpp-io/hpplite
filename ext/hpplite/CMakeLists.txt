@@ -339,19 +339,13 @@ if(HPPLITE_BUILD_TESTS)
         target_link_libraries(test_anvil hpplite_testlib)
         target_include_directories(test_anvil PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME test_anvil COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/l1/anvil_test.sh $<TARGET_FILE:test_anvil>)
-        set_tests_properties(test_anvil PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)   # every scenario; the fleet ones (#316) wait on leases and Retry-Afters
-        # the reference relay (#170): a wallet with USDC.e and no ETH, its rollup, lease and anchor through it
+        set_tests_properties(test_anvil PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)   # every scenario
+        # the reference relay (#170): a wallet with USDC.e and no ETH, its rollup, lease and anchor through it; its send queue (operators#45)
         add_test(NAME test_relay COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/relay/selftest.sh)
         set_tests_properties(test_relay PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
-        # the relay's v11 calls (#313): a fleet's databases and roots sponsored apart, on anvil
-        add_test(NAME test_relay_fleet COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/relay/fleet_selftest.sh)
-        set_tests_properties(test_relay_fleet PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
         # hpplite-store/2 (#213): buckets, accounts, permit pulls and x402 top-ups on anvil (doc/store-protocol.md)
         add_test(NAME test_store_buckets COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/bucket_selftest.sh)
         set_tests_properties(test_store_buckets PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
-        # hpplite-fleet/1's store side (#297): the v11 contracts on anvil, heads with their writes, the fence, roots
-        add_test(NAME test_store_fleet COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/store/fleet_selftest.sh)
-        set_tests_properties(test_store_fleet PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
 
     # === CTest Registration ===
