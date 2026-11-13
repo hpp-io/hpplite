@@ -17,7 +17,10 @@ nothing to a service that names another, or none.
 ## The idea
 
 - **A bucket** is a rollup's space at a store, named by its DA address, kept
-  while its account covers it. No per-item expiry, no renewal.
+  while its account covers it. No per-item expiry, no renewal. A **key's
+  bucket** is the same space for a key that is not a rollup's, named by the
+  key's own address (#349, [below](#a-keys-bucket)): a pinning service's
+  customer, paid the same way.
 - **An account** belongs to a **funding wallet** (an address holding the
   asset, USDC.e) and may pay for several buckets. Its `credit` is what was
   paid in minus what was charged; negative is owed. Money comes in two ways:
@@ -39,9 +42,9 @@ nothing to a service that names another, or none.
 A store must read the chain (`--rpc`): who may bind, write and prune is the
 rollup's `sequencer()` - the key its owner names, so a rotation takes effect
 at once (#208); a name also needs the lease (`sequencerWallet()` and
-`sequencerInstance()`, #167). The reference store without `--rpc` keeps a
-bucket for its first binder's sequencer key: development and unit tests
-only.
+`sequencerInstance()`, #167). A key's bucket needs no chain read: its key
+is its name. The reference store without `--rpc` keeps a bucket for its
+first binder's sequencer key: development and unit tests only.
 
 ## Signatures
 
@@ -55,12 +58,14 @@ gives it:
 | `Delete(address da,address funder,uint256 issuedAt)` | the funder | stop paying and delete the bucket now (#275): `POST /bucket/<da>/release` with `delete: true` |
 | `Content(address da,uint256 height,bytes32 hash)` | the sequencer | put bytes into the bucket (`hash` the keccak-256 of the bytes; `height` the batch they belong to, for pruning) |
 | `Prune(address da,uint256 height,uint256 issuedAt)` | the sequencer | let go of the bucket's history before `height` |
+| `Unpin(address da,bytes32 cids,uint256 issuedAt)` | a key's bucket's key | let go of those CIDs (#349): `cids` the keccak-256 of the CIDs as given, joined by `\n` (UTF-8) |
 | `Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)` | the funder | bound what the bucket may take in a day (#274); 0 = no bound on that axis |
 | `BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)` | the store's `signer` | what the store holds (below) |
 
-`issuedAt` (seconds) orders a bucket's bindings and prunes: the store takes
-one only if it is newer than the last it took and at most an hour ahead of
-its clock.
+`issuedAt` (seconds) orders a bucket's bindings, prunes and unpins: the store
+takes one only if it is newer than the last of its kind it took and at most
+an hour ahead of its clock. For a key's bucket, "the sequencer" in this
+document is the key.
 
 The permit is the asset's own `Permit(address owner,address spender,uint256
 value,uint256 nonce,uint256 deadline)` (USDC.e,
@@ -74,8 +79,10 @@ supports it: version 2).
 | `POST /bucket/<da>`, body `{funder, issuedAt, sequencerSignature, funderSignature}` | the sequencer and the funder | `200` the bucket |
 | `POST /bucket/<da>/release`, body `{funder, issuedAt, signature[, delete]}` (`delete: true` signs `Delete`, not `Release`) | the funder | `200` the bucket (`parked`, or `deleted` with `delete`) |
 | `POST /bucket/<da>/prune`, body `{height, issuedAt, signature}` | the sequencer | `200` the bucket |
+| `POST /bucket/<da>/unpin`, body `{cids, issuedAt, signature}` (up to 1000 CIDs) | a key's bucket's key | `200 {da, unpinned, missing, bytes, objects}` |
+| `GET /bucket/<da>/objects?after=<cid>&limit=<n>` | - | `200 {da, objects: [{cid, height, bytes}], next}`: the content puts by CID, ascending, `limit` up to 1000 (default 1000); `next` the CID to pass as `after`, `null` at the end |
 | `POST /bucket/<da>/cap`, body `{funder, writesPerDay, bytesPerDay, issuedAt, signature}` | the funder | `200 {da, cap, today}` |
-| `GET /bucket/<da>` | - | `200 {da, funder, state, bytes, objects, height, pruneHeight, coveredUntil, statement, cap, today}` |
+| `GET /bucket/<da>` | - | `200 {da, key, funder, state, bytes, objects, height, pruneHeight, coveredUntil, statement, cap, today}` (`key`: a key's bucket) |
 | `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | the sequencer; `402` if not covered | `200 {name, bytes, signer}`: the name is the write - its bytes are held in the bucket |
 | `POST /put?bucket=<da>&height=<n>`, the body the bytes, `X-HPPLite-Signature` the `Content` signature | the sequencer; `402` if not covered | `200 {cid, bytes}` |
 | `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names); a name's batch bytes are also read by their CID |
@@ -118,6 +125,39 @@ sent again later. JSON bodies with `error`; for `402` also
   platform that owns its apps' rollups pays for their buckets from one
   treasury without holding the apps' keys; the node runs with `funder=`
   (hpplite #272) and binds nothing itself.
+
+### A key's bucket
+
+A bucket for a key that is not a rollup's (#349): a customer that stores
+bytes and pays for them as a rollup does - a platform's backups, an agent's
+files - without a rollup on chain.
+
+- Its name is the key's own address `K`. The binding is `Bind(K, funder,
+  issuedAt)` with the sequencer half signed by `K` itself; the store needs
+  no chain read for it, since no contract can sit at an address that has a
+  key. `K` is the bucket's writer for good: there is no rotation (a new key
+  is a new bucket).
+- A store with a chain takes no other address for a first binder: a
+  rollup's address is predictable, and a bucket squatted there before the
+  rollup is created would put the squatter's bytes on the rollup's funder
+  once its sequencer bound it.
+- `K` writes content puts (`Content`, `height` the client's own ordering - a
+  snapshot's number, say) and prunes (`Prune`); it takes no names (`403`).
+  Funding, the cap, release and delete are any bucket's.
+- **Listing**: `GET /bucket/<da>/objects` pages through the bucket's content
+  by CID, with each put's height and size: what a client needs to find what
+  it holds, and to prune or unpin it. Any bucket's; a parked one's answers
+  `410`.
+- **Unpinning**: `Unpin(K, cids, issuedAt)` lets go of up to 1000 CIDs at
+  once: their records go, the bucket's bytes and objects drop, and the
+  bytes go from the store once no bucket holds them (the same CID may be in
+  another's). CIDs the bucket does not hold come back in `missing`. A
+  rollup's bucket answers `403`: its history goes by height, with `Prune`.
+  One unpin a second per bucket, by `issuedAt`: a replayed one is refused
+  (`409`), so a signed unpin cannot take a CID put again after it.
+
+Reads by CID are public, as for any bucket: a client keeping private data
+encrypts it.
 
 ### The daily cap
 
@@ -217,6 +257,8 @@ anchored snapshot at or below `height` (#203), as its setting says (`keep=all`,
 everything; or `keep=<duration>`, #223: the newest snapshot at least that old,
 the window behind it kept for point-in-time recovery, #205). The store
 deletes them (it may keep more) and reports `pruneHeight`.
+
+A key's bucket also lets go of single CIDs (`Unpin`, [above](#a-keys-bucket)).
 
 Bytes that are in no bucket (an interrupted put, #200) are the store's to
 sweep on a timer.

@@ -55,6 +55,8 @@ DELETE_TYPE = "Delete(address da,address funder,uint256 issuedAt)"      # a rele
 CONTENT_TYPE = "Content(address da,uint256 height,bytes32 hash)"
 PRUNE_TYPE = "Prune(address da,uint256 height,uint256 issuedAt)"
 CAP_TYPE = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"   # the funder's daily bound (#274)
+UNPIN_TYPE = "Unpin(address da,bytes32 cids,uint256 issuedAt)"      # a key's bucket lets go of CIDs (#349)
+UNPIN_MAX = 1000                                                    # CIDs an unpin, and a listing's page
 # a fleet database's bucket (hpplite-fleet/1, #297, #310): the same four over (fleet, dbId) instead of a rollup's DA
 BINDDB_TYPE = "BindDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
 RELEASEDB_TYPE = "ReleaseDb(address fleet,bytes32 dbId,address funder,uint256 issuedAt)"
@@ -547,7 +549,10 @@ class Service:
         return self.rollups.roles(da) if self.rollups else None
 
     def sequencer_of(self, da, b):
-        """the key that may bind, write and prune: the chain's sequencer, or (no chain) the bucket's first binder"""
+        """the key that may bind, write and prune: a key's bucket's own key (#349), the chain's sequencer, or (no chain)
+        the bucket's first binder"""
+        if b and b.get("key") and b["state"] != "deleted":
+            return da
         if self.rollups:
             r = self.roles(da)
             if r is None:
@@ -665,6 +670,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return fleet_store.fleet_get(self, path, urllib.parse.parse_qs(url.query))
             except ChainUnreadable as e:
                 return self.reply(503, {"error": "the chain cannot be read to follow the fleet: %s" % e})
+        m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})/objects$", path)
+        if m:
+            return self.get_objects(m.group(1).lower(), urllib.parse.parse_qs(url.query))
         if path.startswith("/bucket/"):
             da = path[8:].lower()
             b = self.L.bucket(da) if ADDR_RE.match(da) else None
@@ -672,6 +680,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(404, {"error": "no such bucket", "da": da})
             a = self.L.account(b["funder"]) if b.get("funder") else None
             out = {k: b.get(k) for k in ("da", "funder", "state", "bytes", "objects", "height", "pruneHeight", "parkedAt")}
+            out["key"] = bool(b.get("key"))
             out["coveredUntil"] = self.L.covered_until(a) if a and b["state"] == "covered" else 0
             out["statement"] = self.L.statement(b) if b["state"] != "deleted" else None
             out["cap"], out["today"] = b.get("cap"), self.L.today(b)
@@ -715,6 +724,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply_bytes(data)
         return self.reply(404, {"error": "no such endpoint"})
 
+    def get_objects(self, da, query):
+        """a bucket's content by CID, ascending, a page at a time (#349)"""
+        b = self.L.bucket(da)
+        if not b or b["state"] == "deleted":
+            return self.reply(404, {"error": "no such bucket", "da": da})
+        if b["state"] == "parked":
+            return self.reply(410, {"error": "bucket_parked", "da": da, "funder": b.get("funder")})
+        try:
+            limit = min(max(int((query.get("limit") or [UNPIN_MAX])[0]), 1), UNPIN_MAX)
+        except ValueError:
+            return self.reply(400, {"error": "limit: a number up to %d" % UNPIN_MAX})
+        after = (query.get("after") or [""])[0]
+        cids = sorted(c for c in b.get("content", {}) if c > after)
+        page = cids[:limit]
+        objs = [{"cid": c, "height": b["content"][c]["height"], "bytes": b["content"][c]["bytes"]} for c in page]
+        return self.reply(200, {"da": da, "objects": objs, "next": page[-1] if len(cids) > limit else None})
+
     def account_view(self, a):
         L = self.L
         try:
@@ -753,7 +779,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.post_name(path[6:], body)
             if path == "/put":
                 return self.post_put(query, body)
-            m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})(/release|/prune|/cap)?$", path)
+            m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})(/release|/prune|/cap|/unpin)?$", path)
             if m:
                 da = m.group(1).lower()
                 if m.group(2) == "/release":
@@ -762,6 +788,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.post_prune(da, body)
                 if m.group(2) == "/cap":
                     return self.post_cap(da, body)
+                if m.group(2) == "/unpin":
+                    return self.post_unpin(da, body)
                 return self.post_bind(da, body)
             m = re.match(r"^/account/(0x[0-9a-fA-F]{40})/(permit|pay)$", path)
             if m:
@@ -787,7 +815,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(401, {"error": "the funder's signature does not recover to the funder"})
         with self.L.lock:
             b = self.L.bucket(da)
-            if self.service.rollups:
+            key = bool(signer) and same(signer, da)     # a key's bucket (#349): its key is its name, no rollup can be there
+            if key:
+                seq = da
+            elif self.service.rollups:
                 r = self.service.roles(da)
                 if r is None:
                     return self.reply(404, {"error": "no HPPLite rollup at this DA", "da": da})
@@ -809,7 +840,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.L.accrue(b, now)                   # what accrued so far stays with the old funder
             if b.get("funder") and not same(b.get("funder"), funder):
                 b["cap"], b["capAt"] = None, 0                 # the cap goes with the funder (#274)
-            b.update({"funder": funder, "sequencer": signer.lower(), "boundAt": issued, "state": "covered", "parkedAt": None})
+            b.update({"funder": funder, "sequencer": signer.lower(), "boundAt": issued, "state": "covered", "parkedAt": None, "key": key})
             self.L.save_bucket(b)
             a = self.L.account(funder, create=True)
             self.L.save_account(a)
@@ -891,6 +922,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         b = self.L.bucket(da)
         if not b or b["state"] == "deleted":
             return self.reply(402, {"error": "bucket_unbound", "detail": "bind the rollup's bucket first"})
+        if b.get("key"):
+            return self.reply(403, {"error": "a key's bucket takes content puts, not names", "da": da})
         bad = self.check_sequencer(da, b, signer)
         if bad:
             return self.reply(*bad)
@@ -998,6 +1031,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
             b["pruneHeight"], b["pruneAt"] = max(b.get("pruneHeight", 0), h), req["issuedAt"]
             self.L.save_bucket(b)
             return self.reply(200, {"da": da, "pruneHeight": b["pruneHeight"], "bytes": b["bytes"]})
+
+    def post_unpin(self, da, body):
+        """a key's bucket lets go of CIDs (#349): their records, then their bytes once no bucket holds them"""
+        req = self.body_json(body)
+        cids = req.get("cids") if req else None
+        if (not isinstance(cids, list) or not cids or len(cids) > UNPIN_MAX or not all(isinstance(c, str) and CID_RE.match(c) for c in cids)
+                or not isinstance(req.get("issuedAt"), int)):
+            return self.reply(400, {"error": "an unpin is {cids (1 to %d), issuedAt, signature}" % UNPIN_MAX})
+        sig = sig_bytes(req.get("signature"))
+        h = eth.keccak256("\n".join(cids).encode())
+        signer = eth.recover(eth.typed_digest(self.L.domain, UNPIN_TYPE, da, h, req["issuedAt"]), sig) if sig else ""
+        with self.L.lock:
+            b = self.L.bucket(da)
+            if not b or b["state"] == "deleted":
+                return self.reply(404, {"error": "no such bucket", "da": da})
+            if not b.get("key"):
+                return self.reply(403, {"error": "a rollup's bucket lets go of its history by height (Prune), not by CID", "da": da})
+            if not signer or not same(signer, da):
+                return self.reply(401, {"error": "not signed by the bucket's key over Unpin(da, cids, issuedAt)", "signer": signer})
+            if not self.fresh(req["issuedAt"], b.get("unpinAt")):
+                return self.reply(409, {"error": "an unpin no newer than the last taken", "last": b.get("unpinAt")})
+            self.L.accrue(b, int(time.time()))                 # what was held until now is charged
+            missing, n = [], 0
+            for cid in cids:
+                e = b.get("content", {}).pop(cid, None)
+                if e is None:
+                    missing.append(cid)
+                    continue
+                self.L.unref(cid, da)
+                b["bytes"] -= e["bytes"]
+                b["objects"] -= 1
+                n += 1
+            b["unpinAt"] = req["issuedAt"]
+            self.L.save_bucket(b)
+            return self.reply(200, {"da": da, "unpinned": n, "missing": missing, "bytes": b["bytes"], "objects": b["objects"]})
 
     def post_permit(self, funder, body):
         req = self.body_json(body)

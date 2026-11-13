@@ -39,6 +39,7 @@ DELETE = "Delete(address da,address funder,uint256 issuedAt)"
 CONTENT = "Content(address da,uint256 height,bytes32 hash)"
 CAP = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"
 PRUNE = "Prune(address da,uint256 height,uint256 issuedAt)"
+UNPIN = "Unpin(address da,bytes32 cids,uint256 issuedAt)"
 STATEMENT = "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
 PERMIT = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
 BATCH = "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)"
@@ -327,6 +328,55 @@ def main():
         psig = eth.sign(k3, S.digest(PRUNE, da, 4, issued + 1))
         code, _, _ = jpost(url + "/bucket/%s/prune" % da, {"height": 4, "issuedAt": issued + 1, "signature": "0x" + psig.hex()})
         check(code in (401, 403), "a prune by another key: refused (%s)" % code)
+
+        # --- a key's bucket (#349): named by the key's own address, written, listed, pruned and unpinned by it ---
+        K = secrets.token_bytes(32)
+        kda = eth.address(K).lower()
+        squat = eth.address(secrets.token_bytes(32)).lower()     # an address the binder holds no key of: a rollup's to be, say
+        code, _, _ = S.bind(squat, K, F)
+        check(code in (401, 404, 503), "a plain address bound by a key that is not its own: refused (%s)" % code)
+        code, out, _ = S.bind(kda, K, F)
+        bk = http("GET", url + "/bucket/" + kda)[1]
+        check(code == 200 and out.get("state") == "covered" and bk.get("key") is True, "a key's bucket bound by its key and a funder: covered, key (%s %s)" % (code, out))
+
+        def kput(data, height, key=K):
+            ksig = eth.sign(key, S.digest(CONTENT, kda, height, eth.keccak256(data)))
+            return http("POST", "%s/put?bucket=%s&height=%d" % (url, kda, height), data, {"X-HPPLite-Signature": "0x" + ksig.hex()})
+        blobs = [(b"chunk %d of a backup " % i) * 40 for i in (1, 2, 3)]
+        codes = [kput(d, h)[0] for h, d in zip((1, 2, 3), blobs)]
+        check(codes == [200, 200, 200], "three content puts by the key at heights 1-3 (%s)" % codes)
+        code, _, _ = kput(b"from another key", 4, key=k3)
+        check(code == 403, "a content put into a key's bucket by another key: 403 (%s)" % code)
+        code, _, _ = http("POST", "%s/name/%s-1" % (url, kda[2:]), name_body(kda, 1, b"a batch", instance, K))
+        check(code == 403, "a name into a key's bucket: 403 (%s)" % code)
+        cids = sorted(_cid(d) for d in blobs)
+        code, p1, _ = http("GET", "%s/bucket/%s/objects?limit=2" % (url, kda))
+        code2, p2, _ = http("GET", "%s/bucket/%s/objects?limit=2&after=%s" % (url, kda, (p1 or {}).get("next") or ""))
+        listed = [o["cid"] for o in (p1 or {}).get("objects", []) + (p2 or {}).get("objects", [])]
+        check(code == 200 and code2 == 200 and listed == cids and p1.get("next") == cids[1] and p2.get("next") is None
+              and {o["height"] for o in p1["objects"] + p2["objects"]} == {1, 2, 3},
+              "the listing pages through the bucket's CIDs in order, with heights (%s, %s)" % (p1, p2))
+        gone, never = _cid(blobs[0]), _cid(b"never put here")
+
+        def unpin(cidl, issued, key=K, at=kda):
+            usig = eth.sign(key, S.digest(UNPIN, at, eth.keccak256("\n".join(cidl).encode()), issued))
+            return jpost(url + "/bucket/%s/unpin" % at, {"cids": cidl, "issuedAt": issued, "signature": "0x" + usig.hex()})
+        issued = int(time.time())
+        code, _, _ = unpin([gone], issued, key=k3)
+        check(code == 401, "an unpin signed by another key: 401 (%s)" % code)
+        code, out, _ = unpin([gone, never], issued)
+        check(code == 200 and out.get("unpinned") == 1 and out.get("missing") == [never] and out.get("objects") == 2,
+              "an unpin by the key: one let go, the CID never put reported missing (%s %s)" % (code, out))
+        check(http("GET", "%s/get/%s" % (url, gone))[0] == 404, "the unpinned CID no longer read")
+        code, _, _ = kput(blobs[0], 1)
+        code2, _, _ = unpin([gone], issued)
+        check(code == 200 and code2 == 409, "the same unpin replayed after the CID is put again: 409 (%s, %s)" % (code, code2))
+        code, _, _ = unpin([_cid(blob)], issued + 1, key=k1, at=da)
+        check(code == 403, "an unpin in a rollup's bucket: 403, its history goes by Prune (%s)" % code)
+        psig = eth.sign(K, S.digest(PRUNE, kda, 3, issued))
+        code, out, _ = jpost(url + "/bucket/%s/prune" % kda, {"height": 3, "issuedAt": issued, "signature": "0x" + psig.hex()})
+        left = [o["cid"] for o in http("GET", "%s/bucket/%s/objects" % (url, kda))[1].get("objects", [])]
+        check(code == 200 and left == [_cid(blobs[2])], "a prune at 3 by the key: only height 3 listed (%s %s)" % (code, left))
 
         # --- x402 only: a funder with no permit pays a 402, its credit runs out, the bucket parks, then is deleted ---
         code, out, _ = S.bind(da2, k3, G)

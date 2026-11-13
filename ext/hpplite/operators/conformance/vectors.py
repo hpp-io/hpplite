@@ -57,6 +57,9 @@ def generate():
             # the funder's own words (#274, #275): its daily cap on the bucket, and a release that deletes it now
             ("Cap", hpplite_store.CAP_TYPE, [da2, 100, 1048576, 1800000004], 2),
             ("Delete", hpplite_store.DELETE_TYPE, [da2, funder, 1800000005], 2),
+            # a key's bucket lets go of CIDs (#349): cids the keccak-256 of the CIDs joined by "\n"
+            ("Unpin", hpplite_store.UNPIN_TYPE, [da2, eth.keccak256("\n".join([hpplite_store.cid_of(b"first batch"),
+                                                                                 hpplite_store.cid_of(b"second")]).encode()), 1800000010], 1),
             # a fleet database's bucket (#310): BindDb signed by the funder and by the database's side (its sequencer, or
             # its owner alone - also before its record exists, with owner and nameHash beside it); the rest by the funder
             ("BindDb", hpplite_store.BINDDB_TYPE, [fleet_addr, fleet_db, funder, 1800000006], 2),
