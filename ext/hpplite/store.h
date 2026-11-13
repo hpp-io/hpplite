@@ -122,38 +122,10 @@ void hpplite_store_sha256(const uint8_t *data, size_t len, uint8_t out[32]);
 int hpplite_store_sign_batch(HppliteStore *store, const unsigned char da[20], uint64_t chainId, const unsigned char instance[32],
                              uint64_t height, const uint8_t *data, size_t len, uint8_t sig[65]);
 int hpplite_store_put_named(HppliteStore *store, const char *zName, const unsigned char instance[32], const uint8_t *data, size_t len, const uint8_t sig[65]);
-/* hpplite-fleet/1 (#316 c): a batch's Head digest, and the batch written with its head signed by the store's key */
-void hpplite_store_fleet_head_digest(const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], const unsigned char instance[32],
-                                     uint64_t fromHeight, uint64_t toHeight, const unsigned char chainAfter[32], const unsigned char stateRoot[32],
-                                     const unsigned char manifestDigest[32], uint64_t epoch, unsigned char digest[32]);
-typedef struct HppliteFleetView {
-    uint64_t epoch;                     /* the record as the store holds it */
-    uint64_t admittedAt;                /* ...its admission (#318): latestHead is this life's */
-    unsigned char instance[32];
-    int retired;
-    int hasHead;                        /* the latest head: its height, the rolling hash after it, its recovered signer */
-    uint64_t toHeight;
-    unsigned char chainAfter[32], stateRoot[32], headSigner[20];
-    uint64_t snapHeight;                /* the latest checked snapshot (#314): its height (0: none), its index's CID and signature */
-    char snapIndex[64];
-    unsigned char snapSig[65];
-    int64_t snapAt;
-    uint64_t prunedBelow;               /* the history below this height is gone from the store (0: nothing pruned) */
-} HppliteFleetView;
 int hpplite_store_retry_after(HppliteStore *store);
 /* the chain's time for a payment's validity window (validAfter, validBefore): what the chain checks it against; a
 ** function returning 0 (not read) falls back to the host's clock, said once */
 void hpplite_store_set_chain_time(HppliteStore *store, uint64_t (*xChainTime)(void *), void *pArg);
-int hpplite_store_fleet_view(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], HppliteFleetView *out);
-uint8_t *hpplite_store_get_fleet_name(HppliteStore *store, const unsigned char fleet[20], const unsigned char dbId[32], uint64_t admittedAt, uint64_t height, size_t *pLen);
-int hpplite_store_put_fleet_name(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t admittedAt, uint64_t height,
-                                 const unsigned char instance[32], const unsigned char chainAfter[32], const unsigned char stateRoot[32],
-                                 uint64_t epoch, const uint8_t *data, size_t len);
-/* hpplite-fleet/1's Snapshot (#314): a piece of a database's snapshot at a height - part 0 its index, i >= 1 its chunks */
-void hpplite_store_fleet_snapshot_digest(const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t admittedAt,
-                                         uint64_t height, uint64_t part, const unsigned char sha[32], unsigned char digest[32]);
-int hpplite_store_put_fleet_snapshot(HppliteStore *store, const unsigned char fleet[20], uint64_t chainId, const unsigned char dbId[32], uint64_t admittedAt,
-                                     uint64_t height, uint64_t part, const uint8_t *data, size_t len);
 /* the address a 65-byte signature over a digest recovers to: 0, or -1 */
 int hpplite_store_recover(const unsigned char digest[32], const unsigned char sig[65], unsigned char out[20]);
 uint8_t *hpplite_store_get_named(HppliteStore *store, const char *zName, size_t *pLen, uint8_t sig[65], unsigned char instance[32]);

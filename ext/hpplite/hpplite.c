@@ -683,15 +683,6 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->storePermit = cfg->storePermitSet ? cfg->storePermit : 20000000;   /* 20 USDC.e by default (#214) */
     memcpy(nc->funder, cfg->funder, 20);
     nc->hasFunder = cfg->hasFunder;
-    nc->hasFleet = cfg->hasFleet;                          /* fleet= (#316) */
-    memcpy(nc->fleet, cfg->fleet, 20);
-    memcpy(nc->dbId, cfg->dbId, 32);
-    memcpy(nc->fleetOwner, cfg->fleetOwner, 20);
-    memcpy(nc->nameHash, cfg->nameHash, 32);
-    nc->admitIssuedAt = cfg->admitIssuedAt;
-    memcpy(nc->admitSig, cfg->admitSig, 65);
-    nc->hasAdmit = cfg->hasAdmit;
-    nc->onForeign = cfg->onForeign;
     nc->syncTo = nc->verifyOnly ? cfg->syncTo : 0;      /* a stop for a verifier only: a sequencer must replay all (#206) */
     nc->keepSeconds = cfg->keepSeconds;                /* pruning behind a snapshot (#223) */
     nc->fromSnapshot = !nc->verifyOnly;                /* a new replica starts from the latest snapshot (#222); a verifier from batch 1, else the oldest kept (#224, #255) */
@@ -703,8 +694,6 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->relayCap = cfg->relayCap;
     nc->storeFallback = cfg->storeFallback;
     nc->snapshotIntervalMs = cfg->snapshotIntervalMs;   /* snapshots at anchors (#221) */
-    nc->snapshotGiven = cfg->snapshotGiven;             /* ...a fleet database's by default (#314) */
-    nc->keepAll = cfg->keepAll;
     nc->anchorIntervalMs = cfg->anchorIntervalMs;   /* the anchor's cadence (#164) */
     nc->keepLease = cfg->keepLease;                  /* the lease left running at a close alone (#265) */
     nc->noAnchorAtClose = !cfg->anchorClose;         /* the close anchors nothing (#266) */

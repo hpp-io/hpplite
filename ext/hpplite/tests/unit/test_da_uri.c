@@ -7,9 +7,11 @@
 #include "da_uri.h"
 #include "l1_interface.h"
 #include "config.h"
+#include "sqlite3.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -359,130 +361,30 @@ static void test_relay_exact_only(void) {
     PASS();
 }
 
-/* #316 (a): fleet= names a database by owner= and dbname= alone; what names a rollup (contract=, factory=) and what a
-** fleet's anchor does for it (anchor=, checkpoint=, keep=) refuse the open, one line each naming it */
-static void test_fleet_params(void) {
-    TEST("fleet=: owner= and dbname= are required; contract=, factory=, anchor=, checkpoint=, keep=<duration> refuse the open with fleet= (#316); snapshot= and keep=all are taken (#314)");
-    static const char *base = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
-                              "&store=http://127.0.0.1:1&relay=http://127.0.0.1:2";
-    static const char *bare = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
-                              "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes";
-    static const char *cases[][2] = {
-        { "&dbname=notes", "owner=" }, { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1", "dbname=" },
-        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&contract=0x2222222222222222222222222222222222222222", "contract=" },
-        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&factory=0x2222222222222222222222222222222222222222", "factory=" },
-        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&anchor=24h", "anchor=" },
-        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&checkpoint=7", "checkpoint=" },
-        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&keep=7d", "keep=" },
-        { "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&anchorclose=off", "anchorclose=" },
-    };
-    char uri[600];
-    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        snprintf(uri, sizeof uri, "%s%s", base, cases[i][0]);
-        HppliteConfig *cfg = hpplite_config_load(uri);
-        const char *why = hpplite_config_error();
-        int refused = !cfg || why != NULL;
-        printf("  %s: %s\n", cases[i][1], why ? why : "(no error)");
-        if (cfg) hpplite_config_free(cfg);
-        if (!refused || !why || !strstr(why, cases[i][1])) { FAIL("fleet= with this should refuse the open, naming it"); }
-    }
-    /* store= and relay= are required: a fleet's batches live at a store; it joins and claims through a relay (v1) */
-    {
-        static const char *missing[][2] = { { "", "store=" }, { "&store=http://127.0.0.1:1", "relay=" } };
-        for (size_t i = 0; i < 2; i++) {
-            snprintf(uri, sizeof uri, "%s%s", bare, missing[i][0]);
-            HppliteConfig *cfg = hpplite_config_load(uri);
-            const char *why = hpplite_config_error();
-            printf("  without %s: %s\n", missing[i][1], why ? why : "(no error)");
-            if (cfg) hpplite_config_free(cfg);
-            if (!why || !strstr(why, missing[i][1])) { FAIL("fleet= without store= or relay= should refuse the open"); }
-        }
-    }
-    /* the same settings from the environment alone refuse it too, naming the variable */
-    {
-        static const char *envs[][2] = { { "HPPLITE_ANCHOR", "24h" }, { "HPPLITE_KEEP", "7d" },
-                                         { "HPPLITE_CHECKPOINT_INTERVAL", "7" }, { "HPPLITE_ANCHOR_CLOSE", "off" },
-                                         { "HPPLITE_CONTRACT_ADDRESS", "0x2222222222222222222222222222222222222222" },
-                                         { "HPPLITE_FACTORY_ADDRESS", "0x2222222222222222222222222222222222222222" } };
-        snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes", base);
-        for (size_t i = 0; i < sizeof envs / sizeof envs[0]; i++) {
-            setenv(envs[i][0], envs[i][1], 1);
-            HppliteConfig *cfg = hpplite_config_load(uri);
-            const char *why = hpplite_config_error();
-            printf("  %s=%s in the environment: %s\n", envs[i][0], envs[i][1], why ? why : "(no error)");
-            unsetenv(envs[i][0]);
-            if (cfg) hpplite_config_free(cfg);
-            if (!why || !strstr(why, envs[i][0])) { FAIL("the setting from the environment should refuse the open beside fleet=, naming the variable"); }
-        }
-    }
-    /* snapshots and pruning in a fleet (#314): snapshot= sets how often, keep=all keeps the history - from the URI or the
-    ** environment */
-    {
-        static const char *ok[][3] = { { "&snapshot=1h", NULL, NULL }, { "&keep=all", NULL, NULL }, { "", "HPPLITE_SNAPSHOT", "1h" }, { "", "HPPLITE_KEEP", "all" } };
-        for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++) {
-            snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes%s", base, ok[i][0]);
-            if (ok[i][1]) setenv(ok[i][1], ok[i][2], 1);
-            HppliteConfig *cfg = hpplite_config_load(uri);
-            const char *why = hpplite_config_error();
-            int good = cfg && !why && (strstr(ok[i][0], "keep") || (ok[i][1] && strstr(ok[i][1], "KEEP")) ? cfg->keepAll : cfg->snapshotGiven && cfg->snapshotIntervalMs == 3600000);
-            printf("  %s%s%s with fleet=: %s\n", ok[i][1] ? ok[i][1] : ok[i][0] + 1, ok[i][1] ? "=" : "", ok[i][1] ? ok[i][2] : "", good ? "taken" : (why ? why : "not read"));
-            if (ok[i][1]) unsetenv(ok[i][1]);
-            if (cfg) hpplite_config_free(cfg);
-            if (!good) { FAIL("snapshot= and keep=all should be taken with fleet= (#314)"); }
-        }
-    }
-    /* a dbname is any bytes after percent-decoding: somaro names "<app>/<path in the volume>" */
-    {
-        snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=smrt-sqlite%%2Fdata%%2Fmy%%20db.sqlite%%C3%%A9", base);
-        HppliteConfig *cfg = hpplite_config_load(uri);
-        static const unsigned char want2[32] = { 0xf8,0x58,0xca,0x3f,0xda,0x10,0x96,0xc8,0x3d,0x6a,0x1b,0x14,0xbe,0xe2,0xf3,0x21,
-                                                 0xf2,0x31,0xb4,0xb5,0x4f,0x5c,0xf4,0x40,0xc9,0xb7,0xe7,0x96,0x4d,0x4d,0x05,0x37 };
-        int same = cfg && !hpplite_config_error() && memcmp(cfg->dbId, want2, 32) == 0;
-        printf("  dbname \"smrt-sqlite/data/my db.sqlite\\xc3\\xa9\": %s\n", same ? "the dbId fleet.py gives" : (hpplite_config_error() ? hpplite_config_error() : "another dbId"));
-        if (cfg) hpplite_config_free(cfg);
-        if (!same) { FAIL("a percent-encoded dbname with '/', a space and a non-ASCII byte should give the dbId fleet.py computes"); }
-    }
-    /* the vectors' first database: "notes" of key 0x01..01's address, dbId as operators/conformance/vectors.json (fleet) */
-    snprintf(uri, sizeof uri, "%s&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&admit=1800000000:0x%s", base,
-             "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222" "1b");
-    HppliteConfig *cfg = hpplite_config_load(uri);
-    static const unsigned char want[32] = { 0x0d,0x00,0x46,0xe2,0x14,0xcb,0x02,0x16,0x94,0x1a,0x01,0x56,0x73,0xfa,0x82,0x8c,
-                                            0x60,0xa4,0x2d,0x13,0x9b,0x75,0xe4,0xad,0x10,0x8a,0xe5,0xd5,0xa3,0x48,0x03,0x0e };
-    int ok = cfg && !hpplite_config_error() && cfg->hasFleet && memcmp(cfg->dbId, want, 32) == 0 && cfg->hasAdmit && cfg->admitIssuedAt == 1800000000;
-    printf("  owner, dbname and admit: %s\n", ok ? "parsed, the vectors' dbId" : (hpplite_config_error() ? hpplite_config_error() : "the dbId differs"));
-    int resolves = cfg && hpplite_config_resolve_operators(cfg) == 0;              /* served since #316 (c) */
-    if (cfg) hpplite_config_free(cfg);
-    if (!ok) { FAIL("fleet=, owner= and dbname= should give the vectors' dbId, admit= its issuedAt"); }
-    if (!resolves) { printf("(%s) ", hpplite_config_error() ? hpplite_config_error() : "?"); FAIL("a fleet= open resolves its operators and goes on"); }
-    PASS();
-}
-
-/* somaro#93: onforeign= (history|file) or HPPLITE_ON_FOREIGN with fleet=, the parameter winning; any other value refuses */
-static void test_fleet_onforeign_param(void) {
-    TEST("fleet=: onforeign=history|file, HPPLITE_ON_FOREIGN when no parameter, the parameter winning; another value refuses the open naming it (somaro#93)");
-    static const char *base = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
-                              "&store=http://127.0.0.1:1&relay=http://127.0.0.1:2&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes";
-    char uri[600];
-    HppliteConfig *c;
-    int got[5];
-    unsetenv("HPPLITE_ON_FOREIGN");
-    c = hpplite_config_load(base); got[0] = c && !hpplite_config_error() ? c->onForeign : -1; if (c) hpplite_config_free(c);
-    snprintf(uri, sizeof uri, "%s&onforeign=history", base);
-    c = hpplite_config_load(uri); got[1] = c && !hpplite_config_error() ? c->onForeign : -1; if (c) hpplite_config_free(c);
-    setenv("HPPLITE_ON_FOREIGN", "file", 1);
-    c = hpplite_config_load(base); got[2] = c && !hpplite_config_error() ? c->onForeign : -1; if (c) hpplite_config_free(c);
-    c = hpplite_config_load(uri); got[3] = c && !hpplite_config_error() ? c->onForeign : -1; if (c) hpplite_config_free(c);
-    setenv("HPPLITE_ON_FOREIGN", "both", 1);
-    c = hpplite_config_load(base);
-    int envBad = hpplite_config_error() && strstr(hpplite_config_error(), "HPPLITE_ON_FOREIGN=both: onforeign takes history or file") != NULL;
+/* #352: fleet mode is gone (decision 0003) - fleet= refuses the open saying so, from the URI as from the SQLite URI,
+** rather than opening the file as a rollup of its own */
+static void test_fleet_gone(void) {
+    TEST("fleet= is gone (#352, decision 0003): it refuses the open saying so, in either form of the URI");
+    static const char *uri = "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+                             "&owner=0x1a642f0e3c3af545e7acbd38b07251b3990914f1&dbname=notes&store=http://127.0.0.1:1&relay=http://127.0.0.1:2";
+    HppliteConfig *c = hpplite_config_load(uri);
+    const char *why = hpplite_config_error();
+    int refused = why && strstr(why, "fleet= is gone") && strstr(why, "decision 0003");
+    printf("  hpplite://: %s\n", why ? why : "taken");
     if (c) hpplite_config_free(c);
-    unsetenv("HPPLITE_ON_FOREIGN");
-    snprintf(uri, sizeof uri, "%s&onforeign=keep", base);
-    c = hpplite_config_load(uri);
-    int uriBad = hpplite_config_error() && strstr(hpplite_config_error(), "onforeign=keep: onforeign takes history or file") != NULL;
+    if (!refused) { FAIL("fleet= should refuse the open, saying fleet mode is gone"); }
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2("file:fleet_gone.db?fleet=0xf1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1", &db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+    c = rc == SQLITE_OK ? hpplite_config_create() : NULL;
+    if (c) hpplite_config_load_sqlite_uri(c, sqlite3_db_filename(db, "main"));
+    why = hpplite_config_error();
+    refused = why && strstr(why, "fleet= is gone") != NULL;
+    printf("  file: URI: %s\n", why ? why : "taken");
     if (c) hpplite_config_free(c);
-    printf("  unset %d, onforeign=history %d, HPPLITE_ON_FOREIGN=file %d, both %d; bad env %d, bad parameter %d\n", got[0], got[1], got[2], got[3], envBad, uriBad);
-    if (got[0] != 0 || got[1] != 1 || got[2] != 2 || got[3] != 1 || !envBad || !uriBad) { FAIL("onforeign: unset 0, history 1, file 2, the parameter winning, another value refused"); }
+    sqlite3_close(db);
+    unlink("fleet_gone.db");
+    if (!refused) { FAIL("fleet= in a SQLite URI should refuse the open too"); }
     PASS();
 }
 
@@ -566,8 +468,7 @@ int main(void) {
     test_operators_on();
     test_keep_not_capped();
     test_relay_exact_only();
-    test_fleet_params();
-    test_fleet_onforeign_param();
+    test_fleet_gone();
     test_money_knobs_env_only();
     test_from_soft_gone();
 

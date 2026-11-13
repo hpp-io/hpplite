@@ -90,9 +90,6 @@ typedef struct StatusCursor {
 #define STATUS_COL_SPEND_WARNING  38  /* what runs out and when at the recent rate (HPPLITE_LOW_BALANCE); NULL when nothing does */
 #define STATUS_COL_STORE_BUCKET   41  /* ...the bucket's state at the store: covered, parked, deleted; NULL before one is known */
 #define STATUS_COL_SNAPSHOT       42  /* the latest snapshot's height: the one this sequencer's anchors name, or a replica started from (#221, #222); NULL: none */
-#define STATUS_COL_FLEET          43  /* fleet= (#316): the shared rollup; NULL for a rollup of its own */
-#define STATUS_COL_DB_ID          44  /* ...the database's dbId there */
-#define STATUS_COL_EPOCH          45  /* ...the lease epoch this run's heads are signed at; NULL before one is known */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
                          sqlite3_vtab **ppVtab, char **pzErr) {
@@ -110,7 +107,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
         " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_funder TEXT, store_covered_until INTEGER, spent_window INTEGER, spend_warning TEXT, soft_height INTEGER, soft_disagreements INTEGER,"
-        " store_bucket TEXT, snapshot_height INTEGER, fleet TEXT, db_id TEXT, epoch INTEGER)");
+        " store_bucket TEXT, snapshot_height INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -390,23 +387,6 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             break;
         case STATUS_COL_SNAPSHOT:
             if (node->snapHeight) sqlite3_result_int64(ctx, (sqlite3_int64)node->snapHeight);
-            break;
-        case STATUS_COL_FLEET:
-        case STATUS_COL_DB_ID: {
-            char hex[67];
-            int n = col == STATUS_COL_FLEET ? 20 : 32;
-            if (!node->config.hasFleet) break;
-            hex[0] = '0'; hex[1] = 'x';
-            hpplite_bytes_to_hex(col == STATUS_COL_FLEET ? node->config.fleet : node->config.dbId, n, hex + 2);
-            for (int i = 2; i < 2 + 2 * n; i++) if (hex[i] >= 'A' && hex[i] <= 'F') hex[i] += 32;
-            sqlite3_result_text(ctx, hex, 2 + 2 * n, SQLITE_TRANSIENT);
-            break;
-        }
-        case STATUS_COL_EPOCH:
-            if (node->config.hasFleet && node->l1) {
-                uint64_t e = hpplite_l1_fleet_epoch(node->l1);
-                if (e) sqlite3_result_int64(ctx, (sqlite3_int64)e);
-            }
             break;
         case STATUS_COL_SOFT_HEIGHT:
             if (node->config.verifyOnly && node->store) sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_get_block_height(node->ctx));

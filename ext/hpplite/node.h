@@ -81,15 +81,8 @@ typedef struct HppliteNodeConfig {
     uint64_t storeCap;              /* HPPLITE_STORE_CAP: the most to pay a store per call, atomic units (0 = pay nothing) */
     uint64_t storePermit;           /* HPPLITE_STORE_PERMIT: what the funding wallet's permit lets the store pull (0: none, #214) */
     unsigned char funder[20];       /* funder= (#272): the bucket's funding wallet is external; the node binds nothing, gives no permit */
-    int hasFleet;                   /* fleet= (#316): one database in a shared rollup */
-    unsigned char fleet[20], dbId[32], fleetOwner[20], nameHash[32];
-    uint64_t admitIssuedAt;
-    unsigned char admitSig[65];
-    int hasAdmit;
-    int onForeign;                  /* somaro#93: a file with pages, no bookkeeping, history at the store - 0 refuse, 1 history, 2 file */
-    int hasFunder;
+                     int hasFunder;
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
-    int keepAll;                    /* keep=all: a fleet database's snapshots let no history go (#314) */
     int fromSnapshot;               /* a new replica (no role=verify, an empty file) starts from the latest snapshot (#222); a verifier
                                     ** reads batch 1 and, when the store has pruned it, starts from the oldest snapshot kept (#224, #255) */
     uint64_t syncTo;                /* syncto=: a verifier applies no batch past this height (#206); 0: none */
@@ -100,7 +93,6 @@ typedef struct HppliteNodeConfig {
     uint64_t relayCap;              /* HPPLITE_RELAY_CAP: the most to pay the relay per call (0 = pay nothing) */
     int storeFallback;              /* HPPLITE_STORE_FALLBACK: a store that does not answer lets the chain carry the bytes (default on) */
     int snapshotIntervalMs;         /* snapshot=: a snapshot at an anchor when the last is older than this (#221); 0: never */
-    int snapshotGiven;              /* snapshot= was set: a fleet database snapshots every 24 h otherwise (#314) */
     int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
     int keepLease;                  /* keeplease=on: a sequencer closing alone lets its lease run instead of releasing it (#265) */
     int noAnchorAtClose;            /* anchorclose=off: the close flushes to the store and leaves the anchor to the timer or hpplite_anchor() (#266) */
@@ -124,11 +116,6 @@ typedef struct HppliteNode {
     int64_t idleSyncAt;             /* An idle lease holder asks the chain again at this time, not at every tick (#292) */
     uint64_t leaseDuration;         /* Seconds, learned from the contract (default 300) */
     int warnedForeignLease;         /* "someone else holds the lease" said once */
-    int warnedClaim;                /* fleet= (#316 d): why the claim failed, said once per episode */
-    int warnedFenced;               /* fleet= (#316 d): "fenced" said once */
-    int fleetOpenRefused;           /* fleet= (somaro): the history at the store could not be rebuilt - the open fails, nothing written */
-    int fleetForeignFile;           /* somaro#93: onforeign=file took the file over the history (its own line said) */
-    uint64_t fleetForeignHistory;   /* somaro#93: onforeign=history replaces the file with the history at this height */
     int leaseHeldElsewhere;         /* The last look found another instance's lease (hpplite_status.state = waiting) */
     int lastFetchForeign;           /* The last fetch found a batch that fails our authentication */
     int failStreak;                 /* Consecutive flushes that did not reach L1 */

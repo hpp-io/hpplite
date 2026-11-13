@@ -20,13 +20,13 @@
 ** before the application opens the file - pages cannot be applied while
 ** another connection holds the file in WAL mode. Everything else goes to stderr.
 **
-** A fleet in one process (somaro, decision 0016):
+** Many databases in one process:
 **
-**   hpplite-sequencer --dir /etc/hpplite/fleet
+**   hpplite-sequencer --dir /etc/hpplite/databases
 **
 ** holds every database named by a file <name>.conf in the directory, each its
 ** own connection, key and rollup. A file is key=value lines - db=<path>,
-** params=<HPPLITE_PARAMS, with contract=: a fleet opens by address, never by
+** params=<HPPLITE_PARAMS, with contract=: each opens by address, never by
 ** name>, privkey=0x... - and must be readable by its owner alone (mode 0600):
 ** the keys are never on the command line nor in one shared environment.
 ** SIGHUP reads the directory again: a new file is opened, a removed one is
@@ -41,7 +41,7 @@
 **
 ** One run over a copy (#345, somaro#144):
 **
-**   HPPLITE_PARAMS="fleet=...&..." hpplite-sequencer --once [--from /path/to/app.db] /path/to/copy.db
+**   HPPLITE_PARAMS="contract=...&store=...&..." hpplite-sequencer --once [--from /path/to/app.db] /path/to/copy.db
 **
 ** opens the copy as above (bookkeeping, the store's view, the lease), sends what
 ** is pending as one height, closes and exits; nothing of HPPLite touches the
@@ -51,8 +51,7 @@
 ** record). The stat of the app's file and its -wal is kept in <copy>-once; both
 ** unchanged since the last run, there is no backup, no read and no height. An
 ** app's file of fewer than two pages while the history has heights (an app
-** started on an empty volume) is refused, never sent as the newest state. A
-** fleet database is anchored by the fleet's anchor, not here. One line on
+** started on an empty volume) is refused, never sent as the newest state. One line on
 ** stdout, "<copy>: sent height N" or "<copy>: unchanged at height N", exit 0;
 ** exit 1 with the reason on stderr (the open refused, the send kept pending:
 ** it goes at the next run); exit 3 when another process holds the copy. A close
@@ -101,7 +100,7 @@ static char *status_text(sqlite3 *db, const char *col, char *out, size_t n) {
     return out;
 }
 
-/* ---- the fleet: one connection per <name>.conf, each in its own thread ---- */
+/* ---- --dir: one connection per <name>.conf, each in its own thread ---- */
 
 typedef struct Db Db;
 struct Db {
@@ -114,7 +113,7 @@ struct Db {
     Db *after;                      /* the entry this one replaces: it opens once that one is closed */
     Db *next;
 };
-static Db *fleet;
+static Db *dbs;
 static pthread_mutex_t outMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void say(const char *name, const char *fmt, ...) {
@@ -198,7 +197,7 @@ static char *read_conf(const char *dir, const char *file, const char *name, uint
     }
     if (!db || !db[0]) say(name, "error: %s names no db=", path);
     else if (!params || !(strncmp(params, "contract=", 9) == 0 || strstr(params, "&contract=")))
-        say(name, "error: %s: params= must name the rollup by contract= (a fleet opens by address)", path);
+        say(name, "error: %s: params= must name the rollup by contract= (each database opens by address)", path);
     else uri = sqlite3_mprintf("file:%s?hpplite=on&%s%s%s", db, params, key && key[0] ? "&privkey=" : "", key ? key : "");
     memset(buf, 0, sizeof buf);
     return uri;
@@ -210,7 +209,7 @@ static void start_db(Db *d) {
 }
 
 /* the directory read again: added, removed, changed and failed entries */
-static void fleet_scan(const char *dir) {
+static void dir_scan(const char *dir) {
     static unsigned gen;
     DIR *dh = opendir(dir);
     struct dirent *e;
@@ -224,7 +223,7 @@ static void fleet_scan(const char *dir) {
         if (e->d_name[0] == '.' || m <= 5 || strcmp(e->d_name + m - 5, ".conf") != 0 || m - 5 >= sizeof name) continue;
         snprintf(name, sizeof name, "%.*s", (int)(m - 5), e->d_name);
         Db *cur = NULL;
-        for (d = fleet; d; d = d->next) if (!d->quit && strcmp(d->name, name) == 0) cur = d;
+        for (d = dbs; d; d = d->next) if (!d->quit && strcmp(d->name, name) == 0) cur = d;
         if (cur) cur->gen = gen;                    /* its file is there: kept, whatever it reads */
         char *uri = read_conf(dir, e->d_name, name, &hash);
         if (!uri) continue;
@@ -236,22 +235,22 @@ static void fleet_scan(const char *dir) {
         nd->gen = gen;
         nd->uri = uri;
         if (cur) { cur->quit = 1; if (!cur->done) nd->after = cur; }   /* changed or failed: the old one goes first */
-        nd->next = fleet;
-        fleet = nd;
+        nd->next = dbs;
+        dbs = nd;
         if (!nd->after) start_db(nd);
     }
     closedir(dh);
-    for (d = fleet; d; d = d->next) if (!d->quit && d->gen != gen) d->quit = 1;   /* a file gone: its database closes */
+    for (d = dbs; d; d = d->next) if (!d->quit && d->gen != gen) d->quit = 1;   /* a file gone: its database closes */
 }
 
 /* closed entries joined and freed; replacements started once what they replace is closed */
-static void fleet_reap(void) {
-    for (Db *d = fleet; d; d = d->next) if (d->after && d->after->done) { d->after = NULL; start_db(d); }
-    Db **pp = &fleet;
+static void dir_reap(void) {
+    for (Db *d = dbs; d; d = d->next) if (d->after && d->after->done) { d->after = NULL; start_db(d); }
+    Db **pp = &dbs;
     while (*pp) {
         Db *d = *pp;
         int referenced = 0;
-        for (Db *o = fleet; o; o = o->next) if (o->after == d) referenced = 1;
+        for (Db *o = dbs; o; o = o->next) if (o->after == d) referenced = 1;
         if (d->done && (d->quit || d->failed) && !referenced) {
             if (d->started) pthread_join(d->th, NULL);
             d->started = 0;
@@ -261,7 +260,7 @@ static void fleet_reap(void) {
     }
 }
 
-static int fleet_main(const char *dir) {
+static int dir_main(const char *dir) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
@@ -269,24 +268,24 @@ static int fleet_main(const char *dir) {
     sigaction(SIGINT, &sa, NULL);
     sa.sa_handler = on_hup;
     sigaction(SIGHUP, &sa, NULL);
-    fleet_scan(dir);
+    dir_scan(dir);
     while (!stop) {
-        if (reread) { reread = 0; fleet_scan(dir); }
-        fleet_reap();
+        if (reread) { reread = 0; dir_scan(dir); }
+        dir_reap();
         usleep(200000);
     }
     const char *z = getenv("HPPLITE_STOP_SECONDS");
     int secs = z && atoi(z) > 0 ? atoi(z) : 30, open = 0;
     time_t until = time(NULL) + secs;
     fprintf(stderr, "hpplite-sequencer: stopping; every database posts what is pending (at most %d s)\n", secs);
-    for (Db *d = fleet; d; d = d->next) { d->quit = 1; if (d->after) d->after = NULL; }   /* a replacement not started stays unstarted */
+    for (Db *d = dbs; d; d = d->next) { d->quit = 1; if (d->after) d->after = NULL; }   /* a replacement not started stays unstarted */
     for (;;) {
         open = 0;
-        for (Db *d = fleet; d; d = d->next) if (d->started && !d->done) open++;
+        for (Db *d = dbs; d; d = d->next) if (d->started && !d->done) open++;
         if (!open || time(NULL) >= until) break;
         usleep(100000);
     }
-    for (Db *d = fleet; d; d = d->next) if (d->started && !d->done) say(d->name, "error: not closed within %d s: its pending pages stay in its file for the next start", secs);
+    for (Db *d = dbs; d; d = d->next) if (d->started && !d->done) say(d->name, "error: not closed within %d s: its pending pages stay in its file for the next start", secs);
     return open ? 1 : 0;
 }
 
@@ -407,7 +406,7 @@ int main(int argc, char **argv) {
         if (argc == 3) return once_main(argv[2], NULL);
         if (argc == 5 && strcmp(argv[2], "--from") == 0) return once_main(argv[4], argv[3]);
     }
-    if (argc == 3 && strcmp(argv[1], "--dir") == 0) return fleet_main(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "--dir") == 0) return dir_main(argv[2]);
     if (argc != 2) {
         fprintf(stderr, "usage: HPPLITE_PARAMS=... %s <database file>\n       %s --dir <directory of <name>.conf files>\n       %s --once [--from <app's database file>] <copy>\n", argv[0], argv[0], argv[0]);
         return 2;

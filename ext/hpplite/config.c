@@ -147,70 +147,13 @@ static void refuse_soft(void) {
     snprintf(gConfigError, sizeof(gConfigError), "soft= is gone (v0.8, #255): a verifier follows the store's batches past the anchor (hpplite-verify reports them as the soft tier); with syncto= or syncat= it stays at the hard tier");
 }
 
+/* fleet= is gone (#352, decision 0003): the shared rollup was an experiment set aside; a database opened with it
+** refuses rather than opening as a rollup of its own */
+static void refuse_fleet(void) {
+    snprintf(gConfigError, sizeof(gConfigError), "fleet= is gone (#352, decision 0003): fleet mode was removed; its history is on the branch fleet-experiment");
+}
+
 /* role=verify, nothing else (#248): sequencer and observer were parsed and read nowhere - a sequencer needs no role= */
-/* fleet= (#316): a database in a shared rollup is named by owner= and dbname= alone; admit= carries the fleet's Admit */
-static void fleet_param(HppliteConfig *cfg, const char *name, const char *val) {
-    if (!val) return;
-    if (strcmp(name, "fleet") == 0) { if (hex_to_bytes(val, cfg->fleet, 20) == 0) cfg->hasFleet = 1;
-                                      else snprintf(gConfigError, sizeof(gConfigError), "fleet=%.48s: not an address", val); }
-    else if (strcmp(name, "owner") == 0) { if (hex_to_bytes(val, cfg->fleetOwner, 20) == 0) cfg->hasFleetOwner = 1;
-                                           else snprintf(gConfigError, sizeof(gConfigError), "owner=%.48s: not an address", val); }
-    else if (strcmp(name, "onforeign") == 0) {
-        if (strcasecmp(val, "history") == 0) cfg->onForeign = 1;
-        else if (strcasecmp(val, "file") == 0) cfg->onForeign = 2;
-        else snprintf(cfg->onForeignBad, sizeof cfg->onForeignBad, "onforeign=%.32s", val);
-    }
-    else if (strcmp(name, "admit") == 0) {
-        const char *colon = strchr(val, ':');
-        cfg->admitIssuedAt = strtoull(val, NULL, 10);
-        if (!colon || !cfg->admitIssuedAt || hex_to_bytes(colon + 1, cfg->admitSig, 65) != 0)
-            snprintf(gConfigError, sizeof(gConfigError), "admit=: <issuedAt>:0x<65-byte signature>, the fleet's Admit");
-        else cfg->hasAdmit = 1;
-    }
-}
-
-/* with fleet=: owner=, dbname=, store= and relay= required; what names a rollup or is a fleet anchor's job refuses the
-** open from any source - the URI or the environment (a sidecar's environment is where an old HPPLITE_ANCHOR stays) - and
-** the dbId. uri[]: contract, factory, anchor, checkpoint, keep, snapshot, anchorclose given in the URI */
-static void fleet_check(HppliteConfig *cfg, const int uri[7]) {
-    static const struct { const char *name, *env; int anchors; } k[7] = {
-        { "contract", HPPLITE_ENV_CONTRACT, 0 }, { "factory", HPPLITE_ENV_FACTORY, 0 }, { "anchor", "HPPLITE_ANCHOR", 1 },
-        { "checkpoint", HPPLITE_ENV_CHECKPOINT, 1 }, { "keep", "HPPLITE_KEEP", 1 }, { "snapshot", "HPPLITE_SNAPSHOT", 1 },
-        { "anchorclose", "HPPLITE_ANCHOR_CLOSE", 1 } };
-    unsigned char word[64];
-    int i;
-    if (!cfg->hasFleet || gConfigError[0]) return;
-    if (!cfg->hasFleetOwner) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: owner= is required (with dbname= it names the database)"); return; }
-    if (!cfg->dbName || !cfg->dbName[0]) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: dbname= is required (with owner= it names the database)"); return; }
-    if (!cfg->storeUrl) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: store= is required: a fleet's batches live at a store"); return; }
-    if (!cfg->relayUrl) { snprintf(gConfigError, sizeof(gConfigError), "fleet=: relay= is required: a fleet database joins and claims through a relay"); return; }
-    if (!cfg->onForeign && !cfg->onForeignBad[0]) {          /* the parameter wins over HPPLITE_ON_FOREIGN (somaro#93) */
-        const char *ev = getenv("HPPLITE_ON_FOREIGN");
-        if (ev && ev[0]) {
-            if (strcasecmp(ev, "history") == 0) cfg->onForeign = 1;
-            else if (strcasecmp(ev, "file") == 0) cfg->onForeign = 2;
-            else snprintf(cfg->onForeignBad, sizeof cfg->onForeignBad, "HPPLITE_ON_FOREIGN=%.24s", ev);
-        }
-    }
-    if (cfg->onForeignBad[0]) { snprintf(gConfigError, sizeof(gConfigError), "%s: onforeign takes history or file", cfg->onForeignBad); return; }
-    for (i = 0; i < 7; i++) {
-        const char *ev = getenv(k[i].env);
-        int env = ev != NULL && ev[0];
-        if (!uri[i] && !env) continue;
-        if (i == 5) continue;                       /* snapshot=: how often the node snapshots a fleet database (#314) */
-        if (i == 4 && cfg->keepAll) continue;       /* keep=all: snapshots, and the history kept (#314) */
-        snprintf(gConfigError, sizeof(gConfigError), "%s%s with fleet=: %s", uri[i] ? k[i].name : k[i].env, uri[i] ? "=" : " (environment)",
-                 i == 4 ? "a fleet database's history goes below an anchored snapshot, or with keep=all is kept (#314)"
-                 : k[i].anchors ? "the fleet's anchor anchors its databases" : "a database in a fleet is named by fleet=, owner= and dbname= alone");
-        return;
-    }
-    memset(word, 0, 12);
-    memcpy(word + 12, cfg->fleetOwner, 20);
-    hpplite_keccak256((const unsigned char *)cfg->dbName, strlen(cfg->dbName), word + 32);
-    memcpy(cfg->nameHash, word + 32, 32);
-    hpplite_keccak256(word, 64, cfg->dbId);
-}
-
 static void parse_role(HppliteConfig *cfg, const char *val, int source) {
     if (strcasecmp(val, "verify") == 0) { cfg->roleVerify = 1; cfg->roleSource = source; return; }
     snprintf(gConfigError, sizeof(gConfigError), "role=%.40s: role= takes verify only (an audit connection); a sequencer needs no role=", val);
@@ -335,7 +278,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
     val = getenv("HPPLITE_KEEP");
-    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; cfg->keepAll = k == 0; } }
+    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; } }
     val = getenv("HPPLITE_KEEP_LEASE");
     if (val) cfg->keepLease = parse_on(val);
     val = getenv("HPPLITE_ANCHOR_CLOSE");
@@ -345,7 +288,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv("HPPLITE_SNAPSHOT");
     if (val) {
         int ms = parse_duration_ms(val);
-        if (ms >= 0) { cfg->snapshotIntervalMs = ms; cfg->snapshotGiven = 1; }
+        if (ms >= 0) { cfg->snapshotIntervalMs = ms; }
     }
 
     /* Encryption */
@@ -600,7 +543,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
     if (get_uri_param(uri, "anchorclose", buf, sizeof(buf))) cfg->anchorClose = !parse_off(buf);
     if (get_uri_param(uri, HPPLITE_URI_SNAPSHOT, buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
-        if (ms >= 0) { cfg->snapshotIntervalMs = ms; cfg->snapshotGiven = 1; }
+        if (ms >= 0) { cfg->snapshotIntervalMs = ms; }
     }
 
     /* Encryption */
@@ -630,8 +573,9 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (HPPLITE_RELAY_CAP bounds a call)");
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf))) refuse_soft();
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
-    if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) { int64_t k = parse_keep_seconds(buf); if (k >= 0) { cfg->keepSeconds = k; cfg->keepAll = k == 0; } }
+    if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) { int64_t k = parse_keep_seconds(buf); if (k >= 0) { cfg->keepSeconds = k; } }
     if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) refuse_from();
+    if (get_uri_param(uri, "fleet", buf, sizeof(buf))) refuse_fleet();
     if (get_uri_param(uri, HPPLITE_URI_SYNC_AT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncAtMs = (uint64_t)atoll(buf);
     if (get_uri_param(uri, HPPLITE_URI_RELAY, buf, sizeof(buf)) && buf[0]) {
         free(cfg->relayUrl);
@@ -646,15 +590,6 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->checkpointInterval = atoi(buf);
     }
 
-    {   /* fleet= (#316): params only */
-        static const char *names[] = { "fleet", "owner", "admit", "onforeign" };
-        for (int i = 0; i < 4; i++) if (get_uri_param(uri, names[i], buf, sizeof(buf))) fleet_param(cfg, names[i], buf);
-        static const char *given[7] = { HPPLITE_URI_CONTRACT, HPPLITE_URI_FACTORY, "anchor", HPPLITE_URI_CHECKPOINT, HPPLITE_URI_KEEP,
-                                        HPPLITE_URI_SNAPSHOT, "anchorclose" };
-        int uriGiven[7];
-        for (int i = 0; i < 7; i++) uriGiven[i] = get_uri_param(uri, given[i], buf, sizeof(buf)) != NULL;
-        fleet_check(cfg, uriGiven);
-    }
 
     /* the chain's cadence applies to whatever goes to the chain (#162, #164): the batches
     ** of a node without a store, the anchors of a node with one */
@@ -797,7 +732,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SNAPSHOT);
     if (val) {
         int ms = parse_duration_ms(val);
-        if (ms >= 0) { cfg->snapshotIntervalMs = ms; cfg->snapshotGiven = 1; }
+        if (ms >= 0) { cfg->snapshotIntervalMs = ms; }
     }
 
     /* Encryption */
@@ -824,9 +759,10 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_TO);
     if (val && atoll(val) > 0) cfg->syncTo = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_KEEP);
-    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; cfg->keepAll = k == 0; } }
+    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; } }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_FROM);
     if (val) refuse_from();
+    if (sqlite3_uri_parameter(filename, "fleet")) refuse_fleet();
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_AT);
     if (val && atoll(val) > 0) cfg->syncAtMs = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_RELAY_DEPOSIT);
@@ -844,15 +780,6 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     ** of a node without a store, the anchors of a node with one */
     if (cfg->aliasIntervalMs && cfg->storeUrl) { if (!cfg->anchorGiven) cfg->anchorIntervalMs = cfg->aliasIntervalMs; }
     else if (cfg->aliasIntervalMs && !cfg->intervalGiven) cfg->batchIntervalMs = cfg->aliasIntervalMs;
-    {   /* fleet= (#316): params only */
-        static const char *names[] = { "fleet", "owner", "admit", "onforeign" };
-        for (int i = 0; i < 4; i++) fleet_param(cfg, names[i], sqlite3_uri_parameter(filename, names[i]));
-        static const char *given[7] = { HPPLITE_URI_CONTRACT, HPPLITE_URI_FACTORY, "anchor", HPPLITE_URI_CHECKPOINT, HPPLITE_URI_KEEP,
-                                        HPPLITE_URI_SNAPSHOT, "anchorclose" };
-        int uriGiven[7];
-        for (int i = 0; i < 7; i++) uriGiven[i] = sqlite3_uri_parameter(filename, given[i]) != NULL;
-        fleet_check(cfg, uriGiven);
-    }
     return 0;
 }
 
@@ -953,19 +880,6 @@ int hpplite_config_resolve_operators(HppliteConfig *cfg) {
         free(*k[i].pz);
         *k[i].pz = strdup(url);
         if (i == 1 && cfg->relayCap == 0) cfg->relayCap = HPPLITE_DEFAULT_RELAY_CAP;   /* relay=on pays: a cap of 0 could pay nothing (#251) */
-    }
-    if (cfg->hasFleet && !gConfigError[0]) {
-        /* the dbId said at once, so a wrong owner= or dbname= is seen (#316) */
-        char id[65], fl[41], ow[41], *name = malloc(strlen(cfg->dbName) * 3 + 1), *q = name;
-        for (i = 0; i < 32; i++) snprintf(id + 2 * i, 3, "%02x", cfg->dbId[i]);
-        for (i = 0; i < 20; i++) { snprintf(fl + 2 * i, 3, "%02x", cfg->fleet[i]); snprintf(ow + 2 * i, 3, "%02x", cfg->fleetOwner[i]); }
-        /* the name as given, %HH outside printable ASCII and for '"' and '%': a name cannot write a line of its own */
-        for (const unsigned char *p = (const unsigned char *)cfg->dbName; name && *p; p++) {
-            if (*p < 0x20 || *p > 0x7e || *p == '"' || *p == '%') q += sprintf(q, "%%%02X", *p); else *q++ = (char)*p;
-        }
-        if (name) *q = 0;
-        fprintf(stderr, "hpplite: fleet 0x%s: database \"%s\" of 0x%s, dbId 0x%s\n", fl, name ? name : "?", ow, id);
-        free(name);
     }
     return 0;
 }

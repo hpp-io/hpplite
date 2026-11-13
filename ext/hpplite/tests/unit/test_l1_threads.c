@@ -1,5 +1,5 @@
 /*
-** One process, many databases (somaro's fleet): the chain client's first use may come from several threads at
+** One process, many databases (hpplite-sequencer --dir): the chain client's first use may come from several threads at
 ** once - each database's timer thread connects on its own. The ABI selectors are computed once, behind a
 ** pthread_once; before, a plain flag guarded them and concurrent first use was a data race (ThreadSanitizer:
 ** 'data race ... init_selectors'). Run under -fsanitize=thread to see it; without the sanitizer this checks
@@ -36,7 +36,7 @@ static void test_first_use_from_threads(void) {
 
 int main(void) {
     test_suite_init("l1_threads", NULL, NULL);
-    printf("The chain client from many threads (a fleet in one process)\n");
+    printf("The chain client from many threads (many databases in one process)\n");
     test_first_use_from_threads();
     return test_report();
 }

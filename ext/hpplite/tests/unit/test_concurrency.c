@@ -397,7 +397,7 @@ static void test_file_changed_under_node(void) {
 }
 
 /* The file emptied under a running sequencer (#330): an empty database is never its newest state - the file check
-** refuses it, says so, and sends nothing; the next start rebuilds it (a fleet database's) or it is restored */
+** refuses it, says so, and sends nothing; it is restored */
 static void test_file_emptied_under_node(void) {
     TEST("the file replaced by an empty database under a running sequencer: refused by the file check, said, nothing sent");
     reset_dir();

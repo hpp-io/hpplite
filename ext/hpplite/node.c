@@ -168,27 +168,8 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.keepLease = config->keepLease;
     node->config.noAnchorAtClose = config->noAnchorAtClose;
     node->config.snapshotIntervalMs = config->snapshotIntervalMs;
-    if (config->hasFleet) {
-        /* fleet= (#316): one database in a shared rollup - the fleet's anchor anchors, there is no release */
-        node->config.hasFleet = 1;
-        memcpy(node->config.fleet, config->fleet, 20);
-        memcpy(node->config.dbId, config->dbId, 32);
-        memcpy(node->config.fleetOwner, config->fleetOwner, 20);
-        memcpy(node->config.nameHash, config->nameHash, 32);
-        node->config.admitIssuedAt = config->admitIssuedAt;
-        memcpy(node->config.admitSig, config->admitSig, 65);
-        node->config.hasAdmit = config->hasAdmit;
-        node->config.onForeign = config->onForeign;
-        node->config.anchorIntervalMs = 0;
-        /* a snapshot every HPPLITE_FLEET_SNAPSHOT_BATCHES batches, or after snapshot= (default 24 h) with any batch since;
-        ** snapshot=0: none (#314) */
-        node->config.snapshotIntervalMs = config->snapshotGiven ? config->snapshotIntervalMs : 24 * 3600 * 1000;
-        node->config.keepLease = 1;
-        node->config.noAnchorAtClose = 1;
-    }
     node->config.fromSnapshot = config->fromSnapshot;
     node->config.keepSeconds = config->keepSeconds;
-    node->config.keepAll = config->keepAll;
     node->config.relayUrl = node_strdup(config->relayUrl);
     node->config.relayCap = config->relayCap;
     if (node->config.relayUrl) {
@@ -446,10 +427,6 @@ static void node_pages_decide_snapshot(HppliteNode *node) {
     if (!node->pm || node->pagesSnapshotDecided || node->config.verifyOnly || node->follower) return;
     hpplite_pagemode_root(node->pm, have);
     if (node->ctx->blockHeight <= 1 || memcmp(have, node->ctx->stateRoot, 32) != 0) {
-        /* somaro#93, case 1: a fleet database's file that is not what its bookkeeping last sent goes whole, said once */
-        if (node->config.hasFleet && node->ctx->blockHeight > 1 && !node->fleetForeignFile)
-            fprintf(stderr, "hpplite: %s is not the state of height %llu it last sent: the file goes whole as height %llu\n",
-                    sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1), (unsigned long long)node->ctx->blockHeight);
         hpplite_pagemode_snapshot(node->pm);
     }
     node->pagesSnapshotDecided = 1;
@@ -495,9 +472,8 @@ static void node_check_file(HppliteNode *node) {
         hpplite_pageroot_free(pr);
         memcpy(node->fileKey, key, sizeof key);
         node->fileMatched = 1;                                   /* said once for this file; a file changed again is looked at again */
-        hpplite_error(node->ctx, "%s is empty and its bookkeeping says the history has %llu heights: not sent; %s",
-                      sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1),
-                      node->config.hasFleet ? "the next start rebuilds it from the store" : "restore the file");
+        hpplite_error(node->ctx, "%s is empty and its bookkeeping says the history has %llu heights: not sent; restore the file",
+                      sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1));
         return;
     }
     hpplite_pageroot_get(pr, file);
@@ -546,17 +522,6 @@ static int node_file_has_log(sqlite3 *db) {
     return sqlite3_table_column_metadata(db, "main", "_hpplite_meta", "next_height", NULL, NULL, NULL, NULL, NULL) == SQLITE_OK;
 }
 
-/* somaro#93: the file holds a database - a schema, or more than the one page an empty file switched to WAL has; a
-** fresh file (absent, or opened and empty) is not one */
-static int node_file_has_pages(sqlite3 *db) {
-    sqlite3_stmt *q = NULL;
-    int has = 0;
-    if (sqlite3_prepare_v2(db, "SELECT (SELECT count(*) FROM sqlite_master) > 0 OR (SELECT page_count FROM pragma_page_count()) > 1", -1, &q, NULL) == SQLITE_OK
-        && sqlite3_step(q) == SQLITE_ROW) has = sqlite3_column_int(q, 0);
-    sqlite3_finalize(q);
-    return has;
-}
-
 /* Page capture is the one capture (#253): the pages each commit wrote, read from the WAL, the bookkeeping in a
 ** sidecar. It needs a file: an in-memory database has no WAL and no path */
 static int node_init_tracking(HppliteNode *node) {
@@ -575,26 +540,6 @@ static int node_init_tracking(HppliteNode *node) {
         return SQLITE_ERROR;
     }
     sqlite3_busy_timeout(node->db, 5000);
-    if (node->config.hasFleet && node->store && !node->config.verifyOnly && !node->config.onForeign) {
-        /* somaro#93, case 2 with no onforeign=: a file with pages and no bookkeeping beside it, against a history at the
-        ** store - refused before the sidecar or the page capture touch anything (the switch to WAL alone rewrites the
-        ** header), and before any claim */
-        char *zSide = sqlite3_mprintf("%s-hpplite.db", zFile);
-        struct stat sst;
-        HppliteFleetView v;
-        int pages = node_file_has_pages(node->db), side = zSide && stat(zSide, &sst) == 0;
-        sqlite3_free(zSide);
-        if (pages && !side && hpplite_store_fleet_view(node->store, node->config.fleet, hpplite_l1_default_chain_id(), node->config.dbId, &v) == 0
-            && v.hasHead && v.toHeight > 0) {
-            static char why[PATH_MAX + 300];                  /* the init error is a static string */
-            snprintf(why, sizeof why, "%s has pages and no bookkeeping, and the fleet's history of this database is at height %llu: refused; "
-                     "onforeign=history rebuilds the file from the history, onforeign=file sends the file as height %llu",
-                     zFile, (unsigned long long)v.toHeight, (unsigned long long)v.toHeight + 1);
-            hpplite_set_init_error(why);
-            fprintf(stderr, "hpplite: %s\n", hpplite_init_error());
-            return SQLITE_ERROR;
-        }
-    }
     rc = node_init_pages(node, zFile);
     if (rc != SQLITE_OK) return rc;
 
@@ -620,7 +565,6 @@ static void node_learn_batch_limit(HppliteNode *node);
 ** Auto-connect to L1 and sync state.
 */
 static int node_ensure_lease(HppliteNode *node);
-static uint64_t node_fleet_chain_id(HppliteNode *node);
 static void node_load_readers(HppliteNode *node);
 
 static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
@@ -758,20 +702,12 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
     if (node->follower) return;
     if (!config->rpcUrl) return;
     if (config->chainId) hpplite_l1_set_default_chain_id(config->chainId);
-    if (!config->hasContract && !config->hasFactory && !config->hasFleet) return;
+    if (!config->hasContract && !config->hasFactory) return;
     node->wantsL1 = 1;
 
     /* contract= names the rollup and wins over any factory beside it - the alias's (l1=hpp-sepolia), HPPLITE_FACTORY,
     ** factory= (#271): the factory only finds or creates a rollup when none is named */
-    if (config->hasFleet) {
-        /* fleet= (#316): the chain client's fleet form, for this database; its lease is the fleet's record. First:
-        ** a chain alias's factory never makes it a rollup instead */
-        node->l1 = hpplite_l1_connect_fleet(config->rpcUrl, config->fleet, config->dbId, config->fleetOwner, config->nameHash,
-                                            config->hasAdmit ? config->admitIssuedAt : 0, config->hasAdmit ? config->admitSig : NULL);
-        node->ownsL1 = (node->l1 != NULL);
-        if (node->l1 && config->hasPrivkey) hpplite_l1_set_privkey(node->l1, config->privkey);
-        else if (node->l1 && node->hasSigner) hpplite_l1_set_signer(node->l1, node->signer.sign, node->signer.arg, node->signer.address);
-    } else if (config->hasFactory && config->hasPrivkey && !config->hasContract) {
+    if (config->hasFactory && config->hasPrivkey && !config->hasContract) {
         /* Use factory to find/create rollup */
         char factoryHex[43];
         snprintf(factoryHex, sizeof(factoryHex), "0x");
@@ -878,151 +814,10 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
     /* Catch up with whatever is already on L1, then take the lease now
     ** rather than at the first write: a restart has no window in which the
     ** rollup is unclaimed, and lease trouble shows at open */
-    if (node->l1 && node->config.hasFleet && node->store && !node->config.verifyOnly) {
-        /* fleet= (#316 d): a file behind the history the store holds (a fresh or emptied file, a new volume) is rebuilt
-        ** from it - the lease first, then the store at this run's epoch (the fence: from then the store refuses the old
-        ** holder, so nothing it writes after is missed), then the batches by the sync below. Not this run's lease: the
-        ** file is not opened as the database's sequencer */
-        HppliteFleetView v;
-        /* the store not answering (a deploy, a herd of opens, #329): the open waits for it - with a backoff from 1 s to
-        ** 30 s, a 429's Retry-After, a jitter of up to a quarter from the instance - and says so once; after
-        ** HPPLITE_FLEET_OPEN_WAIT (120 s) it fails, loud: "synced height N" is not said of a file the store's history
-        ** may be ahead of, nor is the database left open and unsequenced */
-        const char *zWait = getenv("HPPLITE_FLEET_OPEN_WAIT");
-        int64_t waitMs = (zWait && atol(zWait) > 0 ? atol(zWait) : 120) * 1000, t0 = node_current_time_ms(), backoff = 1000;
-        int attempt = 0;
-        while (hpplite_store_fleet_view(node->store, node->config.fleet, node_fleet_chain_id(node), node->config.dbId, &v) != 0) {
-            int64_t now = node_current_time_ms(), pause = hpplite_store_retry_after(node->store) > 0 ? hpplite_store_retry_after(node->store) * 1000LL : backoff;
-            pause += (int64_t)(node->instanceId[4 + attempt % 8] * (uint64_t)(pause / 4) / 256);
-            if (now - t0 + pause > waitMs) {
-                hpplite_error(node->ctx, "the store's view of this fleet database could not be read after %lld s: %s; not opened as its sequencer",
-                              (long long)((now - t0) / 1000), hpplite_store_error(node->store));
-                node->state = HPPLITE_STATE_ERROR;
-                node->fleetOpenRefused = 2;
-                return;
-            }
-            if (attempt++ == 0)
-                fprintf(stderr, "hpplite: waiting for the store to read this fleet database's view: %s; tried again for up to %lld s (HPPLITE_FLEET_OPEN_WAIT)\n",
-                        hpplite_store_error(node->store), (long long)(waitMs / 1000));
-            usleep((useconds_t)(pause * 1000));
-            backoff = backoff * 2 < 30000 ? backoff * 2 : 30000;
-        }
-        /* #330: the file emptied beside its bookkeeping at N (a restore that brought the sidecars back and not the file)
-        ** is a lost file, never the database's newest state: rebuilt from the store's history, as a new volume is */
-        if (node->ctx->blockHeight > 1 && !node_file_has_pages(node->db)) {
-            const char *zLost = sqlite3_db_filename(node->db, "main");
-            unsigned long long n = (unsigned long long)(node->ctx->blockHeight - 1);
-            if (!v.hasHead) {
-                hpplite_error(node->ctx, "%s is empty and its bookkeeping says the history has %llu heights, and the store holds none of it: not sent; "
-                              "restore the file, or retire the database", zLost, n);
-                node->state = HPPLITE_STATE_ERROR;
-                node->fleetOpenRefused = 2;
-                return;
-            }
-            if (hppliteResetMeta(node->ctx) != SQLITE_OK) {
-                hpplite_error(node->ctx, "%s is empty and its bookkeeping says the history has %llu heights: the bookkeeping could not be reset for the rebuild", zLost, n);
-                node->state = HPPLITE_STATE_ERROR;
-                node->fleetOpenRefused = 2;
-                return;
-            }
-            node->lastCheckpointHeight = 0;
-            node->batchesSinceCheckpoint = 0;
-            fprintf(stderr, "hpplite: %s is empty and its bookkeeping says the history has %llu heights: rebuilt from the store\n", zLost, n);
-        }
-        if (v.hasHead && v.toHeight + 1 > node->ctx->blockHeight) {
-            int i, atEpoch = 0;
-            const char *zFile = sqlite3_db_filename(node->db, "main");
-            /* somaro#93, case 2: pages and no bookkeeping against a history at the store - which is true is not known
-            ** here, so onforeign= decides; unset, nothing is touched, no claim (an empty or absent file is case 3) */
-            int foreign = node->ctx->blockHeight <= 1 && zFile && zFile[0] && node_file_has_pages(node->db);
-            if (foreign && !node->config.onForeign) {
-                hpplite_error(node->ctx, "%s has pages and no bookkeeping, and the fleet's history of this database is at height %llu: refused; "
-                              "onforeign=history rebuilds the file from the history, onforeign=file sends the file as height %llu",
-                              zFile, (unsigned long long)v.toHeight, (unsigned long long)v.toHeight + 1);
-                node->state = HPPLITE_STATE_ERROR;
-                node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
-                return;
-            }
-            node_learn_batch_limit(node);                     /* the relay, before the claim */
-            node->leaseRecheckAt = 0;
-            if (!node_ensure_lease(node)) {
-                hpplite_error(node->ctx, "the store holds this database's history to height %llu and the file is at %llu: it is rebuilt by the lease's "
-                              "holder, and the lease is not this run's (%s); not opened as its sequencer", (unsigned long long)v.toHeight,
-                              (unsigned long long)(node->ctx->blockHeight - 1), node->ctx->zLastError[0] ? node->ctx->zLastError : "held elsewhere");
-                node->state = HPPLITE_STATE_ERROR;
-                node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
-                return;
-            }
-            for (i = 0; i < 60 && !atEpoch; i++) {
-                if (i) usleep(500 * 1000);
-                atEpoch = hpplite_store_fleet_view(node->store, node->config.fleet, node_fleet_chain_id(node), node->config.dbId, &v) == 0
-                          && v.epoch == hpplite_l1_fleet_epoch(node->l1) && memcmp(v.instance, node->instanceId, 32) == 0
-                          && v.admittedAt == hpplite_l1_fleet_admitted_at(node->l1);      /* and its admission (#318) */
-            }
-            if (!atEpoch) {
-                hpplite_error(node->ctx, "the store does not show this run's lease (epoch %llu) after 30 s: the rebuild waits for it (the fence); not opened as its sequencer",
-                              (unsigned long long)hpplite_l1_fleet_epoch(node->l1));
-                node->state = HPPLITE_STATE_ERROR;
-                node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
-                return;
-            }
-            if (foreign && node->config.onForeign == 2) {
-                /* onforeign=file: the bookkeeping as of the history's height N - batch N's hash, the signed head's
-                ** rolling hash and root - and the file, not that root, goes whole as N+1 (case 1's path) */
-                size_t n = 0;
-                unsigned char blk[32];
-                uint8_t *raw = hpplite_store_get_fleet_name(node->store, node->config.fleet, node->config.dbId, v.admittedAt, v.toHeight, &n);
-                unsigned char me[20];
-                if (!raw || (hpplite_l1_get_my_address(node->l1, me) == 0 && memcmp(me, v.headSigner, 20) != 0)) {
-                    free(raw);
-                    hpplite_error(node->ctx, "onforeign=file: the store's height %llu could not be read or is not this database's key's: %s",
-                                  (unsigned long long)v.toHeight, hpplite_store_error(node->store));
-                    node->state = HPPLITE_STATE_ERROR;
-                    node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
-                    return;
-                }
-                hpplite_sha256(raw, n, blk);
-                free(raw);
-                if (hppliteSetMetaAt(node->ctx, v.toHeight, blk, v.chainAfter, v.stateRoot) != SQLITE_OK) {
-                    hpplite_error(node->ctx, "onforeign=file: the bookkeeping could not be set to height %llu", (unsigned long long)v.toHeight);
-                    node->state = HPPLITE_STATE_ERROR;
-                    node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
-                    return;
-                }
-                node->fleetForeignFile = 1;
-                fprintf(stderr, "hpplite: %s sent whole as height %llu over the fleet's history (onforeign=file)\n", zFile, (unsigned long long)v.toHeight + 1);
-            } else {
-                if (foreign) {
-                    /* onforeign=history: the batches are page diffs from an empty file, so the file is emptied first - only
-                    ** now, the lease this run's and the store at its epoch, so a refused claim never costs the file */
-                    char *zWal = sqlite3_mprintf("%s-wal", zFile);
-                    if (truncate(zFile, 0) != 0 || (zWal && access(zWal, F_OK) == 0 && truncate(zWal, 0) != 0)) {
-                        sqlite3_free(zWal);
-                        hpplite_error(node->ctx, "onforeign=history: %s could not be emptied for the rebuild", zFile);
-                        node->state = HPPLITE_STATE_ERROR;
-                        node->fleetOpenRefused = 2;               /* the open fails: no ready line over this file (#338) */
-                        return;
-                    }
-                    sqlite3_free(zWal);
-                    node->fleetForeignHistory = v.toHeight;
-                }
-                fprintf(stderr, "hpplite: fleet database behind the store: rebuilding heights %llu to %llu from it\n",
-                        (unsigned long long)node->ctx->blockHeight, (unsigned long long)v.toHeight);
-            }
-        }
-    }
     if (node->l1) {
         node_learn_batch_limit(node);
         if (hpplite_node_sync_from_l1(node, 1) < 0) {
             node->state = HPPLITE_STATE_ERROR;
-            /* fleet= (somaro): a history that does not rebuild - a root that differs, a rolling hash or signer that
-            ** does not match - fails the open: no write, no lease used, and nothing a platform could take as ready */
-            if (node->config.hasFleet) node->fleetOpenRefused = 1;
-        } else if (node->fleetForeignHistory && node->ctx->blockHeight == node->fleetForeignHistory + 1 && (node->fleetForeignHistory = 0, 1)) {
-            /* somaro#93: onforeign=history - the file is now the history's state, as a rebuild of an empty file */
-            fprintf(stderr, "hpplite: %s replaced by the fleet's history at height %llu (onforeign=history)\n",
-                    sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1));
-            if (!node->follower && !node->config.verifyOnly && (node->cipher || node->config.noEncrypt)) node_ensure_lease(node);
         } else if (!node->follower && !node->config.verifyOnly && (node->cipher || node->config.noEncrypt)) {
             node_ensure_lease(node);          /* an audit never takes it (#5) */
         }
@@ -1077,19 +872,6 @@ static int node_try_promote(HppliteNode *node) {
     return 1;
 }
 
-/* fleet= (somaro): the open fails when the store's history did not rebuild - the reason as the open's error and on
-** stderr, once */
-static int node_fleet_refuse_open(HppliteNode *node) {
-    static char why[700];
-    if (!node->fleetOpenRefused) return 0;
-    if (node->fleetOpenRefused == 2) snprintf(why, sizeof why, "%s", node->ctx ? node->ctx->zLastError : "the store's view could not be read");   /* #329 */
-    else snprintf(why, sizeof why, "the fleet database could not be rebuilt from the store's history: %s; nothing was written and it is not "
-             "opened as its sequencer", node->ctx && node->ctx->zLastError[0] ? node->ctx->zLastError : "the sync stopped");
-    fprintf(stderr, "hpplite: %s\n", why);
-    hpplite_set_init_error(why);
-    return 1;
-}
-
 /*
 ** Initialize a node with configuration.
 */
@@ -1126,7 +908,6 @@ HppliteNode *hpplite_node_create(const HppliteNodeConfig *config) {
 
     /* Auto-connect to L1 */
     node_auto_connect_l1(node, config);
-    if (node_fleet_refuse_open(node)) { hpplite_node_destroy(node); return NULL; }
 
     /* Register node with global registry */
     hpplite_register_node(node->db, node);
@@ -1163,7 +944,6 @@ HppliteNode *hpplite_node_create_with_db(sqlite3 *db, const HppliteNodeConfig *c
 
     /* Auto-connect to L1 */
     node_auto_connect_l1(node, config);
-    if (node_fleet_refuse_open(node)) { hpplite_node_destroy(node); return NULL; }
 
     /* Register node with global registry */
     hpplite_register_node(node->db, node);
@@ -1591,13 +1371,6 @@ static int node_skip_foreign_height(HppliteNode *node, uint64_t height) {
 */
 static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen) {
     uint8_t *data;
-    if (node->config.hasFleet) {
-        /* fleet= (#316 d): a batch is a name at the store; the seal is the database's key, the rolling hash is checked
-        ** against the signed latest head when the sync is done */
-        data = node->store ? hpplite_store_get_fleet_name(node->store, node->config.fleet, node->config.dbId, hpplite_l1_fleet_admitted_at(node->l1), height, pLen) : NULL;
-        if (!data) hpplite_error(node->ctx, "batch %llu: %s", (unsigned long long)height, node->store ? hpplite_store_error(node->store) : "no store= names one");
-        return data;
-    }
     data = hpplite_l1_get_batch(l1, height, pLen);
     unsigned char hash[32], got[32];
     char *zRef = NULL;
@@ -1774,20 +1547,6 @@ static int node_adopt_existing(HppliteNode *node) {
 ** when ours is past half its life, claimed when free, and left alone when
 ** someone else holds it. Returns 1 when posting is allowed.
 */
-/* the chain a fleet's heads are signed on (#316) */
-static uint64_t node_fleet_chain_id(HppliteNode *node) {
-    uint64_t id = node->l1 ? hpplite_l1_chain_id(node->l1) : 0;
-    return id ? id : hpplite_l1_default_chain_id();
-}
-
-/* fleet= (#316 d): the fence's line, once - an operator sees the epoch held and the record's */
-static void node_say_fenced(HppliteNode *node) {
-    if (node->warnedFenced) return;
-    node->warnedFenced = 1;
-    hpplite_error(node->ctx, "%s", hpplite_l1_relay_error(node->l1) && strncmp(hpplite_l1_relay_error(node->l1), "fenced:", 7) == 0
-                                   ? hpplite_l1_relay_error(node->l1) : "fenced: the fleet's record of this database moved past this run's epoch; this run writes no more - reopen to take the lease again");
-}
-
 static int node_ensure_lease(HppliteNode *node) {
     int64_t now = node_current_time_ms();
     HppliteL1State *st;
@@ -1796,23 +1555,10 @@ static int node_ensure_lease(HppliteNode *node) {
 
     if (now < node->leaseRecheckAt) return node->hasLease;
 
-    if (node->config.hasFleet) {
-        /* fleet= (#316 d): the record moved past this run's epoch - it writes no more and reads nothing, until reopened;
-        ** it stays up (a restart is a new run that may claim) */
-        hpplite_l1_fleet_set_instance(node->l1, node->instanceId);
-        if (hpplite_l1_fleet_fenced(node->l1)) { node->hasLease = 0; node->leaseRecheckAt = INT64_MAX; return 0; }
-    }
     st = hpplite_l1_get_state(node->l1);
     if (!st) {
         hpplite_error(node->ctx, "cannot read the sequencer lease from L1; not posting");
         node->leaseRecheckAt = now + 5000;
-        return 0;
-    }
-    if (node->config.hasFleet && hpplite_l1_fleet_fenced(node->l1)) {
-        hpplite_l1_state_free(st);
-        node_say_fenced(node);
-        node->hasLease = 0;
-        node->leaseRecheckAt = INT64_MAX;
         return 0;
     }
     chainNow = st->currentTimestamp ? st->currentTimestamp : (uint64_t)time(NULL);
@@ -1852,32 +1598,8 @@ static int node_ensure_lease(HppliteNode *node) {
         if (hpplite_node_claim_lease(node) != 0) {
             if (getenv("HPPLITE_TRACE_LEASE")) fprintf(stderr, "hpplite: lease check: claim failed\n");
             node->leaseRecheckAt = now + 5000;
-            if (node->config.hasFleet) {
-                /* fleet= (#316 d): fenced, or refused (the relay's 402, a retired record...): rows stay pending; the claim
-                ** is tried again every 30 s, the reason said once per episode */
-                const char *why = hpplite_l1_relay_error(node->l1);
-                int ra = node->relay ? hpplite_store_retry_after(node->relay) : 0;
-                int limited = ra > 0 || (why && strstr(why, "answered 429")), queued = why && strstr(why, "answered 503");
-                int64_t wait = ra > 0 ? ra * 1000LL : 30000, jitter;
-                if (hpplite_l1_fleet_fenced(node->l1)) { node_say_fenced(node); node->leaseRecheckAt = INT64_MAX; return 0; }
-                /* the relay's 429 says when (somaro#48); a jitter of up to a quarter of the wait on top, drawn from the
-                ** instance, so a host's refused claims come back spread over the relay's next window, not all at its edge */
-                jitter = wait / 4;
-                wait += (int64_t)((((uint64_t)node->instanceId[2] << 8) | node->instanceId[3]) % (uint64_t)jitter);
-                if (!node->warnedClaim) {
-                    if (limited)
-                        hpplite_error(node->ctx, "the fleet's lease waits on the relay's %s (%s): batches are kept pending, the claim tried again in %lld s%s",
-                                      queued ? "send queue" : "rate limit", why && why[0] ? why : "429", (long long)(wait / 1000), ra > 0 ? " (its Retry-After, and a jitter)" : "");
-                    else
-                        hpplite_error(node->ctx, "the fleet's lease could not be taken: %s; batches are kept pending, tried again every 30 s",
-                                      why && why[0] ? why : "no reason given");
-                    node->warnedClaim = 1;
-                }
-                node->leaseRecheckAt = now + (limited ? wait : 30000);
-            }
             return 0;
         }
-        node->warnedClaim = 0;
         if (getenv("HPPLITE_TRACE_LEASE")) fprintf(stderr, "hpplite: lease check: claim ok\n");
         /* a mined claim can still have reverted (this wallet is not the
         ** sequencer the owner named, #17): the chain says whose it is */
@@ -2478,170 +2200,6 @@ done:
 }
 
 static void node_prune_plan(HppliteNode *node);
-
-#define HPPLITE_FLEET_SNAPSHOT_BATCHES 100
-
-/*
-** A fleet database's snapshot (#314, doc/fleet-protocol.md "Snapshots and pruning"): after a flush, while the lease is
-** this run's, when HPPLITE_FLEET_SNAPSHOT_BATCHES batches have gone since the last one or snapshot= has passed with any
-** batch since. The page mode's image at the height just finalized, its root the head's; sealed as a batch at that
-** height is, in chunks, then the index naming them - each piece signed by this database's key. The store checks the
-** index against the head it holds there and lets the history below go once a root holds a later head (unless
-** keep=all). Not taken: said once, tried at the next flush; the batches go on regardless.
-*/
-static void node_fleet_snapshot(HppliteNode *node, uint64_t height, const unsigned char root[32]) {
-    HppliteCtx *ctx = node->ctx;
-    unsigned char *image = NULL, imgRoot[32], sha[32];
-    uint8_t *sealed = NULL;
-    size_t len = 0, sealedLen = 0, off, nChunks = 0;
-    const char *why = NULL;
-    char fl[43], db[67], hx[67], *zChunks = NULL, *zIndex = NULL;
-    uint64_t chainId, admitted, part;
-    int64_t now = (int64_t)time(NULL);
-    int prc, i;
-    if (node->config.snapshotIntervalMs <= 0 || !node->pm || !node->store || !node->hasLease || height < 2) return;
-    if (!node->snapAt) node->snapAt = now;          /* none known: the interval counts from this run */
-    if (height < node->snapHeight + HPPLITE_FLEET_SNAPSHOT_BATCHES
-        && !(height > node->snapHeight && (now - node->snapAt) * 1000 >= (int64_t)node->config.snapshotIntervalMs)) return;
-    if (ctx->blockHeight != height + 1 || ctx->openTxnId) return;          /* a commit cut over batches: the next flush */
-    prc = hpplite_pagemode_image(node->pm, &image, &len, imgRoot);
-    if (prc == SQLITE_BUSY) { sqlite3_free(image); return; }               /* commits still queued: the next flush */
-    if (prc != SQLITE_OK) why = "the image could not be built";
-    else if (memcmp(imgRoot, root, 32) != 0) why = "the image's root is not the head's";
-    if (!why && !(sealed = node_seal_at(node, height, image, len, 6, &sealedLen))) why = "the image could not be sealed";
-    sqlite3_free(image);
-    chainId = hpplite_l1_chain_id(node->l1);
-    if (!chainId) chainId = hpplite_l1_default_chain_id();
-    admitted = hpplite_l1_fleet_admitted_at(node->l1);
-    zChunks = sqlite3_mprintf("");
-    for (off = 0, part = 1; !why && off < sealedLen; off += HPPLITE_SNAPSHOT_CHUNK, part++) {
-        size_t n = sealedLen - off < HPPLITE_SNAPSHOT_CHUNK ? sealedLen - off : HPPLITE_SNAPSHOT_CHUNK;
-        char *z;
-        if (hpplite_store_put_fleet_snapshot(node->store, node->config.fleet, chainId, node->config.dbId, admitted, height, part, sealed + off, n) != 0) {
-            why = hpplite_store_error(node->store);
-            break;
-        }
-        hpplite_store_sha256(sealed + off, n, sha);
-        hpplite_bytes_to_hex(sha, 32, hx);
-        z = sqlite3_mprintf("%s%s\"0x%s\"", zChunks, nChunks ? "," : "", hx);
-        sqlite3_free(zChunks); zChunks = z;
-        nChunks++;
-    }
-    if (!why && zChunks) {
-        /* fleet.snapshot_index: canonical JSON, keys sorted */
-        char blk[67], ch[67], rt[67];
-        for (i = 0; i < 20; i++) snprintf(fl + 2 * i, 3, "%02x", node->config.fleet[i]);
-        for (i = 0; i < 32; i++) snprintf(db + 2 * i, 3, "%02x", node->config.dbId[i]);
-        hpplite_bytes_to_hex(ctx->prevBlockHash, 32, blk); hpplite_bytes_to_hex(ctx->chainHash, 32, ch); hpplite_bytes_to_hex(root, 32, rt);
-        zIndex = sqlite3_mprintf("{\"admittedAt\":%llu,\"at\":%lld,\"block\":\"0x%s\",\"bytes\":%llu,\"chain\":\"0x%s\",\"chunks\":[%s],"
-                                 "\"dbId\":\"0x%s\",\"height\":%llu,\"protocol\":\"hpplite-fleet/1\",\"prune\":%s,\"rollup\":\"0x%s\",\"root\":\"0x%s\"}",
-                                 (unsigned long long)admitted, (long long)now, blk, (unsigned long long)sealedLen, ch, zChunks, db,
-                                 (unsigned long long)height, node->config.keepAll ? "false" : "true", fl, rt);
-        if (!zIndex || hpplite_store_put_fleet_snapshot(node->store, node->config.fleet, chainId, node->config.dbId, admitted, height, 0,
-                                                        (const uint8_t *)zIndex, strlen(zIndex)) != 0)
-            why = zIndex ? hpplite_store_error(node->store) : "out of memory";
-    }
-    free(sealed);
-    sqlite3_free(zChunks);
-    sqlite3_free(zIndex);
-    node->storeBalanceOk = 0;
-    if (why) {
-        if (!node->warnedSnapshot) fprintf(stderr, "hpplite: no snapshot at height %llu: %s; tried at the next flush\n", (unsigned long long)height, why);
-        node->warnedSnapshot = 1;
-        return;
-    }
-    node->warnedSnapshot = 0;
-    node->snapHeight = height;
-    node->snapAt = now;
-    fprintf(stderr, "hpplite: snapshot at height %llu put at the store (%llu bytes in %llu chunk%s)%s\n", (unsigned long long)height,
-            (unsigned long long)sealedLen, (unsigned long long)nChunks, nChunks == 1 ? "" : "s",
-            node->config.keepAll ? ", the history kept (keep=all)" : "; the history below it goes once a root holds a later head");
-}
-
-/*
-** A fleet database rebuilt from its latest snapshot (#314): the file behind it (empty, a lost volume) or below the
-** history the store pruned. The index by its CID, its Snapshot signature this database's key's; each chunk by its
-** sha-256; the image opened with this database's keys, every page, its root the index's - all before the file is
-** touched. Then written as the file, the bookkeeping set at its height (block, chain, root), and the batches after it
-** follow; the rolling hash after the last must be the latest head's, signed by this database's key (the caller's
-** check), which ties the snapshot's chain hash to the history. 1 started there; 0 not (why said); -1 the file could
-** not be written.
-*/
-static int node_fleet_start_from_snapshot(HppliteNode *node, const HppliteFleetView *fv) {
-    HppliteCtx *ctx = node->ctx;
-    uint8_t *text = NULL, *all = NULL;
-    size_t n = 0, total = 0, want = 0;
-    unsigned char sha[32], digest[32], signer[20], me[20], root[32], chain[32], block[32];
-    char cid[64];
-    cJSON *ix = NULL, *chunks = NULL, *c;
-    HppliteBatch *batch = NULL;
-    const char *why = NULL;
-    uint64_t h = fv->snapHeight, chainId = hpplite_l1_chain_id(node->l1);
-    if (!chainId) chainId = hpplite_l1_default_chain_id();
-    text = hpplite_store_get(node->store, fv->snapIndex, &n);
-    if (text) { hpplite_store_sha256(text, n, sha); hpplite_store_cid_from_sha256(sha, cid); }
-    if (!text || strcmp(cid, fv->snapIndex) != 0) why = "its index is not at the store under its CID";
-    if (!why) {
-        hpplite_store_fleet_snapshot_digest(node->config.fleet, chainId, node->config.dbId, fv->admittedAt, h, 0, sha, digest);
-        if (hpplite_store_recover(digest, fv->snapSig, signer) != 0 || hpplite_l1_get_my_address(node->l1, me) != 0 || memcmp(signer, me, 20) != 0)
-            why = "its index is not signed by this database's key";
-    }
-    if (!why && !(ix = cJSON_ParseWithLength((const char *)text, n))) why = "its index is not JSON";
-    if (!why) {
-        const cJSON *jh = cJSON_GetObjectItemCaseSensitive(ix, "height"), *ja = cJSON_GetObjectItemCaseSensitive(ix, "admittedAt"),
-                    *jn = cJSON_GetObjectItemCaseSensitive(ix, "bytes");
-        unsigned char jdb[32];
-        chunks = cJSON_GetObjectItemCaseSensitive(ix, "chunks");
-        if (!cJSON_IsNumber(jh) || (uint64_t)jh->valuedouble != h || !cJSON_IsNumber(ja) || (uint64_t)ja->valuedouble != fv->admittedAt
-            || !cJSON_IsNumber(jn) || !cJSON_IsArray(chunks) || !json_hex32(cJSON_GetObjectItemCaseSensitive(ix, "dbId"), jdb) || memcmp(jdb, node->config.dbId, 32) != 0
-            || !json_hex32(cJSON_GetObjectItemCaseSensitive(ix, "root"), root) || !json_hex32(cJSON_GetObjectItemCaseSensitive(ix, "chain"), chain)
-            || !json_hex32(cJSON_GetObjectItemCaseSensitive(ix, "block"), block))
-            why = "its index is malformed or names another database, admission or height";
-        else want = (size_t)jn->valuedouble;
-    }
-    free(text);
-    if (!why) {
-        cJSON_ArrayForEach(c, chunks) {
-            unsigned char d[32];
-            uint8_t *piece = NULL, *grown;
-            if (json_hex32(c, d)) { hpplite_store_cid_from_sha256(d, cid); piece = node_store_get_checked(node, cid, d, &n); }
-            if (!piece) { why = "a chunk is not at the store, or not the one the index names"; break; }
-            grown = realloc(all, total + n);
-            if (!grown) { free(piece); why = "out of memory"; break; }
-            all = grown; memcpy(all + total, piece, n); total += n; free(piece);
-        }
-        if (!why && total != want) why = "its chunks do not add up to its size";
-    }
-    cJSON_Delete(ix);
-    if (!why && !(batch = node_decode_batch(node, h, all, total))) why = "it does not open with this database's keys";
-    free(all);
-    if (!why && !batch->bPages) why = "it is not a page image";
-    if (!why) {
-        HpplitePageBatch *pb = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
-        if (!pb || pb->nPages != pb->commitSize || pb->bMore || memcmp(pb->root, root, 32) != 0) why = "its image is not the state its index names";
-        if (pb) hpplite_pagebatch_free(pb);
-    }
-    if (why) {
-        if (batch) hpplite_batch_free(batch);
-        fprintf(stderr, "hpplite: the fleet's snapshot at height %llu is not used (%s)\n", (unsigned long long)h, why);
-        return 0;
-    }
-    batch->height = h;
-    node->snapApply = 1; memcpy(node->snapChain, chain, 32); memcpy(node->snapBlock, block, 32);
-    if (node_apply_pages(node, batch) != SQLITE_OK) {
-        node->snapApply = 0;
-        hpplite_batch_free(batch);
-        return -1;
-    }
-    node->snapApply = 0;
-    hpplite_batch_free(batch);
-    node->snapHeight = h;
-    node->snapAt = fv->snapAt;
-    fprintf(stderr, "hpplite: started from the fleet's snapshot at height %llu (signed by this database's key, its root matched); replaying from %llu\n",
-            (unsigned long long)h, (unsigned long long)(h + 1));
-    (void)ctx;
-    return 1;
-}
 
 /* The snapshot this anchor's manifest names (#221): a new one when snapshot= says the last is old
 ** enough, else the latest an earlier anchor named (read once from that anchor's manifest) */
@@ -3248,27 +2806,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         /* the sidecar knows the batch before the chain does: a process that dies
         ** between the submit and the finalize finds it its own on reopen */
         if (hppliteMarkInflightPages(ctx, height, root) != SQLITE_OK) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); free(sealed); free(framed); *pMore = 0; return 0; }
-        if (node->store && node->config.hasFleet) {
-            /* fleet= (#316 c): the batch and its head, signed by this database's key, in one write - the rolling hash
-            ** after it, the page root, the bytes' sha-256 and the lease's epoch; the fleet's anchor commits to it */
-            unsigned char k[32], after[32];
-            uint64_t chainId = hpplite_l1_chain_id(node->l1);
-            if (!chainId) chainId = hpplite_l1_default_chain_id();
-            hpplite_keccak256(payload, payloadLen, k);
-            hpplite_chain_hash_next(ctx->chainHash, height, k, after);
-            if (hpplite_store_put_fleet_name(node->store, node->config.fleet, chainId, node->config.dbId, hpplite_l1_fleet_admitted_at(node->l1), height, node->instanceId, after, root,
-                                             hpplite_l1_fleet_epoch(node->l1), payload, payloadLen) == 0) {
-                node->warnedStoreDown = 0;
-                node->warnedFunder = 0;
-                storedOnly = 1;
-            } else {
-                snprintf(zStoreWhy, sizeof zStoreWhy, "the store did not take it: %s", hpplite_store_error(node->store));
-                /* not the lease's epoch (#316 d): the record is read again at the next look - moved past this run's epoch,
-                ** the run is fenced; still ours (the store behind), the batch goes again at the next flush */
-                if (strstr(hpplite_store_error(node->store), "not the lease's epoch")) { node->hasLease = 0; node->leaseRecheckAt = 0; }
-            }
-            txHash = NULL;
-        } else if (node->store) {
+        if (node->store) {
             /* the bytes to the store, the commitment to the chain (#11), as the row flush does */
             char *zRef = NULL;
             int named = 0;
@@ -3349,7 +2887,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         *pMore = 0;
         return 0;
     }
-    ctx->pAnchorRow = storedOnly && !node->config.hasFleet ? &node->anchorRow : NULL;   /* a fleet's anchor is the fleet's */
+    ctx->pAnchorRow = storedOnly ? &node->anchorRow : NULL;
     rc = hppliteAdvanceMetaPages(ctx, height, node->l1 ? payload : NULL, node->l1 ? payloadLen : 0, root, hpplite_pagemode_piece_more(node->pm));
     ctx->pAnchorRow = NULL;
     if (rc == SQLITE_OK) {
@@ -3360,7 +2898,6 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         node->retryAt = 0;
         hpplite_error_clear(ctx);
         test_crash_point(*pMore ? "mid_series" : "after_finalize");
-        if (node->config.hasFleet && storedOnly && !*pMore) node_fleet_snapshot(node, height, root);   /* #314 */
     } else {
         /* on the chain, not finalized here: the next flush adopts it (#90) */
         hpplite_pagemode_failed(node->pm);
@@ -3877,17 +3414,11 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     unsigned char latestHash[32];
     int synced = 0;
 
-    HppliteFleetView fv;
     if (!node || !node->l1 || !node->ctx) return 0;
     if (node_check_rollup(node) < 0) return -1;
-    memset(&fv, 0, sizeof fv);
-    if (node->config.hasFleet) {
-        /* fleet= (#316 d): the history is the store's heads; the fleet's anchor, not the node, posts roots */
-        if (!node->store || hpplite_store_fleet_view(node->store, node->config.fleet, node_fleet_chain_id(node), node->config.dbId, &fv) != 0) return 0;
-        lastBatch = fv.hasHead ? fv.toHeight : 0;
-    } else if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
-    else node->anchoredHeight = lastBatch;
-    if (!node->config.hasFleet && node_soft_follows(node)) {
+    if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
+    node->anchoredHeight = lastBatch;
+    if (node_soft_follows(node)) {
         /* the soft tier (#166): a state from before this process counted again, then what the anchor settled */
         if (!node->softFirst && node->ctx->blockHeight > lastBatch + 1 && node_soft_recount(node, lastBatch) != 0) {
             node->softStopped = 1;
@@ -3905,17 +3436,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
 
-    if (node->config.hasFleet && fv.snapHeight > node->snapHeight) { node->snapHeight = fv.snapHeight; node->snapAt = fv.snapAt; }   /* #314 */
-    if (node->config.hasFleet && fv.snapHeight >= 2 && fv.snapHeight <= lastBatch && node->ctx->blockHeight <= fv.snapHeight
-        && (node->ctx->blockHeight == 1 || fv.prunedBelow > node->ctx->blockHeight) && node->pm && !node->config.verifyOnly
-        && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0) {
-        /* a fleet database behind its latest snapshot (#314): from it rather than batch 1 - and below the store's prune,
-        ** the only way back */
-        int started = node_fleet_start_from_snapshot(node, &fv);
-        if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
-        if (started > 0) synced++;
-    }
-    if (!node->config.hasFleet && node->config.fromSnapshot && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2
+    if (node->config.fromSnapshot && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2
         && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0) {
         /* a new replica: from the latest snapshot rather than batch 1 (#222) */
         int started = node_start_from_snapshot(node, lastBatch, 0);
@@ -3986,17 +3507,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     ** The DA contract keeps a rolling hash over every batch (#33); ours
     ** advanced with every batch finalized, replayed or skipped. A file from
     ** before the hash was kept has none (zero) and is not compared. */
-    if (node->config.hasFleet && lastBatch > 0 && node->ctx->blockHeight == lastBatch + 1) {
-        /* the rolling hash over what was read is the latest head's, and the head is this database's key's (#316 d) */
-        unsigned char me[20];
-        if (memcmp(node->ctx->chainHash, fv.chainAfter, 32) != 0
-            || (hpplite_l1_get_my_address(node->l1, me) == 0 && memcmp(me, fv.headSigner, 20) != 0)) {
-            hpplite_error(node->ctx, "the batches read from the store to height %llu are not the history its latest head signs (the rolling hash or the "
-                          "signer differs)", (unsigned long long)lastBatch);
-            node->state = HPPLITE_STATE_ERROR;
-            return -1;
-        }
-    } else if (lastBatch > 0 && node->ctx->blockHeight == lastBatch + 1) {
+    if (lastBatch > 0 && node->ctx->blockHeight == lastBatch + 1) {
         static const unsigned char zero[32];
         unsigned char chain[32];
         uint64_t covered = 0;
@@ -4010,9 +3521,9 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
-    if (!node->config.hasFleet && !node->config.verifyOnly && node->ctx->blockHeight == lastBatch + 1 && hpplite_node_pending_count(node) == 0)
+    if (!node->config.verifyOnly && node->ctx->blockHeight == lastBatch + 1 && hpplite_node_pending_count(node) == 0)
         synced += node_soft_walk(node);             /* what the store holds past the chain (#167), before anything of ours */
-    if (!node->config.hasFleet && node->ctx->blockHeight >= lastBatch + 1) synced += node_soft_follow(node);   /* a verifier's soft tier (#166) */
+    if (node->ctx->blockHeight >= lastBatch + 1) synced += node_soft_follow(node);   /* a verifier's soft tier (#166) */
     node_pages_decide_snapshot(node);               /* the chain seen: is the file ahead of it? */
     if (node->pagesWalSuspended && !node->pieceDb) {
         /* the pages applied: back to WAL for this node's own writes, the file as
