@@ -5,7 +5,16 @@ import threading
 import time
 
 from . import eth
-from .chain import RpcError, revert_reason, selector, signed_tx
+from .chain import ChainUnreadable, RpcError, revert_reason, selector, signed_tx  # noqa: F401 (ChainUnreadable: its old home)
+
+
+def funder_sig_bytes(h):
+    """A funder's signature from 0x-hex, any length up to 2 KB (#356: a smart wallet's is seldom 65 bytes), or None"""
+    try:
+        b = bytes.fromhex(h[2:] if isinstance(h, str) and h.startswith("0x") else "")
+    except ValueError:
+        return None
+    return b if 0 < len(b) <= 2048 else None
 
 
 def sig_bytes(h):
@@ -17,8 +26,6 @@ def sig_bytes(h):
     return b if len(b) == 65 else None
 
 
-class ChainUnreadable(Exception):
-    """The chain could not be asked (unreachable, or answering an error): not the same as 'no rollup' (#198)"""
 
 
 class Token:
@@ -51,7 +58,11 @@ class Token:
 
     @staticmethod
     def permit_data(owner, p):
-        sig = sig_bytes(p["signature"])
+        sig = funder_sig_bytes(p["signature"])
+        if len(sig) != 65:      # a smart wallet's (#356): USDC v2.2's permit taking the signature as bytes, checked by ERC-1271
+            tail = len(sig).to_bytes(32, "big") + sig + b"\0" * (-len(sig) % 32)
+            return "0x" + selector("permit(address,address,uint256,uint256,bytes)") + "".join(
+                eth.word(w).hex() for w in (owner, p["spender"], int(p["value"]), int(p["deadline"]), 160)) + tail.hex()
         v, r, s = sig[64], sig[:32], sig[32:64]
         return "0x" + selector("permit(address,address,uint256,uint256,uint8,bytes32,bytes32)") + "".join(
             eth.word(w).hex() for w in (owner, p["spender"], int(p["value"]), int(p["deadline"]), int(v), r, s))

@@ -52,9 +52,9 @@ import urllib.parse
 here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 from x402seller import eth  # noqa: E402
-from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_tx  # noqa: E402
+from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_by, signed_tx  # noqa: E402
 from x402seller.payments import Payments  # noqa: E402
-from x402seller.token import ChainUnreadable, Token, sig_bytes  # noqa: E402
+from x402seller.token import ChainUnreadable, Token, funder_sig_bytes, sig_bytes  # noqa: E402
 
 
 FACTORY_CALLS = {selector("createRollupFor(address,uint256,uint256,uint256,bytes)"): "createRollupFor"}
@@ -507,19 +507,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         r = self.relay
         try:
             value, deadline = int(req["value"]), int(req["deadline"])
-            sig = sig_bytes(req["signature"]) if "signature" in req else \
+            sig = funder_sig_bytes(req["signature"]) if "signature" in req else \
                 bytes.fromhex(req["r"][2:]) + bytes.fromhex(req["s"][2:]) + bytes([int(req["v"])])
         except (KeyError, TypeError, ValueError):
             return self.reply(400, {"error": "a permit is {value, deadline, signature} (or v, r, s)"})
-        if not sig or len(sig) != 65 or deadline <= int(time.time()):
-            return self.reply(400, {"error": "a permit with a 65-byte signature and a deadline ahead"})
+        if not sig or deadline <= int(time.time()):
+            return self.reply(400, {"error": "a permit with a signature and a deadline ahead"})
         try:
             nonce = r.token.nonce(funder)
         except ChainUnreadable as e:
             return self.reply(503, {"error": "the chain cannot be read: %s" % e})
         domain = eth.domain_separator(r.args.asset_name, r.args.asset_version, r.chain_id, r.args.asset)
         digest = eth.typed_digest(domain, PERMIT_TYPE, funder, r.token.spender, value, nonce, deadline)
-        if not same(eth.recover(digest, sig), funder):
+        try:
+            funded = signed_by(r.chain, funder, digest, sig)     # or a smart wallet's (#356)
+        except ChainUnreadable as e:
+            return self.reply(503, {"error": "the chain cannot be read: %s" % e})
+        if not funded:
             return self.reply(401, {"error": "the permit does not recover to the funder (spender, nonce, domain?)", "spender": r.token.spender, "nonce": nonce})
         r.accounts.give_permit(funder, value, deadline, sig)
         return self.reply(200, r.accounts.view_account(funder))
@@ -555,7 +559,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         req = self.body_json() or {}
         r = self.relay
         funder, issued = str(req.get("funder", "")).lower(), req.get("issuedAt")
-        sig = sig_bytes(req.get("signature"))
+        sig = funder_sig_bytes(req.get("signature"))
         if not ADDR_RE.match(funder) or not isinstance(issued, int) or not sig:
             return self.reply(400, {"error": "a sponsorship is {funder, issuedAt, signature}" + (" with callsPerDay" if action == "/cap" else "")})
         if action == "/cap":
@@ -565,7 +569,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             digest = eth.typed_digest(r.domain, CAP_TYPE, rollup, calls, issued)
         else:
             digest = eth.typed_digest(r.domain, UNSPONSOR_TYPE if action == "/release" else SPONSOR_TYPE, rollup, funder, issued)
-        if not same(eth.recover(digest, sig), funder):
+        try:
+            funded = signed_by(r.chain, funder, digest, sig)     # or a smart wallet's (#356)
+        except ChainUnreadable as e:
+            return self.reply(503, {"error": "the chain cannot be read: %s" % e})
+        if not funded:
             return self.reply(401, {"error": "the signature does not recover to the funder", "domain": r.status()["accounts"]["domain"]})
         if action == "/cap":
             return self.reply(*r.accounts.cap(rollup, funder, calls, issued))

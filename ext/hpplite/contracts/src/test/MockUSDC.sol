@@ -74,6 +74,29 @@ contract MockUSDC {
         emit Approval(owner, spender, value);
     }
 
+    /// USDC v2.2's form (hpp-io/hpplite#356): the signature as bytes - ERC-1271's isValidSignature when the owner is a
+    /// contract (a smart wallet), else a 65-byte signature recovered
+    function permit(address owner, address spender, uint256 value, uint256 deadline, bytes memory signature) external {
+        require(block.timestamp <= deadline, "permit expired");
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(),
+            keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonces[owner]++, deadline))));
+        require(_signedBy(owner, digest, signature), "invalid signature");
+        allowance[owner][spender] = value;
+        emit Approval(owner, spender, value);
+    }
+
+    function _signedBy(address who, bytes32 digest, bytes memory signature) internal view returns (bool) {
+        if (who.code.length > 0) {
+            (bool ok, bytes memory out) = who.staticcall(abi.encodeWithSelector(bytes4(0x1626ba7e), digest, signature));
+            return ok && out.length >= 32 && abi.decode(out, (bytes4)) == bytes4(0x1626ba7e);
+        }
+        if (signature.length != 65) return false;
+        bytes32 r; bytes32 s; uint8 v;
+        assembly { r := mload(add(signature, 32)) s := mload(add(signature, 64)) v := byte(0, mload(add(signature, 96))) }
+        address signer = ecrecover(digest, v, r, s);
+        return signer != address(0) && signer == who;
+    }
+
     /// EIP-3009: `from` signed it, anyone submits it, the nonce is used once
     function transferWithAuthorization(
         address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce,

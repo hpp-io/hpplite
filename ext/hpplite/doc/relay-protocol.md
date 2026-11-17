@@ -108,6 +108,14 @@ with a newer `issuedAt` and an empty account, and the rollup's calls would
 stop being paid; with it, a newer `Sponsor` by another funder is a takeover
 the rollup asked for. `Unsponsor` and `Cap` are the sponsor's alone.
 
+**A funder may be a smart account (#356).** The funder's signatures -
+`Sponsor`, `Unsponsor`, `Cap` and the permit - are valid when 65 bytes that
+recover to the funder, or, when the funder's address has code, when its
+ERC-1271 `isValidSignature(digest, signature)` answers `0x1626ba7e` (any
+length up to 2048 bytes); its permit goes to the asset as
+`permit(owner, spender, value, deadline, bytes)`. `rollupSignature` stays a
+65-byte signature that recovers to the rollup's owner or sequencer.
+
 **Paying.** A sponsored call is charged the price its caller would have
 been quoted, before it is submitted, and given back when the transaction is
 refused, fails to be included or reverts: two calls at once never spend the

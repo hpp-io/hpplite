@@ -394,6 +394,42 @@ def main():
         st, body = post_raw(url + "/account/%s/pay?amount=5" % wallet.lower(), {})
         check(st == 400 and body.get("minPull") == 1_000_000, "a top-up below minPull: 400 (%s)" % st)
         check(balance_eth(treasury) == 0, "the treasury holds no ETH")
+        # 9. a smart wallet as the sponsor (#356): its ERC-1271 signatures (66 bytes) give the permit and the sponsorship,
+        # the rollup's owner signing beside it; the relay pulls from the wallet, its permit sent on chain as bytes
+        import re
+        st, status = http_get(url + "/status")
+        acc = status["accounts"]
+        W = secrets.token_bytes(32)
+        made = subprocess.run(["forge", "create", "--rpc-url", RPC, "--private-key", KEY0, "--broadcast", "--json",
+                               "src/test/MockWallet1271.sol:MockWallet1271", "--constructor-args", eth.address(W)],
+                              cwd=os.path.join(here, "..", "..", "contracts"), capture_output=True, text=True)
+        m = re.search(r'"deployedTo":\s*"(0x[0-9a-fA-F]{40})"', made.stdout)
+        swallet = m.group(1).lower() if m else ""
+        check(len(swallet) == 42, "a smart wallet (MockWallet1271) deployed (%s)" % (swallet or made.stderr[-200:]))
+        subprocess.run(["cast", "send", "--rpc-url", RPC, "--private-key", KEY0, USDC, "transfer(address,uint256)", swallet, "5000000"], check=True, capture_output=True)
+        wsig = lambda d: b"\x00" + eth.sign(W, d)          # the wallet's form: a mode byte, then its owner's signature
+        nonce, dl = int(call_view(USDC, "nonces(address)", swallet), 16), int(time.time()) + 86400
+        pd = eth.typed_digest(eth.domain_separator(acc["assetDomain"]["name"], acc["assetDomain"]["version"], int(status["chainId"]), acc["asset"]),
+                              "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)", swallet, acc["spender"], 5_000_000, nonce, dl)
+        st, out = post_raw(url + "/account/%s/permit" % swallet, {"value": 5_000_000, "deadline": dl, "signature": "0x" + wsig(pd).hex()})
+        check(st == 200 and out.get("permit", {}).get("sent") is False, "the smart wallet's permit taken by the relay (%s %s)" % (st, out))
+        dom = acc["domain"]
+        sd = eth.typed_digest(eth.domain_separator(dom["name"], dom["version"], int(dom["chainId"]), dom["verifyingContract"]),
+                              "Sponsor(address rollup,address funder,uint256 issuedAt)", rollup.lower(), swallet, int(time.time()) + 2)
+        st, out = post_raw(url + "/sponsor/" + rollup.lower(), {"funder": swallet, "issuedAt": int(time.time()) + 2,
+                                                                "signature": "0x" + wsig(sd).hex(), "rollupSignature": "0x" + eth.sign(wkey, sd).hex()})
+        check(st == 200 and out.get("funder") == swallet and out.get("state") == "sponsored",
+              "the smart wallet sponsors the rollup by its ERC-1271 signature, the owner signing beside it (%s %s)" % (st, out))
+        # the cap the treasury set stays with the rollup (3 a day, spent): the wallet lifts it, by its signature too
+        ct = int(time.time()) + 3
+        cd = eth.typed_digest(eth.domain_separator(dom["name"], dom["version"], int(dom["chainId"]), dom["verifyingContract"]),
+                              "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)", rollup.lower(), 0, ct)
+        st, out = post_raw(url + "/sponsor/%s/cap" % rollup.lower(), {"funder": swallet, "callsPerDay": 0, "issuedAt": ct, "signature": "0x" + wsig(cd).hex()})
+        check(st == 200 and out.get("cap") is None, "the smart wallet lifts the rollup's cap by its ERC-1271 signature (%s %s)" % (st, out))
+        s0 = balance_usdc(swallet)
+        st, body = post_raw(url + "/commit", {"to": rollup, "data": encode("renewLeaseFor(bytes32,uint256,uint256,bytes)", instance, 7, deadline, lease("renew", 7))})
+        check(st == 200 and body.get("sponsor") == swallet and s0 - balance_usdc(swallet) >= 1_000_000,
+              "a sponsored call charged to the smart wallet, the relay pulling from it (%s, %d units)" % (st, s0 - balance_usdc(swallet)))
         queue_section(work, keyfile, chain_id)
     finally:
         proc.terminate()

@@ -39,9 +39,9 @@ import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from x402seller import eth  # noqa: E402
-from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_tx  # noqa: E402
+from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_by, signed_tx  # noqa: E402
 from x402seller.payments import Payments  # noqa: E402
-from x402seller.token import ChainUnreadable, Token  # noqa: E402
+from x402seller.token import ChainUnreadable, Token, funder_sig_bytes  # noqa: E402
 
 PROTOCOL = "hpplite-store/2"
 MIB = 1024 * 1024
@@ -490,6 +490,7 @@ class Service:
                 spender_key = bytes.fromhex(f.read().strip().replace("0x", ""))
         self.chain_id = int(args.network.split(":")[1])
         chain = Chain(args.rpc, "hpplite-store/2") if args.rpc else None
+        self.chain = chain                  # a smart wallet's signature is checked by asking it (#356)
         self.rollups = Rollups(chain) if chain else None
         token = Token(chain, args.asset, spender_key, self.chain_id) if chain else None
         self.ledger = Ledger(args, self.disk, key, self.chain_id, self.rollups, token)
@@ -771,9 +772,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(400, {"error": "a binding is {funder, issuedAt, sequencerSignature, funderSignature}"})
         funder, issued = req["funder"].lower(), req["issuedAt"]
         digest = eth.typed_digest(self.L.domain, BIND_TYPE, da, funder, issued)
-        s_sig, f_sig = sig_bytes(req.get("sequencerSignature")), sig_bytes(req.get("funderSignature"))
+        s_sig, f_sig = sig_bytes(req.get("sequencerSignature")), funder_sig_bytes(req.get("funderSignature"))
         signer = eth.recover(digest, s_sig) if s_sig else ""
-        if not f_sig or not same(eth.recover(digest, f_sig), funder):
+        try:
+            funded = bool(f_sig) and signed_by(self.service.chain, funder, digest, f_sig)     # or a smart wallet's (#356)
+        except ChainUnreadable as e:
+            return self.reply(503, {"error": "the chain cannot be read: %s" % e})
+        if not funded:
             return self.reply(401, {"error": "the funder's signature does not recover to the funder"})
         with self.L.lock:
             b = self.L.bucket(da)
@@ -825,8 +830,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not b or b["state"] == "deleted" or not b.get("funder"):
                 return self.reply(404, {"error": "no bound bucket", "da": da})
             digest = eth.typed_digest(self.L.domain, CAP_TYPE, da, writes, nbytes, issued)
-            sig = sig_bytes(req.get("signature"))
-            if not sig or not same(funder, b["funder"]) or not same(eth.recover(digest, sig), b["funder"]):
+            sig = funder_sig_bytes(req.get("signature"))
+            try:
+                funded = bool(sig) and same(funder, b["funder"]) and signed_by(self.service.chain, b["funder"], digest, sig)
+            except ChainUnreadable as e:
+                return self.reply(503, {"error": "the chain cannot be read: %s" % e})
+            if not funded:
                 return self.reply(401, {"error": "not signed by the bucket's funder"})
             if not self.fresh(issued, b.get("capAt")):
                 return self.reply(409, {"error": "a cap no newer than the last taken", "last": b.get("capAt")})
@@ -845,8 +854,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(404, {"error": "no bound bucket", "da": da})
             delete = req.get("delete") is True                      # delete now (#275): signed over Delete, not Release
             digest = eth.typed_digest(self.L.domain, DELETE_TYPE if delete else RELEASE_TYPE, da, b["funder"], req["issuedAt"])
-            sig = sig_bytes(req.get("signature"))
-            if not sig or not same(eth.recover(digest, sig), b["funder"]) or not same(req.get("funder"), b["funder"]):
+            sig = funder_sig_bytes(req.get("signature"))
+            try:
+                funded = bool(sig) and same(req.get("funder"), b["funder"]) and signed_by(self.service.chain, b["funder"], digest, sig)
+            except ChainUnreadable as e:
+                return self.reply(503, {"error": "the chain cannot be read: %s" % e})
+            if not funded:
                 return self.reply(401, {"error": "not signed by the bucket's funder" + (" over Delete(da, funder, issuedAt)" if delete else "")})
             if not self.fresh(req["issuedAt"], b.get("boundAt")):
                 return self.reply(409, {"error": "a release no newer than the binding"})
@@ -1033,12 +1046,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         req = self.body_json(body)
         try:
             value, deadline = int(req["value"]), int(req["deadline"])
-            sig = sig_bytes(req["signature"]) if "signature" in req else \
+            sig = funder_sig_bytes(req["signature"]) if "signature" in req else \
                 bytes.fromhex(req["r"][2:]) + bytes.fromhex(req["s"][2:]) + bytes([int(req["v"])])
         except (KeyError, TypeError, ValueError):
             return self.reply(400, {"error": "a permit is {value, deadline, signature} (or v, r, s)"})
-        if not sig or len(sig) != 65 or deadline <= int(time.time()):
-            return self.reply(400, {"error": "a permit with a 65-byte signature and a deadline ahead"})
+        if not sig or deadline <= int(time.time()):
+            return self.reply(400, {"error": "a permit with a signature and a deadline ahead"})
         L = self.L
         if L.token:
             try:
@@ -1048,7 +1061,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             domain = eth.domain_separator(self.service.args.asset_name, self.service.args.asset_version,
                                           self.service.chain_id, self.service.args.asset)
             digest = eth.typed_digest(domain, PERMIT_TYPE, funder, L.token.spender, value, nonce, deadline)
-            if not same(eth.recover(digest, sig), funder):
+            try:
+                funded = signed_by(L.token.chain, funder, digest, sig)     # or a smart wallet's (#356)
+            except ChainUnreadable as e:
+                return self.reply(503, {"error": "the chain cannot be read: %s" % e})
+            if not funded:
                 return self.reply(401, {"error": "the permit does not recover to the funder (spender, nonce, domain?)",
                                         "spender": L.token.spender, "nonce": nonce})
         with L.lock:

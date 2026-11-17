@@ -79,3 +79,36 @@ def revert_reason(err: RpcError) -> str:
         except ValueError:
             pass
     return str(err)
+
+
+ERC1271_MAGIC = "1626ba7e"      # isValidSignature(bytes32,bytes)'s answer for a signature the account accepts
+
+
+class ChainUnreadable(Exception):
+    """The chain could not be asked (unreachable, or answering an error): not the same as 'no rollup' (#198)"""
+
+
+def signed_by(chain, account, digest: bytes, sig: bytes) -> bool:
+    """A funder's signature (#356): it recovers to the account, or - the account being a contract, a smart wallet -
+    the account's ERC-1271 isValidSignature(digest, sig) answers 0x1626ba7e. A plain key's signature never asks the
+    chain; without a chain only recovery counts. The chain unreadable raises ChainUnreadable: the caller answers 503"""
+    if len(sig) == 65:
+        try:
+            if eth.recover(digest, sig).lower() == account.lower():
+                return True
+        except ValueError:
+            pass
+    if chain is None or not sig:
+        return False
+    try:
+        if chain.call("eth_getCode", account, "latest") in (None, "0x", "0x0"):
+            return False
+        tail = len(sig).to_bytes(32, "big") + sig + b"\0" * (-len(sig) % 32)
+        data = "0x" + selector("isValidSignature(bytes32,bytes)") + digest.hex() + (64).to_bytes(32, "big").hex() + tail.hex()
+        out = chain.call("eth_call", {"to": account, "data": data}, "latest") or ""
+    except RpcError:
+        return False                    # the account reverted: it does not accept the signature
+    except (OSError, ValueError) as e:
+        raise ChainUnreadable(str(e)[:200])
+    return out[2:10] == ERC1271_MAGIC
+

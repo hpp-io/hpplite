@@ -72,6 +72,17 @@ value,uint256 nonce,uint256 deadline)` (USDC.e,
 `0x401eCb1D350407f13ba348573E5630B83638E30D` on HPP Sepolia and mainnet,
 supports it: version 2).
 
+**A funder may be a smart account (#356).** A funder's signature - `Bind`'s
+`funderSignature`, `Release`, `Delete`, `Cap` and the permit - is valid when
+it is 65 bytes and recovers to the funder, or, when the funder's address has
+code, when the funder's ERC-1271 `isValidSignature(digest, signature)`
+answers `0x1626ba7e`; such a signature may be any length up to 2048 bytes.
+A smart account's permit goes to the asset in the form that takes the
+signature as bytes, `permit(owner, spender, value, deadline, bytes)` (USDC
+v2.2's; CHIP accepts ERC-1271 too). A store that cannot read the chain to
+ask answers `503`. The sequencer's signatures, and a key's bucket's key,
+stay 65-byte signatures that recover to it.
+
 ## Calls
 
 | Call | Signed / paid | Answer |
@@ -86,7 +97,7 @@ supports it: version 2).
 | `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | the sequencer; `402` if not covered | `200 {name, bytes, signer}`: the name is the write - its bytes are held in the bucket |
 | `POST /put?bucket=<da>&height=<n>`, the body the bytes, `X-HPPLite-Signature` the `Content` signature | the sequencer; `402` if not covered | `200 {cid, bytes}` |
 | `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names); a name's batch bytes are also read by their CID |
-| `POST /account/<funder>/permit`, body `{value, deadline, signature}` (65 bytes hex; `{v, r, s}` taken too) | the funder (the permit) | `200` the account |
+| `POST /account/<funder>/permit`, body `{value, deadline, signature}` (hex: 65 bytes, or a smart account's, #356; `{v, r, s}` taken too) | the funder (the permit) | `200` the account |
 | `POST /account/<funder>/pay?amount=<units>` | x402 `exact` | `200` the account: `credit` raised by the amount |
 | `GET /account/<funder>` | - | `200 {funder, credit, balance, allowance, deadline, dailyCost, coveredUntil, buckets, state}` |
 | `GET /status` | - | below |
@@ -99,7 +110,7 @@ the lease's `409`, the chain unreadable `503` (#198); the same body again
 name is taken only from the chain's sequencer, into a bucket it bound.
 
 Errors: `400` malformed; `401` a signature that does not recover to the
-sequencer (or the funder); `402` a write its account cannot cover, or an
+sequencer (or the funder, or that a smart-account funder does not accept); `402` a write its account cannot cover, or an
 unpaid `/pay` (x402 requirements, below); `403`/`409`/`503` as above; `404`
 not held, or no such bucket; `409` a binding or prune older than the last
 taken; `410` a read of a parked bucket (the body says what restores it);

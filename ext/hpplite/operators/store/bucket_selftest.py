@@ -10,6 +10,7 @@ parks and is deleted. Prune, release, the statement, the sweep.
 """
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -435,6 +436,47 @@ def main():
               "the bucket reads deleted, its names are gone")
         code, out, _ = S.bind(da, k2, F, issued=issued + 3)
         check(code == 200 and http("GET", url + "/bucket/" + da)[1].get("objects") == 0, "a new binding starts an empty bucket (%s)" % code)
+
+        # --- a smart wallet as the funder (#356): its ERC-1271 signatures (66 bytes) bind a key's bucket, give a permit
+        # (sent on chain as bytes) and release; the store pulls from the wallet ---
+        W = secrets.token_bytes(32)
+        made = subprocess.run(["forge", "create", "--rpc-url", RPC, "--private-key", KEY0, "--broadcast", "--json",
+                               "src/test/MockWallet1271.sol:MockWallet1271", "--constructor-args", eth.address(W)],
+                              cwd=os.path.join(here, "..", "..", "contracts"), capture_output=True, text=True)
+        m = re.search(r'"deployedTo":\s*"(0x[0-9a-fA-F]{40})"', made.stdout)
+        wallet = m.group(1).lower() if m else ""
+        check(len(wallet) == 42, "a smart wallet (MockWallet1271) deployed (%s)" % (wallet or made.stderr[-200:]))
+        send(KEY0, USDC, "transfer(address,uint256)", wallet, 5_000_000)
+        wsig = lambda d: b"\x00" + eth.sign(W, d)          # the wallet's form: a mode byte, then its owner's signature
+        K = secrets.token_bytes(32)
+        kda, t = eth.address(K).lower(), int(time.time())
+        d = S.digest(BIND, kda, wallet, t)
+        bind = {"funder": wallet, "issuedAt": t, "sequencerSignature": "0x" + eth.sign(K, d).hex(), "funderSignature": "0x" + eth.sign(W, d).hex()}
+        code, out, _ = jpost(url + "/bucket/" + kda, bind)
+        check(code == 401, "the wallet's owner key signing for the wallet, not the wallet's own form: 401 (%s)" % code)
+        bind["funderSignature"] = "0x" + wsig(d).hex()
+        code, out, _ = jpost(url + "/bucket/" + kda, bind)
+        check(code == 200 and out.get("funder") == wallet and out.get("state") == "covered",
+              "a smart wallet's ERC-1271 signature binds a key's bucket, the wallet the funder (%s %s)" % (code, out))
+        nonce = int(cast("call", USDC, "nonces(address)(uint256)", wallet).split()[0])
+        deadline = int(time.time()) + 86400
+        pd = eth.typed_digest(eth.domain_separator("Bridged USDC", "2", CHAIN_ID, USDC), PERMIT, wallet, S.spender, 1_000_000, nonce, deadline)
+        code, out, _ = jpost(url + "/account/%s/permit" % wallet, {"value": 1_000_000, "deadline": deadline, "signature": "0x" + wsig(pd).hex()})
+        check(code == 200 and out.get("permit", {}).get("sent") is False, "the smart wallet's permit taken (%s %s)" % (code, out))
+        blob = secrets.token_bytes(200_000)
+        csig = eth.sign(K, S.digest(CONTENT, kda, 1, eth.keccak256(blob)))
+        code, _, _ = http("POST", "%s/put?bucket=%s&height=1" % (url, kda), blob, {"X-HPPLite-Signature": "0x" + csig.hex()})
+        check(code == 200, "content into the wallet's bucket: 200 (%s)" % code)
+        held = usdc_of(wallet)
+        check(wait_for(lambda: usdc_of(wallet) < held, 30), "storage accrued: the store pulled from the smart wallet (%d units)" % (held - usdc_of(wallet)))
+        acct = wait_for(lambda: (lambda a: a if (a.get("permit") or {}).get("sent") else None)(http("GET", url + "/account/" + wallet)[1]), 10) \
+            or http("GET", url + "/account/" + wallet)[1]
+        check(acct.get("permit", {}).get("sent") is True and acct.get("state") == "covered",
+              "the wallet's permit went on chain in USDC's bytes form; covered (%s)" % acct.get("state"))
+        issued = int(time.time()) + 1
+        code, out, _ = jpost(url + "/bucket/%s/release" % kda,
+                             {"funder": wallet, "issuedAt": issued, "signature": "0x" + wsig(S.digest(RELEASE, kda, wallet, issued)).hex()})
+        check(code == 200 and out.get("state") == "parked", "released by the smart wallet's signature: parked (%s)" % code)
 
         # --- sweep ---
         if CHECK_SWEEP_FILES:
