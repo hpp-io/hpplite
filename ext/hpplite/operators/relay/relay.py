@@ -158,7 +158,7 @@ class Accounts:
                 return 401, {"error": "not signed by the rollup's sponsor"}
             if not self.fresh(issued, s.get("sponsoredAt")):
                 return 409, {"error": "a release no newer than the sponsorship"}
-            s.update({"funder": None, "sponsoredAt": issued})
+            s.update({"funder": None, "sponsoredAt": issued, "cap": None, "capAt": 0})     # the cap goes with the funder (#359)
             self._save("s", rollup, s)
             return 200, self.view_sponsor(rollup)
 

@@ -420,7 +420,8 @@ def main():
                                                                 "signature": "0x" + wsig(sd).hex(), "rollupSignature": "0x" + eth.sign(wkey, sd).hex()})
         check(st == 200 and out.get("funder") == swallet and out.get("state") == "sponsored",
               "the smart wallet sponsors the rollup by its ERC-1271 signature, the owner signing beside it (%s %s)" % (st, out))
-        # the cap the treasury set stays with the rollup (3 a day, spent): the wallet lifts it, by its signature too
+        check(out.get("cap") is None, "a new sponsor after a release starts uncapped: the cap went with the treasury (#359) (%s)" % out.get("cap"))
+        # a Cap signed by the wallet (ERC-1271) is taken too: it sets none
         ct = int(time.time()) + 3
         cd = eth.typed_digest(eth.domain_separator(dom["name"], dom["version"], int(dom["chainId"]), dom["verifyingContract"]),
                               "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)", rollup.lower(), 0, ct)
