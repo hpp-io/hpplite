@@ -18,9 +18,11 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 sys.path.insert(0, os.path.join(here, "..", "store"))
 sys.path.insert(0, os.path.join(here, "..", "relay"))
+sys.path.insert(0, here)
 from x402seller import eth  # noqa: E402
 import hpplite_store  # noqa: E402
 import relay  # noqa: E402
+from buyer import TRANSFER_TYPE  # noqa: E402
 
 PATH = os.path.join(here, "vectors.json")
 KEYS = ["0x" + (bytes([i]) * 32).hex() for i in (1, 2, 0x42)]
@@ -62,6 +64,23 @@ def generate():
          "digest": "0x" + eth.typed_digest(sdom, ts, *fields).hex(),
          "signature": "0x" + eth.sign(key(k), eth.typed_digest(sdom, ts, *fields)).hex()}
         for t, ts, fields, k in msgs]}
+
+    # what a funding wallet signs in a token's own domain (#342): the EIP-2612 permit a store or relay pulls with, and
+    # x402 exact's EIP-3009 TransferWithAuthorization; the C node's signer is checked against these
+    usdc, chip = "0x401eCb1D350407f13ba348573E5630B83638E30D", "0x0Ac610E77ec39AB5c6B402B376548Ac02ACc5a48"
+    spender, pay = "0x" + "5c" * 20, "0x" + "97" * 20
+    pmsgs = [("Permit", hpplite_store.PERMIT_TYPE, ("Bridged USDC", "2", usdc), [funder, spender, 20000000, 0, 1831536000], 2),
+             ("Permit", hpplite_store.PERMIT_TYPE, ("House Chip", "1", chip), [funder, spender, 2 ** 53 - 1, 7, 1831536000], 2),
+             ("TransferWithAuthorization", TRANSFER_TYPE, ("Bridged USDC", "2", usdc),
+              [funder, pay, 1000000, 1800000000, 1800000120, eth.keccak256(b"nonce one")], 2),
+             ("TransferWithAuthorization", TRANSFER_TYPE, ("House Chip", "1", chip),
+              [funder, pay, 3000, 0, 1800000120, eth.keccak256(b"nonce two")], 2)]
+    v["paymentMessages"] = {"chainId": 181228, "messages": [
+        {"type": t, "typeString": ts, "domain": {"name": n, "version": ver, "verifyingContract": a},
+         "fields": [("0x" + f.hex()) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
+         "digest": "0x" + eth.typed_digest(eth.domain_separator(n, ver, 181228, a), ts, *fields).hex(),
+         "signature": "0x" + eth.sign(key(k), eth.typed_digest(eth.domain_separator(n, ver, 181228, a), ts, *fields)).hex()}
+        for t, ts, (n, ver, a), fields, k in pmsgs]}
 
     # a name's signed batch: Batch(bytes32 instanceId,uint256 height,bytes32 batchHash) in ("HPPLiteDA", "3", chainId, da)
     da = "ab" * 20

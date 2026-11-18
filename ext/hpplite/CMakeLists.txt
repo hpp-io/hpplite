@@ -214,6 +214,8 @@ if(HPPLITE_BUILD_TESTS)
     target_link_libraries(test_l1_dir hpplite_testlib)
 
     add_executable(test_store tests/unit/test_store.c)
+    add_executable(test_signing_vectors tests/unit/test_signing_vectors.c)       # the node's signatures against vectors.json (#342)
+    target_link_libraries(test_signing_vectors hpplite_testlib)
     add_executable(test_l1_threads tests/unit/test_l1_threads.c)
     target_link_libraries(test_l1_threads hpplite_testlib)
     add_executable(test_l1_version tests/unit/test_l1_version.c)
@@ -383,6 +385,7 @@ if(HPPLITE_BUILD_TESTS)
         # ... and leaves nothing running (#196)
         add_test(NAME test_conformance_cleanup COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/operators/conformance/cleanup_check.sh)
         # The node's store client against it (#11); paid on anvil in scenario 19
+        add_test(NAME test_signing_vectors COMMAND test_signing_vectors ${CMAKE_CURRENT_SOURCE_DIR}/operators/conformance/vectors.json)
         add_test(NAME test_store COMMAND test_store ${CMAKE_CURRENT_SOURCE_DIR}/operators/store)
         # the chain client refuses contracts before VERSION 8 (#252), against a JSON-RPC stand-in
         add_test(NAME test_l1_threads COMMAND test_l1_threads)

@@ -273,6 +273,53 @@ static void domainOf(const char *zName, const char *zVersion, uint64_t chainId, 
     hpplite_keccak256(w, 160, out);
 }
 
+/* The EIP-712 digests the node signs, pure so a test checks them against operators/conformance/vectors.json (#342) */
+void hpplite_eip712_store_digest(uint64_t chainId, const unsigned char payTo[20], const char *zType, const unsigned char *words,
+                                 size_t nWords, unsigned char out[32]) {
+    unsigned char domain[32], c[32], buf[32 * 8], h[32];
+    memset(c, 0, 32); memcpy(c + 12, payTo, 20);
+    domainOf("HPPLiteStore", "2", chainId, c, domain);
+    hpplite_keccak256((const unsigned char *)zType, strlen(zType), buf);
+    memcpy(buf + 32, words, 32 * nWords);
+    hpplite_keccak256(buf, 32 * (nWords + 1), h);
+    typedHash(domain, h, out);
+}
+
+void hpplite_eip712_permit_digest(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
+                                  const unsigned char owner[20], const unsigned char spender[20], uint64_t value, uint64_t nonce,
+                                  uint64_t deadline, unsigned char out[32]) {
+    static const char zPermit[] = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)";
+    unsigned char w[32 * 6], domain[32], c[32], h[32];
+    memset(c, 0, 32); memcpy(c + 12, asset, 20);
+    domainOf(zName, zVersion, chainId, c, domain);
+    hpplite_keccak256((const unsigned char *)zPermit, sizeof zPermit - 1, w);
+    memset(w + 32, 0, 32); memcpy(w + 44, owner, 20);
+    memset(w + 64, 0, 32); memcpy(w + 76, spender, 20);
+    wordInt(value, w + 96);
+    wordInt(nonce, w + 128);
+    wordInt(deadline, w + 160);
+    hpplite_keccak256(w, sizeof w, h);
+    typedHash(domain, h, out);
+}
+
+void hpplite_eip712_transfer_digest(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
+                                    const unsigned char from[20], const unsigned char to[20], uint64_t value, uint64_t validAfter,
+                                    uint64_t validBefore, const unsigned char nonce[32], unsigned char out[32]) {
+    static const char zTransferType[] = "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)";
+    unsigned char w[32 * 7], domain[32], c[32], h[32];
+    memset(c, 0, 32); memcpy(c + 12, asset, 20);
+    domainOf(zName, zVersion, chainId, c, domain);
+    hpplite_keccak256((const unsigned char *)zTransferType, sizeof(zTransferType) - 1, w);
+    memset(w + 32, 0, 32); memcpy(w + 44, from, 20);
+    memset(w + 64, 0, 32); memcpy(w + 76, to, 20);
+    wordInt(value, w + 96);
+    wordInt(validAfter, w + 128);
+    wordInt(validBefore, w + 160);
+    memcpy(w + 192, nonce, 32);
+    hpplite_keccak256(w, sizeof w, h);
+    typedHash(domain, h, out);
+}
+
 static const char *jstr(cJSON *o, const char *k) {
     cJSON *v = o ? cJSON_GetObjectItem(o, k) : NULL;
     return v && cJSON_IsString(v) ? v->valuestring : NULL;
@@ -339,16 +386,8 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the %s asks %llu, %s is %llu: refused", s->isRelay ? "relay" : "store",
                                      (unsigned long long)amt, s->isRelay ? "HPPLITE_RELAY_CAP" : "HPPLITE_STORE_CAP", (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
         if (strncmp(network->valuestring, "eip155:", 7) == 0) chainId = strtoull(network->valuestring + 7, NULL, 10);
-        /* domain = keccak(typehash, keccak(name), keccak(version), chainId, asset) */
-        unsigned char domain[32], w[32 * 7], h[32], digest[32], nonce[32], sig[65], t[32];
-        static const char zDomainType[] = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
-        static const char zTransferType[] = "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)";
-        hpplite_keccak256((const unsigned char *)zDomainType, sizeof(zDomainType) - 1, w);
-        hpplite_keccak256((const unsigned char *)name->valuestring, strlen(name->valuestring), w + 32);
-        hpplite_keccak256((const unsigned char *)version->valuestring, strlen(version->valuestring), w + 64);
-        wordInt(chainId, w + 96);
-        if (wordAddress(asset->valuestring, w + 128) != 0) { snprintf(s->error, sizeof s->error, "bad asset address in the 402"); cJSON_Delete(req); return NULL; }
-        hpplite_keccak256(w, 160, domain);
+        unsigned char assetW[32], payToW[32], digest[32], nonce[32], sig[65];
+        if (wordAddress(asset->valuestring, assetW) != 0) { snprintf(s->error, sizeof s->error, "bad asset address in the 402"); cJSON_Delete(req); return NULL; }
 
         /* the window the chain checks the authorization against is the chain's time, not this host's: a host clock off
         ** by minutes (stepped back, never synced) would have every payment refused with nothing pointing at the clock */
@@ -370,22 +409,9 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
             wordInt(++counter + (uint64_t)(uintptr_t)s, seed + 52);
             hpplite_keccak256(seed, sizeof seed, nonce);
         }
-        hpplite_keccak256((const unsigned char *)zTransferType, sizeof(zTransferType) - 1, w);
-        memset(w + 32, 0, 32); memcpy(w + 32 + 12, payAddr, 20);
-        if (wordAddress(payTo->valuestring, w + 64) != 0) { snprintf(s->error, sizeof s->error, "bad payTo in the 402"); cJSON_Delete(req); return NULL; }
-        wordInt(amt, w + 96);
-        wordInt(validAfter, w + 128);
-        wordInt(validBefore, w + 160);
-        memcpy(w + 192, nonce, 32);
-        hpplite_keccak256(w, 224, h);
-        (void)t;
-        {
-            unsigned char pre[66];
-            pre[0] = 0x19; pre[1] = 0x01;
-            memcpy(pre + 2, domain, 32);
-            memcpy(pre + 34, h, 32);
-            hpplite_keccak256(pre, 66, digest);
-        }
+        if (wordAddress(payTo->valuestring, payToW) != 0) { snprintf(s->error, sizeof s->error, "bad payTo in the 402"); cJSON_Delete(req); return NULL; }
+        hpplite_eip712_transfer_digest(name->valuestring, version->valuestring, chainId, assetW + 12, payAddr, payToW + 12, amt,
+                                       validAfter, validBefore, nonce, digest);
         {
             HppliteSignature hs;
             unsigned char v;
@@ -640,13 +666,7 @@ static int signWith(HppliteStore *s, HppliteKeypair *kp, const unsigned char dig
 
 /* ("HPPLiteStore", "2", chainId, payTo) and a struct of words: the digest the store recovers */
 static void storeDigest(HppliteStore *s, const char *zType, const unsigned char *words, size_t nWords, unsigned char out[32]) {
-    unsigned char domain[32], c[32], buf[32 * 8], h[32];
-    memset(c, 0, 32); memcpy(c + 12, s->payTo, 20);
-    domainOf("HPPLiteStore", "2", s->chainId, c, domain);
-    hpplite_keccak256((const unsigned char *)zType, strlen(zType), buf);
-    memcpy(buf + 32, words, 32 * nWords);
-    hpplite_keccak256(buf, 32 * (nWords + 1), h);
-    typedHash(domain, h, out);
+    hpplite_eip712_store_digest(s->chainId, s->payTo, zType, words, nWords, out);
 }
 
 static long getJson(HppliteStore *s, const char *path, cJSON **pOut) {
@@ -671,8 +691,7 @@ static void ensurePermit(HppliteStore *s) {
     char fund[43], path[80], sigHex[133], num[32];
     cJSON *a = NULL, *p, *body;
     uint64_t now = (uint64_t)time(NULL), deadline = now + 365ull * 86400, nonce;
-    unsigned char w[32 * 5], domain[32], c[32], h[32], digest[32], sig[65];
-    static const char zPermit[] = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)";
+    unsigned char digest[32], sig[65];
     Buf out = {0};
     if (s->external || !s->permitCap || !s->hasFund || (s->pricePerWrite == 0 && s->pricePerMiBMonth == 0)) return;
     if (s->permitChecked && now - (uint64_t)s->permitChecked < 3600) return;
@@ -692,20 +711,8 @@ static void ensurePermit(HppliteStore *s) {
     }
     nonce = a ? jnum(a, "permitNonce") : 0;
     cJSON_Delete(a);
-    memset(c, 0, 32); memcpy(c + 12, s->asset, 20);
-    domainOf(s->assetName, s->assetVersion, s->chainId, c, domain);
-    hpplite_keccak256((const unsigned char *)zPermit, sizeof zPermit - 1, w);
-    memset(w + 32, 0, 32); memcpy(w + 44, s->fundAddr, 20);
-    memset(w + 64, 0, 32); memcpy(w + 76, s->spender, 20);
-    wordInt(s->permitCap, w + 96);
-    wordInt(nonce, w + 128);
-    {
-        unsigned char ww[32 * 6];
-        memcpy(ww, w, 160);
-        wordInt(deadline, ww + 160);
-        hpplite_keccak256(ww, 192, h);
-    }
-    typedHash(domain, h, digest);
+    hpplite_eip712_permit_digest(s->assetName, s->assetVersion, s->chainId, s->asset, s->fundAddr, s->spender, s->permitCap, nonce,
+                                 deadline, digest);
     if (signWith(s, &s->fundKp, digest, sig) != 0) return;
     lowerHex(sig, 65, sigHex);
     body = cJSON_CreateObject();

@@ -73,6 +73,17 @@ int hpplite_store_bind_digest(HppliteStore *store, const unsigned char funder[20
 int hpplite_store_sign_bind(HppliteStore *store, const unsigned char funder[20], uint64_t issuedAt, unsigned char sig[65]);
 /* The Cap(da, writesPerDay, bytesPerDay, issuedAt) digest in this store's domain (#274): the funder signs it to bound the bucket's day */
 int hpplite_store_cap_digest(HppliteStore *store, uint64_t writesPerDay, uint64_t bytesPerDay, uint64_t issuedAt, unsigned char digest[32]);
+/* The EIP-712 digests the node signs (#342), pure: a store message's words in ("HPPLiteStore", "2", chainId, payTo); the funding
+** wallet's EIP-2612 permit; x402 exact's EIP-3009 TransferWithAuthorization. tests/unit/test_signing_vectors.c checks them
+** against operators/conformance/vectors.json */
+void hpplite_eip712_store_digest(uint64_t chainId, const unsigned char payTo[20], const char *zType, const unsigned char *words,
+                                 size_t nWords, unsigned char out[32]);
+void hpplite_eip712_permit_digest(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
+                                  const unsigned char owner[20], const unsigned char spender[20], uint64_t value, uint64_t nonce,
+                                  uint64_t deadline, unsigned char out[32]);
+void hpplite_eip712_transfer_digest(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
+                                    const unsigned char from[20], const unsigned char to[20], uint64_t value, uint64_t validAfter,
+                                    uint64_t validBefore, const unsigned char nonce[32], unsigned char out[32]);
 int64_t hpplite_store_covered_until(HppliteStore *store);
 const char *hpplite_store_bucket_state(HppliteStore *store);
 int hpplite_store_statement(HppliteStore *store, uint8_t out[HPPLITE_STATEMENT_SIZE]);
