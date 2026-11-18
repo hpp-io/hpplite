@@ -66,6 +66,8 @@ int hpplite_pagebatch_is(const unsigned char *p, size_t n);
 int hpplite_pagebatch_meta(const unsigned char *p, size_t n, uint64_t *pTimestampMs, int *pMore);
 /* the bytes of a batch; sqlite3_free */
 unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen);
+/* SQLite's lock-byte page for this page size (#363): in no commit, no root, no image; 0 for no page size */
+unsigned hpplite_lock_page(int pageSize);
 /* the same bytes head bytes into a malloc'd buffer with tail bytes after (#233: a snapshot sealed in place); free() */
 unsigned char *hpplite_pagebatch_encode_room(const HpplitePageBatch *b, size_t head, size_t tail, size_t *pLen);
 /* a batch from its bytes: the records point into p, which must outlive it; sqlite3_free the batch */

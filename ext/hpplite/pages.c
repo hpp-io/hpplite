@@ -162,6 +162,14 @@ void hpplite_dbfile_close(HppliteDbFile *d) {
   sqlite3_free(d->f); sqlite3_free(d->zName); sqlite3_free(d);
 }
 
+/* SQLite's lock-byte page (#363): the page holding the pending byte, 0x40000000 unless a test moved it. SQLite never
+** writes it, so it is in no commit: never a leaf, never in an image, never read from the file. 0 for no page size */
+unsigned hpplite_lock_page(int pageSize) {
+  unsigned pending = (unsigned)sqlite3_test_control(SQLITE_TESTCTRL_PENDING_BYTE, 0);
+  if (pending == 0) pending = 0x40000000u;          /* a build without test controls */
+  return pageSize > 0 ? pending / (unsigned)pageSize + 1 : 0;
+}
+
 HpplitePageRoot *hpplite_pageroot_from_file(const char *zPath, int *pPageSize) {
   HppliteDbFile *f = hpplite_dbfile_open(zPath);
   unsigned char hdr[100], *page;
@@ -177,6 +185,7 @@ HpplitePageRoot *hpplite_pageroot_from_file(const char *zPath, int *pPageSize) {
   page = sqlite3_malloc64((sqlite3_uint64)pageSize);
   if (!pr || !page || grow(pr, n ? n : 1) != SQLITE_OK) { hpplite_pageroot_free(pr); sqlite3_free(page); hpplite_dbfile_close(f); return NULL; }
   for (i = 1; i <= n; i++) {
+    if (i == hpplite_lock_page(pageSize)) continue;
     if (hpplite_dbfile_read(f, page, (size_t)pageSize, (int64_t)(i - 1) * pageSize) != (size_t)pageSize) break;
     hpplite_pageroot_set(pr, i, page);
   }

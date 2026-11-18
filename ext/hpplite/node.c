@@ -2451,7 +2451,8 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
     if (!why && !batch->bPages) why = "it is not a page image";
     if (!why) {
         HpplitePageBatch *pb = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
-        if (!pb || pb->nPages != pb->commitSize || pb->bMore || memcmp(pb->root, root, 32) != 0) why = "its image is not the anchored state";
+        /* every page, but the lock-byte page within the file (#363) */
+        if (!pb || pb->nPages + (hpplite_lock_page((int)pb->pageSize) <= pb->commitSize) != pb->commitSize || pb->bMore || memcmp(pb->root, root, 32) != 0) why = "its image is not the anchored state";
         if (pb) hpplite_pagebatch_free(pb);
     }
     free(all);
