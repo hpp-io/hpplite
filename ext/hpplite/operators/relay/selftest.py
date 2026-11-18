@@ -120,7 +120,7 @@ def start_relay(work, port, keyfile, log, eth_usd="30"):
                           "--asset", USDC, "--eth-usd", eth_usd, "--dir", os.path.join(work, "relay")]
                          # the other tokens it takes (#361): CHIP at $1 with x402, HPP at $0.01 (10000 units) by permit
                          + (["--extra-asset", "%s,House Chip,1,6,1000000,exact" % CHIP] if CHIP else [])
-                         + (["--extra-asset", "%s,HousePartyProtocol,1,18,10000" % HPP] if HPP else []), stdout=log, stderr=log)
+                         + (["--extra-asset", "%s,HousePartyProtocol,1,18,10000,upto" % HPP] if HPP else []), stdout=log, stderr=log)   # HPP by upto too (#358)
     for _ in range(100):
         if p.poll() is not None:
             return p, None
@@ -481,15 +481,34 @@ def main():
                                                   cwallet, 100, 0, cdl))
             cdata = encode("createRollupFor(address,uint256,uint256,uint256,bytes)", cwallet, 100, 0, cdl, csig)
             st, body = post_raw(url + "/commit", {"to": FACTORY, "data": cdata})
-            offers = body.get("accepts", []) if isinstance(body, dict) else []
+            offers = [o for o in body.get("accepts", []) if o.get("scheme") == "exact"] if isinstance(body, dict) else []
             check(st == 402 and [o["asset"].lower() for o in offers] == [USDC.lower(), CHIP.lower()] and offers[0]["amount"] == offers[1]["amount"]
                   and offers[1]["extra"].get("name") == "House Chip" and offers[1]["extra"].get("quote"),
-                  "an unsponsored call's 402 offers USDC.e, then CHIP at the same amount with its own quote; not HPP (%s)" % offers)
+                  "an unsponsored call's 402 offers exact in USDC.e, then CHIP at the same amount with its own quote; not HPP (%s)" % offers)
             c0, rc0 = chip_of(cwallet), chip_of(relay_addr)
             st, body, settlement = Buyer(url, ckey, cap=50_000_000, valid_for=3600, asset=CHIP).call("POST", "/commit", json.dumps({"to": FACTORY, "data": cdata}).encode())
             check(st == 200 and settlement and settlement.get("success") and c0 - chip_of(cwallet) == chip_of(relay_addr) - rc0 > 0
                   and balance_usdc(cwallet) == 0,
                   "a wallet holding only CHIP pays its call in CHIP over x402 (%s, %d units)" % (st, c0 - chip_of(cwallet)))
+            # x402 upto in HPP (#358): a wallet holding only HPP, no ETH, never having approved Permit2, pays its call
+            ukey = secrets.token_bytes(32)
+            uwallet = eth.address(ukey)
+            subprocess.run(["cast", "send", "--rpc-url", RPC, "--private-key", KEY0, HPP, "transfer(address,uint256)", uwallet, str(10_000 * 10 ** 18)], check=True, capture_output=True)
+            udl = int(chain.call("eth_getBlockByNumber", "latest", False)["timestamp"], 16) + 3600
+            usig = eth.sign(ukey, eth.typed_digest(fdomain, "CreateRollup(address owner,uint256 checkpointInterval,uint256 nonce,uint256 deadline)",
+                                                  uwallet, 100, 0, udl))
+            udata = encode("createRollupFor(address,uint256,uint256,uint256,bytes)", uwallet, 100, 0, udl, usig)
+            st, body = post_raw(url + "/commit", {"to": FACTORY, "data": udata})
+            uoffer = next((o for o in (body.get("accepts") or []) if o.get("scheme") == "upto"), None) if isinstance(body, dict) else None
+            check(st == 402 and uoffer and uoffer["asset"].lower() == HPP.lower() and uoffer["extra"].get("facilitatorAddress") and uoffer["extra"].get("quote")
+                  and (body.get("extensions") or {}).get("eip2612GasSponsoring"),
+                  "the 402 offers upto in HPP, naming the facilitator, with its quote, and declares the EIP-2612 extension (%s)" % uoffer)
+            u0 = hpp_of(uwallet)
+            st, body, settlement = Buyer(url, ukey, cap=10_000 * 10 ** 18, valid_for=3600, asset=HPP, scheme="upto", rpc=RPC).call(
+                "POST", "/commit", json.dumps({"to": FACTORY, "data": udata}).encode())
+            check(st == 200 and settlement and settlement.get("success") and u0 - hpp_of(uwallet) == int(uoffer["amount"]) > 2 ** 53
+                  and balance_eth(uwallet) == 0,
+                  "a wallet holding only HPP pays its call by x402 upto, Permit2 approved through the facilitator: the quote, past 2^53, and no ETH (%s, %d)" % (st, u0 - hpp_of(uwallet)))
         queue_section(work, keyfile, chain_id)
     finally:
         proc.terminate()

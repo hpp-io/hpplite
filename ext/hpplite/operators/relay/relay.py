@@ -53,7 +53,7 @@ here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(here, ".."))
 from x402seller import eth  # noqa: E402
 from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_by, signed_tx  # noqa: E402
-from x402seller.payments import Payments  # noqa: E402
+from x402seller.payments import EIP2612_DECLARATION, Payments  # noqa: E402
 from x402seller.token import ChainUnreadable, Token, funder_sig_bytes, sig_bytes  # noqa: E402
 from x402seller.assets import amt, asset_info, first_asset, listed, other_offers, parse_asset, to_amount, to_units  # noqa: E402
 
@@ -417,7 +417,18 @@ class Relay:
             ok = until >= now and hmac.compare_digest(str(q["mac"]), self._quote_mac(to, data, amount, gas, until))
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
-        return (amount, gas, until) if ok else None
+        if not ok:
+            return None
+        # an offer in another token (#361, #358) names its amount in that token: the price is the credit units it was
+        # converted from, the one whose conversion gives that amount exactly
+        asset = asset_info(self.assets, accepted.get("asset"))
+        if asset and asset is not self.assets[0]:
+            units = to_units(asset, amount)
+            units = next((u for u in (units, units - 1) if u > 0 and to_amount(asset, u) == amount), None)
+            if units is None:
+                return None
+            amount = units
+        return (amount, gas, until)
 
     def fees(self):
         base = int(self.chain.call("eth_getBlockByNumber", "latest", False).get("baseFeePerGas", "0x0"), 16)
@@ -561,7 +572,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if amount < r.args.min_pull:
             return self.reply(400, {"error": "amount below minPull", "minPull": r.args.min_pull})
         requirements = p.requirements(amount, "http://%s%s" % (self.headers.get("Host", "localhost"), self.path), "top up %s's account at the relay" % funder,
-                                      offers=other_offers(r.assets, amount))      # an offer per token with exact (#361)
+                                      offers=other_offers(r.assets, amount, p.upto_facilitator()))      # an offer per token with exact (#361), or upto (#358)
         header = self.headers.get("PAYMENT-SIGNATURE")
         if not header:
             return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
@@ -709,9 +720,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                           "%s, %d gas, submitted and paid for by the relay" % (name, gas),
                                           r.quote_extra(to, data, amount, gas, until))
             # an offer per other token with exact (#361), each quote MACed over its own amount
-            for asset, tamount, ex in other_offers(r.assets, amount):
-                requirements["accepts"].append(dict(requirements["accepts"][0], asset=asset, amount=str(tamount),
-                                                    extra=dict(ex, **r.quote_extra(to, data, tamount, gas, until))))
+            for o in other_offers(r.assets, amount, p.upto_facilitator()):
+                requirements["accepts"].append(dict(requirements["accepts"][0], scheme=o["scheme"], asset=o["asset"], amount=str(o["amount"]),
+                                                    extra=dict(o["extra"], **r.quote_extra(to, data, o["amount"], gas, until))))
+            if any(a["scheme"] == "upto" for a in requirements["accepts"]):
+                requirements["extensions"] = dict(EIP2612_DECLARATION)
             if sponsor_why:
                 requirements["sponsor"] = {"funder": sponsor, "why": sponsor_why}
             if not header:

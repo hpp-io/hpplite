@@ -70,6 +70,12 @@ fi
 hpp=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --broadcast --json src/test/MockToken.sol:MockToken --constructor-args HousePartyProtocol HPP 1 18 1000000000000000000000000000 2>/dev/null | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' | head -1)
 [ -n "$hpp" ] && echo "MockToken (HPP) $hpp" || echo "MockToken (HPP) not deployed: the HPP store checks will be skipped"
 [ -n "$fork" ] || { [ -n "$chip" ] && echo "MockToken (CHIP) $chip" || echo "MockToken (CHIP) not deployed: the CHIP scenario will be skipped"; }
+# x402 upto (#358): the canonical Permit2 and x402's upto proxy at their addresses, their code as on HPP Sepolia
+# (tests/fixtures/*.runtime.hex; Permit2 builds its domain from the chain it runs on); a fork has them already
+if [ -z "$fork" ]; then
+    cast rpc --rpc-url "$rpc" anvil_setCode 0x000000000022D473030F116dDEE9F6B43aC78BA3 "$(cat "$here/../fixtures/permit2.runtime.hex")" >/dev/null
+    cast rpc --rpc-url "$rpc" anvil_setCode 0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002 "$(cat "$here/../fixtures/x402_upto_permit2_proxy.runtime.hex")" >/dev/null
+fi
 # the x402 facilitator the services pay through on this chain (#183), with a key of its own that no test uses
 fkey=0x0fac11177a70f0fac11177a70f0fac11177a70f0fac11177a70f0fac11177a70
 faddr=$(cast wallet address "$fkey")

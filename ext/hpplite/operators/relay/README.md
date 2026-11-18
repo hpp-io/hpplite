@@ -12,7 +12,7 @@ relay.py --port 8430 --rpc https://sepolia.hpp.io --key-file relay.key \
     --factory 0xbce61e56f84620bc4365e95126f82b51faed7b4e \
     --facilitator https://facilitator-sepolia.hpp.io \
     --extra-asset "0xCHIP,House Chip,1,6,1000000,exact" \
-    --extra-asset "0xHPP,HousePartyProtocol,1,18,10000"     # other tokens (#361), as the store's
+    --extra-asset "0xHPP,HousePartyProtocol,1,18,10000,upto"     # other tokens (#361), as the store's
 ```
 
 ## What it does

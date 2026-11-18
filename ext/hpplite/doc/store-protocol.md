@@ -215,19 +215,19 @@ a millionth of a dollar). Another token converts at its `unitsPerToken`,
 the credit one whole token buys, a decimal string the operator sets and may
 change at any deploy:
 
-| Token | `decimals` | `unitsPerToken` | `exact` |
-|---|---|---|---|
-| USDC.e | 6 | `"1000000"` | yes |
-| CHIP | 6 | `"1000000"` ($1) | yes |
-| HPP | 18 | `"10000"` ($0.01, set by the operator) | no (no EIP-3009) |
+| Token | `decimals` | `unitsPerToken` | `exact` | `upto` |
+|---|---|---|---|---|
+| USDC.e | 6 | `"1000000"` | yes | no |
+| CHIP | 6 | `"1000000"` ($1) | yes | as the operator sets |
+| HPP | 18 | `"10000"` ($0.01, set by the operator) | no (no EIP-3009) | yes |
 
 - A pull converts what is owed into the permit's token at the rate then,
   rounded up (`ceil(owed x 10^decimals / unitsPerToken)`), and credits what
   it pulled, rounded down - never less than was owed.
 - An x402 top-up offers `exact` in each token with `exact: true`, the first
   asset's offer first, each amount converted the same way; the payment
-  credits what its token's amount buys. HPP pays by permit (x402 `upto` is
-  #358).
+  credits what its token's amount buys. A token with `upto: true` gets an
+  `upto` offer too, below.
 - **Token amounts may pass 2^53** (HPP: one is 10^18 units), beyond JSON
   numbers' exact range. In the account view, `balance`, `allowance` and
   `permit.value` are JSON numbers up to 2^53 - 1 and decimal strings past
@@ -338,13 +338,29 @@ Amounts are whole numbers of the asset's atomic units, but
 `pricePerMiBMonth` is a number that may carry a fraction: `30` and `30.0`
 are the same quote, and a client reads it as a decimal (#282).
 
-## Payment (x402 v2, `exact` only)
+## Payment (x402 v2: `exact`, `upto`)
 
 A `402` carries x402 v2 requirements, in the body and base64 in
 `PAYMENT-REQUIRED`: `exact` (EIP-3009 `TransferWithAuthorization`) to
 `payTo`, `extra` naming the token's EIP-712 domain - an offer for each
 [token](#tokens) with `exact`, the first asset's first; the payment names the
-one it took (`accepted`). For a write the amount
+one it took (`accepted`).
+
+**`upto` (#358)**, for a token with `upto: true` when the facilitator takes
+it: an offer with `scheme: "upto"`, `amount` the top-up converted (the
+maximum the payer signs, and what the store settles: the whole of it), and
+`extra.facilitatorAddress`, the facilitator's settling address from its
+`/supported`. The payer signs a Permit2 `PermitWitnessTransferFrom` (domain
+`("Permit2", chainId, 0x000000000022D473030F116dDEE9F6B43aC78BA3)`, no
+version) of that amount to x402's upto proxy
+`0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002`, witness
+`Witness(address to,address facilitator,uint256 validAfter)` naming `payTo`
+and the facilitator; the payload is `{signature, permit2Authorization}` as
+`@x402/evm`'s `UptoEvmScheme` makes it. The `402` declares
+`extensions.eip2612GasSponsoring`: a payer that never approved Permit2
+adds its EIP-2612 permit of the token to Permit2
+(`extensions.eip2612GasSponsoring.info`), and the facilitator sends it with
+the settlement, so the payer needs no ETH. For a write the amount
 is a top-up - the larger of `minPay` and what covers the write and 30 days
 of the account's storage - so an agent pays now and then, not per write;
 for `/pay`, the amount asked. The payer repeats the request with

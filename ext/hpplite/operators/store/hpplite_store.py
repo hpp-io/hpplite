@@ -605,7 +605,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         settled; a settlement that fails takes the credit back (the work stays, owed)"""
         p = self.service.payments
         requirements = p.requirements(amount, "http://%s%s" % (self.headers.get("Host", "localhost"), self.path), description,
-                                      offers=other_offers(self.service.assets, amount))       # the first asset's offer first (#357)
+                                      offers=other_offers(self.service.assets, amount, p.upto_facilitator()))   # the first asset's first (#357); upto (#358)
         header = self.headers.get("PAYMENT-SIGNATURE")
         if not header:
             requirements["error"] = getattr(self, "why402", None) or requirements["error"]

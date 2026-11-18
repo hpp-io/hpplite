@@ -200,7 +200,7 @@ def main():
                                     "--min-pay", "3000", "--sweep-age", "2"]
                        # the other tokens it takes (#357): CHIP at $1 with x402 top-ups, HPP at $0.01 (10000 units) by permit
                        + (["--extra-asset", "%s,House Chip,1,6,1000000,exact" % CHIP] if CHIP else [])
-                       + (["--extra-asset", "%s,HousePartyProtocol,1,18,10000" % HPP] if HPP else []))
+                       + (["--extra-asset", "%s,HousePartyProtocol,1,18,10000,upto" % HPP] if HPP else []))   # HPP by x402 upto too (#358)
     try:
         st = wait_for(lambda: http("GET", url + "/status")[1] if _up(url) else None)
         check(isinstance(st, dict) and st.get("protocol") == "hpplite-store/2", "the store speaks hpplite-store/2")
@@ -532,11 +532,25 @@ def main():
             code, out, hdr = http("POST", url + "/account/%s/pay?amount=3000" % ca)
             hdr = {k.upper(): v for k, v in hdr.items()}
             offers = json.loads(__import__("base64").b64decode(hdr.get("PAYMENT-REQUIRED", "e30="))).get("accepts", [])
-            check(code == 402 and [o["asset"].lower() for o in offers] == [USDC.lower(), CHIP.lower()] and all(o["amount"] == "3000" for o in offers),
-                  "a top-up's 402 offers USDC.e first, then CHIP, 3000 units each, not HPP (%s)" % offers)
+            check(code == 402 and [(o["scheme"], o["asset"].lower(), o["amount"]) for o in offers]
+                  == [("exact", USDC.lower(), "3000"), ("exact", CHIP.lower(), "3000"), ("upto", HPP.lower(), str(3000 * 10 ** 14))]
+                  and offers[2]["extra"].get("facilitatorAddress"),
+                  "a top-up's 402 offers exact in USDC.e and CHIP (3000 units each), then upto in HPP (3x10^17), naming the facilitator (%s)" % offers)
             code, data, _ = Buyer(url, C, 10_000, asset=CHIP).call("POST", "/account/%s/pay?amount=3000" % ca)
             check(code == 200 and data.get("credit") == 3000 and chip_of(pay_to) - before == 3000,
                   "a CHIP top-up by x402: the account credited 3000 units, payTo holds the CHIP (%s %s)" % (code, data))
+            # x402 upto in HPP (#358): a wallet with HPP, no ETH and no approval of Permit2 tops up; the facilitator sends
+            # its EIP-2612 permit to Permit2 with the settlement through x402's upto proxy
+            U = secrets.token_bytes(32)
+            ua = eth.address(U).lower()
+            send(KEY0, HPP, "transfer(address,uint256)", ua, 10 ** 18)
+            h0 = hpp_of(pay_to)
+            code, data, settled = Buyer(url, U, 10 ** 18, asset=HPP, scheme="upto", rpc=RPC).call("POST", "/account/%s/pay?amount=3000" % ua)
+            # payTo also takes the HPP-funded bucket's pulls meanwhile: the payer's side is the exact one
+            check(code == 200 and settled and settled.get("success") and settled.get("amount") == str(3 * 10 ** 17) and data.get("credit") == 3000
+                  and hpp_of(ua) == 10 ** 18 - 3 * 10 ** 17 and hpp_of(pay_to) - h0 >= 3 * 10 ** 17 and int(cast("balance", ua)) == 0,
+                  "an HPP top-up by x402 upto, Permit2 approved by EIP-2612 through the facilitator: 3000 units credited, 0.3 HPP from the payer, who holds no ETH (%s, credit %s, settled %s, payer %d)"
+                  % (code, (data or {}).get("credit"), settled, hpp_of(ua)))
 
         # --- sweep ---
         if CHECK_SWEEP_FILES:

@@ -53,7 +53,11 @@ credits what it pulled rounded down. A `402` offers `exact` in each token
 with `exact: true`, the first asset's first, each with its amount converted
 and its own `extra.quote` (the MAC is over that offer's amount); the payment
 names the offer it took. HPP has no `exact` (no EIP-3009): a sponsor pays in
-it by permit.
+it by permit, and a caller by `upto` (#358) as the store offers it
+([store-protocol.md, Payment](store-protocol.md#payment-x402-v2-exact-upto)):
+each `upto` offer carries its quote too, MACed over its amount in its token,
+and the relay settles the whole quote. A payment naming an offer in another
+token is honoured at the credit units its amount was converted from.
 
 ## The price and the quote
 

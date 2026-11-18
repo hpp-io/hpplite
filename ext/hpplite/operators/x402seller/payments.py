@@ -10,6 +10,12 @@ import urllib.error
 import urllib.request
 
 
+# what a seller's 402 declares beside an upto offer (#358): the facilitator sends the payer's EIP-2612 permit of the token to
+# Permit2 with the settlement, so a payer who never approved Permit2, and holds no ETH, still pays (@x402/extensions)
+EIP2612_DECLARATION = {"eip2612GasSponsoring": {"info": {
+    "description": "The facilitator accepts EIP-2612 gasless Permit to `Permit2` canonical contract.", "version": "1"}}}
+
+
 class Payments:
     """Quote a price in a 402, verify and settle a payment through the facilitator."""
 
@@ -28,7 +34,8 @@ class Payments:
 
     def requirements(self, amount: int, resource_url: str, description: str, extra=None, offers=None):
         """The 402. extra: fields every offer carries besides the token's (the relay's signed quote, #184); offers:
-        (asset, amount, token extra) for other tokens the payer may choose, after this one (#357)"""
+        {scheme, asset, amount, extra} the payer may choose instead, after this one (#357, #358). An upto offer declares
+        the EIP-2612 extension: the facilitator sends the payer's Permit2 approval, so a payer with no ETH pays"""
         out = {
             "x402Version": 2,
             "error": "PAYMENT-SIGNATURE header is required",
@@ -37,20 +44,39 @@ class Payments:
                 "scheme": "exact", "network": self.network, "amount": str(amount), "asset": self.asset,
                 "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": self.extra,
             }] + [{
-                "scheme": "exact", "network": self.network, "amount": str(amt), "asset": asset,
-                "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": ex,
-            } for asset, amt, ex in (offers or [])],
+                "scheme": o["scheme"], "network": self.network, "amount": str(o["amount"]), "asset": o["asset"],
+                "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": o["extra"],
+            } for o in (offers or [])],
         }
         for a in out["accepts"]:
-            a["extra"] = dict(a["extra"], **(extra or {}))
+            a["extra"] = dict(extra or {}, **a["extra"])       # an offer's own fields (its quote) over the common ones
+        if any(a["scheme"] == "upto" for a in out["accepts"]):
+            out["extensions"] = dict(EIP2612_DECLARATION)
         return out
+
+    def upto_facilitator(self):
+        """the address the facilitator settles upto from (its /supported upto entry's extra.facilitatorAddress), or None
+        when it takes no upto; asked once, and again after a failed ask"""
+        if not self.enabled:
+            return None
+        if getattr(self, "_upto", None) is None:
+            try:
+                req = urllib.request.Request(self.facilitator + "/supported", headers={
+                    "Accept": "application/json", "User-Agent": "hpplite-operators/1 (+https://github.com/hpp-io/hpplite)"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    kinds = json.loads(r.read()).get("kinds", [])
+                k = next((k for k in kinds if k.get("scheme") == "upto" and k.get("network") == self.network), None)
+                self._upto = ((k.get("extra") or {}).get("facilitatorAddress") or "") if k else ""
+            except (OSError, ValueError):
+                return None
+        return self._upto or None
 
     @staticmethod
     def offer_paid(payload, requirements):
-        """the offer the payment says it took (x402 v2's `accepted`), by its asset; the first when it names none"""
+        """the offer the payment says it took (x402 v2's `accepted`), by its asset and scheme; the first when it names none"""
         acc = payload.get("accepted") if isinstance(payload.get("accepted"), dict) else {}
-        asset = str(acc.get("asset", "")).lower()
-        return next((a for a in requirements["accepts"] if a["asset"].lower() == asset), requirements["accepts"][0])
+        asset, scheme = str(acc.get("asset", "")).lower(), acc.get("scheme", "exact")
+        return next((a for a in requirements["accepts"] if a["asset"].lower() == asset and a["scheme"] == scheme), requirements["accepts"][0])
 
     def decode(self, header: str):
         try:

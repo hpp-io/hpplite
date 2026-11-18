@@ -15,7 +15,7 @@ hpplite_store.py --port 8420 --dir /var/lib/hpplite-store --signer-key /etc/hppl
 hpplite_store.py ... --price-per-write 0 --price-per-mib-month 0        # free (development)
 
 hpplite_store.py ... --extra-asset "0xCHIP,House Chip,1,6,1000000,exact" \
-    --extra-asset "0xHPP,HousePartyProtocol,1,18,10000"                 # other tokens (#357): CHIP at $1, HPP at $0.01, by permit
+    --extra-asset "0xHPP,HousePartyProtocol,1,18,10000,upto"                 # other tokens (#357): CHIP at $1, HPP at $0.01 by permit or x402 upto (#358)
 ```
 
 ## The model

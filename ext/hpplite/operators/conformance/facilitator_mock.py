@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """An x402 facilitator for anvil (#183): /verify, /settle and /supported for
-`exact` (EIP-3009 transferWithAuthorization), sending the transactions with
-its own key. The services only ever talk to a facilitator URL; this one stands
+`exact` (EIP-3009 transferWithAuthorization) and `upto` (#358: a Permit2
+PermitWitnessTransferFrom settled through x402UptoPermit2Proxy, with the
+payer's EIP-2612 permit to Permit2 when it brings one), sending the
+transactions with its own key. The services only ever talk to a facilitator URL; this one stands
 in for HPP's on a test chain, and behaves as HPP's was found to:
 
 - /settle answers a body it has seen settle with its earlier result and
@@ -28,6 +30,12 @@ from x402seller import eth  # noqa: E402
 from x402seller.chain import Chain, RpcError, revert_reason, selector  # noqa: E402
 
 TRANSFER_SIG = "transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32)"
+# upto (#358): the canonical Permit2 and x402's upto proxy, at their addresses on every chain (tests/l1/anvil_test.sh puts
+# their code there on anvil)
+PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+UPTO_PROXY = "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002"
+SETTLE_SIG = "settle(((address,uint256),uint256,uint256),uint256,address,(address,address,uint256),bytes)"
+SETTLE_PERMIT_SIG = "settleWithPermit((uint256,uint256,bytes32,bytes32,uint8),((address,uint256),uint256,uint256),uint256,address,(address,address,uint256),bytes)"
 
 
 class Facilitator:
@@ -106,9 +114,63 @@ class Facilitator:
         self.spent.add(auth["nonce"].lower())
         return {"success": True, "payer": auth["from"], "transaction": tx, "network": self.network}
 
+    # --- upto (#358) ---
+    def _upto_data(self, payload, amount):
+        """the proxy's settle calldata for this payload and amount: settleWithPermit when it brings an EIP-2612 permit
+        and the payer's allowance to Permit2 is short"""
+        a = payload["payload"]["permit2Authorization"]
+        args = ["((%s,%s),%s,%s)" % (a["permitted"]["token"], a["permitted"]["amount"], a["nonce"], a["deadline"]), str(amount), a["from"],
+                "(%s,%s,%s)" % (a["witness"]["to"], a["witness"]["facilitator"], a["witness"]["validAfter"]), payload["payload"]["signature"]]
+        info = ((payload.get("extensions") or {}).get("eip2612GasSponsoring") or {}).get("info")
+        if info:
+            allowed = int(self.chain.call("eth_call", {"to": a["permitted"]["token"], "data": "0x" + selector("allowance(address,address)")
+                                                       + eth.word(a["from"]).hex() + eth.word(PERMIT2).hex()}, "latest") or "0x0", 16)
+            if allowed < int(a["permitted"]["amount"]):
+                sig = bytes.fromhex(info["signature"][2:])
+                args = ["(%s,%s,0x%s,0x%s,%d)" % (info["amount"], info["deadline"], sig[:32].hex(), sig[32:64].hex(), sig[64])] + args
+                return self.calldata(SETTLE_PERMIT_SIG, *args)
+        return self.calldata(SETTLE_SIG, *args)
+
+    def calldata(self, sig, *args):
+        r = subprocess.run(["cast", "calldata", sig] + list(args), capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise ValueError((r.stderr or "cast calldata failed").strip()[:200])
+        return r.stdout.strip()
+
+    def verify_upto(self, payload, req):
+        acc = payload.get("accepted", {})
+        a = payload["payload"]["permit2Authorization"]
+        if acc.get("scheme") != "upto" or acc.get("network") != self.network or a["permitted"]["token"].lower() != req["asset"].lower():
+            return {"isValid": False, "invalidReason": "unsupported_scheme"}
+        if int(a["permitted"]["amount"]) != int(req["amount"]) or a["witness"]["to"].lower() != req["payTo"].lower():
+            return {"isValid": False, "invalidReason": "invalid_upto_evm_payload_recipient_mismatch"}
+        if a["witness"]["facilitator"].lower() != self.address.lower() or a["spender"].lower() != UPTO_PROXY.lower():
+            return {"isValid": False, "invalidReason": "upto_facilitator_mismatch"}
+        now = self.chain_now()
+        if not (int(a["witness"]["validAfter"]) <= now < int(a["deadline"])):
+            return {"isValid": False, "invalidReason": "invalid_upto_evm_payload_deadline"}
+        try:
+            self.chain.call("eth_call", {"from": self.address, "to": UPTO_PROXY, "data": self._upto_data(payload, int(req["amount"]))}, "latest")
+        except RpcError as e:
+            return {"isValid": False, "invalidReason": "invalid_upto_evm_payload_signature", "invalidMessage": revert_reason(e)}
+        except (OSError, ValueError, KeyError) as e:
+            return {"isValid": False, "invalidReason": "rpc_error", "invalidMessage": str(e)}
+        return {"isValid": True, "payer": a["from"]}
+
+    def settle_upto(self, payload, req):
+        """settles req's amount (at most the signed maximum): the seller's actual charge"""
+        a = payload["payload"]["permit2Authorization"]
+        try:
+            tx = self.cast(UPTO_PROXY, self._upto_data(payload, int(req["amount"])), send=True)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as e:
+            return {"success": False, "errorReason": "settle_failed", "errorMessage": str(e), "transaction": "", "network": self.network}
+        return {"success": True, "payer": a["from"], "transaction": tx, "network": self.network, "amount": str(req["amount"])}
+
     # --- the endpoints ---
     def verify(self, body):
         payload, req = body["paymentPayload"], body["paymentRequirements"]
+        if (payload.get("accepted") or {}).get("scheme") == "upto":
+            return self.verify_upto(payload, req)
         return self.verify_exact(payload, req)
 
     def settle(self, body):
@@ -116,14 +178,16 @@ class Facilitator:
         if self.settle_cache and key in self.cache:
             return self.cache[key]             # as HPP's: the same body, the earlier answer, nothing sent
         req = body["paymentRequirements"]
-        out = self.settle_exact(body["paymentPayload"], req)
+        upto = (body["paymentPayload"].get("accepted") or {}).get("scheme") == "upto"
+        out = (self.settle_upto if upto else self.settle_exact)(body["paymentPayload"], req)
         if self.settle_cache and out.get("success"):
             self.cache[key] = out
         return out
 
     def supported(self):
-        return {"kinds": [{"x402Version": 2, "scheme": "exact", "network": self.network}],
-                "signers": {self.network: [self.address]}}
+        return {"kinds": [{"x402Version": 2, "scheme": "exact", "network": self.network},
+                          {"x402Version": 2, "scheme": "upto", "network": self.network, "extra": {"facilitatorAddress": self.address}}],
+                "extensions": ["eip2612GasSponsoring"], "signers": {self.network: [self.address]}}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):

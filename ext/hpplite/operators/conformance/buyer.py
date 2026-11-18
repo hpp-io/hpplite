@@ -28,8 +28,26 @@ class OverCap(Exception):
     pass
 
 
+PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+UPTO_PROXY = "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002"
+
+
+def permit2_upto_digest(chain_id, auth):
+    """the EIP-712 digest of an upto Permit2 PermitWitnessTransferFrom (#358): Permit2's domain has no version"""
+    k = eth.keccak256
+    domain = k(k(b"EIP712Domain(string name,uint256 chainId,address verifyingContract)") + k(b"Permit2")
+               + eth.word(chain_id) + eth.word(PERMIT2))
+    tp = k(k(b"TokenPermissions(address token,uint256 amount)") + eth.word(auth["permitted"]["token"]) + eth.word(int(auth["permitted"]["amount"])))
+    w = auth["witness"]
+    wh = k(k(b"Witness(address to,address facilitator,uint256 validAfter)") + eth.word(w["to"]) + eth.word(w["facilitator"]) + eth.word(int(w["validAfter"])))
+    typ = (b"PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,Witness witness)"
+           b"TokenPermissions(address token,uint256 amount)Witness(address to,address facilitator,uint256 validAfter)")
+    struct = k(k(typ) + tp + eth.word(auth["spender"]) + eth.word(int(auth["nonce"])) + eth.word(int(auth["deadline"])) + wh)
+    return k(b"\x19\x01" + domain + struct)
+
+
 class Buyer:
-    def __init__(self, service, key: bytes, cap: int, valid_for: int = 120, asset=None):
+    def __init__(self, service, key: bytes, cap: int, valid_for: int = 120, asset=None, scheme="exact", rpc=None):
         u = urllib.parse.urlparse(service)
         self.host, self.port = u.hostname, u.port or 80
         self.key = key
@@ -38,6 +56,8 @@ class Buyer:
         self.valid_for = valid_for   # the authorization's window; a test chain whose clock ran ahead needs a wide one
         self.paid = []          # settlements
         self.asset = asset      # pay in this token's offer when the 402 has several (#357); else the first
+        self.scheme = scheme    # exact, or upto (#358: a Permit2 transfer the facilitator settles through x402's proxy)
+        self.rpc = rpc          # upto: the chain, to read the allowance to Permit2 and the token's permit nonce
 
     def _request(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection(self.host, self.port, timeout=120)
@@ -52,13 +72,15 @@ class Buyer:
 
     def _payment(self, requirements_header: str) -> str:
         req = json.loads(base64.b64decode(requirements_header))
-        acc = next((a for a in req.get("accepts", []) if a.get("scheme") == "exact"
+        acc = next((a for a in req.get("accepts", []) if a.get("scheme") == self.scheme
                     and (not self.asset or a.get("asset", "").lower() == self.asset.lower())), None)
         if not acc:
-            raise ValueError("no exact-scheme offer in the 402")
+            raise ValueError("no %s-scheme offer in the 402" % self.scheme)
         amount = int(acc["amount"])
         if amount > self.cap:
             raise OverCap("the service asks %d, the cap is %d" % (amount, self.cap))
+        if self.scheme == "upto":
+            return base64.b64encode(json.dumps(self._upto(req, acc, amount)).encode()).decode()
         chain_id = int(acc["network"].split(":")[1])
         domain = eth.domain_separator(acc["extra"]["name"], acc["extra"]["version"], chain_id, acc["asset"])
         now = int(time.time())
@@ -70,6 +92,35 @@ class Buyer:
         payload = {"x402Version": 2, "resource": req.get("resource"), "accepted": acc,
                    "payload": {"signature": "0x" + sig.hex(), "authorization": auth}, "extensions": {}}
         return base64.b64encode(json.dumps(payload).encode()).decode()
+
+    def _view(self, to, sig, *words):
+        from x402seller.chain import Chain, selector
+        out = Chain(self.rpc).call("eth_call", {"to": to, "data": "0x" + selector(sig) + "".join(eth.word(w).hex() for w in words)}, "latest")
+        return int(out or "0x0", 16)
+
+    def _upto(self, req, acc, amount):
+        """the upto payload (#358), as @x402/evm's UptoEvmScheme makes it: a Permit2 PermitWitnessTransferFrom of the
+        offer's amount to x402's upto proxy, the witness naming payTo and the facilitator; and, when the 402 declares
+        the EIP-2612 extension and the allowance to Permit2 is short, the token's permit to Permit2 for the facilitator
+        to send"""
+        chain_id = int(acc["network"].split(":")[1])
+        now = int(time.time())
+        auth = {"from": self.address, "permitted": {"token": acc["asset"], "amount": str(amount)}, "spender": UPTO_PROXY,
+                "nonce": str(int.from_bytes(eth.random_nonce(), "big")), "deadline": str(now + int(acc.get("maxTimeoutSeconds", 120))),
+                "witness": {"to": acc["payTo"], "facilitator": acc["extra"]["facilitatorAddress"], "validAfter": str(now - 600)}}
+        payload = {"x402Version": 2, "resource": req.get("resource"), "accepted": acc,
+                   "payload": {"signature": "0x" + eth.sign(self.key, permit2_upto_digest(chain_id, auth)).hex(), "permit2Authorization": auth},
+                   "extensions": {}}
+        if (req.get("extensions") or {}).get("eip2612GasSponsoring") and self.rpc \
+                and self._view(acc["asset"], "allowance(address,address)", self.address, PERMIT2) < amount:
+            nonce = self._view(acc["asset"], "nonces(address)", self.address)
+            domain = eth.domain_separator(acc["extra"]["name"], acc["extra"]["version"], chain_id, acc["asset"])
+            digest = eth.typed_digest(domain, "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+                                      self.address, PERMIT2, amount, nonce, int(auth["deadline"]))
+            payload["extensions"]["eip2612GasSponsoring"] = {"info": {
+                "from": self.address, "asset": acc["asset"], "spender": PERMIT2, "amount": str(amount), "nonce": str(nonce),
+                "deadline": auth["deadline"], "signature": "0x" + eth.sign(self.key, digest).hex(), "version": "1"}}
+        return payload
 
     def call(self, method, path, body=None):
         """The request; on 402, paid and repeated. (status, json-or-bytes, settlement-or-None)."""
