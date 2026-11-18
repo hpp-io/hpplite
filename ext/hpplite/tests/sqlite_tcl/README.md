@@ -147,7 +147,12 @@ What fails in the other 44, by cause:
   scheduled on `test.db-journal`; HPPLite's file is in WAL and the child has
   no HPPLite. From the first iteration the file reads as `database disk
   image is malformed`, in the child and in the parent's integrity check.
-  Not analysed further here; it needs a look at what the child writes.
+  It is the harness, not HPPLite (#122, 2026-11-18): stock SQLite with only
+  `PRAGMA journal_mode=WAL` added to the test's first statements, no
+  HPPLite loaded, fails the same way - 1000 errors out of 2001, "malformed"
+  - while the unchanged test passes 3175 of 3175. The crash VFS models a
+  rollback journal (the crash is scheduled on `test.db-journal`); a file in
+  WAL is outside what it simulates.
 
 ## How to read a difference
 
