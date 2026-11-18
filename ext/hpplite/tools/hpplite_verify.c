@@ -263,7 +263,14 @@ int main(int argc, char **argv) {
         rebuilt = height > 0 ? (uint64_t)height - 1 : 0;
         if (atMs && node->syncAtReached) target = rebuilt;           /* the next batch was written after the time */
         if (rebuilt >= target || node->state == HPPLITE_STATE_ERROR) break;
-        if (hpplite_node_sync_from_l1(node, 1) <= 0) break;
+        if (hpplite_node_sync_from_l1(node, 1) <= 0) {
+            /* nothing new applied - but the sync may have settled what the store served past the last anchor, now
+            ** anchored: the height is the one after it, not the one read before it (#362, the nightly soak's
+            ** "926 batches on chain, 461 replayed" with every root matched) */
+            height = scalar(db, "SELECT height FROM hpplite_status");
+            rebuilt = height > 0 ? (uint64_t)height - 1 : 0;
+            break;
+        }
     }
     const char *zState = status_text(db, "state");
     const char *zErr = status_text(db, "last_error");
