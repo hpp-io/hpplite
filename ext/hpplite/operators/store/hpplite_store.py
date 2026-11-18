@@ -42,6 +42,7 @@ from x402seller import eth  # noqa: E402
 from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_by, signed_tx  # noqa: E402
 from x402seller.payments import Payments  # noqa: E402
 from x402seller.token import ChainUnreadable, Token, funder_sig_bytes  # noqa: E402
+from x402seller.assets import amt, asset_info, first_asset, listed, other_offers, parse_asset, to_amount, to_units  # noqa: E402
 
 PROTOCOL = "hpplite-store/2"
 MIB = 1024 * 1024
@@ -99,40 +100,6 @@ def sig_bytes(h):
 
 def same(a, b):
     return bool(a) and bool(b) and a.lower() == b.lower()
-
-# ============ The tokens a store takes (#357) ============
-# Credit is in the first asset's atomic units; another token converts at its unitsPerToken (credit units for one whole
-# token: USDC.e and CHIP 1000000, HPP at $0.01 10000). A token amount may pass 2^53 (HPP has 18 decimals).
-
-SAFE = 2 ** 53 - 1
-
-
-def asset_info(assets, address):
-    return next((x for x in assets if same(x["asset"], address)), None) if address else None
-
-
-def to_units(asset, amount):
-    """credit units for an amount of the token, rounded down"""
-    return int(amount) * asset["unitsPerToken"] // 10 ** asset["decimals"]
-
-
-def to_amount(asset, units):
-    """the token amount that buys these credit units, rounded up"""
-    return -(-int(units) * 10 ** asset["decimals"] // asset["unitsPerToken"])
-
-
-def amt(n):
-    """a token amount in JSON: a number up to 2^53 - 1, past it a decimal string (#357)"""
-    return None if n is None else (int(n) if int(n) <= SAFE else str(int(n)))
-
-
-def parse_asset(text):
-    """--extra-asset ADDRESS,NAME,VERSION,DECIMALS,UNITS_PER_TOKEN[,exact]"""
-    f = [x.strip() for x in text.split(",")]
-    if len(f) not in (5, 6) or not ADDR_RE.match(f[0]) or (len(f) == 6 and f[5] != "exact"):
-        raise argparse.ArgumentTypeError("an asset is ADDRESS,NAME,VERSION,DECIMALS,UNITS_PER_TOKEN[,exact]")
-    return {"asset": f[0].lower(), "name": f[1], "version": f[2], "decimals": int(f[3]), "unitsPerToken": int(f[4]),
-            "exact": len(f) == 6}
 
 # ============ Objects on disk ============
 
@@ -542,8 +509,7 @@ class Service:
         self.chain = chain                  # a smart wallet's signature is checked by asking it (#356)
         self.rollups = Rollups(chain) if chain else None
         # the first asset, then any others (#357); one lock for the spender's nonces whatever the token
-        self.assets = [{"asset": args.asset.lower(), "name": args.asset_name, "version": args.asset_version, "decimals": args.asset_decimals,
-                        "unitsPerToken": 10 ** args.asset_decimals, "exact": True}] + list(args.extra_asset or [])
+        self.assets = [first_asset(args.asset, args.asset_name, args.asset_version, args.asset_decimals)] + list(args.extra_asset or [])
         lock = threading.Lock()
         tokens = {x["asset"]: Token(chain, x["asset"], spender_key, self.chain_id, lock=lock) for x in self.assets} if chain else None
         self.ledger = Ledger(args, self.disk, key, self.chain_id, self.rollups, tokens, self.assets)
@@ -572,8 +538,7 @@ class Service:
                         "payTo": a.pay_to, "spender": self.spender, "pricePerWrite": a.price_per_write,
                         "pricePerMiBMonth": a.price_per_mib_month, "pullThreshold": a.pull_threshold,
                         "pullIntervalSeconds": a.pull_interval, "parkSeconds": a.park_seconds,
-                        "assets": [{"asset": x["asset"], "name": x["name"], "version": x["version"], "decimals": x["decimals"],
-                                    "unitsPerToken": str(x["unitsPerToken"]), "exact": x["exact"]} for x in self.assets]},
+                        "assets": listed(self.assets)},
             "payment": {"scheme": "exact", "network": a.network, "facilitator": a.facilitator, "minPay": a.min_pay,
                         "extra": {"name": a.asset_name, "version": a.asset_version}} if self.payments.enabled else None,
             "chain": bool(a.rpc), "warnings": self.ledger.warnings, "uptime": int(time.time()) - self.started,
@@ -639,10 +604,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """402 until a payment for `amount` verifies; then the account is credited, the work done, the payment
         settled; a settlement that fails takes the credit back (the work stays, owed)"""
         p = self.service.payments
-        offers = [(x["asset"], to_amount(x, amount), {"name": x["name"], "version": x["version"]})
-                  for x in self.service.assets[1:] if x["exact"]]       # the first asset's offer first (#357)
         requirements = p.requirements(amount, "http://%s%s" % (self.headers.get("Host", "localhost"), self.path), description,
-                                      offers=offers)
+                                      offers=other_offers(self.service.assets, amount))       # the first asset's offer first (#357)
         header = self.headers.get("PAYMENT-SIGNATURE")
         if not header:
             requirements["error"] = getattr(self, "why402", None) or requirements["error"]

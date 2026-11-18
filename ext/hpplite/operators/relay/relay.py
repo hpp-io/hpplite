@@ -55,6 +55,7 @@ from x402seller import eth  # noqa: E402
 from x402seller.chain import Chain, RpcError, revert_reason, selector, signed_by, signed_tx  # noqa: E402
 from x402seller.payments import Payments  # noqa: E402
 from x402seller.token import ChainUnreadable, Token, funder_sig_bytes, sig_bytes  # noqa: E402
+from x402seller.assets import amt, asset_info, first_asset, listed, other_offers, parse_asset, to_amount, to_units  # noqa: E402
 
 
 FACTORY_CALLS = {selector("createRollupFor(address,uint256,uint256,uint256,bytes)"): "createRollupFor"}
@@ -88,8 +89,9 @@ class Accounts:
     """Funders' accounts and the rollups they sponsor (#276), as JSON files under --dir. An account is credited by
     x402 top-ups or by pulls from the funder's EIP-2612 permit; a sponsored rollup's calls are charged to it."""
 
-    def __init__(self, directory, token, pay_to, min_pull):
-        self.dir, self.token, self.pay_to, self.min_pull = directory, token, pay_to, min_pull
+    def __init__(self, directory, tokens, assets, pay_to, min_pull):
+        # the tokens it takes (#361): credit is in the first's units, a permit in any of them
+        self.dir, self.tokens, self.assets, self.pay_to, self.min_pull = directory, tokens, assets, pay_to, min_pull
         self.lock = threading.Lock()
         for sub in ("a", "s"):
             os.makedirs(os.path.join(directory, sub), exist_ok=True)
@@ -175,10 +177,19 @@ class Accounts:
             self._save("s", rollup, s)
             return 200, self.view_sponsor(rollup)
 
-    def give_permit(self, funder, value, deadline, sig):
+    def asset_of(self, a):
+        """the asset an account's permit is in: the first asset's when it names none (before #361)"""
+        return asset_info(self.assets, (a.get("permit") or {}).get("asset")) or self.assets[0]
+
+    def token_of(self, a):
+        return self.tokens[self.asset_of(a)["asset"]]
+
+    def give_permit(self, funder, value, deadline, sig, asset):
         with self.lock:
             a = self.account(funder, create=True)
-            a["permit"] = {"value": value, "deadline": deadline, "spender": self.token.spender, "signature": "0x" + sig.hex()}
+            # one permit an account: a newer one, in any token, replaces it (#361)
+            a["permit"] = {"value": value, "deadline": deadline, "spender": self.tokens[asset].spender, "signature": "0x" + sig.hex(),
+                           "asset": asset}
             a["permitSent"], a["uncovered"], a["why"] = False, False, ""
             self._save("a", funder, a)
             return a
@@ -245,27 +256,29 @@ class Accounts:
         if not p or int(p["deadline"]) <= now:
             return "the sponsor's account holds %d and has no permit to pull from" % a["credit"]
         pull = max(self.min_pull, amount - a["credit"])
+        asset, token = self.asset_of(a), self.token_of(a)
+        tokens = to_amount(asset, pull)         # the pull in the permit's token, rounded up (#361)
 
         def refused(why):
             a["uncovered"], a["why"] = True, why
             return why
         try:
             if not a.get("permitSent"):
-                if self.token.allowance(a["funder"]) < pull:
-                    outcome, why = self.token.send(self.token.permit_data(a["funder"], p))
+                if token.allowance(a["funder"]) < tokens:
+                    outcome, why = token.send(token.permit_data(a["funder"], p))
                     if outcome == "refused":
                         return refused("the permit was refused: " + why)
                     if outcome != "ok":
                         return "the permit could not be sent: " + why
                 a["permitSent"] = True
-            outcome, why = self.token.send(self.token.transfer_data(a["funder"], self.pay_to, pull))
+            outcome, why = token.send(token.transfer_data(a["funder"], self.pay_to, tokens))
         except ChainUnreadable as e:
             return "the chain cannot be read: %s" % e
         if outcome == "refused":
             return refused("the pull was refused: " + why)
         if outcome != "ok":
             return "the pull could not be sent: " + why
-        a["credit"] += pull
+        a["credit"] += to_units(asset, tokens)
         a["lastPull"] = now
         return None
 
@@ -273,13 +286,14 @@ class Accounts:
         a = self.account(funder)
         if not a:
             return None
+        token, asset = self.token_of(a), self.asset_of(a)["asset"]      # the permit's token: balance, allowance, nonce (#361)
         try:
-            bal, allow, nonce = self.token.balance(funder), self.token.allowance(funder), self.token.nonce(funder)
+            bal, allow, nonce = token.balance(funder), token.allowance(funder), token.nonce(funder)
         except ChainUnreadable:
             bal = allow = nonce = None
         p = a.get("permit")
-        return {"funder": a["funder"], "credit": a["credit"], "balance": bal, "allowance": allow, "permitNonce": nonce,
-                "permit": {"value": p["value"], "deadline": p["deadline"], "sent": a.get("permitSent", False)} if p else None,
+        return {"funder": a["funder"], "credit": a["credit"], "asset": asset, "balance": amt(bal), "allowance": amt(allow), "permitNonce": nonce,
+                "permit": {"value": amt(p["value"]), "deadline": p["deadline"], "sent": a.get("permitSent", False), "asset": asset} if p else None,
                 "rollups": self.rollups_of(funder), "state": "uncovered" if a.get("uncovered") else "covered", "why": a.get("why", "")}
 
     def view_sponsor(self, rollup):
@@ -343,8 +357,11 @@ class Relay:
         # accounts and sponsorship (#276): the funder's messages in the relay's domain; pulls by the relay's own key
         self.pay_to = pay_to.lower()
         self.domain = eth.domain_separator("HPPLiteRelay", "1", self.chain_id, self.pay_to)
-        self.token = Token(self.chain, args.asset, self.key, self.chain_id, args.receipt_timeout, self.lock)   # one lock: one nonce
-        self.accounts = Accounts(args.dir, self.token, self.pay_to, args.min_pull)
+        # the first asset, then any others (#361); one lock: one nonce, whatever the token
+        self.assets = [first_asset(args.asset, args.asset_name, args.asset_version, args.asset_decimals)] + list(args.extra_asset or [])
+        self.tokens = {x["asset"]: Token(self.chain, x["asset"], self.key, self.chain_id, args.receipt_timeout, self.lock) for x in self.assets}
+        self.token = self.tokens[self.assets[0]["asset"]]
+        self.accounts = Accounts(args.dir, self.tokens, self.assets, self.pay_to, args.min_pull)
         self.submitted = 0
         self.started = int(time.time())
 
@@ -450,7 +467,8 @@ class Relay:
                        if self.payments.enabled else None,
             "accounts": {"spender": self.address, "payTo": self.pay_to, "minPull": self.args.min_pull,
                          "domain": {"name": "HPPLiteRelay", "version": "1", "chainId": self.chain_id, "verifyingContract": self.pay_to},
-                         "asset": self.args.asset, "assetDomain": {"name": self.args.asset_name, "version": self.args.asset_version}}
+                         "asset": self.args.asset, "assetDomain": {"name": self.args.asset_name, "version": self.args.asset_version},
+                         "assets": listed(self.assets)}
                         if self.payments.enabled else None,
             "uptime": int(time.time()) - self.started,
         }
@@ -513,19 +531,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(400, {"error": "a permit is {value, deadline, signature} (or v, r, s)"})
         if not sig or deadline <= int(time.time()):
             return self.reply(400, {"error": "a permit with a signature and a deadline ahead"})
+        asset = asset_info(r.assets, req.get("asset")) if req.get("asset") else r.assets[0]     # its token (#361)
+        if not asset:
+            return self.reply(400, {"error": "this relay takes no such asset", "assets": [x["asset"] for x in r.assets]})
+        token = r.tokens[asset["asset"]]
         try:
-            nonce = r.token.nonce(funder)
+            nonce = token.nonce(funder)
         except ChainUnreadable as e:
             return self.reply(503, {"error": "the chain cannot be read: %s" % e})
-        domain = eth.domain_separator(r.args.asset_name, r.args.asset_version, r.chain_id, r.args.asset)
-        digest = eth.typed_digest(domain, PERMIT_TYPE, funder, r.token.spender, value, nonce, deadline)
+        domain = eth.domain_separator(asset["name"], asset["version"], r.chain_id, asset["asset"])
+        digest = eth.typed_digest(domain, PERMIT_TYPE, funder, token.spender, value, nonce, deadline)
         try:
             funded = signed_by(r.chain, funder, digest, sig)     # or a smart wallet's (#356)
         except ChainUnreadable as e:
             return self.reply(503, {"error": "the chain cannot be read: %s" % e})
         if not funded:
-            return self.reply(401, {"error": "the permit does not recover to the funder (spender, nonce, domain?)", "spender": r.token.spender, "nonce": nonce})
-        r.accounts.give_permit(funder, value, deadline, sig)
+            return self.reply(401, {"error": "the permit does not recover to the funder (spender, nonce, domain?)", "spender": token.spender, "nonce": nonce})
+        r.accounts.give_permit(funder, value, deadline, sig, asset["asset"])
         return self.reply(200, r.accounts.view_account(funder))
 
     def post_pay(self, funder, query):
@@ -538,21 +560,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(404, {"error": "this relay takes no x402 payments: give a permit"})
         if amount < r.args.min_pull:
             return self.reply(400, {"error": "amount below minPull", "minPull": r.args.min_pull})
-        requirements = p.requirements(amount, "http://%s%s" % (self.headers.get("Host", "localhost"), self.path), "top up %s's account at the relay" % funder)
+        requirements = p.requirements(amount, "http://%s%s" % (self.headers.get("Host", "localhost"), self.path), "top up %s's account at the relay" % funder,
+                                      offers=other_offers(r.assets, amount))      # an offer per token with exact (#361)
         header = self.headers.get("PAYMENT-SIGNATURE")
         if not header:
             return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
         payload = p.decode(header)
         if not payload or "payload" not in payload:
             return self.reply(400, {"error": "PAYMENT-SIGNATURE is not a payment payload"})
-        v = p.verify(payload, requirements["accepts"][0])
+        offer = p.offer_paid(payload, requirements)
+        v = p.verify(payload, offer)
         if not v.get("isValid"):
             requirements["error"] = v.get("invalidReason", "invalid payment")
             return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
-        st = p.settle(payload, requirements["accepts"][0])
+        st = p.settle(payload, offer)
         if not st.get("success"):
             return self.reply(402, {"error": "settlement failed: " + st.get("errorReason", "?"), "settlement": st})
-        r.accounts.credit(funder, amount)
+        r.accounts.credit(funder, to_units(asset_info(r.assets, offer["asset"]) or r.assets[0], int(offer["amount"])))
         return self.reply(200, r.accounts.view_account(funder), {"PAYMENT-RESPONSE": base64.b64encode(json.dumps(st).encode()).decode()})
 
     def post_sponsor(self, rollup, action):
@@ -684,12 +708,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             requirements = p.requirements(amount, "http://%s/commit" % self.headers.get("Host", "localhost"),
                                           "%s, %d gas, submitted and paid for by the relay" % (name, gas),
                                           r.quote_extra(to, data, amount, gas, until))
+            # an offer per other token with exact (#361), each quote MACed over its own amount
+            for asset, tamount, ex in other_offers(r.assets, amount):
+                requirements["accepts"].append(dict(requirements["accepts"][0], asset=asset, amount=str(tamount),
+                                                    extra=dict(ex, **r.quote_extra(to, data, tamount, gas, until))))
             if sponsor_why:
                 requirements["sponsor"] = {"funder": sponsor, "why": sponsor_why}
             if not header:
                 return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
+        offer = p.offer_paid(payload, requirements) if p.enabled else None
         if p.enabled:
-            v = p.verify(payload, requirements["accepts"][0])
+            v = p.verify(payload, offer)
             if not v.get("isValid"):
                 requirements["error"] = v.get("invalidReason", "invalid payment") + (
                     ": " + str(v["invalidMessage"])[:200] if v.get("invalidMessage") else "")
@@ -704,7 +733,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                                          "charged": False})
             settlement = None
             if p.enabled:
-                settlement = p.settle(payload, requirements["accepts"][0])
+                settlement = p.settle(payload, offer)
         out = {"tx": rcpt["transactionHash"], "block": int(rcpt["blockNumber"], 16), "gasUsed": int(rcpt["gasUsed"], 16),
                "call": name}
         headers = {}
@@ -738,6 +767,9 @@ def main():
     ap.add_argument("--asset", default="0x401eCb1D350407f13ba348573E5630B83638E30D", help="the EIP-3009 token (USDC.e on HPP)")
     ap.add_argument("--asset-name", default="Bridged USDC")
     ap.add_argument("--asset-version", default="2")
+    ap.add_argument("--asset-decimals", type=int, default=6, help="the asset's decimals: credit is in its atomic units")
+    ap.add_argument("--extra-asset", action="append", type=parse_asset, default=[],
+                    help="another token taken (#361): ADDRESS,NAME,VERSION,DECIMALS,UNITS_PER_TOKEN[,exact], as the store's")
     ap.add_argument("--eth-usd", type=float, default=3000.0, help="the rate the gas is charged at")
     ap.add_argument("--margin", type=float, default=0.2, help="on top of the gas, for the relay's risk and upkeep")
     ap.add_argument("--min-fee", type=int, default=100, help="atomic units (USDC.e: 1e-6) at least per call")

@@ -35,6 +35,8 @@ FACTORY = os.environ["HPPLITE_ANVIL_FACTORY"]
 USDC = os.environ.get("HPPLITE_ANVIL_USDC", "")
 KEY0 = os.environ["HPPLITE_ANVIL_KEY0"]                  # holds the MockUSDC supply
 RELAY_KEY = os.environ["HPPLITE_ANVIL_KEY9"]             # the relay's funded hot key
+CHIP = os.environ.get("HPPLITE_ANVIL_CHIP", "")
+HPP = os.environ.get("HPPLITE_ANVIL_HPP", "")            # an 18-decimal stand-in for HPP (#361)
 chain = Chain(RPC)
 fails = 0
 
@@ -115,7 +117,10 @@ def start_relay(work, port, keyfile, log, eth_usd="30"):
     url = "http://127.0.0.1:%d" % port
     p = subprocess.Popen([sys.executable, "-I", os.path.join(here, "relay.py"), "--port", str(port), "--rpc", RPC,
                           "--key-file", keyfile, "--factory", FACTORY, "--facilitator", os.environ["HPPLITE_ANVIL_FACILITATOR"],
-                          "--asset", USDC, "--eth-usd", eth_usd, "--dir", os.path.join(work, "relay")], stdout=log, stderr=log)
+                          "--asset", USDC, "--eth-usd", eth_usd, "--dir", os.path.join(work, "relay")]
+                         # the other tokens it takes (#361): CHIP at $1 with x402, HPP at $0.01 (10000 units) by permit
+                         + (["--extra-asset", "%s,House Chip,1,6,1000000,exact" % CHIP] if CHIP else [])
+                         + (["--extra-asset", "%s,HousePartyProtocol,1,18,10000" % HPP] if HPP else []), stdout=log, stderr=log)
     for _ in range(100):
         if p.poll() is not None:
             return p, None
@@ -431,6 +436,60 @@ def main():
         st, body = post_raw(url + "/commit", {"to": rollup, "data": encode("renewLeaseFor(bytes32,uint256,uint256,bytes)", instance, 7, deadline, lease("renew", 7))})
         check(st == 200 and body.get("sponsor") == swallet and s0 - balance_usdc(swallet) >= 1_000_000,
               "a sponsored call charged to the smart wallet, the relay pulling from it (%s, %d units)" % (st, s0 - balance_usdc(swallet)))
+        # 10. one relay, several tokens (#361): a sponsor paying by an HPP permit (18 decimals: a pull of minPull, 1000000
+        # units, is 100 HPP, past 2^53), and a wallet holding only CHIP paying its call over x402
+        if CHIP and HPP:
+            assets = {x["asset"]: x for x in acc.get("assets") or []}
+            check(list(assets)[:1] == [USDC.lower()] and assets.get(HPP.lower(), {}).get("unitsPerToken") == "10000"
+                  and assets.get(CHIP.lower(), {}).get("exact") is True, "/status lists the tokens: USDC.e first, CHIP exact, HPP at 10000 units (%s)" % acc.get("assets"))
+            hkey = secrets.token_bytes(32)
+            hfund = eth.address(hkey).lower()
+            total = 10_000 * 10 ** 18
+            subprocess.run(["cast", "send", "--rpc-url", RPC, "--private-key", KEY0, HPP, "transfer(address,uint256)", hfund, str(total)], check=True, capture_output=True)
+            hpp_of = lambda a: int(call_view(HPP, "balanceOf(address)", a), 16)
+            value, dl = 10 ** 21 + 1, int(time.time()) + 86400
+            pd = eth.typed_digest(eth.domain_separator("HousePartyProtocol", "1", int(status["chainId"]), HPP),
+                                  "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)", hfund, acc["spender"], value, 0, dl)
+            permit = {"value": str(value), "deadline": dl, "signature": "0x" + eth.sign(hkey, pd).hex()}
+            st, out = post_raw(url + "/account/%s/permit" % hfund, permit)
+            check(st == 401, "an HPP permit without its asset is checked in USDC.e's domain: 401 (%s)" % st)
+            st, out = post_raw(url + "/account/%s/permit" % hfund, dict(permit, asset="0x" + "22" * 20))
+            check(st == 400, "a permit in a token the relay does not take: 400 (%s)" % st)
+            st, out = post_raw(url + "/account/%s/permit" % hfund, dict(permit, asset=HPP))
+            check(st == 200 and out.get("asset") == HPP.lower() and (out.get("permit") or {}).get("value") == str(value) and out.get("balance") == str(total),
+                  "an HPP permit taken: value and balance exact, decimal strings past 2^53 (%s %s)" % (st, out))
+            it = int(time.time()) + 5
+            sd = eth.typed_digest(eth.domain_separator(dom["name"], dom["version"], int(dom["chainId"]), dom["verifyingContract"]),
+                                  "Sponsor(address rollup,address funder,uint256 issuedAt)", rollup.lower(), hfund, it)
+            st, out = post_raw(url + "/sponsor/" + rollup.lower(), {"funder": hfund, "issuedAt": it, "signature": "0x" + eth.sign(hkey, sd).hex(),
+                                                                    "rollupSignature": "0x" + eth.sign(wkey, sd).hex()})
+            check(st == 200 and out.get("funder") == hfund, "the HPP holder sponsors the rollup (%s %s)" % (st, out))
+            r0 = hpp_of(relay_addr)
+            st, body = post_raw(url + "/commit", {"to": rollup, "data": encode("renewLeaseFor(bytes32,uint256,uint256,bytes)", instance, 8, deadline, lease("renew", 8))})
+            pulled = hpp_of(relay_addr) - r0
+            check(st == 200 and body.get("sponsor") == hfund and pulled == 10 ** 20 and hpp_of(hfund) == total - 10 ** 20,
+                  "a sponsored call charged to the HPP account: minPull pulled as 100 HPP exactly, past 2^53 (%s, %d)" % (st, pulled))
+            st, out = http_get(url + "/account/" + hfund)
+            check(st == 200 and out.get("credit", 0) > 0 and (out.get("permit") or {}).get("sent") is True,
+                  "the account keeps the rest as credit; the HPP permit sent (%s)" % out)
+            ckey = secrets.token_bytes(32)
+            cwallet = eth.address(ckey)
+            subprocess.run(["cast", "send", "--rpc-url", RPC, "--private-key", KEY0, CHIP, "transfer(address,uint256)", cwallet, "50000000"], check=True, capture_output=True)
+            chip_of = lambda a: int(call_view(CHIP, "balanceOf(address)", a), 16)
+            cdl = int(chain.call("eth_getBlockByNumber", "latest", False)["timestamp"], 16) + 3600
+            csig = eth.sign(ckey, eth.typed_digest(fdomain, "CreateRollup(address owner,uint256 checkpointInterval,uint256 nonce,uint256 deadline)",
+                                                  cwallet, 100, 0, cdl))
+            cdata = encode("createRollupFor(address,uint256,uint256,uint256,bytes)", cwallet, 100, 0, cdl, csig)
+            st, body = post_raw(url + "/commit", {"to": FACTORY, "data": cdata})
+            offers = body.get("accepts", []) if isinstance(body, dict) else []
+            check(st == 402 and [o["asset"].lower() for o in offers] == [USDC.lower(), CHIP.lower()] and offers[0]["amount"] == offers[1]["amount"]
+                  and offers[1]["extra"].get("name") == "House Chip" and offers[1]["extra"].get("quote"),
+                  "an unsponsored call's 402 offers USDC.e, then CHIP at the same amount with its own quote; not HPP (%s)" % offers)
+            c0, rc0 = chip_of(cwallet), chip_of(relay_addr)
+            st, body, settlement = Buyer(url, ckey, cap=50_000_000, valid_for=3600, asset=CHIP).call("POST", "/commit", json.dumps({"to": FACTORY, "data": cdata}).encode())
+            check(st == 200 and settlement and settlement.get("success") and c0 - chip_of(cwallet) == chip_of(relay_addr) - rc0 > 0
+                  and balance_usdc(cwallet) == 0,
+                  "a wallet holding only CHIP pays its call in CHIP over x402 (%s, %d units)" % (st, c0 - chip_of(cwallet)))
         queue_section(work, keyfile, chain_id)
     finally:
         proc.terminate()

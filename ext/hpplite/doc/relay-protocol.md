@@ -40,6 +40,21 @@ the rollups and DA contracts that factory created. For factory VERSION 10:
 `/status` lists them by name in `calls`. A factory version that adds or
 changes a signed form changes this list; a relay serves one factory.
 
+## Tokens
+
+A relay may take several tokens (#361), as a store does
+([store-protocol.md, Tokens](store-protocol.md#tokens)): `accounts.assets`
+lists them, the first being `accounts.asset`; the price, `minFee`,
+`minPull` and credit are in the first asset's units, another token converts
+at its `unitsPerToken` (CHIP `"1000000"`, $1; HPP `"10000"`, $0.01, 18
+decimals). A sponsor's permit names its token; a pull takes `minPull` or
+more in credit units, converted into the permit's token rounded up, and
+credits what it pulled rounded down. A `402` offers `exact` in each token
+with `exact: true`, the first asset's first, each with its amount converted
+and its own `extra.quote` (the MAC is over that offer's amount); the payment
+names the offer it took. HPP has no `exact` (no EIP-3009): a sponsor pays in
+it by permit.
+
 ## The price and the quote
 
 The `402` quotes the call's estimated gas at the current fee, plus the
@@ -91,12 +106,12 @@ chainId, payTo)` (`/status` → `accounts.domain`):
 
 | Call | Signed by | Answer |
 |------|-----------|--------|
-| `POST /account/<funder>/permit`, body `{value, deadline, signature}` (`{v, r, s}` taken too) | the funder: an EIP-2612 permit of the asset to `accounts.spender`, at the token's current nonce | `200` the account; `401` it does not recover to the funder |
+| `POST /account/<funder>/permit`, body `{value, deadline, signature[, asset]}` (`{v, r, s}` taken too; `asset` one of `accounts.assets`, the first by default, else `400`; `value` a number or a decimal string) | the funder: an EIP-2612 permit of that token to `accounts.spender`, at its current nonce | `200` the account; `401` it does not recover to the funder |
 | `POST /account/<funder>/pay?amount=<units>` | anyone, by x402 `exact` (at least `accounts.minPull`) | `402` the offer; paid: `200` the account, `credit` raised; `400` below `minPull` |
 | `POST /sponsor/<rollup>`, body `{funder, issuedAt, signature, rollupSignature?}` | the funder, and the rollup's side (below) | `200` the sponsorship; `401` either signature; `404` not a rollup of the factory; `409` `issuedAt` not newer than the last taken; `503` the chain cannot be read |
 | `POST /sponsor/<rollup>/release`, body `{funder, issuedAt, signature}` | the sponsor | `200` the sponsorship, `state: released`; `401` not the sponsor |
 | `POST /sponsor/<rollup>/cap`, body `{funder, callsPerDay, issuedAt, signature}` | the sponsor | `200` the sponsorship; `401` not the sponsor; `409` not newer |
-| `GET /account/<funder>` | - | `200 {funder, credit, balance, allowance, permitNonce, permit, rollups, state, why}`; `404` |
+| `GET /account/<funder>` | - | `200 {funder, credit, asset, balance, allowance, permitNonce, permit, rollups, state, why}` (`asset` the permit's token; `balance`, `allowance` and `permit.value` in it, decimal strings past 2^53); `404` |
 | `GET /sponsor/<rollup>` | - | `200 {rollup, da, funder, cap, today: {calls, since}, state}`; `404` |
 
 **Who may name a rollup's sponsor.** The rollup's side agrees to every
@@ -154,6 +169,7 @@ line.
               "ethUsd": 3000, "margin": 0.2, "minFee": 100, "facilitator": "https://…"},
   "accounts": {"spender": "0x…", "payTo": "0x…", "minPull": 1000000, "asset": "0x…",
                "assetDomain": {"name": "Bridged USDC", "version": "2"},
+               "assets": [{"asset": "0x…", "name": "Bridged USDC", "version": "2", "decimals": 6, "unitsPerToken": "1000000", "exact": true}, …],
                "domain": {"name": "HPPLiteRelay", "version": "1", "chainId": 181228, "verifyingContract": "0x…"}}
 }
 ```
