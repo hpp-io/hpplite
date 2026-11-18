@@ -368,6 +368,26 @@ uint8_t *hpplite_envelope_seal(const HppliteCipher *cipher, const uint8_t key[32
   return out;
 }
 
+/* The same envelope sealed where its payload lies (#233): buf holds hpplite_envelope_head_len(cipher) bytes, then the
+** payload, then cipher->tagLen bytes; the header is written before the payload, which is encrypted in place (ChaCha20
+** XORs block by block), and the tag after it. 0, and *pOutLen the envelope's length from buf; -1 */
+size_t hpplite_envelope_head_len(const HppliteCipher *cipher) { return HPPLITE_ENVELOPE_HEADER_LEN + cipher->nonceLen; }
+
+int hpplite_envelope_seal_inplace(const HppliteCipher *cipher, const uint8_t key[32], uint64_t height, uint8_t encoding,
+                                  uint8_t *buf, size_t payloadLen, size_t *pOutLen) {
+  size_t headLen = hpplite_envelope_head_len(cipher);
+  uint8_t ad[10];
+  size_t adLen;
+  memcpy(buf, HPPLITE_ENVELOPE_MAGIC, HPPLITE_ENVELOPE_MAGIC_LEN);
+  buf[HPPLITE_ENVELOPE_MAGIC_LEN] = cipher->id;
+  buf[HPPLITE_ENVELOPE_MAGIC_LEN + 1] = encoding;
+  if (hpplite_random_bytes(buf + HPPLITE_ENVELOPE_HEADER_LEN, cipher->nonceLen) != 0) return -1;
+  adLen = envelope_ad(ad, cipher->id, encoding, height);
+  if (cipher->seal(key, buf + HPPLITE_ENVELOPE_HEADER_LEN, ad, adLen, buf + headLen, payloadLen, buf + headLen) != 0) return -1;
+  if (pOutLen) *pOutLen = headLen + payloadLen + cipher->tagLen;
+  return 0;
+}
+
 /* "HPE2" and at least the scheme byte; nothing else is an envelope (#249: the pre-release "HPE1" is not read) */
 static int envelope_is_sealed(const uint8_t *data, size_t len) {
   return data && len >= HPPLITE_ENVELOPE_MAGIC_LEN + 1 && memcmp(data, HPPLITE_ENVELOPE_MAGIC, HPPLITE_ENVELOPE_MAGIC_LEN) == 0;

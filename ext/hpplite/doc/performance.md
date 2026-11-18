@@ -298,3 +298,24 @@ How to read it:
 
 Reproduce: `cmake --build build_mock -t oltp_bench`, then `oltp_bench --ext
 build_mock/hpplite.dylib --uri "&capture=pages" --mode write_only --seconds 10`.
+
+## Snapshots (2026-11-18, #233)
+
+A snapshot (#221) is the whole database as one page batch, deflated, sealed and put in 8 MiB chunks at an anchor.
+`tests/bench/snapshot_bench.c` writes a database of random 4 KB rows (deflate's worst case: nothing compresses)
+through a node into the reference store, then anchors once with `snapshot=` on; Apple M-series, mock chain.
+
+| Database | Peak RSS before the anchor | Added at the anchor | The node's CPU for it |
+|---|---|---|---|
+| 200 MB, before #233 | 207 MB | **+619 MB** (three copies) | 6.3 s |
+| 200 MB, sealed in place | 235 MB | **+399 MB** (two copies) | 6.5 s |
+
+- **Before the anchor:** about the database's size. Page mode keeps every page's last posted image to diff against (`aPrev`).
+- **Before #233, the anchor added three copies:** the encoded image, the deflated copy and the sealed envelope, all alive at once.
+- **Now:** the image is encoded with room for the envelope's header and tag, freed as soon as its deflated copy replaces it, and sealed in place (`node_seal_owned`, `hpplite_envelope_seal_inplace`).
+  - With incompressible pages the peak is two copies (the image and its deflated attempt); with real pages it is nearer one.
+  - The bytes are the same as before, so readers and the index and chunk format are unchanged.
+- **Wall time:** the bench's anchor took about 490 s. That is the reference store verifying each put's keccak hash in pure Python (about 2 s a MB), not the node, whose CPU time is the column above.
+- **What remains:** a fully streamed snapshot (sealed and put chunk by chunk from the pages) would bound the peak to a chunk. It needs an incremental AEAD, and the deflate-or-not decision taken before the whole batch is deflated.
+
+Reproduce: `cmake --build build_mock -t snapshot_bench`, then `build_mock/snapshot_bench --mb 200 --store operators/store`.

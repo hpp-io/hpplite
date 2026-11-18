@@ -1,4 +1,5 @@
 /* Page-based capture (#146): the page root and the page batch. See pages.h. */
+#include <stdlib.h>
 #include "hpplite_sqlite.h"
 #include "pages.h"
 #include "sha256.h"
@@ -201,12 +202,16 @@ int hpplite_pagebatch_is(const unsigned char *p, size_t n) {
   return p && n >= PB_HEADER_V1 && memcmp(p, PB_MAGIC, 4) == 0 && (r32(p + 4) == 1u || r32(p + 4) == PB_VERSION);
 }
 
-unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen) {
+static size_t pagebatch_len(const HpplitePageBatch *b) {
   unsigned nName = b->zName ? b->nName : 0;
-  size_t rec = 6 + (size_t)b->pageSize, len = PB_HEADER + rec * b->nPages + PB_TRAILER + nName, o = PB_HEADER;
-  unsigned char *p = sqlite3_malloc64(len);
+  return PB_HEADER + (6 + (size_t)b->pageSize) * b->nPages + PB_TRAILER + nName;
+}
+
+/* the batch's bytes into p, pagebatch_len(b) of them */
+static void pagebatch_write(const HpplitePageBatch *b, unsigned char *p) {
+  unsigned nName = b->zName ? b->nName : 0;
+  size_t rec = 6 + (size_t)b->pageSize, o = PB_HEADER;
   unsigned i;
-  if (!p) return NULL;
   memcpy(p, PB_MAGIC, 4); w32(p + 4, PB_VERSION); w32(p + 8, b->pageSize); w32(p + 12, b->commitSize);
   w64(p + 16, b->firstCommit); w64(p + 24, b->lastCommit); w32(p + 32, b->salt1); w32(p + 36, b->salt2);
   w64(p + 40, b->timestampMs); w32(p + 48, b->nPages); w32(p + 52, nName);
@@ -218,6 +223,24 @@ unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen)
   }
   memcpy(p + o, b->root, 32); w64(p + o + 32, b->crc);
   if (nName) memcpy(p + o + PB_TRAILER, b->zName, nName);
+}
+
+unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen) {
+  size_t len = pagebatch_len(b);
+  unsigned char *p = sqlite3_malloc64(len);
+  if (!p) return NULL;
+  pagebatch_write(b, p);
+  *pLen = len;
+  return p;
+}
+
+/* The same bytes at head bytes into a malloc'd buffer, tail bytes after them (#233): room for an envelope's header
+** and tag, so a snapshot is sealed where it was encoded. *pLen is the batch's length; free() the buffer */
+unsigned char *hpplite_pagebatch_encode_room(const HpplitePageBatch *b, size_t head, size_t tail, size_t *pLen) {
+  size_t len = pagebatch_len(b);
+  unsigned char *p = malloc(head + len + tail);
+  if (!p) return NULL;
+  pagebatch_write(b, p + head);
   *pLen = len;
   return p;
 }

@@ -120,11 +120,34 @@ static void test_envelope(void) {
     PASS();
 }
 
+/* Sealed in place (#233, a snapshot's image): the payload encrypted where it lies, the header before it and the tag
+** after - the same envelope as hpplite_envelope_seal's, opened by the same open */
+static void test_envelope_inplace(void) {
+    TEST("an envelope sealed in place opens to its payload, at the length hpplite_envelope_seal gives (#233)");
+    const HppliteCipher *c = hpplite_cipher_default();
+    uint8_t key[32];
+    size_t head = hpplite_envelope_head_len(c), n = 100000, outLen = 0, openLen = 0, refLen = 0;
+    uint8_t *payload = malloc(n), *buf = malloc(head + n + c->tagLen), *ref, *opened;
+    for (size_t i = 0; i < 32; i++) key[i] = (uint8_t)(i * 7 + 1);
+    for (size_t i = 0; i < n; i++) payload[i] = (uint8_t)(i * 31 + (i >> 8));
+    memcpy(buf + head, payload, n);
+    if (hpplite_envelope_seal_inplace(c, key, 9, HPPLITE_ENCODING_DEFLATE, buf, n, &outLen) != 0) { free(payload); free(buf); FAIL("seal in place"); }
+    ref = hpplite_envelope_seal(c, key, 9, HPPLITE_ENCODING_DEFLATE, payload, n, &refLen);
+    opened = hpplite_envelope_open(key, 9, buf, outLen, &openLen, NULL);
+    int ok = opened && openLen == n && memcmp(opened, payload, n) == 0 && ref && refLen == outLen
+             && memcmp(buf + head, payload, 64) != 0 && hpplite_envelope_encoding(buf, outLen) == HPPLITE_ENCODING_DEFLATE
+             && hpplite_envelope_open(key, 10, buf, outLen, &openLen, NULL) == NULL;
+    free(opened); free(ref); free(payload); free(buf);
+    if (!ok) FAIL("the in-place envelope is not the one hpplite_envelope_seal makes");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Cipher Tests ===\n");
     test_rfc8439_aead();
     test_rfc5869_hkdf();
     test_hmac();
     test_envelope();
+    test_envelope_inplace();
     return test_report();
 }

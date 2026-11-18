@@ -80,6 +80,10 @@ uint8_t *hpplite_envelope_seal(const HppliteCipher *cipher, const uint8_t key[32
                                uint64_t height, uint8_t encoding,
                                const uint8_t *payload, size_t payloadLen,
                                size_t *pOutLen);
+/* sealed in place (#233): buf = [hpplite_envelope_head_len(cipher) free][payload][cipher->tagLen free] */
+size_t hpplite_envelope_head_len(const HppliteCipher *cipher);
+int hpplite_envelope_seal_inplace(const HppliteCipher *cipher, const uint8_t key[32], uint64_t height, uint8_t encoding,
+                                  uint8_t *buf, size_t payloadLen, size_t *pOutLen);
 
 /* Bytes the envelope adds around the (encoded) payload */
 size_t hpplite_envelope_overhead(const HppliteCipher *cipher);

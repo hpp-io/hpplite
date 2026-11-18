@@ -2057,6 +2057,56 @@ static uint8_t *node_seal_at(HppliteNode *node, uint64_t height, const uint8_t *
     return out;
 }
 
+/* The room a payload sealed in place needs before and after it (#233): the envelope's header and tag, or the plain
+** form's magic */
+static void node_seal_room(HppliteNode *node, size_t *pHead, size_t *pTail) {
+    *pHead = node->cipher ? hpplite_envelope_head_len(node->cipher) : HPPLITE_PLAIN_MAGIC_LEN;
+    *pTail = node->cipher ? node->cipher->tagLen : 0;
+}
+
+/* As node_seal_at, for a payload that is not needed after (a snapshot's image, #233): buf is malloc'd, the payload at
+** buf + head with tail bytes free after it (node_seal_room), and this takes it. The deflated copy replaces it as soon
+** as it is made, and the envelope is sealed where the payload lies: about one copy alive at a time beyond the deflate's,
+** where node_seal_at held three. The bytes are node_seal_at's. Returns the sealed bytes (free()), or NULL */
+static uint8_t *node_seal_owned(HppliteNode *node, uint64_t height, uint8_t *buf, size_t len, int level, size_t *pLen) {
+    size_t head, tail, outLen = 0;
+    uint8_t encoding = HPPLITE_ENCODING_NONE;
+    node_seal_room(node, &head, &tail);
+    *pLen = 0;
+    if (!buf) return NULL;
+    if (!node->config.noCompress) {
+        size_t n = 0;
+        uint8_t *c = hpplite_deflate_level(buf + head, len, level, &n);
+        if (c && n + HPPLITE_PLAIN_MAGIC_LEN < len) {
+            uint8_t *room;
+            free(buf);                                  /* the image goes as its deflated copy takes its place */
+            room = realloc(c, head + n + tail);
+            if (!room) { free(c); return NULL; }
+            memmove(room + head, room, n);
+            buf = room; len = n; encoding = HPPLITE_ENCODING_DEFLATE;
+        } else free(c);
+    }
+    if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
+        /* several readers: the per-recipient envelope, a copy (rare for a snapshot) */
+        uint8_t *aTo = NULL, dek[32], *out = NULL;
+        int nTo = node_recipients(node, &aTo);
+        hpplite_random_bytes(dek, 32);
+        if (aTo && nTo > 1) out = hpplite_envelope_seal_pk(node->cipher, dek, aTo, nTo, height, encoding, buf + head, len, &outLen);
+        free(aTo);
+        free(buf);
+        *pLen = out ? outLen : 0;
+        return out;
+    }
+    if (node->cipher) {
+        if (hpplite_envelope_seal_inplace(node->cipher, node->encKey, height, encoding, buf, len, &outLen) != 0) { free(buf); return NULL; }
+        *pLen = outLen;
+        return buf;
+    }
+    if (encoding == HPPLITE_ENCODING_DEFLATE) { memcpy(buf, HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN); *pLen = HPPLITE_PLAIN_MAGIC_LEN + len; }
+    else { memmove(buf, buf + head, len); *pLen = len; }
+    return buf;
+}
+
 /* A rollup's name from its latest snapshot (#226): batch 1, which names it (#160), may be pruned (keep=, #223).
 ** The manifest the last anchor names, its snapshot's index, the sealed name object - each checked by its hash. */
 static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1) {
@@ -2109,14 +2159,19 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
     int rc = -1, prc;
     if (!node->pm) why = "the rollup is not in page mode (capture=pages)";
     else if (ctx->blockHeight != height + 1 || ctx->openTxnId) why = "a commit is cut over batches at the anchored height";
-    if (!why && (prc = hpplite_pagemode_image(node->pm, &image, &len, imgRoot)) != SQLITE_OK) why = prc == SQLITE_BUSY ? "the whole file is still queued" : "the image could not be built";
+    {
+        size_t head, tail;
+        node_seal_room(node, &head, &tail);       /* encoded with room to be sealed where it lies (#233) */
+        if (!why && (prc = hpplite_pagemode_image_room(node->pm, head, tail, &image, &len, imgRoot)) != SQLITE_OK) why = prc == SQLITE_BUSY ? "the whole file is still queued" : "the image could not be built";
+    }
     if (!why && memcmp(imgRoot, root, 32) != 0) why = "the image's root is not the anchored one";
     if (why) {
         if (!node->warnedSnapshot) { fprintf(stderr, "hpplite: no snapshot at height %llu: %s\n", (unsigned long long)height, why); node->warnedSnapshot = 1; }
-        sqlite3_free(image);
+        free(image);
         return -1;
     }
-    payload = sealed = node_seal_at(node, height, image, len, 6, &payloadLen);
+    payload = sealed = node_seal_owned(node, height, image, len, 6, &payloadLen);
+    image = NULL;                                 /* taken by the seal */
     if (!payload) goto done;
     ix = cJSON_CreateObject();
     cJSON_AddNumberToObject(ix, "v", 1);
@@ -2196,7 +2251,7 @@ done:
     sqlite3_free(zRef);
     free(text);
     cJSON_Delete(ix);
-    sqlite3_free(image); free(sealed);
+    free(image); free(sealed);
     return rc;
 }
 

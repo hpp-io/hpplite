@@ -254,7 +254,18 @@ void hpplite_pagemode_root(HpplitePageMode *pm, unsigned char out[32]) { hpplite
 
 static uint64_t now_ms(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000; }
 
+static int pagemode_image(HpplitePageMode *pm, size_t head, size_t tail, int bRoom, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]);
+
 int hpplite_pagemode_image(HpplitePageMode *pm, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]) {
+  return pagemode_image(pm, 0, 0, 0, ppBytes, pLen, root);
+}
+
+/* the image head bytes into a malloc'd buffer, tail bytes after it (#233: sealed in place); free() */
+int hpplite_pagemode_image_room(HpplitePageMode *pm, size_t head, size_t tail, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]) {
+  return pagemode_image(pm, head, tail, 1, ppBytes, pLen, root);
+}
+
+static int pagemode_image(HpplitePageMode *pm, size_t head, size_t tail, int bRoom, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]) {
   HpplitePageBatch b;
   HpplitePageRec *recs;
   unsigned i, n;
@@ -272,7 +283,7 @@ int hpplite_pagemode_image(HpplitePageMode *pm, unsigned char **ppBytes, size_t 
   b.nPages = n; b.aPage = recs;
   hpplite_pageroot_get(pm->pRoot, b.root); b.crc = hpplite_pageroot_crc(pm->pRoot);
   memcpy(root, b.root, 32);
-  *ppBytes = hpplite_pagebatch_encode(&b, pLen);
+  *ppBytes = bRoom ? hpplite_pagebatch_encode_room(&b, head, tail, pLen) : hpplite_pagebatch_encode(&b, pLen);
   sqlite3_free(recs);
   return *ppBytes ? SQLITE_OK : SQLITE_NOMEM;
 }
