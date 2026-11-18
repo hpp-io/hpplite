@@ -169,6 +169,7 @@ typedef struct HppliteNode {
     /* Ranges (#164): the store holds the batches, the chain one commitment per anchor */
     int64_t anchorAt;               /* the timer anchors at this time (ms, monotonic); 0 = not yet decided */
     uint64_t anchoredHeight;        /* the chain's last height as last read: above it, the store alone holds the batches */
+    uint64_t rootsKeptAt;           /* a verifier: the anchored height its kept roots were last named for (#362) */
     uint64_t syncTo;                /* a verifier's stop (hpplite-verify --to, #206): no batch past it is applied; 0: none */
     uint64_t syncAtMs;              /* ...by time (--at, #205): no batch written after it begins (a transaction in flight completes) */
     uint64_t lastAppliedMs;         /* the writer's time of the last batch applied (ms) */

@@ -123,6 +123,9 @@ struct HppliteCtx {
 #define HPPLITE_ROOT_RING 64
   struct { uint64_t height; unsigned char root[32]; } aRootAt[HPPLITE_ROOT_RING];
   int nRootAt;
+  /* ...and at the heights the chain names (its last checkpoint, the last anchored range's end): kept however many
+  ** batches follow, as a verifier following the store past the anchor applies more than the ring holds (#362) */
+  struct { uint64_t height; unsigned char root[32]; int have; } aRootKeep[2];
 
   /* Callbacks for external integration */
   void (*xOnCommit)(void*, unsigned char*, int);  /* root is NULL; use hpplite_get_state_root() */
@@ -205,6 +208,8 @@ typedef struct HppliteAnchorRow {
 /* A verifier's rebuilt root after batch height, when it is among the last HPPLITE_ROOT_RING replayed
 ** (bTrackRoots) or is the last posted root compared: 0, or -1 when not kept */
 int hpplite_root_at(HppliteCtx *pCtx, uint64_t height, unsigned char out[32]);
+/* the root at this height is kept in slot (0, 1) whatever follows (#362): the chain's last checkpoint, the anchor's end */
+void hpplite_root_keep(HppliteCtx *pCtx, int slot, uint64_t height);
 
 /*
 ** Content hash of any connection's main database, same definition as the

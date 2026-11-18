@@ -1674,6 +1674,41 @@ static void test_soft_replica(const char *url) {
     PASS();
 }
 
+/* 11b. ... and when the store holds more batches past the anchor than the node's root ring (64, #362): the verifier
+** still holds the root at the anchored height, which hpplite-verify checks against the anchor's */
+static void test_soft_past_ring(const char *url) {
+    TEST("soft replica: 70 batches at the store past the anchor, more than the root ring holds: the verifier still has the anchored height's root, the anchor's (#362)");
+    static const unsigned char kseq[32] = { [31] = 0x67 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "ring_w", .privkey = kseq };
+    HppliteNode *w = test_open_node(tpath("ring_w.db"), l1, &o), *r = NULL;
+    HppliteRange rg;
+    unsigned char at[32];
+    int i, kept;
+    if (!w) FAIL("open");
+#define RING_DONE() do { if (r) { r->l1 = NULL; hpplite_node_destroy(r); } w->ownsL1 = 0; hpplite_node_destroy(w); hpplite_l1_disconnect(l1); } while (0)
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3 + 70; i++) {
+        if (i == 3 && hpplite_node_anchor(w) != 3) { printf("(%s) ", status_text(w->db, "last_error")); RING_DONE(); FAIL("the anchor 1-3"); }
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('ring')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); RING_DONE(); FAIL("a flush"); }
+    }
+    memset(&rg, 0, sizeof rg);
+    if (hpplite_l1_get_range(l1, 3, &rg) != 0 || rg.toHeight != 3) { RING_DONE(); FAIL("the range the anchor wrote, 1-3"); }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "ring_r", .privkey = kseq };
+        r = test_open_node(tpath("ring_r.db"), l1, &ro);
+    }
+    if (!r) { hpplite_l1_range_clear(&rg); RING_DONE(); FAIL("open the verifier"); }
+    printf("(height %lld, soft_height %lld) ", (long long)status_int(r->db, "height"), (long long)status_int(r->db, "soft_height"));
+    kept = hpplite_root_at(r->ctx, 3, at) == 0 && memcmp(at, rg.stateRoot, 32) == 0;
+    hpplite_l1_range_clear(&rg);
+    if (status_int(r->db, "soft_height") != 74 || !kept) { RING_DONE(); FAIL("the verifier applied 73 batches and still holds the anchored root at 3"); }
+    RING_DONE();
+#undef RING_DONE
+    PASS();
+}
+
 /* 12. ... and when the chain commits another batch than the one the store served (the store lost it, a
 ** successor wrote its own at that height), the verifier says its soft state is not the rollup's */
 static void test_soft_disagreement(const char *url) {
@@ -1828,6 +1863,7 @@ int main(int argc, char **argv) {
     test_anchor_idle_deadline(url);
     test_recovery(url);
     test_soft_replica(url);
+    test_soft_past_ring(url);
     test_soft_disagreement(url);
     stop_service();
     remove_dir();

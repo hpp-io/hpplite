@@ -91,6 +91,16 @@ void hpplite_chain_hash_next(const unsigned char *pPrev, uint64_t height, const 
   hpplite_keccak256(buf, sizeof(buf), pOut);
 }
 
+/* the root after a batch, or a snapshot's (#222): in the ring of the last HPPLITE_ROOT_RING, and in a keep slot when the
+** chain named this height (#362) */
+static void hppliteRecordRoot(HppliteCtx *pCtx, uint64_t height, const unsigned char *root) {
+  int i = pCtx->nRootAt % HPPLITE_ROOT_RING;
+  pCtx->aRootAt[i].height = height; memcpy(pCtx->aRootAt[i].root, root, 32); pCtx->nRootAt++;
+  for (i = 0; i < 2; i++) {
+    if (pCtx->aRootKeep[i].height == height) { memcpy(pCtx->aRootKeep[i].root, root, 32); pCtx->aRootKeep[i].have = 1; }
+  }
+}
+
 /* Page mode (#146): a batch of pages posted at height. The block hash chains
 ** the height, the previous hash and the root; the contract's rolling hash
 ** advances by the posted bytes as for any batch; the meta row moves; the
@@ -139,8 +149,7 @@ int hppliteAdvanceMetaPages(HppliteCtx *pCtx, uint64_t height, const unsigned ch
   memcpy(pCtx->chainHash, chainHash, HPPLITE_HASH_SIZE);
   memcpy(pCtx->stateRoot, root, HPPLITE_HASH_SIZE);
   pCtx->inflightHeight = 0;
-  { int i = pCtx->nRootAt % HPPLITE_ROOT_RING;        /* the root at this height, for hpplite_root_at (the verifier's checkpoint check) */
-    pCtx->aRootAt[i].height = height; memcpy(pCtx->aRootAt[i].root, root, 32); pCtx->nRootAt++; }
+  hppliteRecordRoot(pCtx, height, root);              /* the root at this height, for hpplite_root_at (the verifier's checkpoint check) */
   return SQLITE_OK;
 }
 
@@ -171,8 +180,7 @@ int hppliteSetMetaAt(HppliteCtx *pCtx, uint64_t height, const unsigned char *blo
   memcpy(pCtx->chainHash, chain, HPPLITE_HASH_SIZE);
   memcpy(pCtx->stateRoot, root, HPPLITE_HASH_SIZE);
   pCtx->inflightHeight = 0;
-  { int i = pCtx->nRootAt % HPPLITE_ROOT_RING;
-    pCtx->aRootAt[i].height = height; memcpy(pCtx->aRootAt[i].root, root, 32); pCtx->nRootAt++; }
+  hppliteRecordRoot(pCtx, height, root);
   return SQLITE_OK;
 }
 
@@ -209,9 +217,23 @@ int hppliteMarkInflightPages(HppliteCtx *pCtx, uint64_t height, const unsigned c
 }
 
 /* The verifier's rebuilt root after a height, when it is among the last HPPLITE_ROOT_RING applied (#120) */
+void hpplite_root_keep(HppliteCtx *pCtx, int slot, uint64_t height) {
+  int i;
+  if (!pCtx || slot < 0 || slot > 1 || pCtx->aRootKeep[slot].height == height) return;
+  pCtx->aRootKeep[slot].height = height;
+  pCtx->aRootKeep[slot].have = 0;
+  /* already applied: the ring may still have it */
+  for (i = 0; i < (pCtx->nRootAt < HPPLITE_ROOT_RING ? pCtx->nRootAt : HPPLITE_ROOT_RING); i++) {
+    if (pCtx->aRootAt[i].height == height) { memcpy(pCtx->aRootKeep[slot].root, pCtx->aRootAt[i].root, 32); pCtx->aRootKeep[slot].have = 1; }
+  }
+}
+
 int hpplite_root_at(HppliteCtx *pCtx, uint64_t height, unsigned char out[32]) {
   int i, n;
   if (!pCtx) return -1;
+  for (i = 0; i < 2; i++) {
+    if (pCtx->aRootKeep[i].have && pCtx->aRootKeep[i].height == height && height > 0) { memcpy(out, pCtx->aRootKeep[i].root, 32); return 0; }
+  }
   n = pCtx->nRootAt < HPPLITE_ROOT_RING ? pCtx->nRootAt : HPPLITE_ROOT_RING;
   for (i = 0; i < n; i++) {
     if (pCtx->aRootAt[i].height == height) { memcpy(out, pCtx->aRootAt[i].root, 32); return 0; }

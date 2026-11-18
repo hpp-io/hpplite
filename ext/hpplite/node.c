@@ -3418,6 +3418,14 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     if (node_check_rollup(node) < 0) return -1;
     if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
     node->anchoredHeight = lastBatch;
+    if (node->config.verifyOnly && lastBatch != node->rootsKeptAt) {
+        /* the heights a verifier checks against the chain - the anchored one and the last checkpoint - keep their roots
+        ** however many of the store's batches follow them (#362); read again only when the chain moved */
+        HppliteL1State *st = hpplite_l1_get_state(node->l1);
+        node->rootsKeptAt = lastBatch;
+        hpplite_root_keep(node->ctx, 0, lastBatch);
+        if (st) { hpplite_root_keep(node->ctx, 1, st->lastCheckpointHeight); hpplite_l1_state_free(st); }
+    }
     if (node_soft_follows(node)) {
         /* the soft tier (#166): a state from before this process counted again, then what the anchor settled */
         if (!node->softFirst && node->ctx->blockHeight > lastBatch + 1 && node_soft_recount(node, lastBatch) != 0) {
