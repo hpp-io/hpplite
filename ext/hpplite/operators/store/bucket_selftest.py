@@ -30,6 +30,8 @@ RPC = os.environ["HPPLITE_ANVIL_RPC"]
 USDC = os.environ["HPPLITE_ANVIL_USDC"]
 FACTORY = os.environ["HPPLITE_ANVIL_FACTORY"]
 FACILITATOR = os.environ["HPPLITE_ANVIL_FACILITATOR"]
+CHIP = os.environ.get("HPPLITE_ANVIL_CHIP", "")
+HPP = os.environ.get("HPPLITE_ANVIL_HPP", "")         # an 18-decimal stand-in for HPP (#357)
 KEY0, KEY1, KEY2, KEY3 = (os.environ["HPPLITE_ANVIL_KEY%d" % i] for i in range(4))
 CHAIN_ID = 31337
 fails = 0
@@ -195,7 +197,10 @@ def main():
                                     "--pay-to", pay_to, "--rpc", RPC, "--facilitator", FACILITATOR, "--network", "eip155:%d" % CHAIN_ID,
                                     "--asset", USDC, "--tick-interval", "0.5", "--price-per-mib-month", "1e12", "--price-per-write", "10",
                                     "--pull-threshold", "2000", "--pull-interval", "100000", "--retry-seconds", "1", "--park-seconds", "4",
-                                    "--min-pay", "3000", "--sweep-age", "2"])
+                                    "--min-pay", "3000", "--sweep-age", "2"]
+                       # the other tokens it takes (#357): CHIP at $1 with x402 top-ups, HPP at $0.01 (10000 units) by permit
+                       + (["--extra-asset", "%s,House Chip,1,6,1000000,exact" % CHIP] if CHIP else [])
+                       + (["--extra-asset", "%s,HousePartyProtocol,1,18,10000" % HPP] if HPP else []))
     try:
         st = wait_for(lambda: http("GET", url + "/status")[1] if _up(url) else None)
         check(isinstance(st, dict) and st.get("protocol") == "hpplite-store/2", "the store speaks hpplite-store/2")
@@ -308,7 +313,8 @@ def main():
         # --- refilled: covered again at the next try ---
         send(KEY0, USDC, "transfer(address,uint256)", fa, 2_000_000)
         covered = wait_for(lambda: http("GET", url + "/bucket/" + da)[1].get("state") == "covered", 30)
-        check(covered, "the wallet refilled: the retried pull succeeds, the bucket covered again")
+        check(covered, "the wallet refilled: the retried pull succeeds, the bucket covered again (%s)" % (
+            "" if covered else http("GET", url + "/account/" + fa)[1]))
         code, data, _ = http("GET", "%s/name/%s-1" % (url, da[2:]))
         check(code == 200 and data == body1, "its names read again")
 
@@ -477,6 +483,60 @@ def main():
         code, out, _ = jpost(url + "/bucket/%s/release" % kda,
                              {"funder": wallet, "issuedAt": issued, "signature": "0x" + wsig(S.digest(RELEASE, kda, wallet, issued)).hex()})
         check(code == 200 and out.get("state") == "parked", "released by the smart wallet's signature: parked (%s)" % code)
+
+        # --- one store, several tokens (#357): an HPP permit (18 decimals, amounts past 2^53) pays a key's bucket by
+        # pulls at 10000 units an HPP; a CHIP top-up by x402 credits 1:1 ---
+        if HPP and CHIP:
+            assets = {x["asset"]: x for x in st["buckets"].get("assets") or []}
+            check(list(assets)[:1] == [USDC.lower()] and assets.get(HPP.lower(), {}).get("unitsPerToken") == "10000"
+                  and assets.get(HPP.lower(), {}).get("decimals") == 18 and assets.get(CHIP.lower(), {}).get("exact") is True,
+                  "/status lists the tokens taken: USDC.e first, CHIP with exact, HPP at 10000 units, 18 decimals (%s)" % st["buckets"].get("assets"))
+            H = secrets.token_bytes(32)
+            ha = eth.address(H).lower()
+            total = 10_000 * 10 ** 18
+            send(KEY0, HPP, "transfer(address,uint256)", ha, total)
+            hpp_of = lambda a: int(cast("call", HPP, "balanceOf(address)(uint256)", a).split()[0])
+            K = secrets.token_bytes(32)
+            kda = eth.address(K).lower()
+            code, out, _ = S.bind(kda, K, H)
+            check(code == 200, "an HPP holder binds a key's bucket (%s %s)" % (code, out))
+            value, deadline = 10 ** 21 + 1, int(time.time()) + 86400      # 1000 HPP and a unit: past 2^64, odd to show exactness
+            nonce = int(cast("call", HPP, "nonces(address)(uint256)", ha).split()[0])
+            pd = eth.typed_digest(eth.domain_separator("HousePartyProtocol", "1", CHAIN_ID, HPP), PERMIT, ha, S.spender, value, nonce, deadline)
+            permit = {"value": str(value), "deadline": deadline, "signature": "0x" + eth.sign(H, pd).hex()}
+            code, out, _ = jpost(url + "/account/%s/permit" % ha, permit)
+            check(code == 401, "an HPP permit sent without its asset is checked in USDC.e's domain: 401 (%s)" % code)
+            code, out, _ = jpost(url + "/account/%s/permit" % ha, dict(permit, asset="0x" + "22" * 20))
+            check(code == 400, "a permit in a token the store does not take: 400 (%s)" % code)
+            code, out, _ = jpost(url + "/account/%s/permit" % ha, dict(permit, asset=HPP))
+            check(code == 200 and (out.get("permit") or {}).get("value") == str(value) and out.get("asset") == HPP.lower()
+                  and out.get("balance") == str(total),
+                  "an HPP permit taken: its value and the wallet's balance exact, as decimal strings past 2^53 (%s %s)" % (code, out))
+            blob = secrets.token_bytes(200_000)
+            csig = eth.sign(K, S.digest(CONTENT, kda, 1, eth.keccak256(blob)))
+            code, _, _ = http("POST", "%s/put?bucket=%s&height=1" % (url, kda), blob, {"X-HPPLite-Signature": "0x" + csig.hex()})
+            check(code == 200, "content into the HPP-funded bucket: 200 (%s)" % code)
+            got = wait_for(lambda: hpp_of(pay_to), 30)
+            check(got > 2 ** 53 and got % 10 ** 14 == 0,
+                  "storage accrued: the store pulled HPP to payTo, past 2^53, in whole credit units (10^14 each) (%d)" % got)
+            check(wait_for(lambda: hpp_of(ha) + hpp_of(pay_to) == total, 10), "every HPP pulled went from the funder to payTo, exactly")
+            acct = wait_for(lambda: (lambda a: a if (a.get("permit") or {}).get("sent") else None)(http("GET", url + "/account/" + ha)[1]), 10) \
+                or http("GET", url + "/account/" + ha)[1]
+            check(acct.get("state") == "covered" and (acct.get("permit") or {}).get("sent") is True,
+                  "the HPP permit went on chain with the pull; covered (%s)" % acct)
+            C = secrets.token_bytes(32)
+            ca = eth.address(C).lower()
+            send(KEY0, CHIP, "transfer(address,uint256)", ca, 5_000_000)
+            chip_of = lambda a: int(cast("call", CHIP, "balanceOf(address)(uint256)", a).split()[0])
+            before = chip_of(pay_to)
+            code, out, hdr = http("POST", url + "/account/%s/pay?amount=3000" % ca)
+            hdr = {k.upper(): v for k, v in hdr.items()}
+            offers = json.loads(__import__("base64").b64decode(hdr.get("PAYMENT-REQUIRED", "e30="))).get("accepts", [])
+            check(code == 402 and [o["asset"].lower() for o in offers] == [USDC.lower(), CHIP.lower()] and all(o["amount"] == "3000" for o in offers),
+                  "a top-up's 402 offers USDC.e first, then CHIP, 3000 units each, not HPP (%s)" % offers)
+            code, data, _ = Buyer(url, C, 10_000, asset=CHIP).call("POST", "/account/%s/pay?amount=3000" % ca)
+            check(code == 200 and data.get("credit") == 3000 and chip_of(pay_to) - before == 3000,
+                  "a CHIP top-up by x402: the account credited 3000 units, payTo holds the CHIP (%s %s)" % (code, data))
 
         # --- sweep ---
         if CHECK_SWEEP_FILES:

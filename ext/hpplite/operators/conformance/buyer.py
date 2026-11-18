@@ -29,7 +29,7 @@ class OverCap(Exception):
 
 
 class Buyer:
-    def __init__(self, service, key: bytes, cap: int, valid_for: int = 120):
+    def __init__(self, service, key: bytes, cap: int, valid_for: int = 120, asset=None):
         u = urllib.parse.urlparse(service)
         self.host, self.port = u.hostname, u.port or 80
         self.key = key
@@ -37,6 +37,7 @@ class Buyer:
         self.cap = cap
         self.valid_for = valid_for   # the authorization's window; a test chain whose clock ran ahead needs a wide one
         self.paid = []          # settlements
+        self.asset = asset      # pay in this token's offer when the 402 has several (#357); else the first
 
     def _request(self, method, path, body=None, headers=None):
         conn = http.client.HTTPConnection(self.host, self.port, timeout=120)
@@ -51,7 +52,8 @@ class Buyer:
 
     def _payment(self, requirements_header: str) -> str:
         req = json.loads(base64.b64decode(requirements_header))
-        acc = next((a for a in req.get("accepts", []) if a.get("scheme") == "exact"), None)
+        acc = next((a for a in req.get("accepts", []) if a.get("scheme") == "exact"
+                    and (not self.asset or a.get("asset", "").lower() == self.asset.lower())), None)
         if not acc:
             raise ValueError("no exact-scheme offer in the 402")
         amount = int(acc["amount"])

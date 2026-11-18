@@ -9,7 +9,8 @@ pragma solidity ^0.8.19;
  *         transferWithAuthorization, which is what x402's `exact` scheme
  *         settles with, and receiveWithAuthorization, which batch-settlement's
  *         deposit collector pulls a channel's deposit with (#135), and EIP-2612
- *         permit, which hpplite-store/2's pulls are funded by (#212). Six decimals; the deployer gets the supply.
+ *         permit, which hpplite-store/2's pulls are funded by (#212). Decimals given at deploy (6 for CHIP, 18 for
+ *         an HPP stand-in, #357); the deployer gets the supply.
  *         Not for any chain that matters. The EIP-712 domain is the real
  *         token's: name "Bridged USDC", version "2" (its symbol is USDC.e;
  *         HPP's facilitator checks the name against the token, #11).
@@ -18,7 +19,7 @@ contract MockToken {
     string public name;
     string public symbol;
     string private domainVersion;
-    uint8 public constant decimals = 6;
+    uint8 public immutable decimals;
     uint256 public totalSupply;
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
@@ -38,8 +39,9 @@ contract MockToken {
     event Approval(address indexed owner, address indexed spender, uint256 value);
     event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce);
 
-    constructor(string memory name_, string memory symbol_, string memory version_, uint256 supply) {
+    constructor(string memory name_, string memory symbol_, string memory version_, uint8 decimals_, uint256 supply) {
         name = name_;
+        decimals = decimals_;
         symbol = symbol_;
         domainVersion = version_;
         totalSupply = supply;

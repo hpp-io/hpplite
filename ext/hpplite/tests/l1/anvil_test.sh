@@ -64,8 +64,11 @@ if [ -n "$fork" ]; then
         || { echo "the fork's CHIP at $chip: key0's balance not set (its balances not at slot 0?)"; exit 1; }
     echo "fork of $HPPLITE_ANVIL_FORK at block $(cast block-number --rpc-url "$rpc"), CHIP $chip ($(cast call "$chip" 'name()(string)' --rpc-url "$rpc"))"
 else
-    chip=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --broadcast --json src/test/MockToken.sol:MockToken --constructor-args "House Chip" CHIP 1 1000000000000000 2>/dev/null | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' | head -1)
+    chip=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --broadcast --json src/test/MockToken.sol:MockToken --constructor-args "House Chip" CHIP 1 6 1000000000000000 2>/dev/null | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' | head -1)
 fi
+# a stand-in for HPP (#357): 18 decimals, permit only in use (HPP has no EIP-3009), a supply past 2^64 of its units
+hpp=$(cd "$contracts" && forge create --rpc-url "$rpc" --private-key "$key0" --broadcast --json src/test/MockToken.sol:MockToken --constructor-args HousePartyProtocol HPP 1 18 1000000000000000000000000000 2>/dev/null | sed -n 's/.*"deployedTo": *"\(0x[0-9a-fA-F]\{40\}\)".*/\1/p' | head -1)
+[ -n "$hpp" ] && echo "MockToken (HPP) $hpp" || echo "MockToken (HPP) not deployed: the HPP store checks will be skipped"
 [ -n "$fork" ] || { [ -n "$chip" ] && echo "MockToken (CHIP) $chip" || echo "MockToken (CHIP) not deployed: the CHIP scenario will be skipped"; }
 # the x402 facilitator the services pay through on this chain (#183), with a key of its own that no test uses
 fkey=0x0fac11177a70f0fac11177a70f0fac11177a70f0fac11177a70f0fac11177a70
@@ -78,6 +81,6 @@ trap 'kill $fpid 2>/dev/null; kill -CONT $pid 2>/dev/null; kill $pid 2>/dev/null
 for i in $(seq 1 50); do kill -0 $fpid 2>/dev/null || break; curl -s -m 2 "http://127.0.0.1:$fport/supported" 2>/dev/null | grep -q kinds && break; sleep 0.2; done
 curl -s -m 2 "http://127.0.0.1:$fport/supported" 2>/dev/null | grep -q kinds || { echo "the mock facilitator did not start"; cat "$log.facilitator"; exit 1; }
 export HPPLITE_ANVIL_FACILITATOR="http://127.0.0.1:$fport" HPPLITE_ANVIL_FACILITATOR_ADDR=$faddr
-export HPPLITE_ANVIL_USDC=$usdc HPPLITE_ANVIL_CHIP=$chip HPPLITE_PIN_SERVICE="$here/../../operators/store"
+export HPPLITE_ANVIL_USDC=$usdc HPPLITE_ANVIL_CHIP=$chip HPPLITE_ANVIL_HPP=$hpp HPPLITE_PIN_SERVICE="$here/../../operators/store"
 # the faulty-endpoint proxy (#49), started by the suite itself in front of anvil
 HPPLITE_VERIFY_BIN="$(dirname "$bin")/hpplite-verify" HPPLITE_RPC_PROXY="$here/rpc_proxy.py" HPPLITE_ANVIL_RPC=$rpc HPPLITE_ANVIL_FACTORY=$factory HPPLITE_ANVIL_KEY0=$key0 HPPLITE_ANVIL_KEY1=$key1 HPPLITE_ANVIL_KEY2=$key2 HPPLITE_ANVIL_KEY3=$key3 HPPLITE_ANVIL_KEY4=$key4 HPPLITE_ANVIL_KEY5=$key5 HPPLITE_ANVIL_KEY6=$key6 HPPLITE_ANVIL_KEY7=$key7 HPPLITE_ANVIL_KEY8=$key8 HPPLITE_ANVIL_KEY9=$key9 HPPLITE_ANVIL_PID=$pid "$bin"

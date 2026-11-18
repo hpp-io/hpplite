@@ -26,8 +26,9 @@ class Payments:
     def enabled(self):
         return self.facilitator is not None
 
-    def requirements(self, amount: int, resource_url: str, description: str, extra=None):
-        """The 402. extra: fields every offer carries besides the token's (the relay's signed quote, #184)"""
+    def requirements(self, amount: int, resource_url: str, description: str, extra=None, offers=None):
+        """The 402. extra: fields every offer carries besides the token's (the relay's signed quote, #184); offers:
+        (asset, amount, token extra) for other tokens the payer may choose, after this one (#357)"""
         out = {
             "x402Version": 2,
             "error": "PAYMENT-SIGNATURE header is required",
@@ -35,11 +36,21 @@ class Payments:
             "accepts": [{
                 "scheme": "exact", "network": self.network, "amount": str(amount), "asset": self.asset,
                 "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": self.extra,
-            }],
+            }] + [{
+                "scheme": "exact", "network": self.network, "amount": str(amt), "asset": asset,
+                "payTo": self.pay_to, "maxTimeoutSeconds": 120, "extra": ex,
+            } for asset, amt, ex in (offers or [])],
         }
         for a in out["accepts"]:
             a["extra"] = dict(a["extra"], **(extra or {}))
         return out
+
+    @staticmethod
+    def offer_paid(payload, requirements):
+        """the offer the payment says it took (x402 v2's `accepted`), by its asset; the first when it names none"""
+        acc = payload.get("accepted") if isinstance(payload.get("accepted"), dict) else {}
+        asset = str(acc.get("asset", "")).lower()
+        return next((a for a in requirements["accepts"] if a["asset"].lower() == asset), requirements["accepts"][0])
 
     def decode(self, header: str):
         try:

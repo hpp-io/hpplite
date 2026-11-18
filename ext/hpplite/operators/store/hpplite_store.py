@@ -100,6 +100,40 @@ def sig_bytes(h):
 def same(a, b):
     return bool(a) and bool(b) and a.lower() == b.lower()
 
+# ============ The tokens a store takes (#357) ============
+# Credit is in the first asset's atomic units; another token converts at its unitsPerToken (credit units for one whole
+# token: USDC.e and CHIP 1000000, HPP at $0.01 10000). A token amount may pass 2^53 (HPP has 18 decimals).
+
+SAFE = 2 ** 53 - 1
+
+
+def asset_info(assets, address):
+    return next((x for x in assets if same(x["asset"], address)), None) if address else None
+
+
+def to_units(asset, amount):
+    """credit units for an amount of the token, rounded down"""
+    return int(amount) * asset["unitsPerToken"] // 10 ** asset["decimals"]
+
+
+def to_amount(asset, units):
+    """the token amount that buys these credit units, rounded up"""
+    return -(-int(units) * 10 ** asset["decimals"] // asset["unitsPerToken"])
+
+
+def amt(n):
+    """a token amount in JSON: a number up to 2^53 - 1, past it a decimal string (#357)"""
+    return None if n is None else (int(n) if int(n) <= SAFE else str(int(n)))
+
+
+def parse_asset(text):
+    """--extra-asset ADDRESS,NAME,VERSION,DECIMALS,UNITS_PER_TOKEN[,exact]"""
+    f = [x.strip() for x in text.split(",")]
+    if len(f) not in (5, 6) or not ADDR_RE.match(f[0]) or (len(f) == 6 and f[5] != "exact"):
+        raise argparse.ArgumentTypeError("an asset is ADDRESS,NAME,VERSION,DECIMALS,UNITS_PER_TOKEN[,exact]")
+    return {"asset": f[0].lower(), "name": f[1], "version": f[2], "decimals": int(f[3]), "unitsPerToken": int(f[4]),
+            "exact": len(f) == 6}
+
 # ============ Objects on disk ============
 
 
@@ -183,11 +217,12 @@ class Rollups:
 class Ledger:
     """Everything that changes money or a bucket's state, under one lock (a Worker: Durable Objects)"""
 
-    def __init__(self, args, disk, signer_key, chain_id, rollups, token):
+    def __init__(self, args, disk, signer_key, chain_id, rollups, tokens, assets):
         self.args, self.disk, self.key, self.chain_id = args, disk, signer_key, chain_id
         self.signer = eth.address(signer_key)
         self.domain = eth.domain_separator("HPPLiteStore", "2", chain_id, args.pay_to)
-        self.rollups, self.token = rollups, token
+        # the tokens it takes (#357): credit is in the first's units, the others converted at their unitsPerToken
+        self.rollups, self.tokens, self.assets = rollups, tokens, assets
         self.lock = threading.RLock()
         self.warnings = {}
         self.seen = {}          # funder -> (what its permit could pull, when): the last read that worked
@@ -259,22 +294,33 @@ class Ledger:
         """units per second its buckets cost now"""
         return sum(b["bytes"] for b in self.buckets_of(funder)) * self.args.price_per_mib_month / MIB / MONTH
 
+    # --- the tokens (#357): credit is in units, a token's amounts in its own ---
+    def asset_of(self, a):
+        """the asset an account's permit is in: the first asset's when it names none (before #357)"""
+        p = a.get("permit")
+        return asset_info(self.assets, (p or {}).get("asset")) or self.assets[0]
+
+    def token_of(self, a):
+        return self.tokens.get(self.asset_of(a)["asset"]) if self.tokens else None
+
     def pullable(self, a, now=None):
         """what the permit can still pull: the wallet's balance, the allowance (or the permit not yet sent), before
         its deadline. 0 without a chain or a permit. When the chain cannot be read, what the last read said (#219: a
         failed read must not make the store sign or report less than it knows); None when it never could"""
         now = now or int(time.time())
         p = a.get("permit")
-        if not self.token or not p or int(p["deadline"]) <= now:
+        token = self.token_of(a)
+        if not token or not p or int(p["deadline"]) <= now:
             return 0
         try:
-            bal = self.token.balance(a["funder"])
-            allow = self.token.allowance(a["funder"]) if a.get("permitSent") else int(p["value"])
+            bal = token.balance(a["funder"])
+            allow = token.allowance(a["funder"]) if a.get("permitSent") else int(p["value"])
         except ChainUnreadable:
             seen = self.seen.get(a["funder"])
             return seen[0] if seen else None
-        self.seen[a["funder"]] = (min(bal, allow), now)
-        return min(bal, allow)
+        units = to_units(self.asset_of(a), min(bal, allow))
+        self.seen[a["funder"]] = (units, now)
+        return units
 
     def covered_until(self, a, now=None):
         now = now or int(time.time())
@@ -354,21 +400,24 @@ class Ledger:
         """take what is owed. Refused: the account is uncovered and its buckets park. Failed (the store's own
         trouble): nothing changes; a warning"""
         owed = -a["credit"]
-        if owed <= 0 or not self.token:
+        token = self.token_of(a)
+        if owed <= 0 or not token:
             return
         a["lastTry"] = now
         p = a.get("permit")
         if not p or int(p["deadline"]) <= now:
             self.uncover(a, "no permit" if not p else "the permit's deadline passed", now)
             return
+        asset = self.asset_of(a)
+        amount = to_amount(asset, owed)        # what is owed in the permit's token, rounded up (#357)
         try:
-            allowed = self.token.allowance(a["funder"])
+            allowed = token.allowance(a["funder"])
         except ChainUnreadable as e:
             self.warn("pull", "%s: the chain cannot be read: %s" % (a["funder"], e))
             self.save_account(a)
             return
-        if allowed < owed and not a.get("permitSent"):
-            outcome, why = self.token.send(Token.permit_data(a["funder"], p))
+        if allowed < amount and not a.get("permitSent"):
+            outcome, why = token.send(Token.permit_data(a["funder"], p))
             if outcome == "refused":
                 self.uncover(a, "the permit was refused: %s" % why, now)
                 return
@@ -377,14 +426,14 @@ class Ledger:
                 self.save_account(a)
                 return
             a["permitSent"] = True
-        outcome, why = self.token.send(self.token.transfer_data(a["funder"], self.args.pay_to, owed))
+        outcome, why = token.send(token.transfer_data(a["funder"], self.args.pay_to, amount))
         if outcome == "refused":
             self.uncover(a, "the pull was refused: %s" % why, now)
         elif outcome == "failed":
             self.warn("pull", "%s: %s" % (a["funder"], why))
             self.save_account(a)
         else:
-            a["credit"] += owed
+            a["credit"] += to_units(asset, amount)
             a["lastPull"], a["uncovered"], a["why"] = now, False, ""
             self.warnings.pop("pull", None)
             self.save_account(a)
@@ -492,8 +541,12 @@ class Service:
         chain = Chain(args.rpc, "hpplite-store/2") if args.rpc else None
         self.chain = chain                  # a smart wallet's signature is checked by asking it (#356)
         self.rollups = Rollups(chain) if chain else None
-        token = Token(chain, args.asset, spender_key, self.chain_id) if chain else None
-        self.ledger = Ledger(args, self.disk, key, self.chain_id, self.rollups, token)
+        # the first asset, then any others (#357); one lock for the spender's nonces whatever the token
+        self.assets = [{"asset": args.asset.lower(), "name": args.asset_name, "version": args.asset_version, "decimals": args.asset_decimals,
+                        "unitsPerToken": 10 ** args.asset_decimals, "exact": True}] + list(args.extra_asset or [])
+        lock = threading.Lock()
+        tokens = {x["asset"]: Token(chain, x["asset"], spender_key, self.chain_id, lock=lock) for x in self.assets} if chain else None
+        self.ledger = Ledger(args, self.disk, key, self.chain_id, self.rollups, tokens, self.assets)
         self.payments = Payments(args.facilitator, args.network, args.asset, args.pay_to,
                                  args.asset_name, args.asset_version, args.rpc)
         self.spender = eth.address(spender_key)
@@ -518,7 +571,9 @@ class Service:
             "buckets": {"asset": a.asset, "assetDomain": {"name": a.asset_name, "version": a.asset_version},
                         "payTo": a.pay_to, "spender": self.spender, "pricePerWrite": a.price_per_write,
                         "pricePerMiBMonth": a.price_per_mib_month, "pullThreshold": a.pull_threshold,
-                        "pullIntervalSeconds": a.pull_interval, "parkSeconds": a.park_seconds},
+                        "pullIntervalSeconds": a.pull_interval, "parkSeconds": a.park_seconds,
+                        "assets": [{"asset": x["asset"], "name": x["name"], "version": x["version"], "decimals": x["decimals"],
+                                    "unitsPerToken": str(x["unitsPerToken"]), "exact": x["exact"]} for x in self.assets]},
             "payment": {"scheme": "exact", "network": a.network, "facilitator": a.facilitator, "minPay": a.min_pay,
                         "extra": {"name": a.asset_name, "version": a.asset_version}} if self.payments.enabled else None,
             "chain": bool(a.rpc), "warnings": self.ledger.warnings, "uptime": int(time.time()) - self.started,
@@ -584,7 +639,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """402 until a payment for `amount` verifies; then the account is credited, the work done, the payment
         settled; a settlement that fails takes the credit back (the work stays, owed)"""
         p = self.service.payments
-        requirements = p.requirements(amount, "http://%s%s" % (self.headers.get("Host", "localhost"), self.path), description)
+        offers = [(x["asset"], to_amount(x, amount), {"name": x["name"], "version": x["version"]})
+                  for x in self.service.assets[1:] if x["exact"]]       # the first asset's offer first (#357)
+        requirements = p.requirements(amount, "http://%s%s" % (self.headers.get("Host", "localhost"), self.path), description,
+                                      offers=offers)
         header = self.headers.get("PAYMENT-SIGNATURE")
         if not header:
             requirements["error"] = getattr(self, "why402", None) or requirements["error"]
@@ -592,15 +650,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = p.decode(header)
         if not payload or "payload" not in payload:
             return self.reply(400, {"error": "PAYMENT-SIGNATURE is not a payment payload"})
-        v = p.verify(payload, requirements["accepts"][0])
+        offer = p.offer_paid(payload, requirements)
+        v = p.verify(payload, offer)
         if not v.get("isValid"):
             requirements["error"] = v.get("invalidReason", "invalid payment")
             return self.reply(402, requirements, {"PAYMENT-REQUIRED": base64.b64encode(json.dumps(requirements).encode()).decode()})
-        self.L.credit(funder, amount)
+        units = to_units(asset_info(self.service.assets, offer["asset"]) or self.service.assets[0], int(offer["amount"]))
+        self.L.credit(funder, units)
         status, obj = work()
-        s = p.settle(payload, requirements["accepts"][0])
+        s = p.settle(payload, offer)
         if not s.get("success"):
-            self.L.credit(funder, -amount)
+            self.L.credit(funder, -units)
             return self.reply(402, {"error": "settlement failed: " + s.get("errorReason", "?"), "settlement": s})
         return self.reply(status, obj, {"PAYMENT-RESPONSE": base64.b64encode(json.dumps(s).encode()).decode()})
 
@@ -715,15 +775,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def account_view(self, a):
         L = self.L
+        token = L.token_of(a)       # the permit's token (#357): balance, allowance and nonce are its
         try:
-            bal = L.token.balance(a["funder"]) if L.token else None
-            allow = L.token.allowance(a["funder"]) if L.token else None
-            nonce = L.token.nonce(a["funder"]) if L.token else 0
+            bal = token.balance(a["funder"]) if token else None
+            allow = token.allowance(a["funder"]) if token else None
+            nonce = token.nonce(a["funder"]) if token else 0
         except ChainUnreadable:
             bal = allow = nonce = None
         p = a.get("permit")
-        return {"funder": a["funder"], "credit": a["credit"], "balance": bal, "allowance": allow,
-                "permit": {"value": p["value"], "deadline": p["deadline"], "sent": a.get("permitSent", False)} if p else None,
+        return {"funder": a["funder"], "credit": a["credit"], "asset": L.asset_of(a)["asset"], "balance": amt(bal), "allowance": amt(allow),
+                "permit": {"value": amt(p["value"]), "deadline": p["deadline"], "sent": a.get("permitSent", False),
+                           "asset": L.asset_of(a)["asset"]} if p else None,
                 "permitNonce": nonce,
                 "dailyCost": int(L.rate(a["funder"]) * 86400 + 0.999999), "coveredUntil": L.covered_until(a),
                 "buckets": [b["da"] for b in L.buckets_of(a["funder"]) if ADDR_RE.match(b["da"])],
@@ -1053,25 +1115,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not sig or deadline <= int(time.time()):
             return self.reply(400, {"error": "a permit with a signature and a deadline ahead"})
         L = self.L
-        if L.token:
+        asset = asset_info(self.service.assets, req.get("asset")) if req.get("asset") else self.service.assets[0]
+        if not asset:
+            return self.reply(400, {"error": "this store takes no such asset", "assets": [x["asset"] for x in self.service.assets]})
+        token = L.tokens.get(asset["asset"]) if L.tokens else None
+        if token:
             try:
-                nonce = L.token.nonce(funder)
+                nonce = token.nonce(funder)
             except ChainUnreadable as e:
                 return self.reply(503, {"error": "the chain cannot be read: %s" % e})
-            domain = eth.domain_separator(self.service.args.asset_name, self.service.args.asset_version,
-                                          self.service.chain_id, self.service.args.asset)
-            digest = eth.typed_digest(domain, PERMIT_TYPE, funder, L.token.spender, value, nonce, deadline)
+            domain = eth.domain_separator(asset["name"], asset["version"], self.service.chain_id, asset["asset"])
+            digest = eth.typed_digest(domain, PERMIT_TYPE, funder, token.spender, value, nonce, deadline)
             try:
-                funded = signed_by(L.token.chain, funder, digest, sig)     # or a smart wallet's (#356)
+                funded = signed_by(token.chain, funder, digest, sig)     # or a smart wallet's (#356)
             except ChainUnreadable as e:
                 return self.reply(503, {"error": "the chain cannot be read: %s" % e})
             if not funded:
                 return self.reply(401, {"error": "the permit does not recover to the funder (spender, nonce, domain?)",
-                                        "spender": L.token.spender, "nonce": nonce})
+                                        "spender": token.spender, "nonce": nonce})
         with L.lock:
             a = L.account(funder, create=True)
-            a["permit"] = {"value": value, "deadline": deadline, "spender": L.token.spender if L.token else self.service.spender,
-                           "signature": "0x" + sig.hex()}
+            # one permit an account: a newer one, in any token, replaces it (#357)
+            a["permit"] = {"value": value, "deadline": deadline, "spender": token.spender if token else self.service.spender,
+                           "signature": "0x" + sig.hex(), "asset": asset["asset"]}
             a["permitSent"] = False
             if a.get("uncovered"):
                 a["lastTry"] = 0            # try a pull at the next tick
@@ -1125,6 +1191,10 @@ def main():
     ap.add_argument("--asset", default="0x401eCb1D350407f13ba348573E5630B83638E30D", help="the token (USDC.e on HPP): EIP-3009 and EIP-2612")
     ap.add_argument("--asset-name", default="Bridged USDC")
     ap.add_argument("--asset-version", default="2")
+    ap.add_argument("--asset-decimals", type=int, default=6, help="the asset's decimals: credit is in its atomic units")
+    ap.add_argument("--extra-asset", action="append", type=parse_asset, default=[],
+                    help="another token taken (#357): ADDRESS,NAME,VERSION,DECIMALS,UNITS_PER_TOKEN[,exact] - UNITS_PER_TOKEN the "
+                         "credit one whole token buys; exact: x402 top-ups in it too (EIP-3009)")
     ap.add_argument("--price-per-mib-month", type=float, default=30.0, help="atomic units per MiB per 30 days ($0.03 per GiB-month)")
     ap.add_argument("--price-per-write", type=int, default=10, help="atomic units per name or content put")
     ap.add_argument("--min-pay", type=int, default=1000000, help="the smallest x402 top-up (atomic units)")

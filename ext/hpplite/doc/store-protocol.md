@@ -21,8 +21,8 @@ nothing to a service that names another, or none.
   bucket** is the same space for a key that is not a rollup's, named by the
   key's own address (#349, [below](#a-keys-bucket)): a pinning service's
   customer, paid the same way.
-- **An account** belongs to a **funding wallet** (an address holding the
-  asset, USDC.e) and may pay for several buckets. Its `credit` is what was
+- **An account** belongs to a **funding wallet** (an address holding a
+  token the store takes: USDC.e, or [another](#tokens)) and may pay for several buckets. Its `credit` is what was
   paid in minus what was charged; negative is owed. Money comes in two ways:
   - **x402** (`exact`), started by a payer who is online: an agent, a
     stranger, an "extend now" button. The facilitator pays the gas.
@@ -97,9 +97,9 @@ stay 65-byte signatures that recover to it.
 | `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | the sequencer; `402` if not covered | `200 {name, bytes, signer}`: the name is the write - its bytes are held in the bucket |
 | `POST /put?bucket=<da>&height=<n>`, the body the bytes, `X-HPPLite-Signature` the `Content` signature | the sequencer; `402` if not covered | `200 {cid, bytes}` |
 | `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names); a name's batch bytes are also read by their CID |
-| `POST /account/<funder>/permit`, body `{value, deadline, signature}` (hex: 65 bytes, or a smart account's, #356; `{v, r, s}` taken too) | the funder (the permit) | `200` the account |
+| `POST /account/<funder>/permit`, body `{value, deadline, signature[, asset]}` (hex: 65 bytes, or a smart account's, #356; `{v, r, s}` taken too; `asset` one of `buckets.assets`, else `400`; `value` a number or a decimal string) | the funder (the permit, in `asset`'s EIP-712 domain) | `200` the account |
 | `POST /account/<funder>/pay?amount=<units>` | x402 `exact` | `200` the account: `credit` raised by the amount |
-| `GET /account/<funder>` | - | `200 {funder, credit, balance, allowance, deadline, dailyCost, coveredUntil, buckets, state}` |
+| `GET /account/<funder>` | - | `200 {funder, credit, asset, balance, allowance, permit, deadline, dailyCost, coveredUntil, buckets, state}` (`asset` the permit's token, `balance` and `allowance` in it) |
 | `GET /status` | - | below |
 
 Names keep /1's rules: `<da>-<height>`, the body the batch's bytes followed
@@ -203,6 +203,36 @@ encrypts it.
   or signs the second permit once the first is on chain (`sent`) (#281).
 - The permit's `spender` is `/status`'s `buckets.spender` (the store's
   puller, which holds a little ETH for gas); `transferFrom` pays `payTo`.
+- A permit is in one token, `asset` in its call (the first asset when it
+  names none); a newer permit in another token replaces it.
+
+### Tokens
+
+A store may take several tokens (#357), listed in `/status`
+`buckets.assets`, the first being `buckets.asset`. **Credit, prices,
+`minPay` and `pullThreshold` are in the first asset's atomic units** (USDC.e:
+a millionth of a dollar). Another token converts at its `unitsPerToken`,
+the credit one whole token buys, a decimal string the operator sets and may
+change at any deploy:
+
+| Token | `decimals` | `unitsPerToken` | `exact` |
+|---|---|---|---|
+| USDC.e | 6 | `"1000000"` | yes |
+| CHIP | 6 | `"1000000"` ($1) | yes |
+| HPP | 18 | `"10000"` ($0.01, set by the operator) | no (no EIP-3009) |
+
+- A pull converts what is owed into the permit's token at the rate then,
+  rounded up (`ceil(owed x 10^decimals / unitsPerToken)`), and credits what
+  it pulled, rounded down - never less than was owed.
+- An x402 top-up offers `exact` in each token with `exact: true`, the first
+  asset's offer first, each amount converted the same way; the payment
+  credits what its token's amount buys. HPP pays by permit (x402 `upto` is
+  #358).
+- **Token amounts may pass 2^53** (HPP: one is 10^18 units), beyond JSON
+  numbers' exact range. In the account view, `balance`, `allowance` and
+  `permit.value` are JSON numbers up to 2^53 - 1 and decimal strings past
+  it; a client reads both. A permit's `value` may be sent as either.
+  Credit stays a number: credit units are small.
 
 ### Charges and pulls
 
@@ -295,7 +325,9 @@ bytes above a prune point, is caught by its own signature on chain.
   "domain": {"name": "HPPLiteStore", "version": "2", "chainId": 190415, "verifyingContract": "0x…"},
   "buckets": {"asset": "0x…", "payTo": "0x…", "spender": "0x…",
               "pricePerWrite": 10, "pricePerMiBMonth": 30.0,
-              "pullThreshold": 1000000, "pullIntervalSeconds": 2592000, "parkSeconds": 2592000},
+              "pullThreshold": 1000000, "pullIntervalSeconds": 2592000, "parkSeconds": 2592000,
+              "assets": [{"asset": "0x…", "name": "Bridged USDC", "version": "2", "decimals": 6, "unitsPerToken": "1000000", "exact": true},
+                         {"asset": "0x…", "name": "HousePartyProtocol", "version": "1", "decimals": 18, "unitsPerToken": "10000", "exact": false}]},
   "payment": {"scheme": "exact", "network": "eip155:190415", "facilitator": "https://…", "minPay": 1000000}
 }
 ```
@@ -310,7 +342,9 @@ are the same quote, and a client reads it as a decimal (#282).
 
 A `402` carries x402 v2 requirements, in the body and base64 in
 `PAYMENT-REQUIRED`: `exact` (EIP-3009 `TransferWithAuthorization`) to
-`payTo`, `extra` naming the token's EIP-712 domain. For a write the amount
+`payTo`, `extra` naming the token's EIP-712 domain - an offer for each
+[token](#tokens) with `exact`, the first asset's first; the payment names the
+one it took (`accepted`). For a write the amount
 is a top-up - the larger of `minPay` and what covers the write and 30 days
 of the account's storage - so an agent pays now and then, not per write;
 for `/pay`, the amount asked. The payer repeats the request with
@@ -321,6 +355,9 @@ charged to the account as owed).
 ## The node
 
 - `store=https://…` as today; the node needs a funder (below) to write.
+- The node permits and pays in the first asset (`buckets.asset`, the first
+  `exact` offer); another token is a funder's choice made outside the node
+  (#357).
 - **Self-provisioned**: the node creates a funding key beside its own
   (`<key>.funding`), reports its address (`hpplite_status.funder`) - send
   USDC.e there to fund it - signs the binding with both keys and the permit

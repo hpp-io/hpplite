@@ -13,6 +13,9 @@ hpplite_store.py --port 8420 --dir /var/lib/hpplite-store --signer-key /etc/hppl
     --facilitator https://facilitator-sepolia.hpp.io     # x402 top-ups; without it, permit pulls only
 
 hpplite_store.py ... --price-per-write 0 --price-per-mib-month 0        # free (development)
+
+hpplite_store.py ... --extra-asset "0xCHIP,House Chip,1,6,1000000,exact" \
+    --extra-asset "0xHPP,HousePartyProtocol,1,18,10000"                 # other tokens (#357): CHIP at $1, HPP at $0.01, by permit
 ```
 
 ## The model
@@ -32,6 +35,9 @@ hpplite_store.py ... --price-per-write 0 --price-per-mib-month 0        # free (
   held once.
 - **Charges**: storage (bytes x time at `--price-per-mib-month`, booked at
   each tick) and `--price-per-write` per write.
+- **Tokens**: credit is in `--asset`'s units; `--extra-asset` adds a token at
+  the credit one whole token buys, permitted and pulled in its own units
+  (an amount past 2^53 exact), with x402 top-ups when marked `exact`.
 - **States**: covered; parked (not served, 410; writes 402) when the account
   cannot pay or the funder released it, restorable by paying; deleted
   `--park-seconds` later.
