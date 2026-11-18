@@ -14,9 +14,10 @@
 **
 ** Nothing is cached: every call reads the files it needs, so several
 ** processes on one directory (a writer, replicas, hpplite-verify) see one
-** state, as they see one chain. A claim serializes on lease.lock (O_EXCL);
-** a lock older than DIR_LOCK_STALE seconds is a crashed claimant's and is
-** removed. Time is the wall clock. Transaction hashes are synthetic and
+** state, as they see one chain. A claim serializes on lease.lock (O_EXCL),
+** which names its claimant (pid and host); a lock whose process is gone on
+** this host, or older than DIR_LOCK_STALE seconds, is a crashed claimant's
+** and is removed. Time is the wall clock. Transaction hashes are synthetic and
 ** every "transaction" is final when the call returns.
 */
 
@@ -30,6 +31,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/stat.h>
 
 #define DIR_DEFAULT_LEASE      300
@@ -206,17 +208,39 @@ static int dirReadOwner(HppliteL1 *l1, unsigned char out[20]) {
     return rc;
 }
 
-/* The claim lock: one claimant at a time; a lock a crashed claimant left is taken over */
+/* A lock whose claimant is gone: it names a process on this host that no longer exists (#137). A claimant killed
+** between lock and unlock left it; another host's, or an unreadable one, waits for DIR_LOCK_STALE */
+static int dirLockOrphaned(const char *path) {
+    char host[256] = "", theirs[256] = "";
+    long pid = 0;
+    FILE *f = fopen(path, "r");
+    int n;
+    if (!f) return 0;
+    n = fscanf(f, "%ld %255s", &pid, theirs);
+    fclose(f);
+    gethostname(host, sizeof host);
+    return n == 2 && pid > 0 && strcmp(host, theirs) == 0 && kill((pid_t)pid, 0) != 0 && errno == ESRCH;
+}
+
+/* The claim lock: one claimant at a time, the lock naming it (pid and host); a lock a crashed claimant left is taken
+** over - at once when its process is gone on this host, else once it is DIR_LOCK_STALE seconds old */
 static int dirLock(HppliteL1 *l1) {
     char path[DIR_PATH];
     int fd, tries = 2;
     dirPath(l1, "lease.lock", path);
     while (tries-- > 0) {
         fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
-        if (fd >= 0) { close(fd); return 0; }
+        if (fd >= 0) {
+            char me[300], host[256] = "";
+            gethostname(host, sizeof host);
+            snprintf(me, sizeof me, "%ld %s\n", (long)getpid(), host[0] ? host : "-");
+            (void)!write(fd, me, strlen(me));
+            close(fd);
+            return 0;
+        }
         if (errno != EEXIST) return -1;
         struct stat st;
-        if (stat(path, &st) == 0 && (uint64_t)st.st_mtime + DIR_LOCK_STALE < dirNow()) { unlink(path); continue; }
+        if (dirLockOrphaned(path) || (stat(path, &st) == 0 && (uint64_t)st.st_mtime + DIR_LOCK_STALE < dirNow())) { unlink(path); continue; }
         return -1;
     }
     return -1;

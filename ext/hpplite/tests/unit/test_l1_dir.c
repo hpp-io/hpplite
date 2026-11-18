@@ -315,12 +315,46 @@ static void test_node_keyed(void) {
     node_case("keyed", "&privkey=" KEY_A);
 }
 
+/* A claimant killed between taking lease.lock and letting it go (#137): its lock names it (pid and host), and a lock
+** whose process is gone on this host is taken over at once - not DIR_LOCK_STALE seconds later, when a restarting
+** sequencer's flushes had all come to nothing. A live claimant's lock still holds. */
+static void write_lock(const char *sub, long pid) {
+    char host[256] = "", path[1200];
+    FILE *f;
+    gethostname(host, sizeof host);
+    snprintf(path, sizeof path, "%s/lease.lock", tpath(sub));
+    f = fopen(path, "w");
+    if (f) { fprintf(f, "%ld %s\n", pid, host); fclose(f); }
+}
+
+static void test_lock_of_dead_claimant(void) {
+    TEST("a claim lock a killed claimant left (its pid gone on this host) is taken over at once; a live claimant's holds (#137)");
+    reset_dir();
+    HppliteL1 *a = hpplite_l1_connect(dir_url("da3"), NULL);
+    char *tx;
+    pid_t dead;
+    if (!a) FAIL("connect");
+    if ((dead = fork()) == 0) _exit(0);                    /* a process that is gone: its pid names no one */
+    waitpid(dead, NULL, 0);
+    write_lock("da3", (long)getpid());                     /* a live claimant's lock (this process): the claim waits */
+    tx = hpplite_l1_claim_sequencer(a, INST_A);
+    if (tx) { free_tx(tx); hpplite_l1_disconnect(a); FAIL("claimed through a live claimant's lock"); }
+    write_lock("da3", (long)dead);                         /* the killed claimant's lock */
+    tx = hpplite_l1_claim_sequencer(a, INST_A);
+    if (!tx) { hpplite_l1_disconnect(a); FAIL("a dead claimant's lock blocked the claim (until DIR_LOCK_STALE)"); }
+    free_tx(tx);
+    if (file_exists("da3", "lease.lock")) { hpplite_l1_disconnect(a); FAIL("the claim left its lock behind"); }
+    hpplite_l1_disconnect(a);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     verifyBin = argc > 1 ? argv[1] : getenv("HPPLITE_VERIFY_BIN");
     test_suite_init("l1dir", NULL, NULL);
     printf("Directory backend (#35)\n");
     test_lease();
     test_lease_expires();
+    test_lock_of_dead_claimant();
     test_store();
     test_checkpoint_and_config();
     test_node_keyless();

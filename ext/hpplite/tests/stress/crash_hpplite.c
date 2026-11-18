@@ -30,6 +30,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -140,6 +141,21 @@ static sqlite3_int64 rows_of_t(sqlite3 *db) {
     return scalar(db, "SELECT count(*) FROM t");
 }
 
+/* every hpplite_status column on one line: what a failure looked like (#137) */
+static void status_dump(sqlite3 *db) {
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db, "SELECT * FROM hpplite_status", -1, &st, NULL) != SQLITE_OK) return;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        printf("    status:");
+        for (int i = 0; i < sqlite3_column_count(st); i++) {
+            const unsigned char *v = sqlite3_column_text(st, i);
+            if (v && v[0] && strcmp((const char *)v, "0") != 0) printf(" %s=%.60s", sqlite3_column_name(st, i), v);
+        }
+        printf("\n");
+    }
+    sqlite3_finalize(st);
+}
+
 /* The checker: reopen, sync, count, flush, rebuild, compare. */
 static void check(const char *what) {
     HppliteL1 *l1 = open_l1();
@@ -159,7 +175,16 @@ static void check(const char *what) {
     (void)onL1; (void)height;
     /* a final flush drains pending; a reader rebuilt from L1 matches */
     while (hpplite_node_pending_count(n) > 0) {
-        if (hpplite_node_flush_batch(n) == 0) { CHECK(0, "%s: flush after reopen made no progress", what); break; }
+        if (hpplite_node_flush_batch(n) == 0) {
+            /* what the node says about it (#137): its state, its last error, its height and the backend's */
+            uint64_t last = 0, total = 0;
+            hpplite_l1_get_da_state(l1, &last, &total, NULL);
+            CHECK(0, "%s: flush after reopen made no progress (state %d, height %llu, L1 at %llu, pending %d, error: %s)", what, (int)n->state,
+                  (unsigned long long)hpplite_node_get_height(n), (unsigned long long)last, hpplite_node_pending_count(n),
+                  n->ctx && n->ctx->zLastError[0] ? n->ctx->zLastError : "none");
+            status_dump(n->db);
+            break;
+        }
     }
     CHECK(hpplite_node_pending_count(n) == 0, "%s: pending after final flush", what);
     unsigned char rootW[32], rootR[32];
@@ -339,7 +364,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--l1") && i + 1 < argc) useDir = !strcmp(argv[++i], "dir");
         else if (!strcmp(argv[i], "--store") && i + 1 < argc) storeSvc = argv[++i];
     }
-    srand((unsigned)getpid());
+    /* the random rounds' seed, printed so a failure can be replayed: HPPLITE_CRASH_SEED=<seed> (#137). The kill lands
+    ** after a number of milliseconds, so a replay repeats the rounds' timing, not the scheduler's */
+    {
+        const char *z = getenv("HPPLITE_CRASH_SEED");
+        unsigned seed = z && z[0] ? (unsigned)strtoul(z, NULL, 10) : (unsigned)getpid() ^ (unsigned)time(NULL);
+        srand(seed);
+        printf("random rounds: seed %u (HPPLITE_CRASH_SEED=%u replays them)\n", seed, seed);
+    }
     if (storeSvc) return store_rounds(storeSvc, rounds);
     printf("L1: %s\n", useDir ? "directory backend (l1=file://)" : "directory-backed mock");
 
