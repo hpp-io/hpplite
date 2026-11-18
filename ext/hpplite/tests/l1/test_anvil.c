@@ -1233,7 +1233,16 @@ static void test_soak(void) {
         HppliteNode *n = hpplite_get_node(w);
         why = soak_settle(w, storeUrl[0] != 0);
         /* under a store the chain holds what an anchor names: the passes above ran between anchors, the end anchors (#285) */
-        if (!why && storeUrl[0] && scalar(w, "SELECT hpplite_anchor()") <= 0) why = "the anchor at the end failed";
+        /* 0 is "nothing to anchor" too: the anchor timer (every 30 min) may have just anchored the last batch - a failure
+        ** only when the chain still does not cover the writer's last height (#362: the soak of 24b0d61738 ended 16 s after
+        ** the timer's anchor at 3600 s) */
+        if (!why && storeUrl[0] && scalar(w, "SELECT hpplite_anchor()") <= 0
+            && scalar(w, "SELECT anchored FROM hpplite_status") < scalar(w, "SELECT height FROM hpplite_status") - 1) {
+            snprintf(out, sizeof out, "the anchor at the end failed: the chain covers %lld, the writer is at %lld (%s)",
+                     (long long)scalar(w, "SELECT anchored FROM hpplite_status"), (long long)scalar(w, "SELECT height FROM hpplite_status") - 1,
+                     status_text(w, "last_error"));
+            why = out;
+        }
         if (!why) why = chain_contiguous(n);
         if (!why) { soak_fresh_replica(); why = replica_equals_as(w, "soak_replica.db", KEY0, replicaExtra); }
         if (!why && run_verify(verifyCmd, out, sizeof out) != 0) why = out;
