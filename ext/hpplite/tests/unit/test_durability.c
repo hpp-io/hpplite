@@ -740,6 +740,34 @@ static void test_adopted_batch_kept_for_reorg(void) {
 }
 
 
+/* The file replaced under a running sequencer (#320): removed and made again at the same path, the node's descriptors
+** still point at the removed one. It sent the removed file's commits as the rollup's and the new file nothing; now
+** a flush finds the path names another file and stops, saying so */
+static void test_file_replaced_under_sequencer(void) {
+    TEST("the database file removed and made again at its path while its sequencer runs: the flush stops and says the file was replaced (#320)");
+    reset_dir();
+    const char *path = DIR "/replaced.db";
+    HppliteNode *n = open_node(path, NULL);
+    sqlite3 *other = NULL;
+    if (!n) FAIL("open");
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(n, "INSERT INTO t(v) VALUES('before')", NULL);
+    if (hpplite_node_flush_batch(n) != 1) { hpplite_node_destroy(n); FAIL("the first batch"); }
+    /* another program replaces the file: the old one moved aside (its inode kept by the node), a new one made */
+    if (rename(path, DIR "/replaced.db.old") != 0) { hpplite_node_destroy(n); FAIL("rename"); }
+    rename(DIR "/replaced.db-wal", DIR "/replaced.db.old-wal");
+    if (sqlite3_open(path, &other) != SQLITE_OK) { hpplite_node_destroy(n); FAIL("make the new file"); }
+    sqlite3_exec(other, "CREATE TABLE someone_else(x)", NULL, NULL, NULL);
+    sqlite3_close(other);
+    hpplite_node_exec(n, "INSERT INTO t(v) VALUES('after the replacement')", NULL);
+    uint64_t h = hpplite_node_flush_batch(n);
+    const char *err = n->ctx ? n->ctx->zLastError : "";
+    int said = strstr(err, "replaced") != NULL;
+    if (h != 0 || !said) { printf("(flush %llu, error '%s') ", (unsigned long long)h, err); hpplite_node_destroy(n); FAIL("the flush went on with the removed file"); }
+    hpplite_node_destroy(n);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_suite_init("durability", PRIVKEY, DIR);
@@ -762,6 +790,7 @@ int main(void) {
     test_finalize_commit_fails();
     test_full_disk_mid_series();
     test_adopted_batch_kept_for_reorg();
+    test_file_replaced_under_sequencer();
     remove_dir();
     return test_report();
 }

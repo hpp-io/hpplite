@@ -2955,6 +2955,25 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
     return node_flush_pages(node, pMore, maxBytes);
 }
 
+/* The file at the database's path is still the one this node opened (#320): removed and made again there, the node's
+** descriptors (SQLite's, the page capture's) still point at the removed one, whose commits it would send as the
+** rollup's while the new file gets nothing. The identity is taken at the first flush; a path that names another file,
+** or none, stops the posting with one line */
+static int node_file_still_ours(HppliteNode *node) {
+    const char *zFile = node->db ? sqlite3_db_filename(node->db, "main") : NULL;
+    struct stat st;
+    if (!zFile || !zFile[0]) return 1;                                  /* an in-memory or temporary database */
+    if (stat(zFile, &st) == 0) {
+        if (!node->fileKnown) { node->fileKnown = 1; node->fileDev = (unsigned long long)st.st_dev; node->fileIno = (unsigned long long)st.st_ino; return 1; }
+        if ((unsigned long long)st.st_dev == node->fileDev && (unsigned long long)st.st_ino == node->fileIno) return 1;
+    } else if (!node->fileKnown) return 1;
+    if (node->state != HPPLITE_STATE_ERROR)
+        hpplite_error(node->ctx, "the database file %s was replaced or removed under this sequencer: its commits go to the file it opened, "
+                      "no longer at that path; nothing more is posted - restart it on the file there now", zFile);
+    node->state = HPPLITE_STATE_ERROR;
+    return 0;
+}
+
 static uint64_t node_flush_unlocked(HppliteNode *node) {
     uint64_t height = 0, h;
     int more;
@@ -2964,6 +2983,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     ** application flushes) starts at its first flush (#118) */
     if (node->state == HPPLITE_STATE_INIT) hpplite_node_start(node);
     if (node->config.verifyOnly) return 0;      /* a verifier rebuilds and compares; it posts nothing (#5) */
+    if (!node_file_still_ours(node)) return 0;
     /* the sequencer connection posts - unless it is gone: then this one does */
     if (node->follower && !node_try_promote(node)) return 0;
     if (node->l1 && node_check_rollup(node) < 0) return 0;
