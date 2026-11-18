@@ -196,7 +196,7 @@ def main():
     proc = start_store(work, port, ["--dir", os.path.join(work, "store"), "--signer-key", os.path.join(work, "signer.key"),
                                     "--pay-to", pay_to, "--rpc", RPC, "--facilitator", FACILITATOR, "--network", "eip155:%d" % CHAIN_ID,
                                     "--asset", USDC, "--tick-interval", "0.5", "--price-per-mib-month", "1e12", "--price-per-write", "10",
-                                    "--pull-threshold", "2000", "--pull-interval", "100000", "--retry-seconds", "1", "--park-seconds", "4",
+                                    "--pull-threshold", "2000", "--pull-interval", "100000", "--retry-seconds", "1", "--park-seconds", "15",
                                     "--min-pay", "3000", "--sweep-age", "2"]
                        # the other tokens it takes (#357): CHIP at $1 with x402 top-ups, HPP at $0.01 (10000 units) by permit
                        + (["--extra-asset", "%s,House Chip,1,6,1000000,exact" % CHIP] if CHIP else [])
@@ -399,7 +399,7 @@ def main():
         check(acct.get("credit", 0) > 0, "the account holds credit (%s)" % acct.get("credit"))
         gone = wait_for(lambda: http("GET", url + "/bucket/" + da2)[1].get("state") == "parked", 40)
         check(gone, "its credit spent by storage and no permit: parked")
-        deleted = wait_for(lambda: http("GET", url + "/bucket/" + da2)[1].get("state") == "deleted", 20)
+        deleted = wait_for(lambda: http("GET", url + "/bucket/" + da2)[1].get("state") == "deleted", 40)
         check(deleted and http("GET", "%s/name/%s-1" % (url, da2[2:]))[0] == 404, "parkSeconds later: deleted, its names gone")
 
         # --- the owner rotates the sequencer key (#208): the new key takes the bucket, the old one is refused ---
