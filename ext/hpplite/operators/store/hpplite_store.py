@@ -47,6 +47,7 @@ from x402seller.assets import amt, asset_info, first_asset, listed, other_offers
 PROTOCOL = "hpplite-store/2"
 MIB = 1024 * 1024
 MONTH = 30 * 24 * 3600
+GET_DELAY = float(os.environ.get("HPPLITE_STORE_GET_DELAY") or 0)   # a test hook: seconds added to every batch read (#195)
 FOREVER = 2 ** 53 - 1           # coveredUntil when nothing is charged: exact in a double, an int64 and every JSON (#216)
 
 BIND_TYPE = "Bind(address da,address funder,uint256 issuedAt)"
@@ -666,6 +667,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         path = url.path
+        if GET_DELAY and (path.startswith("/get/") or path.startswith("/name/")):
+            time.sleep(GET_DELAY)                       # a test hook: a far store's round trip on every read (#195)
         if path == "/status":
             return self.reply(200, self.service.status())
         m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})/objects$", path)

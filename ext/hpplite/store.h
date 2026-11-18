@@ -21,6 +21,13 @@ extern "C" {
 
 typedef struct HppliteStore HppliteStore;
 
+/* Reads fetched ahead (#195): GET these batches' refs (/get/<ref>) or names (/name/<name>) several at once and keep
+** each 200 answer for the read that asks for it next; up to hpplite_store_parallel() (HPPLITE_STORE_PARALLEL, default 8) */
+#define HPPLITE_STORE_AHEAD_MAX 32
+int hpplite_store_parallel(void);
+void hpplite_store_prefetch_refs(HppliteStore *s, const char *const *zRefs, int n);
+void hpplite_store_prefetch_names(HppliteStore *s, const char *const *zNames, int n);
+
 /* Open a store by URL; NULL when the scheme is unknown. The key (may be
 ** NULL) pays for calls the provider charges for; cap is the most to pay per
 ** call in the asset's atomic units (0: pay nothing, refuse every 402). */
