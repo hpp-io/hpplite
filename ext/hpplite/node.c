@@ -3126,6 +3126,7 @@ static int node_soft_walk(HppliteNode *node) {
     if (hpplite_l1_get_addresses(node->l1, c, d) != 0 || hpplite_l1_get_my_address(node->l1, me) != 0) return 0;
     zDa = d[0] ? d : c;
     if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return 0;
+    uint64_t start = node->ctx->blockHeight;                    /* where the walk starts: read ahead only past it */
     for (;;) {
         uint64_t h = node->ctx->blockHeight, chainId;
         size_t n = 0;
@@ -3135,7 +3136,7 @@ static int node_soft_walk(HppliteNode *node) {
         sqlite3_stmt *q = NULL;
         snprintf(name, sizeof name, "%.40s-%llu", zDa + 2, (unsigned long long)h);
         for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
-        node_names_ahead(node, h, 0);                                /* recovery reads many: together (#195) */
+        if (h > start) node_names_ahead(node, h, 0);                 /* past the first name found, the rest together (#195); a fresh rollup asks for one */
         data = hpplite_store_get_named(node->store, name, &n, sig, inst);
         if (!data) break;                                            /* the first height the store has no name for: the end */
         chainId = hpplite_l1_chain_id(node->l1);

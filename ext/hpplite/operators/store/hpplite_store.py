@@ -1141,6 +1141,9 @@ def batch_digest(chain_id, da, instance, height, data):
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # the listen backlog (Python's default is 5): a client opening eight connections at once - a node reading batches
+    # ahead (#195) - had the rest of its SYNs dropped on Linux and retried a second later
+    request_queue_size = 128
 
 
 def main():
