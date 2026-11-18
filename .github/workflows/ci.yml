@@ -198,3 +198,40 @@ jobs:
           HPPLITE_PRIVATE_KEY: ${{ secrets.HPPLITE_PRIVATE_KEY }}
           HPPLITE_MNEMONIC: ${{ secrets.HPPLITE_MNEMONIC }}
         run: ext/hpplite/tests/integration/run_integration.sh
+
+  fuzz:
+    # the parsers of outside input under libFuzzer (#343, somaro#136): the page batch decoder (a batch from the store or
+    # the chain) and the WAL reader (frames another process wrote), a minute each from the seeds fuzz_seeds writes
+    name: fuzz (libFuzzer, ASan + UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang cmake pkg-config tcl zlib1g-dev \
+            libsecp256k1-dev libcurl4-openssl-dev
+      - name: SQLite amalgamation
+        run: mkdir -p build && cd build && ../configure >/dev/null && make -s sqlite3.c sqlite3ext.h >/dev/null
+      - name: build
+        run: |
+          cmake -S ext/hpplite -B ext/hpplite/build_fuzz -DHPPLITE_SQLITE_SRC=$PWD/build -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DHPPLITE_FUZZ=libfuzzer -DHPPLITE_BUILD_TESTS=OFF -DHPPLITE_BUILD_EXTENSION=OFF \
+            -DCMAKE_C_FLAGS="-fsanitize=fuzzer-no-link,address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build ext/hpplite/build_fuzz -j"$(nproc)" --target fuzz_pagebatch fuzz_walread fuzz_seeds
+      - name: fuzz
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          cd ext/hpplite/build_fuzz
+          ./fuzz_seeds corpus
+          ./fuzz_pagebatch -max_total_time=60 -print_final_stats=1 corpus/pagebatch
+          ./fuzz_walread -max_total_time=60 -print_final_stats=1 corpus/walread
+      - name: the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash
+          path: ext/hpplite/build_fuzz/crash-*
+          if-no-files-found: ignore

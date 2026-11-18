@@ -459,6 +459,26 @@ if(HPPLITE_BUILD_TESTS)
 endif()
 
 # Examples (require real L1)
+# Fuzz targets (#343, somaro#136): the page batch decoder and the WAL reader, which read outside input.
+# HPPLITE_FUZZ=libfuzzer builds them with clang's -fsanitize=fuzzer (CI; give the build -fsanitize=fuzzer-no-link,address
+# too); HPPLITE_FUZZ=driver links tests/fuzz/fuzz_driver.c instead, for a clang without libFuzzer (Apple's), under the
+# build's own sanitizer flags. fuzz_seeds writes their starting inputs.
+set(HPPLITE_FUZZ "" CACHE STRING "Build fuzz targets: libfuzzer or driver (empty: none)")
+if(HPPLITE_FUZZ)
+    foreach(t pagebatch walread)
+        if(HPPLITE_FUZZ STREQUAL "libfuzzer")
+            add_executable(fuzz_${t} tests/fuzz/fuzz_${t}.c)
+            target_compile_options(fuzz_${t} PRIVATE -fsanitize=fuzzer)
+            target_link_options(fuzz_${t} PRIVATE -fsanitize=fuzzer)
+        else()
+            add_executable(fuzz_${t} tests/fuzz/fuzz_${t}.c tests/fuzz/fuzz_driver.c)
+        endif()
+        target_link_libraries(fuzz_${t} hpplite)
+    endforeach()
+    add_executable(fuzz_seeds tests/fuzz/fuzz_seeds.c)
+    target_link_libraries(fuzz_seeds hpplite)
+endif()
+
 option(HPPLITE_BUILD_EXAMPLES "Build example executables" ${HPPLITE_USE_REAL_L1})
 if(HPPLITE_BUILD_EXAMPLES)
     if(NOT HPPLITE_USE_REAL_L1)
