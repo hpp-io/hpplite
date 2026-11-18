@@ -235,6 +235,7 @@ HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n) {
   unsigned i, hdr;
   if (!hpplite_pagebatch_is(p, n)) return NULL;
   hdr = r32(p + 4) == 1u ? PB_HEADER_V1 : PB_HEADER;
+  if (n < hdr) return NULL;                            /* a v2 header is 64 bytes: is() checks only v1's 56 (#343) */
   o = hdr;
   b = sqlite3_malloc64(sizeof(*b));
   if (!b) return NULL;
@@ -244,7 +245,7 @@ HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n) {
   if (b->pageSize < 512 || b->pageSize > 65536 || (b->pageSize & (b->pageSize - 1)) || b->nName > 255) { sqlite3_free(b); return NULL; }
   rec = 6 + (size_t)b->pageSize;
   if (hdr == PB_HEADER) { b->piece = r32(p + 56); b->bMore = r32(p + 60) & 1u; }
-  if (n != hdr + rec * b->nPages + PB_TRAILER + b->nName) { sqlite3_free(b); return NULL; }
+  if (b->nPages > n / rec || n != hdr + rec * b->nPages + PB_TRAILER + b->nName) { sqlite3_free(b); return NULL; }   /* no wrap on a 32-bit size_t */
   b->aPage = sqlite3_malloc64((sqlite3_uint64)(b->nPages ? b->nPages : 1) * sizeof(HpplitePageRec));
   if (!b->aPage) { sqlite3_free(b); return NULL; }
   for (i = 0; i < b->nPages; i++) {

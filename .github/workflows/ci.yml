@@ -226,7 +226,7 @@ jobs:
         run: |
           cd ext/hpplite/build_fuzz
           ./fuzz_seeds corpus
-          ./fuzz_pagebatch -max_total_time=60 -print_final_stats=1 corpus/pagebatch
+          ./fuzz_pagebatch -max_total_time=60 -print_final_stats=1 corpus/pagebatch ../tests/fuzz/regressions/pagebatch     # inputs that crashed it once
           ./fuzz_walread -max_total_time=60 -print_final_stats=1 corpus/walread
       - name: the crashing input
         if: failure()

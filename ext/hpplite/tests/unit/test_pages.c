@@ -7,6 +7,8 @@
 #include "pages.h"
 #include "walread.h"
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define DIR "/tmp/hpplite_test_pages"
 
@@ -174,12 +176,35 @@ static void test_root_from_file(void) {
     PASS();
 }
 
+/* A short version-2 batch (#343, found by CI's fuzz job): hpplite_pagebatch_is takes 56 bytes (the v1 header), and
+** decode read v2's piece and flags at 56-63 before any length check - a 63-byte input was read a byte past its end.
+** The input sits at the end of a page whose next page is unmapped, so an overread faults with or without ASan */
+static void test_short_v2_batch(void) {
+    TEST("a version-2 batch shorter than its 64-byte header: refused, nothing read past its end (#343)");
+    static const unsigned char crash[] = { 0x48, 0x50, 0x50, 0x4c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x01, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xfc, 0xdd };
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned char *m = mmap(NULL, 2 * (size_t)pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    uint64_t ts;
+    int more;
+    if (m == MAP_FAILED) FAIL("mmap");
+    unsigned char *at = m + pg - sizeof crash;
+    memcpy(at, crash, sizeof crash);
+    if (mprotect(m + pg, (size_t)pg, PROT_NONE) != 0) { munmap(m, 2 * (size_t)pg); FAIL("mprotect"); }
+    HpplitePageBatch *b = hpplite_pagebatch_decode(at, sizeof crash);
+    int meta = hpplite_pagebatch_meta(at, sizeof crash, &ts, &more);
+    munmap(m, 2 * (size_t)pg);
+    if (b) { hpplite_pagebatch_free(b); FAIL("a 63-byte version-2 batch decoded"); }
+    if (meta != -1) FAIL("meta took a 63-byte version-2 batch");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite page root and page batch ===\n");
     test_suite_init("pages", NULL, DIR);
     test_root_incremental_equals_scan();
     test_batches_of_diffs_rebuild_file_and_root();
     test_root_from_file();
+    test_short_v2_batch();
     remove_dir();
     return test_report();
 }
