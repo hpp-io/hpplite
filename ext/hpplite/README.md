@@ -1067,6 +1067,16 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.10.1** (2026-11-19): the node pays in CHIP and HPP.
+
+- **`HPPLITE_PAY_ASSET`** (`usdc`, `chip`, `hpp` or a token's address) names the token a node pays its store and its relay in (#358).
+  - The bucket's permit is signed in that token; `HPPLITE_STORE_PERMIT` and the caps stay micro-USD, converted at the service's rate.
+  - A 402 is paid by the token's `exact` offer (USDC.e, CHIP), else by its `upto` offer (HPP): a Permit2 signature, the wallet's approval of Permit2 a permit carried with the payment. A wallet with HPP and no ETH pays.
+  - Checked on HPP Sepolia against HPP's facilitator: a wallet with CHIP and no ETH created its rollup, flushed and anchored by `upto`; a wallet with HPP and no ETH took and released its lease.
+- **`rpc=` without `chainid=`** signs for the RPC's chain; a `chainid=` the RPC contradicts is an error at open (#369).
+- **`hpplite-sequencer`** prints its status on SIGUSR1 and says once when commits wait with nothing posted (#368).
+- No protocol or format changes. `vectors.json` gains `permit2Messages` (additive).
+
 **v0.10.0** (2026-11-19), "Memory and mainnet":
 
 - **A node's memory no longer grows with its database or its backlog (#364, #365).**
