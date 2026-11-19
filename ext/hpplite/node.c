@@ -372,6 +372,26 @@ static void node_detect_follower(HppliteNode *node) {
 ** lives in a sidecar file beside the database (<db>-hpplite.db); the VFS
 ** hands the connection's commits to the page mode, started on the file as it
 ** is after a checkpoint. */
+/* The journal mode switched, page 1 otherwise as it was (#374): the switch is a write of SQLite's own to page 1, and
+** with the mode bytes and the change counters, which the root leaves out, it stamps its SQLITE_VERSION_NUMBER at
+** offset 96, which the root does not. Where another SQLite version wrote the file (the app's own, beside
+** hpplite-sequencer) the file was then no longer the state of the height just synced, and a rebuilt file went whole
+** again as the next height. The four bytes go back as they were: nothing reads them, the next write of page 1 through
+** the WAL stamps them again and is captured like any other. */
+static int node_journal_mode(HppliteNode *node, const char *zPragma) {
+    unsigned char was[4], now[4];
+    sqlite3_file *pf = NULL;
+    int rc, had;
+    /* out of WAL: page 1 as the file has it once its WAL is in it (the switch checkpoints it anyway) */
+    if (strstr(zPragma, "DELETE")) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    had = sqlite3_file_control(node->db, "main", SQLITE_FCNTL_FILE_POINTER, &pf) == SQLITE_OK && pf && pf->pMethods
+          && pf->pMethods->xRead(pf, was, 4, 96) == SQLITE_OK;
+    rc = hppliteInternalExec(node->ctx, node->db, zPragma);
+    if (had && pf->pMethods->xRead(pf, now, 4, 96) == SQLITE_OK && memcmp(was, now, 4) != 0
+        && pf->pMethods->xWrite(pf, was, 4, 96) == SQLITE_OK) pf->pMethods->xSync(pf, SQLITE_SYNC_NORMAL);
+    return rc;
+}
+
 static int node_init_pages(HppliteNode *node, const char *zFile) {
     char *zSide = sqlite3_mprintf("%s-hpplite.db", zFile);
     char resolved[PATH_MAX];
@@ -402,14 +422,14 @@ static int node_init_pages(HppliteNode *node, const char *zFile) {
         /* a replica: pages are written into its file under an exclusive lock and
         ** its readers see them by the change counter, which rollback-journal
         ** mode checks at every transaction and WAL mode does not */
-        hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=DELETE");
+        node_journal_mode(node, "PRAGMA journal_mode=DELETE");
     } else {
         /* the frames are what is captured: the file must be in WAL mode, and a
         ** switch another connection's transaction prevents (busy past the
         ** timeout) must not leave a connection that captures nothing */
         sqlite3_stmt *q = NULL;
         int wal = 0;
-        hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=WAL");
+        node_journal_mode(node, "PRAGMA journal_mode=WAL");
         if (sqlite3_prepare_v2(node->db, "PRAGMA journal_mode", -1, &q, NULL) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW)
             wal = sqlite3_column_text(q, 0) && strcasecmp((const char *)sqlite3_column_text(q, 0), "wal") == 0;
         sqlite3_finalize(q);
@@ -1750,7 +1770,7 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
             node_ck_close(node);
             node_pins_close(node);
             hpplite_pagemode_pause(node->pm);
-            if (hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=DELETE") != SQLITE_OK) {
+            if (node_journal_mode(node, "PRAGMA journal_mode=DELETE") != SQLITE_OK) {
                 hpplite_pagemode_resume(node->pm);
                 hpplite_pagebatch_free(b);
                 hpplite_error(node->ctx, "batch %llu: pages cannot be applied while other connections hold the file in WAL mode", (unsigned long long)batch->height);
@@ -3865,7 +3885,7 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         /* the pages applied: back to WAL for this node's own writes, the file as
         ** it is now the base the page mode diffs against (a commit's pieces still
         ** to come keep the lock, and the mode, until the last) */
-        hppliteInternalExec(node->ctx, node->db, "PRAGMA journal_mode=WAL");
+        node_journal_mode(node, "PRAGMA journal_mode=WAL");
         hpplite_pagemode_resume(node->pm);
         node->pagesWalSuspended = 0;
     }

@@ -3639,6 +3639,111 @@ static void test_refusal_names_wallet(void) {
     PASS();
 }
 
+/* 62. A file another SQLite wrote (#374): a switch of the journal mode is a write of SQLite's own to page 1, and it
+** leaves the library's SQLITE_VERSION_NUMBER at offset 96. A node rebuilding a file switches twice (out of WAL to apply
+** the pages, back to sequence), so where the app's SQLite is not the node's the rebuilt file's page 1 was no longer the
+** page of the height just synced: 'is not the state of height N it last sent', and the whole file went again as N+1 -
+** at every move to another host. Here the app's file carries another version's number before the sequencer first sees
+** it; a successor on an empty path, the first host back on its old file, and the successor back again must each find
+** their file the state of the height they synced: nothing said, nothing sent, the four bytes as the history has them. */
+static int version_bytes(const char *file, unsigned char out[4], const unsigned char *set) {
+    FILE *f = fopen(file, set ? "r+b" : "rb");
+    int ok;
+    if (!f) return 0;
+    ok = fseek(f, 96, SEEK_SET) == 0 && (set ? fwrite(set, 1, 4, f) == 4 : fread(out, 1, 4, f) == 4);
+    return fclose(f) == 0 && ok;
+}
+static int said_whole(const char *err) {
+    char buf[4000] = "";
+    FILE *f = fopen(err, "r");
+    if (f) { size_t got = fread(buf, 1, sizeof buf - 1, f); buf[got] = 0; fclose(f); }
+    if (strstr(buf, "is not the state of height")) { printf("(%.300s) ", strstr(buf, "is not the state of height") - 0); return 1; }
+    return 0;
+}
+static void test_rebuilt_other_sqlite(void) {
+    TEST("a file another SQLite version wrote (#374): a successor's rebuilt file, the first host's on its return and the successor's again are each the state of the height synced - nothing goes whole, nothing is sent, page 1's version bytes stay the history's");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char SKEY[] = "0x6262626262626262626262626262626262626262626262626262626262626262";
+    static const unsigned char OTHER[4] = { 0x00, 0x2e, 0x76, 0x89 };            /* 3045001: page 1 as SQLite 3.45.1 leaves it */
+    static const char *A = DIR "/ver1/app.db", *B = DIR "/ver2/app.db";
+    char cmd[600], out[400], wallet[80], contract[80], p1[900], p2[900];
+    unsigned char got[4];
+    long h1, h2, h3, h4;
+    int port, rc;
+    pid_t store = -1, side;
+    if (!svc || !bin || access(bin, X_OK) != 0) { printf("SKIP (no operators or no hpplite-sequencer in the environment) "); PASS(); return; }
+#define VER_CLEANUP() do { if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } } while (0)
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", SKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s --value 10ether >/dev/null", RPC, KEY0, wallet);
+    if (run_cmd(cmd, out, sizeof out) != 0) FAIL("fund the wallet");
+    (void)!system("rm -rf " DIR "/ver1 " DIR "/ver2 " DIR "/store_pins && mkdir -p " DIR "/ver1 " DIR "/ver2");
+
+    /* the app's file: plain SQLite, WAL, checkpointed at its close; then its page 1 as another version would have left it */
+    if (plain_exec(A, "PRAGMA journal_mode=WAL; CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('one')") != SQLITE_OK) FAIL("the app's file");
+    if (!version_bytes(A, got, NULL) || memcmp(got, OTHER, 4) == 0 || !version_bytes(A, NULL, OTHER)) FAIL("page 1's version bytes could not be set to another version's");
+
+    port = test_free_port();
+    store = start_pin_service_free(svc, port);
+    if (store < 0) FAIL("the store did not come up");
+    snprintf(p1, sizeof p1, "rpc=%s&factory=%s&chainid=31337&privkey=%s&datadir=" DIR "/ver1&interval=300ms&store=http://127.0.0.1:%d", RPC, FACTORY, SKEY, port);
+
+    /* host 1: the file goes as height 1, a row after it */
+    side = spawn_sidecar(bin, A, p1, DIR "/ver1/side.1.out", DIR "/ver1/side.1.err");
+    h1 = wait_synced(DIR "/ver1/side.1.out", side, 60);
+    if (h1 < 0) { if (h1 == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); VER_CLEANUP(); FAILF("host 1's sequencer did not say it was synced (%ld)", h1); }
+    sleep(2);
+    if (plain_exec(A, "INSERT INTO notes(body) VALUES('two')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); VER_CLEANUP(); FAIL("the app's write"); }
+    sleep(3);
+    rc = stop_sidecar(side, SIGTERM, 60);
+    snprintf(cmd, sizeof cmd, "cast call %s 'rollupOf(address)(address)' %s --rpc-url %s", FACTORY, wallet, RPC);
+    if (rc != 0 || run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) { VER_CLEANUP(); FAILF("host 1 should stop with 0 (%d) and its rollup be the wallet's", rc); }
+    snprintf(contract, sizeof contract, "%.42s", out);
+    snprintf(p1, sizeof p1, "rpc=%s&contract=%s&chainid=31337&privkey=%s&datadir=" DIR "/ver1&interval=300ms&store=http://127.0.0.1:%d", RPC, contract, SKEY, port);
+    snprintf(p2, sizeof p2, "rpc=%s&contract=%s&chainid=31337&privkey=%s&datadir=" DIR "/ver2&interval=300ms&store=http://127.0.0.1:%d", RPC, contract, SKEY, port);
+
+    /* host 2, an empty path: the file is rebuilt and is the state it synced */
+    side = spawn_sidecar(bin, B, p2, DIR "/ver2/side.1.out", DIR "/ver2/side.1.err");
+    h2 = wait_synced(DIR "/ver2/side.1.out", side, 90);
+    if (h2 < 0) { if (h2 == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); VER_CLEANUP(); FAILF("the successor did not say it was synced (%ld)", h2); }
+    sleep(3);                                                   /* the timer's look at the file */
+    if (said_whole(DIR "/ver2/side.1.err")) { stop_sidecar(side, SIGKILL, 5); VER_CLEANUP(); FAIL("the successor's rebuilt file went whole again"); }
+    if (!version_bytes(B, got, NULL) || memcmp(got, OTHER, 4) != 0) { stop_sidecar(side, SIGKILL, 5); VER_CLEANUP(); FAILF("the rebuilt file's page 1 should keep the history's version bytes, has %02x%02x%02x%02x", got[0], got[1], got[2], got[3]); }
+    if (plain_count(B, "SELECT count(*) FROM notes") != 2 || plain_exec(B, "INSERT INTO notes(body) VALUES('three')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); VER_CLEANUP(); FAIL("the successor's file should hold the two rows and take the app's write"); }
+    sleep(3);
+    rc = stop_sidecar(side, SIGTERM, 60);
+    if (rc != 0) { VER_CLEANUP(); FAILF("the successor should stop with 0 (%d)", rc); }
+
+    /* host 1 back on its old file: one height behind, caught up, and the state it synced - the successor sent one height */
+    side = spawn_sidecar(bin, A, p1, DIR "/ver1/side.2.out", DIR "/ver1/side.2.err");
+    h3 = wait_synced(DIR "/ver1/side.2.out", side, 90);
+    if (h3 < 0) { if (h3 == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); VER_CLEANUP(); FAILF("host 1 back did not say it was synced (%ld)", h3); }
+    sleep(3);
+    if (h3 != h2 + 1 || said_whole(DIR "/ver1/side.2.err")) { stop_sidecar(side, SIGKILL, 5); VER_CLEANUP(); FAILF("host 1 back: synced at %ld after the successor's %ld and its one write - the file went whole", h3, h2); }
+    if (!version_bytes(A, got, NULL) || memcmp(got, OTHER, 4) != 0) { stop_sidecar(side, SIGKILL, 5); VER_CLEANUP(); FAILF("host 1's page 1 should keep the history's version bytes, has %02x%02x%02x%02x", got[0], got[1], got[2], got[3]); }
+    if (plain_count(A, "SELECT count(*) FROM notes") != 3 || plain_exec(A, "INSERT INTO notes(body) VALUES('four')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); VER_CLEANUP(); FAIL("host 1's file should hold the three rows and take the app's write"); }
+    sleep(3);
+    rc = stop_sidecar(side, SIGTERM, 60);
+    if (rc != 0) { VER_CLEANUP(); FAILF("host 1 back should stop with 0 (%d)", rc); }
+
+    /* the successor again: host 1 sent one height and no more */
+    side = spawn_sidecar(bin, B, p2, DIR "/ver2/side.2.out", DIR "/ver2/side.2.err");
+    h4 = wait_synced(DIR "/ver2/side.2.out", side, 90);
+    if (h4 < 0) { if (h4 == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); VER_CLEANUP(); FAILF("the successor again did not say it was synced (%ld)", h4); }
+    sleep(3);
+    {
+        int whole = said_whole(DIR "/ver2/side.2.err");
+        long long rows = plain_count(B, "SELECT count(*) FROM notes");
+        rc = stop_sidecar(side, SIGTERM, 60);
+        VER_CLEANUP();
+        if (h4 != h3 + 1 || whole || rows != 4 || rc != 0) FAILF("the successor again: synced at %ld after host 1's %ld and its one write, whole %d, rows %lld, exit %d", h4, h3, whole, rows, rc);
+    }
+#undef VER_CLEANUP
+    printf("(heights synced: %ld, %ld, %ld, %ld) ", h1, h2, h3, h4);
+    PASS();
+}
+
 /* 58. rpc= without chainid= (#369, somaro#352): the node asks the RPC its chain and signs for that, not for HPP Sepolia's
 ** 181228 - before, anvil refused every transaction, the factory's create waited 60 s and the open came back unconnected
 ** without a word. A chainid= the RPC contradicts is said at open, both numbers */
@@ -3809,6 +3914,7 @@ int main(void) {
     if (wanted(59)) test_pay_asset();
     if (wanted(60)) test_pay_upto();
     if (wanted(61)) test_refusal_names_wallet();
+    if (wanted(62)) test_rebuilt_other_sqlite();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
