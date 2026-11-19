@@ -1062,6 +1062,27 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.10.0** (2026-11-19), "Memory and mainnet":
+
+- **A node's memory no longer grows with its database or its backlog (#364, #365).**
+  - Each page's posted image lives in `<db>-hpplite-posted` (one more copy on disk).
+  - The queue keeps `HPPLITE_QUEUE_MEM` (32 MiB) in memory and spills the rest to `<db>-hpplite-queue`.
+  - Snapshots stream to the store and back in 8 MiB chunks.
+  - At 1 GB, peak memory before the anchor fell from 718 MB to 76 MB, and the snapshot adds 12 MB instead of 1.4 GB (doc/performance.md).
+- **Databases past 1 GiB get their snapshots and agree on their root (#363).** SQLite's lock-byte page is not content.
+- **HPP Mainnet:** `l1=hpp-mainnet` with `store=on` / `relay=on` reaches the mainnet store, relay and factory (#337).
+- **Payments:**
+  - One store and one relay per network take USDC.e, CHIP and HPP (#357, #361).
+  - A funder may be a smart account (ERC-1271, #356).
+  - The store and relay take x402 `upto` (Permit2) for HPP. The node's own `upto` signer is still to come (#358).
+- **The node and its tools:**
+  - `hpplite-sequencer --once` (#345).
+  - Store reads run ahead in parallel (#195).
+  - `hpplite-verify` past 64 soft batches (#362).
+  - A database file made again under a running sequencer (#320).
+- **Fleet mode** was tried and removed again (#314-#318, #352-#354).
+- **Formats:** the batch, index and chunk formats are unchanged. Snapshots are now always deflated. A reader older than this release refuses a snapshot past the lock-byte page and replays from batch 1 instead.
+
 **v0.9.1** (2026-11-10) fixes `hpplite-verify` on a store-backed rollup
 between anchors, which v0.9.0 called "NOT verified" although the rollup
 was right (#286), and says a bucket's daily cap once, not at every flush
@@ -1090,6 +1111,7 @@ Paying in the HPP token itself is open (#175).
 | v0.7 | Buckets paid by the funding wallet's permit (#214), snapshots and `keep=` (#203) | same | same |
 | v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#258) | same | same |
 | v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267), the platform shape end to end on anvil (#268), the first-tick anchor fixed (#270), the static musl build of the tools and `HPPLITE_CA_BUNDLE` (#269), `contract=` wins over a factory set beside it (#271), `funder=` for a bucket paid by a platform's treasury (#272), a Bind by the rollup's owner alone (#273), the funder's daily cap on a bucket (#274), a release that deletes the bucket now (#275), relay accounts and sponsorship - a treasury pays the relay for its apps' rollups (#276), a store's rate limit reported as that and not as the funder's daily cap (#280) | same | same |
+| v0.10 | Memory and mainnet: memory independent of the database's size (#364, #365), databases past 1 GiB (#363), HPP Mainnet's store, relay and factory (#337), several tokens per store and relay (#357, #361), smart-account funders (#356) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database
