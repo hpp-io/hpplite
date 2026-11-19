@@ -314,7 +314,11 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   lease taken (#264): a supervisor that starts an app on an empty volume
   waits for it before the app opens the file, since pages cannot be applied
   while another connection holds the file in WAL mode. The rest goes to
-  stderr.
+  stderr. SIGUSR1 prints one line of the node's status there (height,
+  pending, sequencer, lease, state, last error); commits pending for
+  `HPPLITE_STUCK_SECONDS` (30) with nothing posted are said once, with the
+  node's last error (#368). In `--dir` mode SIGUSR1 prints a status line
+  per database on stdout.
 - **Many databases on one host** (a platform with many apps' databases):
   `hpplite-sequencer --dir <directory>` holds every database named by a
   `<name>.conf` there - `db=<path>`, `params=<HPPLITE_PARAMS with

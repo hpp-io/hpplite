@@ -19,6 +19,8 @@
 ** file, the lease taken. A supervisor restoring an empty volume waits for it
 ** before the application opens the file - pages cannot be applied while
 ** another connection holds the file in WAL mode. Everything else goes to stderr.
+** SIGUSR1 prints one line of the node's status there; commits pending for HPPLITE_STUCK_SECONDS (30) with nothing
+** posted are said once, with the node's last error (#368).
 **
 ** Many databases in one process:
 **
@@ -74,8 +76,10 @@
 #include <time.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t stop, reread;
+static volatile sig_atomic_t stop, reread, asked;
 static void on_signal(int sig) { (void)sig; stop = 1; }
+static volatile sig_atomic_t askedGen;     /* --dir: each database's thread answers each SIGUSR1 once */
+static void on_usr1(int sig) { (void)sig; asked = 1; askedGen++; }
 static void on_hup(int sig) { (void)sig; reread = 1; }
 
 static int status_int(sqlite3 *db, const char *col) {
@@ -139,7 +143,7 @@ static void *db_thread(void *arg) {
     Db *d = (Db *)arg;
     sqlite3 *db = hpplite_open(d->uri);
     char err[512] = "", seen[512] = "", state[32];
-    int role = -1;
+    int role = -1, gen = askedGen;
     wipe_free(d->uri);
     d->uri = NULL;
     if (!db) {
@@ -159,6 +163,11 @@ static void *db_thread(void *arg) {
         status_text(db, "state", state, sizeof state);
         status_text(db, "last_error", err, sizeof err);
         if (strcmp(state, "error") == 0 && strcmp(err, seen) != 0) say(d->name, "error: %s", err);
+        if (gen != askedGen) {
+            gen = askedGen;
+            say(d->name, "status: height %d pending %d sequencer %d lease %d state %s last_error %s", status_int(db, "height"),
+                status_int(db, "pending"), status_int(db, "sequencer"), status_int(db, "lease"), state, err[0] ? err : "-");
+        }
         snprintf(seen, sizeof seen, "%s", strcmp(state, "error") == 0 ? err : "");
         for (int i = 0; i < 10 && !d->quit; i++) usleep(100000);
     }
@@ -268,6 +277,8 @@ static int dir_main(const char *dir) {
     sigaction(SIGINT, &sa, NULL);
     sa.sa_handler = on_hup;
     sigaction(SIGHUP, &sa, NULL);
+    sa.sa_handler = on_usr1;
+    sigaction(SIGUSR1, &sa, NULL);                       /* a status line per database (#368) */
     dir_scan(dir);
     while (!stop) {
         if (reread) { reread = 0; dir_scan(dir); }
@@ -424,14 +435,37 @@ int main(int argc, char **argv) {
     fflush(stdout);                                /* the line is the signal: out before anything else happens */
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
+    signal(SIGUSR1, on_usr1);
     int role = -1;
+    /* what a supervisor cannot see otherwise (#368): SIGUSR1 prints the node's status; commits pending for
+    ** HPPLITE_STUCK_SECONDS (default 30) with no height posted are said once, with the node's last error */
+    const char *zStuck = getenv("HPPLITE_STUCK_SECONDS");
+    int stuckAfter = zStuck && atoi(zStuck) > 0 ? atoi(zStuck) : 30, stuckFor = 0, stuckSaid = 0;
+    int lastHeight = status_int(db, "height");
     while (!stop) {
-        int seq = status_int(db, "sequencer");
+        int seq = status_int(db, "sequencer"), height = status_int(db, "height"), pending = status_int(db, "pending");
+        char state[32], err[512];
         if (seq != role) {
             role = seq;
             fprintf(stderr, "hpplite-sequencer: %s %s\n", argv[1],
                     seq == 1 ? "sequencing" : "waiting: another process sequences it");
         }
+        status_text(db, "state", state, sizeof state);
+        status_text(db, "last_error", err, sizeof err);
+        if (asked) {
+            asked = 0;
+            fprintf(stderr, "hpplite-sequencer: %s status: height %d pending %d sequencer %d lease %d state %s last_error %s\n",
+                    argv[1], height, pending, seq, status_int(db, "lease"), state, err[0] ? err : "-");
+        }
+        if (pending > 0 && height == lastHeight) stuckFor++;
+        else { stuckFor = 0; stuckSaid = 0; lastHeight = height; }
+        if (stuckFor >= stuckAfter && !stuckSaid) {
+            fprintf(stderr, "hpplite-sequencer: %s pending %d for %d s, nothing posted: %s\n", argv[1], pending, stuckFor,
+                    err[0] ? err : "the node gave no reason (state %s)");
+            if (!err[0]) fprintf(stderr, "hpplite-sequencer: %s state %s\n", argv[1], state);
+            stuckSaid = 1;
+        }
+        fflush(stderr);
         sleep(1);
     }
     fprintf(stderr, "hpplite-sequencer: stopping; posting what is pending\n");
