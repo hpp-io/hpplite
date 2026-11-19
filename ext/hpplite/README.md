@@ -1067,6 +1067,17 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.10.2** (2026-11-19): a creation paid by a funder, and what a node says when it stops.
+
+- **A key that holds nothing creates its rollup (#376).** A funder signs `SponsorCreate` for a key's creation, the key beside it (`sponsor.py … create`), and the relay charges that key's `createRollupFor` to the funder's account; the rollup is sponsored by the funder from its first call.
+  - One message pays one creation. A named database (`dbname=`) is a second rollup of the key and takes a second message, at nonce 1.
+  - The relay protocol gains `POST /sponsor/create` (additive, still `hpplite-relay/1`); the node's code is unchanged. `vectors.json` gains two `SponsorCreate` vectors.
+  - Checked on HPP Sepolia: a key with no ETH and no token created its rollup, took the lease and committed twice, 0.067 USDC.e from the treasury's account.
+- **A refused send and an unmined transaction are said (#370):** the RPC's refusal where the rollup was not created, the transaction's hash where a batch is not confirmed.
+- **A refused payment names the wallet asked,** which of the node's two it is, and the token (#372).
+- **A file another SQLite wrote stays the state of the height synced (#374),** and a rollup begun on a file with no table is not taken for an emptied one (#373).
+- No format changes.
+
 **v0.10.1** (2026-11-19): the node pays in CHIP and HPP.
 
 - **`HPPLITE_PAY_ASSET`** (`usdc`, `chip`, `hpp` or a token's address) names the token a node pays its store and its relay in (#358).
