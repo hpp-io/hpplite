@@ -14,7 +14,7 @@
 
 #define DIR "/tmp/hpplite_test_memory"
 #define DB_MB 64
-#define BOUND_MB 16
+#define BOUND_MB 24              /* +13 to +16 MB measured (macOS, Linux): the queue, the root, SQLite's cache */
 #define BACKLOG_MB 128            /* four times the queue's memory (HPPLITE_QUEUE_MEM, 32 MiB) */
 #define BACKLOG_BOUND_MB 48
 
@@ -265,6 +265,11 @@ int main(int argc, char **argv) {
         return 2;
     }
     printf("=== HPPLite memory against the database's size ===\n");
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+    /* ASan keeps freed memory in quarantine and maps shadow memory: RSS says nothing of the node's own use */
+    printf("SKIP (an AddressSanitizer build: RSS is not the node's)\n");
+    return 77;
+#endif
     reset_dir();
     test_open_is_not_the_database();
     test_backlog_is_not_in_memory();

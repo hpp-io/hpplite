@@ -15,9 +15,12 @@ static unsigned gCommits;
 
 static void sink(void *pArg, const HppliteWalCommit *c) {
     volatile unsigned *acc = pArg;
+    static unsigned char page[65536];
     gCommits++;
     for (unsigned i = 0; i < c->nPages; i++) {
-        if (c->pageSize > 0) *acc += c->aImg[i][0] + c->aImg[i][c->pageSize - 1] + c->aPgno[i];
+        /* each page read from the WAL, as the sink does since #365 */
+        if (c->pageSize > 0 && c->pageSize <= (int)sizeof page && hpplite_walcommit_page(c, i, page) == 0)
+            *acc += page[0] + page[c->pageSize - 1] + c->aPgno[i];
     }
 }
 
