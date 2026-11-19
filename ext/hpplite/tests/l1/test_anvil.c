@@ -3360,6 +3360,109 @@ static long long once_replica(const char *key, const char *storeUrl, const char 
     if (r) { v = scalar(r, sql); sqlite3_close(r); }
     return v;
 }
+/* 59. A node pays in the token it chooses (#358, HPPLITE_PAY_ASSET): a store taking USDC.e (its first asset), CHIP and HPP.
+** A node with ETH whose funding wallet holds only HPP gives its permit in HPP - the token's own domain, 18 decimals, the
+** store's rate - and the store pulls HPP; a node with no permit pays the store's 402s in CHIP over x402 (exact). Before,
+** the node knew only the first asset: HPP and CHIP went unused and the batches waited */
+static void test_pay_asset(void) {
+    TEST("HPPLITE_PAY_ASSET (#358): a permit in HPP (its domain, 18 decimals, the store's rate) the store pulls; 402s paid over x402 in CHIP");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC"), *chip = getenv("HPPLITE_ANVIL_CHIP"), *hpp = getenv("HPPLITE_ANVIL_HPP");
+    static const char HKEY[] = "0x7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e";
+    static const char CKEY[] = "0x7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f";
+    if (!svc || !usdc || !usdc[0] || !chip || !chip[0] || !hpp || !hpp[0]) { printf("SKIP (no store or mock tokens in the environment) "); PASS(); return; }
+    char cmd[2400], payTo[80], out[600], extra[300], chipArg[200], hppArg[200], fund[80];
+    const char *keys[2] = { HKEY, CKEY };
+    int sport = test_free_port();
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    if (run_cmd(cmd, payTo, sizeof payTo) != 0) FAIL("cast wallet address");
+    payTo[strcspn(payTo, "\r\n")] = 0;
+    for (int k = 0; k < 2; k++) {
+        char addr[80];
+        snprintf(cmd, sizeof cmd, "cast wallet address %s", keys[k]);
+        if (run_cmd(cmd, addr, sizeof addr) != 0) FAIL("cast wallet address");
+        addr[strcspn(addr, "\r\n")] = 0;
+        snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);   /* ETH: this node sends its own transactions */
+        if (system(cmd) != 0) FAIL("give the node ETH");
+    }
+    FILE *f = fopen(DIR "/pa_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    (void)!system("rm -rf " DIR "/pa_pins " DIR "/pa_hpp.db* " DIR "/pa_chip.db*");
+    snprintf(chipArg, sizeof chipArg, "%s,House Chip,1,6,1000000,exact", chip);
+    snprintf(hppArg, sizeof hppArg, "%s,HousePartyProtocol,1,18,10000", hpp);
+    pid_t store = fork();
+    if (store == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", sport);
+        snprintf(script, sizeof script, "%s/hpplite_store.py", svc);
+        int fd = open(DIR "/pa_store.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/pa_pins", "--signer-key", DIR "/pa_signer.key",
+               "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc, "--extra-asset", chipArg, "--extra-asset", hppArg,
+               "--network", "eip155:31337", "--price-per-write", "1000", "--price-per-mib-month", "0", "--min-pay", "3000",
+               "--pull-threshold", "1500", "--tick-interval", "0.5", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        if (!test_child_alive(store)) break;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", sport);
+        up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
+        if (!up) usleep(200 * 1000);
+    }
+#define STOP59() do { unsetenv("HPPLITE_PAY_ASSET"); if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } } while (0)
+    if (!up) { STOP59(); FAIL("the store did not come up"); }
+
+    /* (a) ETH + HPP: the permit in HPP, the store pulls HPP */
+    long long hppBefore = anvil_usdc_of(hpp, payTo), hppAfter, f1 = -1, f2 = -1;
+    char permitAsset[80] = "";
+    money_env(NULL, "200000", NULL, NULL, NULL, "off");                 /* a $0.20 permit: 20 HPP at the store's $0.01 */
+    setenv("HPPLITE_PAY_ASSET", "hpp", 1);
+    snprintf(extra, sizeof extra, "&dbname=pay-hpp&store=http://127.0.0.1:%d&anchor=0", sport);
+    sqlite3 *w = open_db("pa_hpp.db", HKEY, extra);
+    if (w) {
+        snprintf(fund, sizeof fund, "%s", status_text(w, "store_funder"));
+        snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 1000000000000000000000 >/dev/null", RPC, KEY0, hpp, fund);
+        if (system(cmd) != 0) printf("(could not fund the funding wallet with HPP) ");
+        sqlite3_exec(w, "CREATE TABLE h(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+        f1 = scalar(w, "SELECT hpplite_flush()");
+        for (int i = 0; i < 3; i++) { sqlite3_exec(w, "INSERT INTO h(v) VALUES('paid in hpp')", NULL, NULL, NULL); f2 = scalar(w, "SELECT hpplite_flush()"); }
+        snprintf(cmd, sizeof cmd, "curl -s -m 5 http://127.0.0.1:%d/account/%s", sport, fund);
+        if (run_cmd(cmd, out, sizeof out) == 0) { char *p = strstr(out, "\"asset\": \""); if (!p) p = strstr(out, "\"asset\":\""); if (p) { p = strchr(p + 8, '0'); if (p) snprintf(permitAsset, 43, "%s", p); } }
+    }
+    hppAfter = hppBefore;
+    for (int i = 0; i < 60 && hppAfter <= hppBefore; i++) { usleep(250 * 1000); hppAfter = anvil_usdc_of(hpp, payTo); }
+    if (w) sqlite3_close(w);
+    printf("(HPP: flushes %lld %lld, the account's token %.12s, the payee %lld -> %lld units) ", f1, f2, permitAsset[0] ? permitAsset : "-", hppBefore, hppAfter);
+    if (f1 <= 0 || f2 <= 0 || strncasecmp(permitAsset, hpp, 42) != 0 || hppAfter <= hppBefore) { STOP59(); FAIL("the store paid in HPP by permit"); }
+
+    /* (b) ETH + CHIP: no permit, the 402s paid over x402 in CHIP */
+    long long chipBefore = anvil_usdc_of(chip, payTo), chipAfter, g1 = -1, g2 = -1;
+    char err[300] = "";
+    money_env("100000", "0", NULL, NULL, NULL, "off");
+    setenv("HPPLITE_PAY_ASSET", "chip", 1);
+    snprintf(extra, sizeof extra, "&dbname=pay-chip&store=http://127.0.0.1:%d&anchor=0", sport);
+    w = open_db("pa_chip.db", CKEY, extra);
+    if (w) {
+        snprintf(fund, sizeof fund, "%s", status_text(w, "store_funder"));
+        snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 50000 >/dev/null", RPC, KEY0, chip, fund);
+        if (system(cmd) != 0) printf("(could not fund the funding wallet with CHIP) ");
+        sqlite3_exec(w, "CREATE TABLE c(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+        g1 = scalar(w, "SELECT hpplite_flush()");
+        sqlite3_exec(w, "INSERT INTO c(v) VALUES('paid in chip')", NULL, NULL, NULL);
+        g2 = scalar(w, "SELECT hpplite_flush()");
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+        sqlite3_close(w);
+    }
+    chipAfter = anvil_usdc_of(chip, payTo);
+    STOP59();
+#undef STOP59
+    printf("(CHIP: flushes %lld %lld, the payee %lld -> %lld units%s%.120s) ", g1, g2, chipBefore, chipAfter, err[0] ? "; " : "", err);
+    if (g1 <= 0 || g2 <= 0 || chipAfter <= chipBefore) FAIL("the store paid in CHIP over x402");
+    PASS();
+}
+
 /* 58. rpc= without chainid= (#369, somaro#352): the node asks the RPC its chain and signs for that, not for HPP Sepolia's
 ** 181228 - before, anvil refused every transaction, the factory's create waited 60 s and the open came back unconnected
 ** without a word. A chainid= the RPC contradicts is said at open, both numbers */
@@ -3527,6 +3630,7 @@ int main(void) {
     if (wanted(55)) test_paid_in_chip();
     if (wanted(57)) test_sequencer_once();
     if (wanted(58)) test_chain_from_rpc();
+    if (wanted(59)) test_pay_asset();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

@@ -21,6 +21,8 @@
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <time.h>
 #include <math.h>
@@ -69,6 +71,15 @@ struct HppliteStore {
     HppliteKeypair fundKp;
     unsigned char fundAddr[20];
     uint64_t permitCap;             /* HPPLITE_STORE_PERMIT: what the permit lets the store pull (0: none, the 402s are paid) */
+    /* the token this node pays in (HPPLITE_PAY_ASSET, #358): usdc, chip, hpp or an address, one of the store's
+    ** buckets.assets (and of a relay's offers); unset, the store's first asset as before */
+    char payWant[48];
+    int payHave;                    /* resolved against buckets.assets: the fields below are the token's */
+    unsigned char payAsset[20];
+    char payName[64], payVersion[16];
+    int payDecimals;
+    uint64_t payUnitsPerToken;      /* the credit (micro-USD) one whole token buys */
+    char *rpc;                      /* the node's RPC: a permit in a token the account has not used needs the chain's nonce */
     time_t permitChecked;
     unsigned char spender[20];      /* who the permit names (/status buckets.spender) */
     char assetName[64], assetVersion[16];   /* the asset's EIP-712 domain, for the permit */
@@ -359,6 +370,43 @@ static void wordInt(uint64_t v, unsigned char out[32]) {
     for (i = 0; i < 8; i++) out[31 - i] = (unsigned char)(v >> (8 * i));
 }
 
+/* token amounts past 64 bits (#358: HPP has 18 decimals, $20 of it is 2e21 units) */
+typedef unsigned __int128 u128;
+static void wordU128(u128 v, unsigned char out[32]) {
+    int i;
+    memset(out, 0, 32);
+    for (i = 0; i < 16; i++) out[31 - i] = (unsigned char)(v >> (8 * i));
+}
+static u128 parseU128(const char *z) {
+    u128 v = 0;
+    if (!z) return 0;
+    while (*z >= '0' && *z <= '9') v = v * 10 + (u128)(*z++ - '0');
+    return v;
+}
+static void fmtU128(u128 v, char out[48]) {
+    char tmp[48];
+    int n = 0, i;
+    do { tmp[n++] = (char)('0' + (int)(v % 10)); v /= 10; } while (v && n < 47);
+    for (i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    out[n] = 0;
+}
+/* does a token offered (its name, its address) answer HPPLITE_PAY_ASSET? an address must be the token's; a word
+** is matched against the name: usdc / usdc.e, chip, hpp (HousePartyProtocol), else a part of the name */
+static int payMatches(const char *want, const char *name, const char *addr) {
+    char w[48], n[96];
+    size_t i, k;
+    if (!want || !want[0]) return 0;
+    if (strncmp(want, "0x", 2) == 0 || strncmp(want, "0X", 2) == 0) return addr && strcasecmp(want, addr) == 0;
+    for (i = 0, k = 0; want[i] && k + 1 < sizeof w; i++) if (isalnum((unsigned char)want[i])) w[k++] = (char)tolower((unsigned char)want[i]);
+    w[k] = 0;
+    for (i = 0, k = 0; name && name[i] && k + 1 < sizeof n; i++) if (isalnum((unsigned char)name[i])) n[k++] = (char)tolower((unsigned char)name[i]);
+    n[k] = 0;
+    if (!w[0] || !n[0]) return 0;
+    if (strcmp(w, "usdc") == 0 || strcmp(w, "usdce") == 0) return strstr(n, "usdc") != NULL;
+    if (strcmp(w, "hpp") == 0) return strstr(n, "housepartyprotocol") != NULL || strcmp(n, "hpp") == 0;
+    return strstr(n, w) != NULL;
+}
+
 static int wordAddress(const char *hex, unsigned char out[32]) {
     memset(out, 0, 32);
     return (hex && strlen(hex) == 42 && hpplite_hex_to_bytes(hex + 2, out + 12, 20) >= 0) ? 0 : -1;
@@ -396,9 +444,19 @@ void hpplite_eip712_store_digest(uint64_t chainId, const unsigned char payTo[20]
     typedHash(domain, h, out);
 }
 
+static void permitDigestW(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
+                          const unsigned char owner[20], const unsigned char spender[20], const unsigned char valueW[32], uint64_t nonce,
+                          uint64_t deadline, unsigned char out[32]);
 void hpplite_eip712_permit_digest(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
                                   const unsigned char owner[20], const unsigned char spender[20], uint64_t value, uint64_t nonce,
                                   uint64_t deadline, unsigned char out[32]) {
+    unsigned char v[32];
+    wordInt(value, v);
+    permitDigestW(zName, zVersion, chainId, asset, owner, spender, v, nonce, deadline, out);
+}
+static void permitDigestW(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
+                          const unsigned char owner[20], const unsigned char spender[20], const unsigned char valueW[32], uint64_t nonce,
+                          uint64_t deadline, unsigned char out[32]) {
     static const char zPermit[] = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)";
     unsigned char w[32 * 6], domain[32], c[32], h[32];
     memset(c, 0, 32); memcpy(c + 12, asset, 20);
@@ -406,7 +464,7 @@ void hpplite_eip712_permit_digest(const char *zName, const char *zVersion, uint6
     hpplite_keccak256((const unsigned char *)zPermit, sizeof zPermit - 1, w);
     memset(w + 32, 0, 32); memcpy(w + 44, owner, 20);
     memset(w + 64, 0, 32); memcpy(w + 76, spender, 20);
-    wordInt(value, w + 96);
+    memcpy(w + 96, valueW, 32);
     wordInt(nonce, w + 128);
     wordInt(deadline, w + 160);
     hpplite_keccak256(w, sizeof w, h);
@@ -453,8 +511,22 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
     free(json);
     if (!req) { snprintf(s->error, sizeof s->error, "402 without a readable PAYMENT-REQUIRED"); return NULL; }
     cJSON_ArrayForEach(it, accepts) {
-        cJSON *scheme = cJSON_GetObjectItem(it, "scheme");
-        if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "exact") == 0 && !acc) acc = it;
+        cJSON *scheme = cJSON_GetObjectItem(it, "scheme"), *ex = cJSON_GetObjectItem(it, "extra");
+        if (!scheme || !cJSON_IsString(scheme) || strcmp(scheme->valuestring, "exact") != 0 || acc) continue;
+        /* the token this node pays in (HPPLITE_PAY_ASSET, #358): that one's offer, else the first */
+        if (!s->payWant[0] || payMatches(s->payWant, jstr(ex, "name"), jstr(it, "asset"))) acc = it;
+    }
+    if (!acc && s->payWant[0]) {
+        /* the token is offered by upto only (HPP, Permit2), or not at all: said, nothing paid */
+        int upto = 0;
+        cJSON_ArrayForEach(it, accepts) {
+            cJSON *scheme = cJSON_GetObjectItem(it, "scheme"), *ex = cJSON_GetObjectItem(it, "extra");
+            if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "upto") == 0 && payMatches(s->payWant, jstr(ex, "name"), jstr(it, "asset"))) upto = 1;
+        }
+        snprintf(s->error, sizeof s->error, upto ? "the %s takes %s over x402 only by upto (Permit2), which this node does not sign yet (#358): a permit pays the store in it"
+                                                 : "the %s offers no x402 payment in %s (HPPLITE_PAY_ASSET)", s->isRelay ? "relay" : "store", s->payWant);
+        cJSON_Delete(req);
+        return NULL;
     }
     if (acc && s->external) {
         /* funder= (#272): the account is the platform's; a 402 means it is not covered, and this node pays nothing */
@@ -640,6 +712,22 @@ static long statusRead(HppliteStore *s) {
             if (zSpender && strlen(zSpender) == 42) hpplite_hex_to_bytes(zSpender + 2, s->spender, 20);
             snprintf(s->assetName, sizeof s->assetName, "%s", jstr(ad, "name") ? jstr(ad, "name") : "Bridged USDC");
             snprintf(s->assetVersion, sizeof s->assetVersion, "%s", jstr(ad, "version") ? jstr(ad, "version") : "2");
+            if (s->payWant[0]) {
+                /* HPPLITE_PAY_ASSET (#358): the store's token of that name or address, with its domain and its rate */
+                cJSON *as = bk ? cJSON_GetObjectItem(bk, "assets") : NULL, *it;
+                s->payHave = 0;
+                cJSON_ArrayForEach(it, as) {
+                    const char *za = jstr(it, "asset"), *zn = jstr(it, "name"), *zv = jstr(it, "version");
+                    if (s->payHave || !za || strlen(za) != 42 || !zn || !zv || !payMatches(s->payWant, zn, za)) continue;
+                    if (hpplite_hex_to_bytes(za + 2, s->payAsset, 20) < 0) continue;
+                    snprintf(s->payName, sizeof s->payName, "%s", zn);
+                    snprintf(s->payVersion, sizeof s->payVersion, "%s", zv);
+                    s->payDecimals = (int)jnum(it, "decimals");
+                    s->payUnitsPerToken = jnum(it, "unitsPerToken");
+                    s->payHave = s->payUnitsPerToken > 0 && s->payDecimals >= 0 && s->payDecimals <= 30;
+                }
+                if (!s->payHave) fprintf(stderr, "hpplite: HPPLITE_PAY_ASSET=%s: the store %s takes no such token; its first asset is used\n", s->payWant, s->url);
+            }
             s->pricePerWrite = jnum(bk, "pricePerWrite");
             {
                 cJSON *pm = bk ? cJSON_GetObjectItem(bk, "pricePerMiBMonth") : NULL;
@@ -683,6 +771,10 @@ HppliteStore *hpplite_store_open(const char *url, const uint8_t *privkey, uint64
     if (!s->base) { free(s->url); free(s); return NULL; }
     s->cap = cap;
     s->validFor = 120;
+    {
+        const char *z = getenv("HPPLITE_PAY_ASSET");                /* #358: what this node pays in */
+        if (z && z[0]) snprintf(s->payWant, sizeof s->payWant, "%s", z);
+    }
     {
         /* tests on a chain whose clock ran ahead (anvil after evm_increaseTime) widen the window */
         const char *z = getenv("HPPLITE_STORE_VALID_FOR");
@@ -735,8 +827,14 @@ void hpplite_store_close(HppliteStore *s) {
     if (s->crypto) hpplite_crypto_free(s->crypto);
     memset(&s->kp, 0, sizeof s->kp);
     free(s->url);
+    free(s->rpc);
     sqlite3_free(s->base);
     free(s);
+}
+void hpplite_store_set_rpc(HppliteStore *s, const char *rpc) {
+    if (!s) return;
+    free(s->rpc);
+    s->rpc = rpc && rpc[0] ? strdup(rpc) : NULL;
 }
 
 void hpplite_store_set_valid_for(HppliteStore *s, uint64_t seconds) { if (s && seconds) s->validFor = seconds; }
@@ -798,13 +896,42 @@ static long postJson(HppliteStore *s, const char *path, cJSON *body, Buf *out) {
     return status;
 }
 
-/* The permit: given when there is none, it nears its deadline (30 days) or its allowance runs low (a quarter) */
+/* A token's permit nonce read from the chain (#358): nonces(owner). 0 and the nonce, or -1 */
+static int chainNonce(HppliteStore *s, const unsigned char token[20], const unsigned char owner[20], uint64_t *pNonce) {
+    unsigned char call[36], *res;
+    size_t n = 0;
+    EthClient *e;
+    int i;
+    if (!s->rpc || !(e = eth_client_create(s->rpc, s->chainId))) return -1;
+    call[0] = 0x7e; call[1] = 0xce; call[2] = 0xbe; call[3] = 0x00;        /* nonces(address) */
+    memset(call + 4, 0, 12); memcpy(call + 16, owner, 20);
+    res = eth_client_call(e, token, call, sizeof call, &n);
+    eth_client_destroy(e);
+    if (!res || n < 32) { free(res); return -1; }
+    *pNonce = 0;
+    for (i = 24; i < 32; i++) *pNonce = (*pNonce << 8) | res[i];
+    free(res);
+    return 0;
+}
+
+/* The permit: given when there is none, it nears its deadline (30 days) or its allowance runs low (a quarter). In the
+** token HPPLITE_PAY_ASSET names (#358): HPPLITE_STORE_PERMIT is credit (micro-USD), in the token's units at its rate */
 static void ensurePermit(HppliteStore *s) {
-    char fund[43], path[80], sigHex[133], num[32];
+    char fund[43], path[80], sigHex[133], num[48], assetHex[43];
     cJSON *a = NULL, *p, *body;
     uint64_t now = (uint64_t)time(NULL), deadline = now + 365ull * 86400, nonce;
-    unsigned char digest[32], sig[65];
+    unsigned char digest[32], sig[65], valueW[32];
+    const unsigned char *tok = s->payHave ? s->payAsset : s->asset;
+    const char *zName = s->payHave ? s->payName : s->assetName, *zVersion = s->payHave ? s->payVersion : s->assetVersion;
+    u128 cap = s->permitCap;
     Buf out = {0};
+    if (s->payHave) {
+        u128 scale = 1;
+        int i;
+        for (i = 0; i < s->payDecimals; i++) scale *= 10;
+        cap = (u128)s->permitCap * scale / s->payUnitsPerToken;          /* $20 of HPP at $0.01: 2000 tokens, 2e21 units */
+    }
+    lowerHex(tok, 20, assetHex);
     if (s->external || !s->permitCap || !s->hasFund || (s->pricePerWrite == 0 && s->pricePerMiBMonth == 0)) return;
     if (s->permitChecked && now - (uint64_t)s->permitChecked < 3600) return;
     s->permitChecked = (time_t)now;
@@ -816,23 +943,36 @@ static void ensurePermit(HppliteStore *s) {
     p = a ? cJSON_GetObjectItem(a, "permit") : NULL;
     if (p && cJSON_IsObject(p)) {
         cJSON *sent = cJSON_GetObjectItem(p, "sent");
-        uint64_t value = jnum(p, "value"), dl = jnum(p, "deadline"), allow = jnum(a, "allowance");
-        int ok = dl > now + 30ull * 86400 && value >= s->permitCap;
-        if (ok && sent && cJSON_IsTrue(sent) && allow < s->permitCap / 4) ok = 0;
+        const char *pa = jstr(p, "asset");
+        u128 value = parseU128(jstr(p, "value")), allow = parseU128(jstr(a, "allowance"));
+        uint64_t dl = jnum(p, "deadline");
+        int ok = dl > now + 30ull * 86400 && value >= cap && (!pa || strcasecmp(pa, assetHex) == 0);   /* in another token: given again */
+        if (ok && sent && cJSON_IsTrue(sent) && allow < cap / 4) ok = 0;
         if (ok) { cJSON_Delete(a); return; }
     }
-    nonce = a ? jnum(a, "permitNonce") : 0;
+    {
+        /* the nonce the store says is its permit token's: the chosen token's when that is the one, else the chain's */
+        const char *aa = a ? jstr(a, "asset") : NULL;
+        nonce = a ? jnum(a, "permitNonce") : 0;
+        if (s->payHave && (!aa || strcasecmp(aa, assetHex) != 0) && chainNonce(s, tok, s->fundAddr, &nonce) != 0) {
+            fprintf(stderr, "hpplite: a permit in %s needs the token's nonce from the chain, and it could not be read (rpc=?): not given\n", zName);
+            cJSON_Delete(a);
+            s->permitChecked = 0;
+            return;
+        }
+    }
     cJSON_Delete(a);
-    hpplite_eip712_permit_digest(s->assetName, s->assetVersion, s->chainId, s->asset, s->fundAddr, s->spender, s->permitCap, nonce,
-                                 deadline, digest);
+    wordU128(cap, valueW);
+    permitDigestW(zName, zVersion, s->chainId, tok, s->fundAddr, s->spender, valueW, nonce, deadline, digest);
     if (signWith(s, &s->fundKp, digest, sig) != 0) return;
     lowerHex(sig, 65, sigHex);
     body = cJSON_CreateObject();
-    snprintf(num, sizeof num, "%llu", (unsigned long long)s->permitCap);
+    fmtU128(cap, num);
     cJSON_AddStringToObject(body, "value", num);
     snprintf(num, sizeof num, "%llu", (unsigned long long)deadline);
     cJSON_AddStringToObject(body, "deadline", num);
     cJSON_AddStringToObject(body, "signature", sigHex);
+    if (s->payHave) cJSON_AddStringToObject(body, "asset", assetHex);           /* one of buckets.assets (#357) */
     snprintf(path, sizeof path, "/account/%s/permit", fund);
     if (postJson(s, path, body, &out) != 200) {
         fprintf(stderr, "hpplite: the store did not take the funding wallet's permit: %.200s\n", out.p ? out.p : "no answer");

@@ -147,6 +147,8 @@ int hpplite_store_retry_after(HppliteStore *store);
 /* the chain's time for a payment's validity window (validAfter, validBefore): what the chain checks it against; a
 ** function returning 0 (not read) falls back to the host's clock, said once */
 void hpplite_store_set_chain_time(HppliteStore *store, uint64_t (*xChainTime)(void *), void *pArg);
+/* the node's RPC (#358): a permit in a token the account has not used (HPPLITE_PAY_ASSET) needs the token's nonce */
+void hpplite_store_set_rpc(HppliteStore *store, const char *rpc);
 /* the address a 65-byte signature over a digest recovers to: 0, or -1 */
 int hpplite_store_recover(const unsigned char digest[32], const unsigned char sig[65], unsigned char out[20]);
 uint8_t *hpplite_store_get_named(HppliteStore *store, const char *zName, size_t *pLen, uint8_t sig[65], unsigned char instance[32]);

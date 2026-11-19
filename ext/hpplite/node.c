@@ -190,7 +190,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         /* the batch bytes' store (#11): the chain will hold commitments only */
         node->store = hpplite_store_open(node->config.storeUrl, config->hasPrivkey ? config->privkey : NULL, config->storeCap);
         if (node->store && config->hasFunder) hpplite_store_set_funder(node->store, config->funder);   /* an external account (#272) */
-        if (node->store) hpplite_store_set_chain_time(node->store, node_chain_time, node);
+        if (node->store) { hpplite_store_set_chain_time(node->store, node_chain_time, node); hpplite_store_set_rpc(node->store, config->rpcUrl); }
         if (!node->store) {
             fprintf(stderr, "hpplite: store=%s: not a store HPPLite knows: store=on for the network's canonical store, or http(s)://host[:port] of an hpplite-store/2 store (operators/store/hpplite_store.py in front of your own disk; kubo:// and s3:// were removed in v0.8, #250)\n", node->config.storeUrl);
             return -1;
