@@ -1075,6 +1075,14 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.10.3** (2026-11-20): one wallet pays the store and the relay.
+
+- **The funding wallet pays the relay too (#371).** A node paid its store from the funding wallet derived from its key and its relay from the key's own wallet: two balances, and nothing said which was asked. The token now goes on one wallet, the funding wallet (`store_funder`; `relay_payer` in `hpplite_status` names the wallet the relay's payments are asked of).
+  - A node with the token on its key's own wallet keeps running: that wallet is asked when the relay refuses the funding wallet's payment, the node says on stderr which wallet paid instead, and asks it first from then on. Move the token to the funding wallet when convenient.
+  - Where neither wallet pays, the refusal names the funding wallet first and says the key's own was asked too. With `funder=` the key's own wallet pays a relay, as before.
+  - Checked on HPP Sepolia: a key whose own wallet holds nothing created its rollup, took the lease, wrote to the store and anchored, the funding wallet paying both; a key with USDC.e on its own wallet alone still paid the relay, and said so.
+- No protocol or format changes; the relays are unchanged. The protocol text now says that a payment's payer need not be the call's signer.
+
 **v0.10.2** (2026-11-19): a creation paid by a funder, and what a node says when it stops.
 
 - **A key that holds nothing creates its rollup (#376).** A funder signs `SponsorCreate` for a key's creation, the key beside it (`sponsor.py … create`), and the relay charges that key's `createRollupFor` to the funder's account; the rollup is sponsored by the funder from its first call.
