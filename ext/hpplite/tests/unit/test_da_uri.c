@@ -307,9 +307,18 @@ static void test_operators_on(void) {
     ok = cfg && hpplite_config_resolve_operators(cfg) == 0 && strcmp(cfg->storeUrl, "http://127.0.0.1:9") == 0;
     if (cfg) hpplite_config_free(cfg);
     if (!ok) { FAIL("a URL given stays"); }
-    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-mainnet&store=on");
+    /* HPP Mainnet's since hpplite-operators#48 stage 2 (2026-11-19, #337): the store, the relay and the factory */
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=hpp-mainnet&store=on&relay=on");
+    ok = cfg && hpplite_config_resolve_operators(cfg) == 0 && cfg->storeUrl && cfg->relayUrl
+         && strcmp(cfg->storeUrl, "https://store.hpplite.hpp.io") == 0 && strcmp(cfg->relayUrl, "https://relay.hpplite.hpp.io") == 0
+         && hpplite_da_get_factory(190415) && strcasecmp(hpplite_da_get_factory(190415), "0x76A2922e179c0F21B7e4eC1D0c43Fe1db753AFc4") == 0;
+    printf("  hpp-mainnet: store %s, relay %s, factory %s\n", cfg && cfg->storeUrl ? cfg->storeUrl : "-", cfg && cfg->relayUrl ? cfg->relayUrl : "-",
+           hpplite_da_get_factory(190415) ? hpplite_da_get_factory(190415) : "-");
+    if (cfg) hpplite_config_free(cfg);
+    if (!ok) { FAIL("hpp-mainnet's store, relay and factory"); }
+    cfg = hpplite_config_load("hpplite://x?hpplite=1&l1=ethereum&store=on");
     ok = cfg && hpplite_config_resolve_operators(cfg) != 0 && hpplite_config_error() && strstr(hpplite_config_error(), "no canonical store");
-    printf("  hpp-mainnet: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)");
+    printf("  ethereum: %s\n", hpplite_config_error() ? hpplite_config_error() : "(no error)");
     if (cfg) hpplite_config_free(cfg);
     if (!ok) { FAIL("a network without a canonical store: an error"); }
     PASS();
