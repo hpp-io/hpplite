@@ -117,6 +117,7 @@ typedef struct HppliteNode {
     int64_t idleSyncAt;             /* An idle lease holder asks the chain again at this time, not at every tick (#292) */
     uint64_t leaseDuration;         /* Seconds, learned from the contract (default 300) */
     int warnedForeignLease;         /* "someone else holds the lease" said once */
+    char claimWhy[200];             /* why the last lease claim did not take: the RPC's refusal, the transaction unmined (#370) */
     int leaseHeldElsewhere;         /* The last look found another instance's lease (hpplite_status.state = waiting) */
     int lastFetchForeign;           /* The last fetch found a batch that fails our authentication */
     int failStreak;                 /* Consecutive flushes that did not reach L1 */
@@ -228,6 +229,7 @@ typedef struct HppliteNode {
     int wantsL1;                    /* Config named an L1 (contract/factory): local-only flush is not OK */
     char lastBatchTx[80];           /* Transaction hash of the last confirmed batch (status table) */
     int warnedNoL1;                 /* "L1 requested but not connected" said once */
+    char l1Why[300];                /* why the factory gave no rollup: the RPC's refusal of the create, a create not mined (#370) */
     int64_t l1RetryAt;              /* a connection that did not come at open is tried again at a flush, not before this (ms) (#229) */
     int warnedNoChain;              /* "no chain configured, the log is kept" said once (#38) */
     int checkpointGiven;            /* The configuration named an interval (else the contract's is used, #44) */

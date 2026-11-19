@@ -11,12 +11,19 @@
 #include "l1_backend.h"
 #include "hpplite_sqlite.h"
 #include <string.h>
+#include <stdio.h>
 
 static const HppliteL1Ops *backendFor(const char *endpoint) {
     if (endpoint && strcmp(endpoint, "mock") == 0) return &hppliteL1MockOps;
     if (endpoint && strncmp(endpoint, "file://", 7) == 0) return &hppliteL1DirOps;
     return &hppliteL1EthOps;
 }
+
+/* The RPC's refusal of a send (#370). Per thread: the factory's creates have no connection to keep it in, and a
+** flush on its own thread reads its own. Cleared before each call that sends, so what is read is that call's */
+static _Thread_local char tlTxError[200];
+void hppliteL1TxError(const char *zWhy) { snprintf(tlTxError, sizeof tlTxError, "%s", zWhy ? zWhy : ""); }
+const char *hpplite_l1_tx_error(void) { return tlTxError[0] ? tlTxError : NULL; }
 
 const char *hpplite_l1_backend_name(HppliteL1 *l1) {
     return l1 ? l1->ops->name : NULL;
@@ -93,14 +100,17 @@ HppliteL1State *hpplite_l1_get_state(HppliteL1 *l1) {
 }
 
 char *hpplite_l1_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    tlTxError[0] = 0;
     return l1 ? l1->ops->claim_sequencer(l1, instanceId) : NULL;
 }
 
 char *hpplite_l1_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    tlTxError[0] = 0;
     return l1 ? l1->ops->renew_lease(l1, instanceId) : NULL;
 }
 
 char *hpplite_l1_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]) {
+    tlTxError[0] = 0;
     return l1 ? l1->ops->release_lease(l1, instanceId) : NULL;
 }
 
@@ -188,6 +198,7 @@ int hpplite_l1_factory_has_rollup(const char *rpc_url, const char *factory_addre
 
 char *hpplite_l1_factory_get_or_create_rollup(const char *rpc_url, const char *factory_address,
                                               const uint8_t privkey[32], uint8_t rollup_address_out[20]) {
+    tlTxError[0] = 0;
     return backendFor(rpc_url)->factory_get_or_create_rollup(rpc_url, factory_address, privkey, rollup_address_out);
 }
 
@@ -198,6 +209,7 @@ int hpplite_l1_factory_list_rollups(const char *rpc_url, const char *factory_add
 
 int hpplite_l1_factory_create_rollup(const char *rpc_url, const char *factory_address, const uint8_t privkey[32],
                                      uint64_t checkpointInterval, uint8_t rollup_out[20]) {
+    tlTxError[0] = 0;
     return backendFor(rpc_url)->factory_create_rollup(rpc_url, factory_address, privkey, checkpointInterval, rollup_out);
 }
 
@@ -215,6 +227,7 @@ int hpplite_l1_factory_get_my_rollup(const char *rpc_url, const char *factory_ad
 
 char *hpplite_l1_submit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height,
                               const uint8_t *data, size_t data_len) {
+    tlTxError[0] = 0;
     return l1 ? l1->ops->submit_batch(l1, instanceId, height, data, data_len) : NULL;
 }
 
@@ -245,6 +258,7 @@ int hpplite_l1_get_chain_hash(HppliteL1 *l1, uint64_t *pHeight, uint8_t out[32])
 
 char *hpplite_l1_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint64_t height, const uint8_t hash[32],
                               const char *zRef, const uint8_t *receipt, size_t nReceipt) {
+    tlTxError[0] = 0;
     return (l1 && l1->ops->commit_batch) ? l1->ops->commit_batch(l1, instanceId, height, hash, zRef, receipt, nReceipt) : NULL;
 }
 
@@ -256,6 +270,7 @@ int hpplite_l1_get_commitment(HppliteL1 *l1, uint64_t height, uint8_t hash[32], 
 }
 
 char *hpplite_l1_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const HppliteRange *r) {
+    tlTxError[0] = 0;
     return (l1 && r && l1->ops->commit_range) ? l1->ops->commit_range(l1, instanceId, r) : NULL;
 }
 

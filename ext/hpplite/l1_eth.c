@@ -335,6 +335,14 @@ static uint64_t sig_deadline(EthClient *eth) {
     return ts + 600;
 }
 
+/* A transaction from the wallet. The RPC's refusal is kept for the caller to say (#370): the calls below answer
+** NULL, and those without a connection destroy the client that held the reason */
+static uint8_t *send_tx(EthClient *eth, const uint8_t to[20], const uint8_t *data, size_t n, uint64_t gas, uint64_t value) {
+    uint8_t *tx = eth_client_send_tx(eth, to, data, n, gas, value);
+    hppliteL1TxError(tx ? NULL : eth_client_error(eth));
+    return tx;
+}
+
 /* POST {to, data} to the relay's /commit, paid within HPPLITE_RELAY_CAP: the
 ** transaction's hash once it landed (sqlite3_mprintf), or NULL with the
 ** reason in relayError */
@@ -457,7 +465,7 @@ static char *eth_set_checkpoint_interval(HppliteL1 *l1, uint64_t interval) {
     }
     memcpy(calldata, SEL_SET_CHECKPOINT_INTERVAL, 4);
     abi_encode_uint64(interval, calldata + 4);
-    tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
+    tx_hash = send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
     if (!tx_hash) return NULL;
     self->lastPath = "direct";
     return txHashString(tx_hash);
@@ -473,7 +481,7 @@ static char *eth_set_sequencer(HppliteL1 *l1, const unsigned char wallet[20]) {
     memcpy(calldata, SEL_SET_SEQUENCER, 4);
     memset(calldata + 4, 0, 32);
     memcpy(calldata + 4 + 12, wallet, 20);
-    tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 80000, 0);
+    tx_hash = send_tx(self->eth, self->contract, calldata, sizeof(calldata), 80000, 0);
     if (!tx_hash) return NULL;
     return txHashString(tx_hash);
 }
@@ -487,7 +495,7 @@ static char *eth_set_lease_duration(HppliteL1 *l1, uint64_t seconds) {
     init_selectors();
     memcpy(calldata, SEL_SET_LEASE_DURATION, 4);
     abi_encode_uint64(seconds, calldata + 4);
-    tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
+    tx_hash = send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
     if (!tx_hash) return NULL;
     self->lastPath = "direct";
     return txHashString(tx_hash);
@@ -738,7 +746,7 @@ static char *eth_submit_checkpoint(
     abi_encode_bytes32(checkpoint->postStateRoot, p);
 
     /* Send transaction */
-    uint8_t *tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, calldata_len,
+    uint8_t *tx_hash = send_tx(self->eth, self->contract, calldata, calldata_len,
                                            500000, 0);
     free(calldata);
 
@@ -766,7 +774,7 @@ static char *eth_claim_sequencer(HppliteL1 *l1, const unsigned char instanceId[3
     memcpy(calldata + 4, instanceId, 32);
 
     /* Send transaction */
-    uint8_t *tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 200000, 0);
+    uint8_t *tx_hash = send_tx(self->eth, self->contract, calldata, sizeof(calldata), 200000, 0);
     if (!tx_hash) return NULL;
     self->lastPath = "direct";
 
@@ -791,7 +799,7 @@ static char *eth_renew_lease(HppliteL1 *l1, const unsigned char instanceId[32]) 
     memcpy(calldata + 4, instanceId, 32);
 
     /* Send transaction */
-    uint8_t *tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 100000, 0);
+    uint8_t *tx_hash = send_tx(self->eth, self->contract, calldata, sizeof(calldata), 100000, 0);
     if (!tx_hash) return NULL;
     self->lastPath = "direct";
 
@@ -821,11 +829,11 @@ static char *eth_release_lease(HppliteL1 *l1, const unsigned char instanceId[32]
         uint8_t calldata[36];
         memcpy(calldata, SEL_RELEASE_LEASE, 4);
         memcpy(calldata + 4, instanceId, 32);
-        tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
+        tx_hash = send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
     } else {
         uint8_t calldata[4];
         memcpy(calldata, SEL_FORCE_EXPIRE_LEASE, 4);
-        tx_hash = eth_client_send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
+        tx_hash = send_tx(self->eth, self->contract, calldata, sizeof(calldata), 60000, 0);
     }
     if (!tx_hash) {
         fprintf(stderr, "hpplite: lease release: %s\n", eth_client_error(self->eth));
@@ -1035,7 +1043,7 @@ static char *eth_factory_get_or_create_rollup(
     memcpy(calldata, SEL_GET_OR_CREATE_ROLLUP, 4);
 
     /* Send transaction - needs high gas for deploying child HPPLiteDA contract */
-    uint8_t *tx_hash = eth_client_send_tx(eth, factory, calldata, 4, 15000000, 0);
+    uint8_t *tx_hash = send_tx(eth, factory, calldata, 4, 15000000, 0);
 
     if (!tx_hash) {
         eth_client_destroy(eth);
@@ -1106,7 +1114,7 @@ static int eth_factory_create_rollup(
     memcpy(calldata, SEL_CREATE_ROLLUP, 4);
     abi_encode_uint64(checkpointInterval, calldata + 4);
     /* deploys the rollup and its DA contract: the gas getOrCreateRollup() takes */
-    tx_hash = eth_client_send_tx(eth, factory, calldata, sizeof(calldata), 15000000, 0);
+    tx_hash = send_tx(eth, factory, calldata, sizeof(calldata), 15000000, 0);
     if (!tx_hash) { eth_client_destroy(eth); return 0; }
     keccak256((const uint8_t *)sig, strlen(sig), topic0);
     for (i = 0; i < 240 && (rc == 0 || rc == -2); i++) {   /* up to a minute; an RPC error is not an answer (#68) */
@@ -1298,7 +1306,7 @@ static char *eth_submit_batch(
     else gas_estimate += gas_estimate / 4;
     if (gas_estimate < 3000000) gas_estimate = 3000000;
     if (self->maxTxGas && gas_estimate > self->maxTxGas) gas_estimate = self->maxTxGas;
-    uint8_t *tx_hash = eth_client_send_tx(self->eth, self->da_contract, calldata, calldata_len,
+    uint8_t *tx_hash = send_tx(self->eth, self->da_contract, calldata, calldata_len,
                                            gas_estimate, 0);
     free(calldata);
 
@@ -1438,7 +1446,7 @@ static char *eth_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const
     else gas += gas / 4;
     if (gas < 200000) gas = 200000;
     if (self->maxTxGas && gas > self->maxTxGas) gas = self->maxTxGas;
-    tx_hash = eth_client_send_tx(self->eth, self->da_contract, calldata, n, gas, 0);
+    tx_hash = send_tx(self->eth, self->da_contract, calldata, n, gas, 0);
     free(calldata);
     if (tx_hash) self->lastPath = "direct";
     return tx_hash ? txHashString(tx_hash) : NULL;
@@ -1579,7 +1587,7 @@ static char *eth_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint6
     else gas += gas / 4;
     if (gas < 200000) gas = 200000;
     if (self->maxTxGas && gas > self->maxTxGas) gas = self->maxTxGas;
-    tx_hash = eth_client_send_tx(self->eth, self->da_contract, calldata, n, gas, 0);
+    tx_hash = send_tx(self->eth, self->da_contract, calldata, n, gas, 0);
     free(calldata);
     if (tx_hash) self->lastPath = "direct";
     return tx_hash ? txHashString(tx_hash) : NULL;

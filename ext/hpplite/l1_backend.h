@@ -106,6 +106,9 @@ struct HppliteL1Ops {
                                      struct HppliteStore *relay, uint64_t checkpointInterval, uint8_t rollup_out[20]);
 };
 
+/* A backend's send from the wallet: the RPC's refusal, NULL where it was taken (hpplite_l1_tx_error) */
+void hppliteL1TxError(const char *zWhy);
+
 extern const HppliteL1Ops hppliteL1EthOps;    /* l1_eth.c */
 uint64_t hpplite_l1_eth_rpc_chain_id(const char *rpc_url);   /* l1_eth.c */
 extern const HppliteL1Ops hppliteL1MockOps;   /* l1_mock.c */

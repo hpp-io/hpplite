@@ -230,6 +230,9 @@ void hpplite_l1_set_relay(HppliteL1 *l1, struct HppliteStore *relay);
 const char *hpplite_l1_last_tx_path(HppliteL1 *l1);
 /* Why the last relay attempt failed (NULL: no relay, or it succeeded since) */
 const char *hpplite_l1_relay_error(HppliteL1 *l1);
+/* Why the RPC refused the transaction this thread last sent from the wallet (#370: 'insufficient funds for gas *
+** price + value'), NULL where it took it - also after the calls made without a connection, the factory's creates */
+const char *hpplite_l1_tx_error(void);
 /* The wallet's rollup created through the relay (createRollupFor, VERSION 10
 ** factories): 0; -2 create it from the wallet (no signed form, or the relay
 ** failed and the wallet holds ETH); -1 the relay failed and the wallet cannot pay */

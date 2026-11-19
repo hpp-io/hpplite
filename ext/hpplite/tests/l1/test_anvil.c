@@ -3776,6 +3776,63 @@ static void test_chain_from_rpc(void) {
     PASS();
 }
 
+/* 63. A send the RPC refuses and a transaction that never lands are said (#370, somaro#352): a wallet with too little ETH
+** for the factory's create read only 'L1 was configured but is not connected' - the RPC's refusal was in the client the
+** helper destroyed; and a transaction the chain took and did not mine was waited for and passed over without a word */
+static void test_tx_said(void) {
+    TEST("a refused send and an unmined transaction are said (#370): a wallet with no ETH reads the RPC's refusal, funded it connects at the next try; a batch whose transaction is not mined names its hash and is adopted once it lands");
+    static const char *K = "0x6363636363636363636363636363636363636363636363636363636363636363";
+    char addr[48], cmd[600], out[400], uri[1024], atOpen[600], atFlush[600], unmined[600], contract[80];
+    sqlite3 *db = NULL;
+    sqlite3_int64 h0, h1, pending;
+#define ON_FAIL(why) do { cast_rpc("evm_setIntervalMining", "1", out, sizeof out); if (db) sqlite3_close(db); FAIL(why); } while (0)
+    (void)!system("rm -f " DIR "/txs.db*");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", K);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(uri, sizeof uri, "file:" DIR "/txs.db?hpplite=on&rpc=%s&factory=%s&privkey=%s&datadir=" DIR "&interval=0", RPC, FACTORY, K);
+    if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) ON_FAIL("open");
+    /* no ETH: the create is refused, and the open says by whom and why */
+    snprintf(atOpen, sizeof atOpen, "%s", status_text(db, "last_error"));
+    sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL, NULL, NULL);
+    scalar(db, "SELECT hpplite_flush()");
+    snprintf(atFlush, sizeof atFlush, "%s", status_text(db, "last_error"));
+    printf("\n    at open: %s\n    at the flush: %s\n    ", atOpen[0] ? atOpen : "-", atFlush[0] ? atFlush : "-");
+    if (!strstr(atOpen, "nsufficient funds")) ON_FAIL("the open does not say the RPC's refusal of the create");
+    if (!strstr(atFlush, "not connected") || !strstr(atFlush, "nsufficient funds")) ON_FAIL("'not connected' does not say why");
+    /* funded: the next try (at a flush, at most every ten seconds) creates the rollup and posts */
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) ON_FAIL("fund the key");
+    sleep(11);
+    scalar(db, "SELECT hpplite_flush()");
+    snprintf(contract, sizeof contract, "%s", status_text(db, "contract"));
+    h0 = scalar(db, "SELECT height FROM hpplite_status");
+    pending = scalar(db, "SELECT pending FROM hpplite_status");
+    printf("funded: contract %s, height %lld, pending %lld, last_error %s\n    ", contract[0] ? contract : "-", (long long)h0, (long long)pending,
+           status_text(db, "last_error")[0] ? status_text(db, "last_error") : "-");
+    if (!contract[0] || pending != 0) ON_FAIL("the funded wallet did not connect and post at the next try");
+    if (strstr(status_text(db, "last_error"), "not connected")) ON_FAIL("last_error still says 'not connected' once connected");
+    /* the chain takes transactions and mines none: the batch's hash is said, the batch kept */
+    cast_rpc("evm_setIntervalMining", "0", out, sizeof out);
+    sqlite3_exec(db, "INSERT INTO t VALUES(2)", NULL, NULL, NULL);
+    scalar(db, "SELECT hpplite_flush()");
+    snprintf(unmined, sizeof unmined, "%s", status_text(db, "last_error"));
+    pending = scalar(db, "SELECT pending FROM hpplite_status");
+    printf("no block mined: %s (pending %lld)\n    ", unmined[0] ? unmined : "-", (long long)pending);
+    cast_rpc("evm_setIntervalMining", "1", out, sizeof out);
+    if (!strstr(unmined, "is not mined") || !strstr(unmined, "0x")) ON_FAIL("a transaction that is not mined is not said with its hash");
+    if (pending == 0) ON_FAIL("the batch of an unmined transaction is not kept pending");
+    sleep(6);
+    scalar(db, "SELECT hpplite_flush()");
+    h1 = scalar(db, "SELECT height FROM hpplite_status");
+    pending = scalar(db, "SELECT pending FROM hpplite_status");
+    printf("mined again: height %lld, pending %lld ", (long long)h1, (long long)pending);
+    if (pending != 0 || h1 != h0 + 1) ON_FAIL("the batch was not adopted as one height once its transaction landed");
+    sqlite3_close(db);
+#undef ON_FAIL
+    PASS();
+}
+
 static void test_sequencer_once(void) {
     TEST("hpplite-sequencer --once (#345): runs over a kept copy of an app's file send what changed as one height each, nothing when unchanged; an empty app's file is refused, a held copy left alone; a replica rebuilds the app's rows");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
@@ -3915,6 +3972,7 @@ int main(void) {
     if (wanted(60)) test_pay_upto();
     if (wanted(61)) test_refusal_names_wallet();
     if (wanted(62)) test_rebuilt_other_sqlite();
+    if (wanted(63)) test_tx_said();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

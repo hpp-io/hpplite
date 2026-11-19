@@ -47,6 +47,7 @@ static void node_cap_batch_limit(HppliteNode *node);
 static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
 static int node_check_rollup(HppliteNode *node);
 #include <sys/stat.h>
+#include <stdarg.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -89,6 +90,25 @@ static int64_t node_current_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Wait for a transaction and say where it did not land (#370), for the caller's message: the RPC's refusal of the
+** send where no hash came of it, a revert, or not mined in the time waited - a chain can take a transaction and
+** never mine it (#369), and the wait then ended without a word. zWhy is empty where it landed, or where nothing
+** is known. The wait's answer: 1 landed, 0 reverted, -1 neither */
+static int node_tx_landed(HppliteL1 *l1, const char *txHash, int secs, char *zWhy, size_t n) {
+    int64_t t0 = node_current_time_ms();
+    int rc;
+    zWhy[0] = 0;
+    if (!txHash) {
+        const char *zRefused = hpplite_l1_tx_error();
+        if (zRefused) snprintf(zWhy, n, "the transaction was not sent: %s", zRefused);
+        return -1;
+    }
+    rc = hpplite_l1_wait_for_tx(l1, txHash, secs);
+    if (rc == 0) snprintf(zWhy, n, "transaction %s reverted", txHash);
+    else if (rc != 1) snprintf(zWhy, n, "transaction %s is not mined after %d s", txHash, (int)((node_current_time_ms() - t0) / 1000));
+    return rc;
 }
 
 /*
@@ -600,6 +620,25 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
 ** already; else the one whose first batch carries its name (a replica, or a
 ** writer that lost its file); else a new one. 1 with the address, 0 not.
 */
+/* Why the factory gave this wallet no rollup (#370): said where it is met, once while it stays the same (the
+** connection is tried again every ten seconds), and kept for the 'not connected' line of the flushes after */
+static void node_no_rollup(HppliteNode *node, const char *zFmt, ...) {
+    char z[sizeof node->l1Why];
+    va_list ap;
+    va_start(ap, zFmt);
+    vsnprintf(z, sizeof z, zFmt, ap);
+    va_end(ap);
+    if (strcmp(z, node->l1Why) == 0) return;
+    memcpy(node->l1Why, z, sizeof z);
+    hpplite_error(node->ctx, "%s", z);
+}
+
+/* The wallet's create at the factory did not go out: the RPC's word for it */
+static void node_create_refused(HppliteNode *node) {
+    const char *zWhy = hpplite_l1_tx_error();
+    node_no_rollup(node, "the rollup was not created: the wallet's transaction to the factory was not sent (%s)", zWhy ? zWhy : "no reason given");
+}
+
 static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
                              const char *factoryHex, uint8_t rollup[20]) {
     const char *zName = node->ctx->zDbName;
@@ -686,11 +725,12 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
         if (txHash) {
             HppliteL1 *tempL1 = hpplite_l1_connect(config->rpcUrl, factoryHex);
             if (tempL1) {
-                hpplite_l1_wait_for_tx(tempL1, txHash, 60);
+                char zWhy[200];
+                if (node_tx_landed(tempL1, txHash, 60, zWhy, sizeof zWhy) != 1) node_no_rollup(node, "the rollup was not created: %s", zWhy);
                 hpplite_l1_disconnect(tempL1);
             }
             sqlite3_free(txHash);
-        }
+        } else node_create_refused(node);
         if (hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup) != 1) { sqlite3_free(zOthers); sqlite3_free(zTail); return 0; }
     }
     if (node->config.verifyOnly) {
@@ -718,9 +758,10 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
         if (rc == 0) return 1;
         if (rc == -1) return 0;
     }
-    return hpplite_l1_factory_create_rollup(config->rpcUrl, factoryHex, config->privkey,
-                                            config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100,
-                                            rollup);
+    if (hpplite_l1_factory_create_rollup(config->rpcUrl, factoryHex, config->privkey,
+                                         config->checkpointInterval > 0 ? (uint64_t)config->checkpointInterval : 100, rollup)) return 1;
+    if (hpplite_l1_tx_error()) node_create_refused(node);
+    return 0;
 }
 
 static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
@@ -789,7 +830,8 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                 /* Wait for transaction to be mined */
                 HppliteL1 *tempL1 = hpplite_l1_connect(config->rpcUrl, factoryHex);
                 if (tempL1) {
-                    hpplite_l1_wait_for_tx(tempL1, txHash, 60);
+                    char zWhy[200];
+                    if (node_tx_landed(tempL1, txHash, 60, zWhy, sizeof zWhy) != 1) node_no_rollup(node, "the rollup was not created: %s", zWhy);
                     hpplite_l1_disconnect(tempL1);
                 }
                 sqlite3_free(txHash);
@@ -797,7 +839,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
                 /* Try again to get rollup address */
                 result = hpplite_l1_factory_get_my_rollup(
                     config->rpcUrl, factoryHex, config->privkey, rollup);
-            }
+            } else node_create_refused(node);
         }
 
         if (result == 1 && named) {
@@ -852,6 +894,7 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
     ** rather than at the first write: a restart has no window in which the
     ** rollup is unclaimed, and lease trouble shows at open */
     if (node->l1) {
+        node->l1Why[0] = 0;
         node_learn_batch_limit(node);
         if (hpplite_node_sync_from_l1(node, 1) < 0) {
             node->state = HPPLITE_STATE_ERROR;
@@ -1500,7 +1543,7 @@ static int node_repost_lost(HppliteNode *node, uint64_t lastBatch) {
     for (h = lastBatch + 1; h < node->ctx->blockHeight; h++) {
         size_t len = 0;
         uint8_t *bytes = hpplite_posted_batch(node->ctx, h, &len);
-        char *txHash;
+        char *txHash, zWhy[200];
         int ok;
         if (!bytes) {
             hpplite_error(node->ctx, "L1 has %llu batches but this database finalized %llu (a chain "
@@ -1513,9 +1556,12 @@ static int node_repost_lost(HppliteNode *node, uint64_t lastBatch) {
         if (!node_ensure_lease(node)) { free(bytes); return 0; }
         txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, h, bytes, len);
         free(bytes);
-        ok = txHash && hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1;
+        ok = node_tx_landed(node->l1, txHash, 30, zWhy, sizeof zWhy) == 1;
         sqlite3_free(txHash);
-        if (!ok) return 0;
+        if (!ok) {
+            if (zWhy[0]) hpplite_error(node->ctx, "L1 lost batch %llu and it could not be posted again: %s", (unsigned long long)h, zWhy);
+            return 0;
+        }
         fprintf(stderr, "hpplite: L1 lost batch %llu (a chain reorganisation?); posted it again\n",
                 (unsigned long long)h);
     }
@@ -2734,7 +2780,7 @@ static int node_anchor_once(HppliteNode *node) {
     uint8_t compact[HPPLITE_STATEMENT_SIZE];   /* the /2 bucket statement */
     cJSON *m = NULL, *batches;
     sqlite3_stmt *q = NULL;
-    char *text = NULL, *zRef = NULL, *txHash = NULL, cid[64], hx[67];
+    char *text = NULL, *zRef = NULL, *txHash = NULL, cid[64], hx[67], zTxWhy[200];
     HppliteRange r;
     int saved, rc = -1, nCompact = -1, hasRoot = 0, confirmed = 0;
     HppliteCtx *ctx = node->ctx;
@@ -2818,11 +2864,9 @@ static int node_anchor_once(HppliteNode *node) {
     if (nCompact > 0) { r.receipt = compact; r.nReceipt = (size_t)nCompact; }
     if (!node_ensure_lease(node)) { free(text); sqlite3_free(zRef); return -1; }
     txHash = hpplite_l1_commit_range(node->l1, node->instanceId, &r);
-    if (txHash) {
-        confirmed = hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1;
-        if (confirmed) snprintf(node->lastAnchorTx, sizeof node->lastAnchorTx, "%s", txHash);
-        sqlite3_free(txHash);
-    }
+    confirmed = node_tx_landed(node->l1, txHash, 30, zTxWhy, sizeof zTxWhy) == 1;
+    if (confirmed) snprintf(node->lastAnchorTx, sizeof node->lastAnchorTx, "%s", txHash);
+    sqlite3_free(txHash);
     if (!confirmed) {
         /* the transaction may have landed despite the lost answer: the chain's height says */
         uint64_t nowLast = 0;
@@ -2849,8 +2893,9 @@ static int node_anchor_once(HppliteNode *node) {
         rc = 1;
     } else {
         const char *zRelay = hpplite_l1_relay_error(node->l1);    /* why the relay did not take it (#126) */
+        const char *zWhy = zRelay ? zRelay : zTxWhy;               /* or the RPC the wallet's own transaction, or the chain left it unmined (#370) */
         hpplite_error(ctx, "anchor: the chain did not take the commitment of batches %llu-%llu%s%s%s; tried again at the next anchor",
-                      (unsigned long long)from, (unsigned long long)to, zRelay ? " (relay: " : "", zRelay ? zRelay : "", zRelay ? ")" : "");
+                      (unsigned long long)from, (unsigned long long)to, zWhy[0] ? (zRelay ? " (relay: " : " (") : "", zWhy, zWhy[0] ? ")" : "");
         rc = -1;
     }
     free(text); sqlite3_free(zRef);
@@ -3036,9 +3081,9 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
     uint8_t *sealed = NULL, *packed = NULL, *framed = NULL;
     uint8_t encoding = HPPLITE_ENCODING_NONE;
     int rc, confirmed = 0, tries;
-    char zStoreWhy[240];
+    char zStoreWhy[240], zTxWhy[200];
     int storedOnly = 0;
-    zStoreWhy[0] = 0;
+    zStoreWhy[0] = zTxWhy[0] = 0;
     node_wal_maintenance(node);                         /* frames another connection or process committed since (#153); the pins moved */
     node_pages_decide_snapshot(node);                   /* if nothing decided it yet */
     node_retry_l1(node);
@@ -3047,7 +3092,8 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         ** bad RPC): finalizing locally would move the height past batches the
         ** chain never saw; everything stays pending, as the row flush keeps it (#156) */
         if (!node->warnedNoL1) {
-            hpplite_error(ctx, "L1 was configured but is not connected; batches are kept pending (check the key and the RPC endpoint)");
+            hpplite_error(ctx, "L1 was configured but is not connected%s%s; batches are kept pending (check the key and the RPC endpoint)",
+                          node->l1Why[0] ? ": " : "", node->l1Why);
             node->warnedNoL1 = 1;
         }
         *pMore = 0; return 0;
@@ -3167,7 +3213,8 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         } else {
             txHash = hpplite_l1_submit_batch(node->l1, node->instanceId, height, payload, payloadLen);
         }
-        if (txHash) { confirmed = (hpplite_l1_wait_for_tx(node->l1, txHash, 30) == 1); if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash); if (confirmed && node->onBatchPosted) node->onBatchPosted(node->callbackArg, height, txHash); sqlite3_free(txHash); }
+        if (!storedOnly) confirmed = node_tx_landed(node->l1, txHash, 30, zTxWhy, sizeof zTxWhy) == 1;
+        if (txHash) { if (confirmed) snprintf(node->lastBatchTx, sizeof(node->lastBatchTx), "%s", txHash); if (confirmed && node->onBatchPosted) node->onBatchPosted(node->callbackArg, height, txHash); sqlite3_free(txHash); }
         if (storedOnly) confirmed = 1;
         if (confirmed) test_crash_point("after_submit");
     } else {
@@ -3190,7 +3237,8 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
             int funder = node->store && hpplite_store_waiting_on_funder(node->store);
             if (!(funder && node->warnedFunder)) hpplite_error(ctx, "page batch %llu kept pending: %s", (unsigned long long)height, zStoreWhy);
             node->warnedFunder = funder;
-        } else hpplite_error(ctx, "page batch %llu not confirmed on L1, kept pending", (unsigned long long)height);
+        } else hpplite_error(ctx, "page batch %llu not confirmed on L1%s%s%s, kept pending", (unsigned long long)height,
+                             zTxWhy[0] ? " (" : "", zTxWhy, zTxWhy[0] ? ")" : "");
         sqlite3_free(bytes); free(packed); free(sealed); free(framed);
         *pMore = 0;
         return 0;
@@ -3239,8 +3287,8 @@ static uint64_t node_flush_one(HppliteNode *node, int *pMore) {
         ** (no key, bad RPC, ...): finalizing locally would advance the
         ** height past batches L1 never saw. Keep everything pending. */
         if (!node->warnedNoL1) {
-            hpplite_error(node->ctx, "L1 was configured but is not connected; batches are kept pending "
-                            "(check the key and the RPC endpoint)");
+            hpplite_error(node->ctx, "L1 was configured but is not connected%s%s; batches are kept pending (check the key and the RPC endpoint)",
+                          node->l1Why[0] ? ": " : "", node->l1Why);
             node->warnedNoL1 = 1;
         }
         return 0;
@@ -4220,15 +4268,20 @@ int hpplite_node_claim_lease(HppliteNode *node) {
     ** expire the live sequencer's on close (issue #40). Wait for it and
     ** ask the chain who holds the lease. */
     char *txHash = hpplite_l1_claim_sequencer(node->l1, node->instanceId);
-    if (!txHash) {
-        return -1;  /* Lease not available */
-    }
-    hpplite_l1_wait_for_tx(node->l1, txHash, 30);
-    sqlite3_free(txHash);
-    if (node_lease_is_ours(node) != 1) {
+    char zWhy[200];
+    node_tx_landed(node->l1, txHash, 30, zWhy, sizeof zWhy);
+    if (!txHash || node_lease_is_ours(node) != 1) {
+        /* said once while it stays the same: the claim is tried again every five seconds (#370) */
+        if (zWhy[0] && strcmp(zWhy, node->claimWhy) != 0) {
+            hpplite_error(node->ctx, "the lease claim did not take: %s; batches are kept pending", zWhy);
+            memcpy(node->claimWhy, zWhy, sizeof zWhy);
+        }
+        sqlite3_free(txHash);
         node->hasLease = 0;
         return -1;
     }
+    sqlite3_free(txHash);
+    node->claimWhy[0] = 0;
     node->hasLease = 1;
     node->leaseRecheckAt = 0;
     return 0;
@@ -4253,7 +4306,7 @@ int hpplite_node_release_lease(HppliteNode *node) {
     }
     char *txHash = hpplite_l1_release_lease(node->l1, node->instanceId);
     if (!txHash) {
-        fprintf(stderr, "hpplite: lease release transaction could not be sent\n");
+        fprintf(stderr, "hpplite: lease release transaction could not be sent%s%s\n", hpplite_l1_tx_error() ? ": " : "", hpplite_l1_tx_error() ? hpplite_l1_tx_error() : "");
         return -1;
     }
     /* Wait so the next instance (possibly this process restarting) can claim */
