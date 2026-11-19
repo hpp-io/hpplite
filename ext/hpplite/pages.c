@@ -227,12 +227,15 @@ static void pagebatch_write(const HpplitePageBatch *b, unsigned char *p) {
   w32(p + 56, b->piece); w32(p + 60, b->bMore ? 1u : 0u);
   for (i = 0; i < b->nPages; i++) {
     w32(p + o, b->aPage[i].pgno); p[o + 4] = (unsigned char)(b->aPage[i].flags >> 8); p[o + 5] = (unsigned char)b->aPage[i].flags;
-    memcpy(p + o + 6, b->aPage[i].body, (size_t)b->pageSize);
+    if (b->aPage[i].body) memcpy(p + o + 6, b->aPage[i].body, (size_t)b->pageSize);     /* NULL: the caller fills it */
     o += rec;
   }
   memcpy(p + o, b->root, 32); w64(p + o + 32, b->crc);
   if (nName) memcpy(p + o + PB_TRAILER, b->zName, nName);
 }
+
+/* where record i's body lies in an encoded batch of this page size */
+size_t hpplite_pagebatch_body_at(unsigned i, unsigned pageSize) { return PB_HEADER + (size_t)i * (6 + (size_t)pageSize) + 6; }
 
 unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen) {
   size_t len = pagebatch_len(b);

@@ -68,6 +68,8 @@ int hpplite_pagebatch_meta(const unsigned char *p, size_t n, uint64_t *pTimestam
 unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen);
 /* SQLite's lock-byte page for this page size (#363): in no commit, no root, no image; 0 for no page size */
 unsigned hpplite_lock_page(int pageSize);
+/* where record i's body lies in an encoded batch (a record whose body is NULL is encoded empty, for the caller to fill) */
+size_t hpplite_pagebatch_body_at(unsigned i, unsigned pageSize);
 /* the same bytes head bytes into a malloc'd buffer with tail bytes after (#233: a snapshot sealed in place); free() */
 unsigned char *hpplite_pagebatch_encode_room(const HpplitePageBatch *b, size_t head, size_t tail, size_t *pLen);
 /* a batch from its bytes: the records point into p, which must outlive it; sqlite3_free the batch */

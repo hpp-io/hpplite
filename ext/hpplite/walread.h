@@ -23,11 +23,18 @@ struct HppliteWalCommit {
   int pageSize;
   unsigned nPages;                     /* pages the transaction wrote, each once (its last image) */
   const unsigned *aPgno;
-  const unsigned char *const *aImg;    /* pageSize bytes each, valid during the call */
+  const unsigned *aFrame;              /* each page's last image: its frame in the WAL (1-based); read it with hpplite_walcommit_page */
+  int fd;                              /* the WAL, open for reading, valid during the call */
   unsigned nTruncate;                  /* the database's size in pages after the commit */
   unsigned salt1, salt2;               /* the WAL header's salts: its generation */
   unsigned frame;                      /* the commit frame's index in that WAL (1-based) */
 };
+/* Page i of a commit into out (pageSize bytes), from the WAL (#365: the transaction is not held in memory): 0, or -1 */
+int hpplite_walcommit_page(const HppliteWalCommit *c, unsigned i, unsigned char *out);
+/* Every page of a commit into out (nPages * pageSize bytes, back to back): the frames' span in one read when it is
+** short (a commit's frames lie together), page by page otherwise. 0, or -1 */
+int hpplite_walcommit_pages(const HppliteWalCommit *c, unsigned char *out);
+
 /* Called with the reader's lock held: copy what is needed and return; never
 ** touch the database. */
 typedef void (*HppliteWalSink)(void *pArg, const HppliteWalCommit *pCommit);

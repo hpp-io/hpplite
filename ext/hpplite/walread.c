@@ -36,12 +36,13 @@ struct Reader {
   unsigned next;                                    /* the next frame to read, 1-based */
   unsigned s1, s2;                                  /* the checksum chain after frame next-1 */
   unsigned skip;                                    /* frames the file held when the watch began: read for the chain, not delivered */
-  /* the transaction being collected */
-  unsigned char **aImg; unsigned *aPgno; unsigned nTxn, nTxnAlloc;
+  /* the transaction being collected: each frame's page and number (#365: no images in memory) */
+  unsigned *aPgno, *aFrame; unsigned nTxn, nTxnAlloc;
   unsigned char *buf;                               /* READ_FRAMES frames */
   Reader *pNext;
 };
 static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gSortMutex = PTHREAD_MUTEX_INITIALIZER;     /* qsort has no argument: the pages it sorts by */
 static Reader *gReaders;
 
 static unsigned be32(const unsigned char *p) { return ((unsigned)p[0] << 24) | ((unsigned)p[1] << 16) | ((unsigned)p[2] << 8) | p[3]; }
@@ -65,35 +66,86 @@ static Reader *find(const char *zPath) {
   return NULL;
 }
 
-static void txnFree(Reader *r) {
-  unsigned i;
-  for (i = 0; i < r->nTxn; i++) sqlite3_free(r->aImg[i]);
-  r->nTxn = 0;
-}
-static int txnAdd(Reader *r, unsigned pg, const unsigned char *img) {
-  unsigned i;
-  for (i = 0; i < r->nTxn; i++) if (r->aPgno[i] == pg) { memcpy(r->aImg[i], img, (size_t)r->pageSize); return SQLITE_OK; }
+static void txnFree(Reader *r) { r->nTxn = 0; }
+static int txnAdd(Reader *r, unsigned pg, unsigned frame) {
   if (r->nTxn == r->nTxnAlloc) {
     unsigned n = r->nTxnAlloc ? r->nTxnAlloc * 2 : 32;
-    unsigned char **aImg = sqlite3_realloc64(r->aImg, (sqlite3_uint64)n * sizeof(*aImg));
-    unsigned *aPgno = sqlite3_realloc64(r->aPgno, (sqlite3_uint64)n * sizeof(*aPgno));
-    if (!aImg || !aPgno) { sqlite3_free(aImg); sqlite3_free(aPgno); return SQLITE_NOMEM; }
-    r->aImg = aImg; r->aPgno = aPgno; r->nTxnAlloc = n;
+    unsigned *aPgno = sqlite3_realloc64(r->aPgno, (sqlite3_uint64)n * sizeof(unsigned));
+    unsigned *aFrame;
+    if (!aPgno) return SQLITE_NOMEM;
+    r->aPgno = aPgno;
+    aFrame = sqlite3_realloc64(r->aFrame, (sqlite3_uint64)n * sizeof(unsigned));
+    if (!aFrame) return SQLITE_NOMEM;
+    r->aFrame = aFrame; r->nTxnAlloc = n;
   }
-  r->aImg[r->nTxn] = sqlite3_malloc64((sqlite3_uint64)r->pageSize);
-  if (!r->aImg[r->nTxn]) return SQLITE_NOMEM;
-  memcpy(r->aImg[r->nTxn], img, (size_t)r->pageSize);
-  r->aPgno[r->nTxn] = pg;
-  r->nTxn++;
+  r->aPgno[r->nTxn] = pg; r->aFrame[r->nTxn] = frame; r->nTxn++;
   return SQLITE_OK;
+}
+/* each page once, its last frame: sorted by page, then by frame (a transaction's frames are in order) */
+static unsigned *gSortPg;
+static int cmpPgFrame(const void *a, const void *b) {
+  unsigned x = *(const unsigned *)a, y = *(const unsigned *)b;
+  if (gSortPg[x] != gSortPg[y]) return gSortPg[x] < gSortPg[y] ? -1 : 1;
+  return x < y ? -1 : x > y;
 }
 static void txnCommit(Reader *r, unsigned frame, unsigned nTruncate) {
   HppliteWalCommit c;
-  c.zPath = r->zPath; c.pageSize = r->pageSize; c.nPages = r->nTxn; c.aPgno = r->aPgno;
-  c.aImg = (const unsigned char *const *)r->aImg; c.nTruncate = nTruncate;
-  c.salt1 = r->salt1; c.salt2 = r->salt2; c.frame = frame;
-  if (r->xSink && r->nTxn && frame > r->skip) r->xSink(r->pArg, &c);
+  unsigned *ix = NULL, *pg = NULL, *fr = NULL, i, n = 0;
+  if (r->xSink && r->nTxn && frame > r->skip) {
+    ix = sqlite3_malloc64((sqlite3_uint64)r->nTxn * 3 * sizeof(unsigned));
+    if (ix) {
+      pg = ix + r->nTxn; fr = pg + r->nTxn;
+      for (i = 0; i < r->nTxn; i++) ix[i] = i;
+      pthread_mutex_lock(&gSortMutex);
+      gSortPg = r->aPgno; qsort(ix, r->nTxn, sizeof(unsigned), cmpPgFrame); gSortPg = NULL;
+      pthread_mutex_unlock(&gSortMutex);
+      for (i = 0; i < r->nTxn; i++) {
+        if (i + 1 < r->nTxn && r->aPgno[ix[i + 1]] == r->aPgno[ix[i]]) continue;      /* a later image of the same page follows */
+        pg[n] = r->aPgno[ix[i]]; fr[n] = r->aFrame[ix[i]]; n++;
+      }
+      c.zPath = r->zPath; c.pageSize = r->pageSize; c.nPages = n; c.aPgno = pg; c.aFrame = fr; c.fd = r->fd;
+      c.nTruncate = nTruncate; c.salt1 = r->salt1; c.salt2 = r->salt2; c.frame = frame;
+      r->xSink(r->pArg, &c);
+      sqlite3_free(ix);
+    }
+  }
   txnFree(r);
+}
+
+#define SPAN_MAX (1024 * 1024)                      /* a commit's frames read in one go up to this */
+int hpplite_walcommit_pages(const HppliteWalCommit *c, unsigned char *out) {
+  size_t ps = (size_t)c->pageSize, frameSz = FRAME_HDR + ps, span, got = 0;
+  unsigned i, lo = (unsigned)-1, hi = 0;
+  unsigned char *buf;
+  if (!c || c->fd < 0) return -1;
+  for (i = 0; i < c->nPages; i++) { if (c->aFrame[i] < lo) lo = c->aFrame[i]; if (c->aFrame[i] > hi) hi = c->aFrame[i]; }
+  if (c->nPages == 0) return 0;
+  span = (size_t)(hi - lo + 1) * frameSz;
+  if (span > SPAN_MAX || !(buf = sqlite3_malloc64(span))) {
+    for (i = 0; i < c->nPages; i++) if (hpplite_walcommit_page(c, i, out + (size_t)i * ps) != 0) return -1;
+    return 0;
+  }
+  while (got < span) {
+    ssize_t k = pread(c->fd, buf + got, span - got, (off_t)WAL_HDR + (off_t)(lo - 1) * (off_t)frameSz + (off_t)got);
+    if (k <= 0) { sqlite3_free(buf); return -1; }
+    got += (size_t)k;
+  }
+  for (i = 0; i < c->nPages; i++) memcpy(out + (size_t)i * ps, buf + (size_t)(c->aFrame[i] - lo) * frameSz + FRAME_HDR, ps);
+  sqlite3_free(buf);
+  return 0;
+}
+
+int hpplite_walcommit_page(const HppliteWalCommit *c, unsigned i, unsigned char *out) {
+  size_t ps = (size_t)c->pageSize, got = 0;
+  off_t off;
+  if (!c || i >= c->nPages || c->fd < 0) return -1;
+  off = (off_t)WAL_HDR + (off_t)(c->aFrame[i] - 1) * (off_t)(FRAME_HDR + ps) + FRAME_HDR;
+  while (got < ps) {
+    ssize_t k = pread(c->fd, out + got, ps - got, off + (off_t)got);
+    if (k <= 0) return -1;
+    got += (size_t)k;
+  }
+  return 0;
 }
 
 static int readAt(int fd, unsigned char *p, size_t n, off_t off) {
@@ -127,7 +179,7 @@ static int pollOwnLocked(Reader *r, unsigned mxFrame, int *pDone) {
       const unsigned char *fr = r->buf + (size_t)i * frameSz;
       unsigned pg = be32(fr), nTrunc = be32(fr + 4);
       if (be32(fr + 8) != r->salt1 || be32(fr + 12) != r->salt2) { txnFree(r); return 0; }   /* not this generation: the full look */
-      if (txnAdd(r, pg, fr + FRAME_HDR) != SQLITE_OK) { txnFree(r); return 0; }
+      if (txnAdd(r, pg, f) != SQLITE_OK) { txnFree(r); return 0; }
       if (nTrunc) { txnCommit(r, f, nTrunc); r->next = f + 1; delivered++; }
     }
   }
@@ -201,7 +253,7 @@ static int pollLocked(Reader *r, unsigned mxFrame) {
         cksum(r->bigEndian, fr, 8, &a, &b);
         cksum(r->bigEndian, fr + FRAME_HDR, pageSize, &a, &b);
         if (a != be32(fr + 16) || b != be32(fr + 20)) { stop = 1; break; }         /* a frame still being written */
-        if (txnAdd(r, pg, fr + FRAME_HDR) != SQLITE_OK) { txnFree(r); return SQLITE_NOMEM; }
+        if (txnAdd(r, pg, f) != SQLITE_OK) { txnFree(r); return SQLITE_NOMEM; }
         if (nTrunc) { txnCommit(r, f, nTrunc); r->next = f + 1; r->s1 = a; r->s2 = b; delivered++; }
       }
     }

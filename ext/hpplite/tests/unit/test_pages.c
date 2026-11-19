@@ -50,7 +50,7 @@ static void sink(void *pArg, const HppliteWalCommit *c) {
     if (s->n == s->alloc) { s->alloc = s->alloc ? s->alloc * 2 : 64; s->a = realloc(s->a, (size_t)s->alloc * sizeof(Commit)); }
     k = &s->a[s->n++]; k->nPages = c->nPages; k->nTruncate = c->nTruncate;
     k->aPgno = malloc(c->nPages * sizeof(unsigned)); k->aImg = malloc(c->nPages * sizeof(unsigned char *));
-    for (i = 0; i < c->nPages; i++) { k->aPgno[i] = c->aPgno[i]; k->aImg[i] = malloc((size_t)c->pageSize); memcpy(k->aImg[i], c->aImg[i], (size_t)c->pageSize); }
+    for (i = 0; i < c->nPages; i++) { k->aPgno[i] = c->aPgno[i]; k->aImg[i] = malloc((size_t)c->pageSize); hpplite_walcommit_page(c, i, k->aImg[i]); }
     s->pageSize = c->pageSize;
 }
 

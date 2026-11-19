@@ -24,7 +24,7 @@ static void sink(void *pArg, const HppliteWalCommit *c) {
     k->aPgno = malloc(c->nPages * sizeof(unsigned)); k->aImg = malloc(c->nPages * sizeof(unsigned char *));
     for (i = 0; i < c->nPages; i++) {
         k->aPgno[i] = c->aPgno[i];
-        k->aImg[i] = malloc((size_t)c->pageSize); memcpy(k->aImg[i], c->aImg[i], (size_t)c->pageSize);
+        k->aImg[i] = malloc((size_t)c->pageSize); hpplite_walcommit_page(c, i, k->aImg[i]);
         s->bytes += c->pageSize;
     }
     s->pageSize = c->pageSize;
