@@ -311,6 +311,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val && val[0] >= '0' && val[0] <= '9') { cfg->storePermit = (uint64_t)atoll(val); cfg->storePermitSet = 1; }
     val = getenv(HPPLITE_ENV_FUNDER);
     if (val && hex_to_bytes(val, cfg->funder, 20) == 0) cfg->hasFunder = 1;
+    val = getenv(HPPLITE_ENV_INSTANCE_FILE);
+    if (val && val[0]) hpplite_config_load_instance_file(cfg, val);
     val = getenv(HPPLITE_ENV_SOFT);
     if (val) refuse_soft();
     val = getenv(HPPLITE_ENV_SPEND_CAP);
@@ -567,6 +569,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         cfg->storeUrl = strdup(buf);
     }
     if (get_uri_param(uri, HPPLITE_URI_FUNDER, buf, sizeof(buf)) && hex_to_bytes(buf, cfg->funder, 20) == 0) cfg->hasFunder = 1;
+    if (get_uri_param(uri, HPPLITE_URI_INSTANCE_FILE, buf, sizeof(buf)) && buf[0]) hpplite_config_load_instance_file(cfg, buf);
     for (int i = 0; i < N_MONEY_KNOBS; i++)
         if (get_uri_param(uri, gMoneyKnobs[i].uri, buf, sizeof(buf))) refuse_money_knob(i);
     if (get_uri_param(uri, HPPLITE_URI_RELAY_DEPOSIT, buf, sizeof(buf)))
@@ -752,6 +755,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     if (val && val[0]) { free(cfg->storeUrl); cfg->storeUrl = strdup(val); }
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_FUNDER);
     if (val && hex_to_bytes(val, cfg->funder, 20) == 0) cfg->hasFunder = 1;
+    val = sqlite3_uri_parameter(filename, HPPLITE_URI_INSTANCE_FILE);
+    if (val && val[0]) hpplite_config_load_instance_file(cfg, val);
     for (int i = 0; i < N_MONEY_KNOBS; i++)
         if (sqlite3_uri_parameter(filename, gMoneyKnobs[i].uri)) refuse_money_knob(i);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SOFT);
@@ -847,6 +852,41 @@ int hpplite_config_load_privkey_file(HppliteConfig *cfg, const char *path) {
         }
     }
     memset(buf, 0, sizeof(buf));
+    return 0;
+}
+
+/*
+** instancefile= (#378): the seed of the sequencer's instance, given by a platform in place of the random one
+** beside the file - a host rebuilt with the same key and the same file here is the instance the chain's lease
+** names. Exactly 32 bytes are taken as they are; else the first token is 64 hex digits. Not a secret (the id
+** made of it is on the chain, and only the wallet's key can use it), so the file's mode is not looked at.
+*/
+int hpplite_config_load_instance_file(HppliteConfig *cfg, const char *path) {
+    unsigned char buf[160];
+    const char *why = NULL;
+    size_t n = 0;
+    FILE *f;
+    if (!cfg || !path) return -1;
+    f = fopen(path, "rb");
+    if (!f) why = strerror(errno);
+    else { n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f); }
+    if (!why && n == 32) memcpy(cfg->instanceSeed, buf, 32);
+    else if (!why) {
+        char *z = (char *)buf, *e;
+        buf[n] = 0;
+        while (*z == ' ' || *z == '\t' || *z == '\r' || *z == '\n') z++;
+        if (z[0] == '0' && (z[1] == 'x' || z[1] == 'X')) z += 2;
+        e = z;
+        while (*e && *e != ' ' && *e != '\t' && *e != '\r' && *e != '\n') e++;
+        *e = 0;
+        if (strlen(z) != 64 || hex_to_bytes(z, cfg->instanceSeed, 32) != 0) why = "it is neither 32 bytes nor 64 hex digits";
+    }
+    if (why) {
+        cfg->hasInstance = 0;
+        fprintf(stderr, "hpplite: instance file %s: %s; the sequencer's instance is the one beside its file, as without instancefile=\n", path, why);
+        return -1;
+    }
+    cfg->hasInstance = 1;
     return 0;
 }
 

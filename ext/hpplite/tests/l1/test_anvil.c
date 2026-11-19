@@ -3217,6 +3217,110 @@ static void test_platform_sidecar(void) {
 }
 
 
+/* 66. The instance a platform gives (#378): a host lost for good (SIGKILL, its lease running on) and rebuilt on an
+** empty volume with the same key waited out that lease, an hour, and what its app wrote meanwhile was in its file and
+** not at the store - a second loss took it. With instancefile= the platform gives the instance's seed: the rebuilt
+** host is the instance the chain names, claims nothing, and its writes are at the store within a flush. */
+static void test_instance_given(void) {
+    TEST("the instance a platform gives (#378): a host killed and rebuilt on an empty volume with the same key and instancefile= is the instance the chain names - no claim, no wait, its app's writes at the store at once; lost again, a third host has them all");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char *IKEY = "0x6969696969696969696969696969696969696969696969696969696969696969";
+    static const char *SEED = "37803780378037803780378037803780378037803780378037803780378037ab";
+    char addr[48], cmd[600], out[400], contract[80], params[3][800];
+    unsigned char wallet[20], seed[32], wantId[32];
+    uint64_t expiry1 = 0, expiry2 = 0;
+    long long n1, n2, n3;
+    long h;
+    int port, sameId = 0;
+    pid_t store, side;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!bin || access(bin, X_OK) != 0) FAIL("hpplite-sequencer not beside hpplite-verify (HPPLITE_VERIFY_BIN)");
+    unsetenv("HPPLITE_HOST_NAME");
+    (void)!system("rm -rf " DIR "/host5 " DIR "/host6 " DIR "/host7 " DIR "/inst_owner.db* && mkdir -p " DIR "/host5 " DIR "/host6 " DIR "/host7");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", IKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    hpplite_hex_to_bytes(addr, wallet, 20);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    if (hpplite_hex_to_bytes(SEED, seed, 32) != 32) FAIL("the seed");
+    hpplite_keccak256(seed, 32, wantId);                                        /* the id: keccak(seed), no host name in it */
+    {
+        FILE *f = fopen(DIR "/inst.seed", "w");
+        if (!f) FAIL("the seed file");
+        fprintf(f, "0x%s\n", SEED);
+        fclose(f);
+    }
+    {
+        /* the rollup, made by the key before any host runs; this connection's lease is released at its close */
+        sqlite3 *owner = open_db("inst_owner.db", IKEY, NULL);
+        if (!owner) FAIL("create the rollup");
+        snprintf(contract, sizeof contract, "%s", status_text(owner, "contract"));
+        sqlite3_close(owner);
+        if (!contract[0]) FAIL("the rollup's address");
+    }
+    port = test_free_port();
+    store = start_pin_service_free(svc, port);
+    if (store < 0) FAIL("the store did not come up");
+#define IG_CLEANUP() do { kill(store, SIGTERM); waitpid(store, NULL, 0); } while (0)
+    for (int i = 0; i < 3; i++)
+        snprintf(params[i], sizeof params[i], "rpc=%s&contract=%s&chainid=31337&privkey=%s&datadir=" DIR "/host%d&interval=300ms&store=http://127.0.0.1:%d&keeplease=on&anchorclose=off&anchor=24h&instancefile=" DIR "/inst.seed",
+                 RPC, contract, IKEY, 5 + i, port);
+
+    /* the first host: one claim, the instance the seed's */
+    side = spawn_sidecar(bin, DIR "/host5/app.db", params[0], side_path(5, 1, "out"), side_path(5, 1, "err"));
+    h = wait_synced(side_path(5, 1, "out"), side, 60);
+    if (h < 0) { if (h == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); IG_CLEANUP(); FAILF("the first host's sequencer did not say it was synced (%ld)", h); }
+    {
+        HppliteL1 *peek = hpplite_l1_connect(RPC, contract);
+        HppliteL1State *st = peek ? hpplite_l1_get_state(peek) : NULL;
+        sameId = st && memcmp(st->sequencerInstance, wantId, 32) == 0;         /* judged last: what a rebuilt host loses is said first */
+        hpplite_l1_state_free(st);
+        hpplite_l1_disconnect(peek);
+        if (lease_of_wallet(contract, wallet, &expiry1) != 1) { stop_sidecar(side, SIGKILL, 5); IG_CLEANUP(); FAIL("the first host should hold the lease"); }
+    }
+    if (plain_exec(DIR "/host5/app.db", "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('first host')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); IG_CLEANUP(); FAIL("the app's write"); }
+    sleep(3);                                                   /* the timer posts it to the store */
+    stop_sidecar(side, SIGKILL, 5);                             /* the host is lost: nothing released */
+    n1 = nonce_of(addr);
+
+    /* the second host, an empty volume: rebuilt, the lease its own, nothing sent; its app writes */
+    side = spawn_sidecar(bin, DIR "/host6/app.db", params[1], side_path(6, 1, "out"), side_path(6, 1, "err"));
+    h = wait_synced(side_path(6, 1, "out"), side, 90);
+    n2 = nonce_of(addr);
+    if (h < 0 || n2 != n1 || lease_of_wallet(contract, wallet, &expiry2) != 1 || expiry2 != expiry1 || plain_count(DIR "/host6/app.db", "SELECT count(*) FROM notes") != 1) {
+        if (h == -1) kill(side, SIGKILL); waitpid(side, NULL, WNOHANG); IG_CLEANUP();
+        FAILF("the rebuilt host should hold the first host's row (synced %ld), find the lease its own (expiry %llu -> %llu) and send nothing (nonce %lld -> %lld)", h, (unsigned long long)expiry1, (unsigned long long)expiry2, n1, n2);
+    }
+    if (plain_exec(DIR "/host6/app.db", "INSERT INTO notes(body) VALUES('second host')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); IG_CLEANUP(); FAIL("the rebuilt host's app writes"); }
+    sleep(3);
+    stop_sidecar(side, SIGKILL, 5);                             /* lost too, inside the first host's lease */
+
+    /* the third: what the second wrote was at the store */
+    side = spawn_sidecar(bin, DIR "/host7/app.db", params[2], side_path(7, 1, "out"), side_path(7, 1, "err"));
+    h = wait_synced(side_path(7, 1, "out"), side, 90);
+    n3 = nonce_of(addr);
+    {
+        long long rows = h < 0 ? -1 : plain_count(DIR "/host7/app.db", "SELECT count(*) FROM notes");
+        long long second = h < 0 ? -1 : plain_count(DIR "/host7/app.db", "SELECT count(*) FROM notes WHERE body = 'second host'");
+        int rc;
+        if (h == -1) kill(side, SIGKILL);
+        rc = h < 0 ? (waitpid(side, NULL, WNOHANG), -1) : stop_sidecar(side, SIGTERM, 60);
+        IG_CLEANUP();
+        if (h < 0 || rows != 2 || second != 1) {
+            char err[1200] = "";
+            FILE *f = fopen(side_path(6, 1, "err"), "r");
+            if (f) { size_t got = fread(err, 1, sizeof err - 1, f); err[got] = 0; fclose(f); }
+            printf("(the second host said: %.500s) ", err);
+            FAILF("the third host should rebuild both rows from the store (synced %ld, rows %lld, the second host's %lld): what the second wrote was to be at the store at once", h, rows, second);
+        }
+        if (rc != 0 || n3 != n1) FAILF("the third host's stop should exit 0 (%d); no host after the first sent a lease call (nonce %lld -> %lld)", rc, n1, n3);
+        if (!sameId) FAIL("the chain's lease should name keccak(seed) - the instance the platform gave, the host's name left out");
+    }
+#undef IG_CLEANUP
+    PASS();
+}
+
 /* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
 ** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
 ** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
@@ -4220,6 +4324,7 @@ int main(void) {
     if (wanted(63)) test_tx_said();
     if (wanted(64)) test_sponsored_create();
     if (wanted(65)) test_one_wallet();
+    if (wanted(66)) test_instance_given();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

@@ -182,6 +182,8 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storePermit = config->storePermit;
     memcpy(node->config.funder, config->funder, 20);
     node->config.hasFunder = config->hasFunder;
+    memcpy(node->config.instanceSeed, config->instanceSeed, 32);
+    node->config.hasInstance = config->hasInstance;
     node->syncTo = config->syncTo;
     node->syncAtMs = config->syncAtMs;
     node->config.spendCap = config->spendCap;
@@ -327,40 +329,64 @@ static size_t node_envelope_overhead(HppliteNode *node) {
 ** when the holder exits or crashes. The lock file keeps a random seed, and
 ** the instance id is keccak(seed, host name): every process on this host is
 ** the same sequencer to L1 - a handover needs no lease transaction - while a
-** copy of the file on another host is a different one. Returns 1 if this
-** node may sequence (lock held, or no lock possible: then as before), 0 if
-** another process holds it.
+** copy of the file on another host is a different one.
+**
+** instancefile= (#378): a platform gives the seed. It is written to the lock
+** file with a byte after it that says so, and the machine's host name is left
+** out of the id (HPPLITE_HOST_NAME, where set, still enters): a host rebuilt
+** with the same key and the same seed is the instance the chain's lease
+** names - it claims nothing and waits for nothing. That the old host is gone
+** for good is the platform's to know: two hosts alive with one instance both
+** post.
+**
+** Returns 1 if this node may sequence (lock held, or no lock possible: then
+** as before), 0 if another process holds it.
 */
-static void node_file_instance_id(HppliteNode *node, const unsigned char seed[32]) {
+static void node_file_instance_id(HppliteNode *node, const unsigned char seed[32], int given) {
     unsigned char buf[32 + 256];
     memcpy(buf, seed, 32);
     const char *zHost = getenv("HPPLITE_HOST_NAME");          /* a host name the platform keeps across machines (somaro): it wins */
     if (zHost && zHost[0]) snprintf((char *)buf + 32, 255, "%s", zHost);
-    else if (gethostname((char *)buf + 32, 255) != 0) buf[32] = 0;
+    else if (given || gethostname((char *)buf + 32, 255) != 0) buf[32] = 0;
     buf[32 + 255] = 0;
     keccak256(buf, 32 + strlen((char *)buf + 32), node->instanceId);
 }
 static int node_take_file_lock(HppliteNode *node) {
     char path[PATH_MAX + 16];
-    unsigned char seed[32];
+    unsigned char rec[33];                    /* the seed, and 1 where a platform gave it */
+    ssize_t n;
     int fd;
     if (node->lockFd >= 0 || !node->canonicalPath) return 1;
     snprintf(path, sizeof(path), "%s-hpplite", node->canonicalPath);
     fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0) return 1;                     /* no lock possible here (read-only directory) */
+    if (fd < 0) {                             /* no lock possible here (read-only directory) */
+        if (node->config.hasInstance) node_file_instance_id(node, node->config.instanceSeed, 1);
+        return 1;
+    }
+    memset(rec, 0, sizeof rec);
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         /* a follower: the file's id already, for when it takes over (the
         ** holder wrote the seed when it took the lock) */
-        if (pread(fd, seed, 32, 0) == 32) node_file_instance_id(node, seed);
+        if (node->config.hasInstance) node_file_instance_id(node, node->config.instanceSeed, 1);
+        else if (pread(fd, rec, 33, 0) >= 32) node_file_instance_id(node, rec, rec[32] == 1);
         close(fd);
         return 0;
     }
-    if (pread(fd, seed, 32, 0) != 32) {
-        generate_instance_id(seed);
-        if (pwrite(fd, seed, 32, 0) != 32) fprintf(stderr, "hpplite: could not write %s\n", path);
+    n = pread(fd, rec, 33, 0);
+    if (node->config.hasInstance) {
+        if (n != 33 || rec[32] != 1 || memcmp(rec, node->config.instanceSeed, 32) != 0) {
+            memcpy(rec, node->config.instanceSeed, 32);
+            rec[32] = 1;
+            if (pwrite(fd, rec, 33, 0) != 33) fprintf(stderr, "hpplite: could not write %s\n", path);
+            fsync(fd);
+        }
+    } else if (n < 32) {
+        generate_instance_id(rec);
+        rec[32] = 0;
+        if (pwrite(fd, rec, 32, 0) != 32) fprintf(stderr, "hpplite: could not write %s\n", path);
         fsync(fd);
     }
-    node_file_instance_id(node, seed);
+    node_file_instance_id(node, rec, rec[32] == 1);
     node->lockFd = fd;
     return 1;
 }

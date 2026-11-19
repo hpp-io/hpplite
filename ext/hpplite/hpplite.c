@@ -684,6 +684,8 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->storePermit = cfg->storePermitSet ? cfg->storePermit : 20000000;   /* 20 USDC.e by default (#214) */
     memcpy(nc->funder, cfg->funder, 20);
     nc->hasFunder = cfg->hasFunder;
+    memcpy(nc->instanceSeed, cfg->instanceSeed, 32);   /* the instance a platform gives (#378) */
+    nc->hasInstance = cfg->hasInstance;
     nc->syncTo = nc->verifyOnly ? cfg->syncTo : 0;      /* a stop for a verifier only: a sequencer must replay all (#206) */
     nc->keepSeconds = cfg->keepSeconds;                /* pruning behind a snapshot (#223) */
     nc->fromSnapshot = !nc->verifyOnly;                /* a new replica starts from the latest snapshot (#222); a verifier from batch 1, else the oldest kept (#224, #255) */

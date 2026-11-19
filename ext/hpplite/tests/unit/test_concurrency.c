@@ -10,6 +10,8 @@
 
 #include "test_lib.h"
 #include "batch.h"
+#include "config.h"
+#include "crypto.h"
 #include <pthread.h>
 #include <unistd.h>
 #include <signal.h>
@@ -586,6 +588,86 @@ static void test_keep_lease_on_close(void) {
     PASS();
 }
 
+/* instancefile= (#378): a platform gives the instance's seed. A host rebuilt on an empty
+** file - another directory here, so another lock file with a seed of its own - is then
+** the instance the chain's lease names: it claims nothing and waits for nothing. The id
+** is keccak(seed): the machine's host name is left out, HPPLITE_HOST_NAME still enters */
+static void test_instance_given(void) {
+    TEST("instancefile=: a rebuilt host with the seed its platform gives is the instance the chain names - the lease its own, same expiry, nothing sent; without it, another instance (#378)");
+    static const unsigned char SEED[32] = { 0x37, 0x80, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30 };
+    unsigned char want[32], named[32 + 8], wantNamed[32], first[32], held1[32], held2[32], second[32], third[32], other[32];
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR " " DIR "/host1 " DIR "/host2 " DIR "/host3 " DIR "/host4");
+    unsetenv("HPPLITE_HOST_NAME");
+    hpplite_keccak256(SEED, 32, want);
+    memcpy(named, SEED, 32); memcpy(named + 32, "platform", 8);
+    hpplite_keccak256(named, 40, wantNamed);
+    TestNodeOpts o = NODE;
+    o.keepLease = 1;
+    o.instanceSeed = SEED;
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
+    HppliteNode *a = test_open_node(DIR "/host1/app.db", l1, &o);
+    if (!a) FAIL("open");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(a, "INSERT INTO t(v) VALUES('before the loss')", NULL);
+    hpplite_node_flush_batch(a);
+    memcpy(first, a->instanceId, 32);
+    int heldBefore = lease_holder(l1, held1);
+    uint64_t expiryBefore = lease_expiry(l1);
+    hpplite_node_destroy(a);                         /* the host is gone: its lease runs on */
+    /* the rebuilt host: an empty file elsewhere, the same seed */
+    HppliteNode *b = test_open_node(DIR "/host2/app.db", l1, &o);
+    if (!b) FAIL("open the rebuilt host");
+    sqlite3_int64 lease = status_int(b->db, "lease");
+    memcpy(second, b->instanceId, 32);
+    int heldAgain = lease_holder(l1, held2);
+    uint64_t expiryAgain = lease_expiry(l1);
+    hpplite_node_exec(b, "INSERT INTO t(v) VALUES('after it')", NULL);
+    uint64_t posted = hpplite_node_flush_batch(b);
+    sqlite3_int64 pending = status_int(b->db, "pending");
+    hpplite_node_destroy(b);
+    /* HPPLITE_HOST_NAME still enters; and a host without the seed is another instance */
+    setenv("HPPLITE_HOST_NAME", "platform", 1);
+    HppliteNode *c = test_open_node(DIR "/host3/app.db", l1, &o);
+    if (c) { memcpy(third, c->instanceId, 32); hpplite_node_destroy(c); }
+    unsetenv("HPPLITE_HOST_NAME");
+    o.instanceSeed = NULL;
+    HppliteNode *d = test_open_node(DIR "/host4/app.db", l1, &o);
+    sqlite3_int64 leaseOther = d ? status_int(d->db, "lease") : -1;
+    if (d) { memcpy(other, d->instanceId, 32); hpplite_node_destroy(d); }
+    hpplite_l1_disconnect(l1);
+    if (!c || !d) FAIL("open the third and the fourth host");
+    if (memcmp(first, want, 32) != 0) FAIL("the instance should be keccak(seed), the machine's host name left out");
+    if (heldBefore != 1 || memcmp(held1, want, 32) != 0) FAIL("the chain's lease should name that instance");
+    if (memcmp(second, want, 32) != 0 || lease != 1 || heldAgain != 1 || memcmp(held2, want, 32) != 0 || expiryAgain != expiryBefore) {
+        printf("(lease %lld, held %d, expiry %llu -> %llu) ", (long long)lease, heldAgain, (unsigned long long)expiryBefore, (unsigned long long)expiryAgain);
+        FAIL("the rebuilt host should be the instance the chain names: the lease its own, the same expiry, nothing sent");
+    }
+    if (posted == 0 || pending != 0) { printf("(flush %llu, pending %lld) ", (unsigned long long)posted, (long long)pending); FAIL("the rebuilt host's write should be posted at once"); }
+    if (memcmp(third, wantNamed, 32) != 0) FAIL("with HPPLITE_HOST_NAME the instance should be keccak(seed, that name)");
+    if (memcmp(other, want, 32) == 0 || leaseOther != 0) FAIL("a host without the seed is another instance and does not hold the lease");
+    /* the file's forms: 32 bytes as they are, or 64 hex digits; anything else is said and not taken */
+    {
+        HppliteConfig *cfg = hpplite_config_create();
+        FILE *f = fopen(DIR "/seed.raw", "wb");
+        int raw, hex, bad, missing;
+        if (!cfg || !f) FAIL("the seed files");
+        fwrite(SEED, 1, 32, f); fclose(f);
+        f = fopen(DIR "/seed.hex", "w");
+        fprintf(f, "0x"); for (int i = 0; i < 32; i++) fprintf(f, "%02x", SEED[i]); fprintf(f, "\n"); fclose(f);
+        f = fopen(DIR "/seed.bad", "w"); fprintf(f, "not a seed\n"); fclose(f);
+        raw = hpplite_config_load_instance_file(cfg, DIR "/seed.raw") == 0 && cfg->hasInstance && memcmp(cfg->instanceSeed, SEED, 32) == 0;
+        memset(cfg->instanceSeed, 0, 32); cfg->hasInstance = 0;
+        hex = hpplite_config_load_instance_file(cfg, DIR "/seed.hex") == 0 && cfg->hasInstance && memcmp(cfg->instanceSeed, SEED, 32) == 0;
+        bad = hpplite_config_load_instance_file(cfg, DIR "/seed.bad") != 0 && !cfg->hasInstance;
+        missing = hpplite_config_load_instance_file(cfg, DIR "/seed.none") != 0 && !cfg->hasInstance;
+        hpplite_config_free(cfg);
+        if (!raw || !hex) FAIL("the seed file should be read as 32 bytes and as 64 hex digits");
+        if (!bad || !missing) FAIL("a file that is no seed, or is not there, should not be taken");
+    }
+    PASS();
+}
+
 /* Another connection changes the schema; this connection's next statement
 ** finds its schema stale, and SQLite prepares it again and reruns it - the
 ** first run's log row rolled back with it. The rerun must be logged: it was
@@ -696,6 +778,7 @@ int main(int argc, char **argv) {
     test_empty_file_is_its_history();
     test_lease_on_close();
     test_keep_lease_on_close();
+    test_instance_given();
     test_rerun_after_foreign_schema_change();
     test_rerun_in_transaction();
     test_follower_status_follows_the_file();

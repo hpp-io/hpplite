@@ -43,6 +43,7 @@ extern "C" {
 #define HPPLITE_ENV_FACTORY       "HPPLITE_FACTORY_ADDRESS"
 #define HPPLITE_ENV_PRIVKEY       "HPPLITE_PRIVATE_KEY"
 #define HPPLITE_ENV_PRIVKEY_FILE  "HPPLITE_PRIVATE_KEY_FILE"
+#define HPPLITE_ENV_INSTANCE_FILE "HPPLITE_INSTANCE_FILE"   /* instancefile=: the sequencer instance a platform gives (#378) */
 #define HPPLITE_ENV_KEYSTORE      "HPPLITE_KEYSTORE"
 #define HPPLITE_ENV_VIEWKEY       "HPPLITE_VIEW_KEY"
 #define HPPLITE_ENV_OWNERKEY      "HPPLITE_OWNER_KEY"
@@ -80,6 +81,7 @@ extern "C" {
 #define HPPLITE_URI_CONTRACT      "contract"
 #define HPPLITE_URI_PRIVKEY       "privkey"
 #define HPPLITE_URI_PRIVKEY_FILE  "keyfile"
+#define HPPLITE_URI_INSTANCE_FILE "instancefile"   /* instancefile=<path>: 32 bytes (or 64 hex) in place of the random seed beside the file; the machine's host name left out (#378) */
 #define HPPLITE_URI_KEYSTORE      "keystore"
 #define HPPLITE_URI_OWNERKEY      "ownerkey"      /* the rollup owner's public key (33 bytes, compressed): every batch sealed to it too (#209) */
 #define HPPLITE_URI_VIEWKEY       "viewkey"       /* a viewing key's private key (#15) */     /* an Ethereum keystore V3 file (#17); passphrase from HPPLITE_KEYSTORE_PASSWORD */
@@ -173,6 +175,8 @@ typedef struct HppliteConfig {
     int storePermitSet;              /* ...given (0 is a value: no permit, the 402s paid) */
     unsigned char funder[20];        /* funder= (#272): the external funding wallet the bucket must be bound to */
     int hasFunder;
+    unsigned char instanceSeed[32];  /* instancefile= (#378): the instance's seed, given by a platform: a rebuilt host is the instance the chain names */
+    int hasInstance;
     int64_t keepSeconds;             /* keep= (#223): how long the store keeps the history behind the latest snapshot; 0: all of it */
     uint64_t syncTo;                 /* syncto=: a verifier applies no batch past this height (#206); 0: none */
     uint64_t syncAtMs;               /* syncat=: ...none written after this time, ms since the epoch (#205); 0: none */
@@ -234,6 +238,8 @@ HppliteConfig *hpplite_config_load(const char *uri);
 ** Returns 0 on success, -1 on error.
 */
 int hpplite_config_load_privkey_file(HppliteConfig *cfg, const char *path);
+/* instancefile= (#378): the file's 32 bytes, or its 64 hex digits (0x or bare, whitespace around them ignored). 0, or -1 with the reason on stderr */
+int hpplite_config_load_instance_file(HppliteConfig *cfg, const char *path);
 /* An Ethereum keystore V3 file (#17); password NULL: HPPLITE_KEYSTORE_PASSWORD. 0 keyed, -1 (said on stderr) */
 int hpplite_config_load_keystore(HppliteConfig *cfg, const char *path, const char *password);
 

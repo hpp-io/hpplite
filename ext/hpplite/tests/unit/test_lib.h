@@ -89,6 +89,7 @@ typedef struct TestNodeOpts {
     int fromSnapshot;                        /* a new replica starts from the latest snapshot (#222); the node's own field, not a URI setting (#255) */
     int64_t keepSeconds;                     /* keep= (#223): the history behind a snapshot this old is pruned */
     int keepLease;                           /* keeplease=on (#265): the lease is left running at a close alone */
+    const unsigned char *instanceSeed;       /* instancefile= (#378): the instance's 32-byte seed, given; NULL: the one beside the file */
     int noAnchorAtClose;                     /* anchorclose=off (#266): the close anchors nothing */
     int intervalMs;                          /* interval=: the timer (0: none, flush by hand) */
     int anchorMs;                            /* anchor=: the timer's anchor cadence (0: at close and by hand) */

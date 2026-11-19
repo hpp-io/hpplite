@@ -83,6 +83,8 @@ typedef struct HppliteNodeConfig {
     uint64_t storePermit;           /* HPPLITE_STORE_PERMIT: what the funding wallet's permit lets the store pull (0: none, #214) */
     unsigned char funder[20];       /* funder= (#272): the bucket's funding wallet is external; the node binds nothing, gives no permit */
                      int hasFunder;
+    unsigned char instanceSeed[32]; /* instancefile= (#378): the instance's seed, given: it takes the place of the random one beside the file */
+                     int hasInstance;
     int64_t keepSeconds;            /* keep= (#223): batches older than this behind a snapshot are pruned at the store; 0: never */
     int fromSnapshot;               /* a new replica (no role=verify, an empty file) starts from the latest snapshot (#222); a verifier
                                     ** reads batch 1 and, when the store has pruned it, starts from the oldest snapshot kept (#224, #255) */
