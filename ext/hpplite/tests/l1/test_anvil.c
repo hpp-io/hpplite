@@ -3565,6 +3565,80 @@ static void test_pay_upto(void) {
     PASS();
 }
 
+/* 61. A refused payment says who was asked (#372, #371): a node on a store and a relay pays from two wallets - the relay
+** charges the node key's own, the store the funding wallet derived from it. With HPP in the first and none in the second
+** the store's refusal was the facilitator's reason alone, and the balance looked at was the wrong wallet's */
+static void test_refusal_names_wallet(void) {
+    TEST("a refused payment names the wallet asked and the token (#372): the store asks the funding wallet, which holds nothing");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC"), *hpp = getenv("HPPLITE_ANVIL_HPP");
+    static const char UKEY[] = "0x6161616161616161616161616161616161616161616161616161616161616161";
+    if (!svc || !usdc || !usdc[0] || !hpp || !hpp[0]) { printf("SKIP (no store or mock tokens in the environment) "); PASS(); return; }
+    char cmd[2400], payTo[80], wallet[80], fund[80] = "", out[600], extra[300], hppArg[200];
+    int sport = test_free_port(), rport = test_free_port();
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    if (run_cmd(cmd, payTo, sizeof payTo) != 0) FAIL("cast wallet address");
+    payTo[strcspn(payTo, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", UKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 100000000000000000000000 >/dev/null", RPC, KEY0, hpp, wallet);
+    if (system(cmd) != 0) FAIL("fund the wallet with HPP");
+    FILE *f = fopen(DIR "/rn_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    (void)!system("rm -rf " DIR "/rn_pins " DIR "/rn_writer.db*");
+    snprintf(hppArg, sizeof hppArg, "%s,HousePartyProtocol,1,18,10000,upto", hpp);
+    pid_t store = fork();
+    if (store == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", sport);
+        snprintf(script, sizeof script, "%s/hpplite_store.py", svc);
+        int fd = open(DIR "/rn_store.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/rn_pins", "--signer-key", DIR "/rn_signer.key",
+               "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc, "--extra-asset", hppArg,
+               "--network", "eip155:31337", "--price-per-write", "1000", "--price-per-mib-month", "0", "--min-pay", "3000",
+               "--pull-threshold", "1500", "--tick-interval", "0.5", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        if (!test_child_alive(store)) break;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", sport);
+        up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
+        if (!up) usleep(200 * 1000);
+    }
+    gAssetArgs[0] = "--extra-asset"; gAssetArgs[1] = hppArg;
+    pid_t relay = up ? start_relay(svc, usdc, rport) : -1;
+    memset(gAssetArgs, 0, sizeof gAssetArgs);
+#define STOP61() do { unsetenv("HPPLITE_PAY_ASSET"); unsetenv("HPPLITE_STORE_VALID_FOR"); if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } \
+                      if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } } while (0)
+    if (!up || relay < 0) { STOP61(); FAIL("the store or the relay did not come up"); }
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
+    setenv("HPPLITE_PAY_ASSET", "hpp", 1);
+    money_env("100000", "0", NULL, NULL, "200000000", NULL);            /* no bucket permit: the store's 402s over x402 */
+    snprintf(extra, sizeof extra, "&dbname=refusal&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", sport, rport);
+    sqlite3 *w = open_db("rn_writer.db", UKEY, extra);
+    long long lease = w ? status_int(w, "lease") : -1, f1 = -1;
+    char err[400] = "";
+    if (w && lease == 1) {
+        snprintf(fund, sizeof fund, "%s", status_text(w, "store_funder"));
+        sqlite3_exec(w, "CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+        f1 = scalar(w, "SELECT hpplite_flush()");                       /* the funding wallet holds no HPP: refused */
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+    }
+    if (w) sqlite3_close(w);
+    STOP61();
+#undef STOP61
+    printf("(lease %lld, flush %lld, funding wallet %s; last_error: %.300s) ", lease, f1, fund, err);
+    if (lease != 1) FAIL("the relay should be paid from the node key's wallet, which holds the HPP");
+    if (!strstr(err, "refused the payment")) FAIL("the store should refuse the payment of a funding wallet with no HPP");
+    if (!fund[0] || !strcasestr(err, fund) || !strstr(err, "funding wallet") || !strstr(err, "HousePartyProtocol"))
+        FAIL("the refusal should name the funding wallet's address, say it is the funding wallet, and the token");
+    PASS();
+}
+
 /* 58. rpc= without chainid= (#369, somaro#352): the node asks the RPC its chain and signs for that, not for HPP Sepolia's
 ** 181228 - before, anvil refused every transaction, the factory's create waited 60 s and the open came back unconnected
 ** without a word. A chainid= the RPC contradicts is said at open, both numbers */
@@ -3734,6 +3808,7 @@ int main(void) {
     if (wanted(58)) test_chain_from_rpc();
     if (wanted(59)) test_pay_asset();
     if (wanted(60)) test_pay_upto();
+    if (wanted(61)) test_refusal_names_wallet();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

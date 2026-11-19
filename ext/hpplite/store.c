@@ -87,6 +87,7 @@ struct HppliteStore {
     int64_t coveredUntil;           /* from the last statement or bucket read; -1: not known */
     char bucketState[16];
     char error[256];
+    char paidBy[128];               /* who signed the last payment and in what: said when the service refuses it (#372) */
     HppliteCrypto *crypto;
     /* reads fetched ahead, several at a time (#195): a GET's 200 answer by its path, taken once */
     struct { char *path; char *p; size_t n; time_t at; } aAhead[HPPLITE_STORE_AHEAD_MAX];
@@ -791,6 +792,8 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         p.maxTimeout = jnum(acc, "maxTimeoutSeconds");
         p.takesPermit = cJSON_GetObjectItem(cJSON_GetObjectItem(req, "extensions"), "eip2612GasSponsoring") != NULL;
         lowerHex(p.from, 20, p.fromHex);
+        snprintf(s->paidBy, sizeof s->paidBy, "asked of %s, %s, in %.40s", p.fromHex,
+                 s->v2 && s->hasFund ? "the node's funding wallet" : "the node key's own wallet", p.zName);
 
         /* the window the chain checks the authorization against is the chain's time, not this host's: a host clock off
         ** by minutes (stepped back, never synced) would have every payment refused with nothing pointing at the clock */
@@ -1511,7 +1514,7 @@ static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, siz
                 unsigned char *j = b64decode(zRequired, &n);
                 cJSON *r = j ? cJSON_Parse((const char *)j) : NULL;
                 const char *e = jstr(r, "error");
-                if (e) snprintf(s->error, sizeof s->error, "the %s refused the payment: %.200s", s->isRelay ? "relay" : "store", e);
+                if (e) snprintf(s->error, sizeof s->error, "the %s refused the payment: %.100s (%s)", s->isRelay ? "relay" : "store", e, s->paidBy);
                 cJSON_Delete(r);
                 free(j);
             }
