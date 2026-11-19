@@ -478,7 +478,7 @@ static void node_check_file(HppliteNode *node) {
     uint64_t key[4];
     unsigned char have[32], file[32];
     HpplitePageRoot *pr;
-    int nLog = -1, nCkpt = -1, ok, rc;
+    int nLog = -1, nCkpt = -1, ok, rc, empty;
     if (!node->pm || node->follower || node->config.verifyOnly || !node->hasLease || !node->pagesSnapshotDecided || !node->ckDb
         || node->state != HPPLITE_STATE_RUNNING || !node->ctx || !node->ctx->zWalKey || node->ctx->openTxnId) return;
     zFile = node->ctx->zWalKey;
@@ -491,21 +491,22 @@ static void node_check_file(HppliteNode *node) {
     if (!ok) return;
     pr = key[2] ? hpplite_pageroot_from_file(zFile, NULL) : NULL;
     if (key[2] && !pr) return;
-    if (node->ctx->blockHeight > 1 && (!pr || hpplite_pageroot_pages(pr) <= 1)) {
+    empty = !pr || hpplite_pageroot_pages(pr) <= 1;
+    hpplite_pageroot_get(pr, file);
+    hpplite_pageroot_free(pr);
+    hpplite_walread_poll(zFile, 0);
+    if (hpplite_pagemode_pending(node->pm)) return;                                              /* a commit meanwhile: the next check */
+    hpplite_pagemode_root(node->pm, have);
+    /* the state last sent - an empty file too, where the history is a file with no table yet (#373) */
+    if (memcmp(have, file, 32) == 0) { memcpy(node->fileKey, key, sizeof key); node->fileMatched = 1; return; }
+    if (node->ctx->blockHeight > 1 && empty) {
         /* #330: emptied under the node (no table needs fewer than two pages) - never the database's newest state */
-        hpplite_pageroot_free(pr);
         memcpy(node->fileKey, key, sizeof key);
         node->fileMatched = 1;                                   /* said once for this file; a file changed again is looked at again */
         hpplite_error(node->ctx, "%s is empty and its bookkeeping says the history has %llu heights: not sent; restore the file",
                       sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1));
         return;
     }
-    hpplite_pageroot_get(pr, file);
-    hpplite_pageroot_free(pr);
-    hpplite_walread_poll(zFile, 0);
-    if (hpplite_pagemode_pending(node->pm)) return;                                              /* a commit meanwhile: the next check */
-    hpplite_pagemode_root(node->pm, have);
-    if (memcmp(have, file, 32) == 0) { memcpy(node->fileKey, key, sizeof key); node->fileMatched = 1; return; }
     node->fileMatched = 0;
     fprintf(stderr, "hpplite: %s is not the state of height %llu it last sent: the file goes whole as height %llu\n",
             sqlite3_db_filename(node->db, "main"), (unsigned long long)(node->ctx->blockHeight - 1), (unsigned long long)node->ctx->blockHeight);

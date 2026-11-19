@@ -433,6 +433,41 @@ static void test_file_emptied_under_node(void) {
     PASS();
 }
 
+/* An empty file is its own history (#373): a rollup begun on a file with no table yet has the one-page file as its only
+** height - #330's refusal took that for a file emptied under the node and said 'restore the file' at every start.
+** Nothing is said; the app's first table goes as the next height */
+static void test_empty_file_is_its_history(void) {
+    TEST("a sequencer on a file with no table yet: the empty file is the state it sent - nothing said, the first table goes next");
+    reset_dir();
+    (void)!system("mkdir -p " L1DIR);
+    setenv("HPPLITE_FILE_CHECK_SECONDS", "1", 1);
+    TestNodeOpts o = NODE;
+    o.intervalMs = 200;
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(L1DIR);
+    HppliteNode *n = test_open_node(DIR "/ee.db", l1, &o);
+    if (!n) { unsetenv("HPPLITE_FILE_CHECK_SECONDS"); FAIL("open"); }
+    hpplite_node_exec(n, "PRAGMA user_version=1", NULL);          /* a file of one page, no table */
+    hpplite_node_start_timer(n);
+    sqlite3_int64 h1 = -1, h2 = -1;
+    for (int i = 0; i < 100 && (h1 = status_int(n->db, "height")) < 2; i++) usleep(100000);
+    usleep(4000000);                                              /* the file check's turns */
+    h1 = status_int(n->db, "height");
+    char err[300] = "";
+    { sqlite3_stmt *q; if (sqlite3_prepare_v2(n->db, "SELECT last_error FROM hpplite_status", -1, &q, NULL) == SQLITE_OK) {
+        if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_text(q, 0)) snprintf(err, sizeof err, "%s", (const char *)sqlite3_column_text(q, 0));
+        sqlite3_finalize(q); } }
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v); INSERT INTO t(v) VALUES('first')", NULL);
+    for (int i = 0; i < 100 && (h2 = status_int(n->db, "height")) <= h1; i++) usleep(100000);
+    hpplite_node_stop_timer(n);
+    hpplite_node_destroy(n);
+    hpplite_l1_disconnect(l1);
+    unsetenv("HPPLITE_FILE_CHECK_SECONDS");
+    if (h1 < 2) FAILF("the empty file is the first height (height %lld)", (long long)h1);
+    if (err[0]) FAILF("said of a file that is its history: '%s'", err);
+    if (h2 != h1 + 1) FAILF("the first table should go as the next height (%lld -> %lld)", (long long)h1, (long long)h2);
+    PASS();
+}
+
 /* The election across processes: the first full node on a file sequences;
 ** one opened by another process meanwhile is a follower - it captures, it does
 ** not post - and has the same instance id (the file's): when the sequencer
@@ -658,6 +693,7 @@ int main(int argc, char **argv) {
     test_close_at_stop();
     test_file_changed_under_node();
     test_file_emptied_under_node();
+    test_empty_file_is_its_history();
     test_lease_on_close();
     test_keep_lease_on_close();
     test_rerun_after_foreign_schema_change();
