@@ -301,6 +301,8 @@ build_mock/hpplite.dylib --uri "&capture=pages" --mode write_only --seconds 10`.
 
 ## Snapshots (2026-11-18, #233)
 
+*Superseded the next day: since #364 a snapshot streams, and its memory is a chunk's (see "Memory against the database's size" below).*
+
 A snapshot (#221) is the whole database as one page batch, deflated, sealed and put in 8 MiB chunks at an anchor.
 `tests/bench/snapshot_bench.c` writes a database of random 4 KB rows (deflate's worst case: nothing compresses)
 through a node into the reference store, then anchors once with `snapshot=` on; Apple M-series, mock chain.
@@ -323,3 +325,43 @@ through a node into the reference store, then anchors once with `snapshot=` on; 
 - **What remains:** a fully streamed snapshot (sealed and put chunk by chunk from the pages) would bound the peak to a chunk. It needs an incremental AEAD, and the deflate-or-not decision taken before the whole batch is deflated.
 
 Reproduce: `cmake --build build_mock -t snapshot_bench`, then `build_mock/snapshot_bench --mb 200 --store operators/store`.
+
+## Memory against the database's size (2026-11-19, #364, #365)
+
+SQLite runs a database of any size in a few MB of page cache. Until #364 a node held the whole database in memory:
+- every page's last posted image (`aPrev`), read at open;
+- the whole file again when it was queued as one commit;
+- the backlog of commits not yet posted (#365), and each transaction while it was read from the WAL;
+- at a snapshot, the image built in RAM, deflated and sealed; and on a replica starting from one, every chunk joined in memory, then opened and inflated.
+
+Now:
+- the posted images live in a file beside the database (`<db>-hpplite-posted`);
+- the queue keeps up to `HPPLITE_QUEUE_MEM` (32 MiB) in memory and spills the rest to `<db>-hpplite-queue`;
+- `walread` records frame numbers and the pages are read from the WAL;
+- snapshots stream both ways: from the posted file through zlib and a streamed ChaCha20-Poly1305 into 8 MiB chunks, and back through a temporary file whose tag is checked before any page is applied.
+
+The index, chunk and batch formats are unchanged.
+
+`tests/unit/test_memory.c` runs each case in a child process and measures the rise of its peak RSS:
+
+| Case | Before | Now |
+|---|---|---|
+| A. Open and post a 64 MB database | +145 MB | +13 MB |
+| B. 128 MB written with nothing posted | +126 MB | +31 MB (the queue's constant) |
+| C. A 32 MB database anchored with a snapshot | +64 MB | +9 MB (one chunk) |
+| D. A new replica starting from that snapshot | +191 MB | +9 MB |
+
+`snapshot_bench` at 200 MB (incompressible rows):
+
+| | Before #364 | Now |
+|---|---|---|
+| Peak RSS before the anchor | 207 MB | 39 MB |
+| Added by the anchor's snapshot | +619 MB (+399 MB with #233's in-place seal) | +0 MB (below the peak the writes set) |
+| The node's CPU for the anchor | 6.3 s | 6.4 s |
+
+Costs:
+- **Disk:** one more copy of the database (the posted file). The backlog spills to disk during an outage. A replica starting from a snapshot keeps the sealed bytes and the image on disk while it applies them.
+- **Snapshots are always deflated** (stored blocks cost incompressible pages 0.03%). The one-shot deflate refused inputs over 256 MiB, so larger snapshots used to go uncompressed; now any image up to the form's 4 GiB is deflated.
+- **Throughput:** oltp_bench write_only is within 1-2% (7,690 vs 7,600 tps). Opening a 64 MB database and posting it whole went from 34 s to 10 s in test_memory, because a pieced commit's pages now enter the root once instead of at every piece.
+
+Reproduce: `ctest -R test_memory`; `build_mock/snapshot_bench --mb 200 --store operators/store`.
