@@ -399,6 +399,73 @@ def main():
         st, body = post_raw(url + "/account/%s/pay?amount=5" % wallet.lower(), {})
         check(st == 400 and body.get("minPull") == 1_000_000, "a top-up below minPull: 400 (%s)" % st)
         check(balance_eth(treasury) == 0, "the treasury holds no ETH")
+        # 8b. a creation paid by the treasury (#376): a key that holds nothing creates its rollup through the relay,
+        # charged to the treasury's account, and the rollup is the treasury's from its first call; one message, one
+        # creation
+        akey, bkey = secrets.token_bytes(32), secrets.token_bytes(32)
+        app = eth.address(akey).lower()
+        akeyfile = os.path.join(work, "app.key")
+        with open(akeyfile, "w") as f:
+            f.write("0x" + akey.hex())
+        cdom = eth.domain_separator("HPPLiteRelay", "1", chain_id, status["accounts"]["payTo"])
+        ctype = "SponsorCreate(address owner,address funder,uint256 nonce,uint256 issuedAt)"
+
+        def create_call(key, nonce):
+            owner = eth.address(key)
+            csig = eth.sign(key, eth.typed_digest(fdomain, "CreateRollup(address owner,uint256 checkpointInterval,uint256 nonce,uint256 deadline)",
+                                                  owner, 100, nonce, deadline))
+            return {"to": FACTORY, "data": encode("createRollupFor(address,uint256,uint256,uint256,bytes)", owner, 100, nonce, deadline, csig)}
+
+        def sponsor_create(owner_key, nonce, cosigner=None, fkey=tkey):
+            owner, funder, issued = eth.address(owner_key).lower(), eth.address(fkey).lower(), int(time.time())
+            digest = eth.typed_digest(cdom, ctype, owner, funder, nonce, issued)
+            b = {"owner": owner, "funder": funder, "nonce": nonce, "issuedAt": issued, "signature": "0x" + eth.sign(fkey, digest).hex()}
+            if cosigner:
+                b["ownerSignature"] = "0x" + eth.sign(cosigner, digest).hex()
+            return post_raw(url + "/sponsor/create", b)
+        st, body = post_raw(url + "/commit", create_call(akey, 0))
+        check(st == 402 and "sponsor" not in body, "a creation no funder signed for: its 402 (%s)" % st)
+        st, body = sponsor_create(akey, 0)
+        check(st == 401 and "owner" in body.get("error", ""), "a SponsorCreate by the treasury alone: 401, the owner has not agreed (%s %s)" % (st, body.get("error")))
+        st, body = sponsor_create(akey, 0, cosigner=bkey)
+        check(st == 401, "signed beside the treasury by a key that is not the owner: 401 (%s)" % st)
+        st, body = sponsor_create(wkey, 0, cosigner=wkey)
+        check(st == 409 and body.get("createNonce") == 1, "a nonce the factory already spent for its owner: 409, saying the createNonce (%s %s)" % (st, body))
+        # a creation is the dearest call (4.3M gas, about 13 USDC.e at this relay's 3000 USD an ETH): the treasury's
+        # account is given what pays it
+        subprocess.run(["cast", "send", "--rpc-url", RPC, "--private-key", KEY0, USDC, "transfer(address,uint256)", treasury, "40000000"], check=True, capture_output=True)
+        rc, out = tool("permit", "40000000")
+        check(rc == 0 and out.get("permit", {}).get("value") == 40000000, "the treasury's permit for a creation's price (%s)" % rc)
+        rc, out = tool("create", rollup_key=akeyfile)
+        check(rc == 0 and out.get("funder") == treasury and out.get("owner") == app and out.get("state") == "waiting",
+              "sponsor.py create: the treasury signs for the app key's creation, the app's key beside it (%s %s)" % (rc, out))
+        st, body = post_raw(url + "/commit", create_call(bkey, 0))
+        check(st == 402 and "sponsor" not in body, "another owner's creation is not the treasury's: its 402 (%s)" % st)
+        c0, tb = http_get(url + "/account/" + treasury)[1].get("credit", 0), balance_usdc(treasury)
+        st, body = post_raw(url + "/commit", create_call(akey, 0))
+        rollup2 = "0x" + call_view(FACTORY, "getRollup(address)", app)[-40:]
+        c1 = http_get(url + "/account/" + treasury)[1]
+        check(st == 200 and body.get("sponsor") == treasury and body.get("charged", 0) > 0 and int(rollup2, 16) != 0,
+              "the app key's createRollupFor, no payment sent: 200, rollup %s, charged to the treasury (%s %s)" % (rollup2, st, body))
+        check(balance_eth(app) == 0 and balance_usdc(app) == 0 and c0 + (tb - balance_usdc(treasury)) - c1.get("credit", 0) == body.get("charged"),
+              "the app's key holds nothing, before and after; the treasury's account paid %s units" % body.get("charged"))
+        st, sp = http_get(url + "/sponsor/" + rollup2.lower())
+        check(st == 200 and sp.get("funder") == treasury and sp.get("state") == "sponsored" and rollup2.lower() in c1.get("rollups", []),
+              "the rollup it created is sponsored by the treasury already (%s %s)" % (st, sp))
+        hd2, inst2 = eth.domain_separator("HPPLite", "10", chain_id, rollup2), eth.keccak256(b"a sponsored creation")
+        claim2 = eth.sign(akey, eth.typed_digest(hd2, lease_type, eth.keccak256(b"claim"), inst2, 0, deadline))
+        st, body = post_raw(url + "/commit", {"to": rollup2, "data": encode("claimSequencerFor(bytes32,uint256,uint256,bytes)", inst2, 0, deadline, claim2)})
+        check(st == 200 and body.get("sponsor") == treasury and ("0x" + call_view(rollup2, "sequencerWallet()")[-40:]).lower() == app,
+              "its first call, the claim: sponsored, no second step (%s %s)" % (st, body))
+        st, body = post_raw(url + "/commit", create_call(akey, 1))
+        check(st == 402 and "sponsor" not in body, "a second creation by the same key: its 402, the message paid one (%s)" % st)
+        st, body = sponsor_create(akey, 0, cosigner=akey)
+        check(st == 409 and body.get("createNonce") == 1, "the same nonce signed for again: 409, spent (%s)" % st)
+        ekey = secrets.token_bytes(32)                         # a funder with an empty account
+        st, body = sponsor_create(bkey, 0, cosigner=bkey, fkey=ekey)
+        st2, body2 = post_raw(url + "/commit", create_call(bkey, 0))
+        check(st == 200 and st2 == 402 and body2.get("sponsor", {}).get("funder") == eth.address(ekey).lower() and body2["sponsor"].get("why"),
+              "a funder whose account cannot pay: the creation's 402 says so (%s %s %s)" % (st, st2, body2.get("sponsor")))
         # 9. a smart wallet as the sponsor (#356): its ERC-1271 signatures (66 bytes) give the permit and the sponsorship,
         # the rollup's owner signing beside it; the relay pulls from the wallet, its permit sent on chain as bytes
         import re

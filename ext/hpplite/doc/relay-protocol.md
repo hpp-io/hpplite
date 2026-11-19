@@ -95,8 +95,8 @@ gets the `402` above as before (with `sponsor: {funder, why}` when there is
 a sponsor), and a caller that sends a payment always pays itself. A node
 needs nothing for this: it takes a `200` without a `402` as a free relay
 gives one. A DA contract's calls are sponsored through the rollup that is
-its coordinator. The factory's `createRollupFor` has no rollup yet and is
-never sponsored. A free relay (no `payment` in `/status`) keeps no accounts:
+its coordinator. The factory's `createRollupFor` has no rollup yet: a
+funder pays for a creation by a `SponsorCreate` (below, #376). A free relay (no `payment` in `/status`) keeps no accounts:
 `accounts` is `null` and these routes answer `404`.
 
 The messages are EIP-712 in the relay's domain `("HPPLiteRelay", "1",
@@ -107,6 +107,7 @@ chainId, payTo)` (`/status` → `accounts.domain`):
 | `Sponsor(address rollup,address funder,uint256 issuedAt)` | the funder pays for this rollup's calls and its DA's |
 | `Unsponsor(address rollup,address funder,uint256 issuedAt)` | the sponsor stops paying for it |
 | `Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)` | at most this many sponsored calls in a rolling day (0: no bound); the cap goes when the sponsor changes |
+| `SponsorCreate(address owner,address funder,uint256 nonce,uint256 issuedAt)` | the funder pays for the owner's `createRollupFor` at this `createNonce`, once, and for the rollup it creates |
 
 | Call | Signed by | Answer |
 |------|-----------|--------|
@@ -115,6 +116,7 @@ chainId, payTo)` (`/status` → `accounts.domain`):
 | `POST /sponsor/<rollup>`, body `{funder, issuedAt, signature, rollupSignature?}` | the funder, and the rollup's side (below) | `200` the sponsorship; `401` either signature; `404` not a rollup of the factory; `409` `issuedAt` not newer than the last taken; `503` the chain cannot be read |
 | `POST /sponsor/<rollup>/release`, body `{funder, issuedAt, signature}` | the sponsor | `200` the sponsorship, `state: released`; `401` not the sponsor |
 | `POST /sponsor/<rollup>/cap`, body `{funder, callsPerDay, issuedAt, signature}` | the sponsor | `200` the sponsorship; `401` not the sponsor; `409` not newer |
+| `POST /sponsor/create`, body `{owner, funder, nonce, issuedAt, signature, ownerSignature?}` | the funder, and the owner (below) | `200 {owner, funder, nonce, issuedAt, state: waiting}`; `401` either signature; `409` `issuedAt` not newer than the last taken for this owner, or `nonce` below the factory's `createNonce(owner)` (`createNonce` says it); `503` the chain cannot be read |
 | `GET /account/<funder>` | - | `200 {funder, credit, asset, balance, allowance, permitNonce, permit, rollups, state, why}` (`asset` the permit's token; `balance`, `allowance` and `permit.value` in it, decimal strings past 2^53); `404` |
 | `GET /sponsor/<rollup>` | - | `200 {rollup, da, funder, cap, today: {calls, since}, state}`; `404` |
 
@@ -127,8 +129,31 @@ with a newer `issuedAt` and an empty account, and the rollup's calls would
 stop being paid; with it, a newer `Sponsor` by another funder is a takeover
 the rollup asked for. `Unsponsor` and `Cap` are the sponsor's alone.
 
+**A creation paid by a funder (#376).** A key that holds nothing has no
+rollup to sponsor yet, and its `createRollupFor` would be answered `402`.
+The funder signs a `SponsorCreate` naming the owner and the factory's
+`createNonce(owner)` the creation will spend (0 for a key that never
+created a rollup this way); the owner signs the same digest as
+`ownerSignature` (65 bytes; left out when the funder is the owner), so
+nobody's creation is charged to a funder, and nobody's new rollup is put
+under a sponsor, without the two. A `createRollupFor` of that owner at that
+nonce, sent without `PAYMENT-SIGNATURE`, is then submitted and answered
+`200` with `sponsor` and `charged`, paid as any sponsored call; the rollup
+it creates is sponsored by that funder from its first call, as by a
+`Sponsor` issued at the message's `issuedAt` - no second step before the
+claim, and a cap, a release or a later `Sponsor` work on it as on any. One
+message pays one creation: the factory spends the nonce once, and the relay
+drops the message when the creation lands. A relay keeps one message an
+owner, a newer one replacing it. A wallet's named database (`dbname=`) is
+a rollup of its own beside the wallet's first, so a key that opens only a
+named database creates two: the funder signs for nonce 0, and for nonce 1
+once the first has landed. Every other `createRollupFor` gets its
+`402` as before, with `sponsor: {funder, why}` when the funder's account
+cannot pay. A node needs nothing for this either. A relay from before #376
+answers the route `404`.
+
 **A funder may be a smart account (#356).** The funder's signatures -
-`Sponsor`, `Unsponsor`, `Cap` and the permit - are valid when 65 bytes that
+`Sponsor`, `Unsponsor`, `Cap`, `SponsorCreate` and the permit - are valid when 65 bytes that
 recover to the funder, or, when the funder's address has code, when its
 ERC-1271 `isValidSignature(digest, signature)` answers `0x1626ba7e` (any
 length up to 2048 bytes); its permit goes to the asset as

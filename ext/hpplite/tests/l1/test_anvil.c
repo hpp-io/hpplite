@@ -3833,6 +3833,122 @@ static void test_tx_said(void) {
     PASS();
 }
 
+/* 64. A creation paid by a funder (#376): the treasury signs a SponsorCreate for the app's key at the relay, the app's
+** key signing beside it. The key holds nothing - no ETH, no token - and its node creates its rollup through the
+** relay, takes the lease and anchors, all charged to the treasury's account; the rollup is the treasury's from its
+** first call, no Sponsor after the creation. Red before: the relay had no /sponsor/create, the creation was answered
+** 402 and the node had nothing to pay it with: no rollup */
+static void test_sponsored_create(void) {
+    TEST("a creation paid by a funder (#376): a key with no ETH and no token creates its rollup, takes the lease and anchors through the relay, the treasury's account charged; a named database's rollup on a second message");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    static const char *APPKEY = "0x6464646464646464646464646464646464646464646464646464646464646464";
+    static const char *TKEY = "0x6565656565656565656565656565656565656565656565656565656565656565";   /* the treasury: USDC.e, no ETH */
+    char appAddr[48], tre[48], cmd[1600], out[4000], tool[600], contract[80] = "", extra[400], err[300] = "", path[20] = "", sp[1200] = "", acct[1200] = "";
+    char named[80] = "", sp2[1200] = "";
+    int sport = test_free_port(), rport = test_free_port(), signedFor, signedNext = 0;
+    long long lease = -1, spent = -1, f1 = -1, f2 = -1, anchored = -1, lease2 = -1, nf = -1;
+    pid_t store, relay;
+    FILE *f;
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no pin service or MockUSDC in the environment) "); PASS(); return; }
+    (void)!system("rm -f " DIR "/sc_app.db* " DIR "/sc_named.db* 2>/dev/null");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", APPKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(appAddr, sizeof appAddr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", TKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(tre, sizeof tre, "%.42s", out);
+    for (char *p = tre; *p; p++) if (*p >= 'A' && *p <= 'F') *p += 32;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 5000000 >/dev/null 2>&1", RPC, KEY0, usdc, tre);
+    if (system(cmd) != 0) FAIL("fund the treasury with MockUSDC");
+    if (eth_balance_of(appAddr) != 0 || eth_balance_of(tre) != 0 || anvil_token_of(usdc, appAddr) != 0) FAIL("the app's key should hold nothing and the treasury no ETH");
+    f = fopen(DIR "/sc_treasury.key", "w");
+    if (!f) FAIL("the treasury's key file");
+    fprintf(f, "%s\n", TKEY); fclose(f);
+    f = fopen(DIR "/sc_app.key", "w");                     /* the owner-to-be signs the SponsorCreate beside the treasury */
+    if (!f) FAIL("the app's key file");
+    fprintf(f, "%s\n", APPKEY); fclose(f);
+
+    store = start_pin_service_free(svc, sport);
+    if (store < 0) FAIL("the pin service did not come up");
+    relay = start_relay(svc, usdc, rport);
+#define SC_CLEANUP() do { if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } kill(store, SIGTERM); waitpid(store, NULL, 0); unsetenv("HPPLITE_STORE_VALID_FOR"); } while (0)
+    if (relay < 0) { SC_CLEANUP(); FAIL("the relay did not come up (see relay.log)"); }
+    /* the treasury's control plane: a permit at the relay, and the app key's creation signed for */
+    snprintf(cmd, sizeof cmd, "python3 -I %s/../relay/sponsor.py http://127.0.0.1:%d --key-file " DIR "/sc_treasury.key permit 5000000", svc, rport);
+    if (run_cmd(cmd, out, sizeof out) != 0 || !strstr(out, "\"permit\"")) { printf("(%s) ", out); SC_CLEANUP(); FAIL("the treasury's permit at the relay"); }
+    snprintf(cmd, sizeof cmd, "python3 -I %s/../relay/sponsor.py http://127.0.0.1:%d --key-file " DIR "/sc_treasury.key --rollup-key-file " DIR "/sc_app.key create 2>&1",
+             svc, rport);
+    signedFor = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"waiting\"") != NULL;
+    snprintf(tool, sizeof tool, "%.500s", out);
+
+    /* the app: a key with nothing, no rollup yet, the store, the relay */
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", sport, rport);
+    sqlite3 *app = open_db("sc_app.db", APPKEY, extra);
+    if (app) {
+        lease = status_int(app, "lease");
+        snprintf(contract, sizeof contract, "%s", status_text(app, "contract"));
+        snprintf(err, sizeof err, "%s", status_text(app, "last_error"));
+    }
+    if (app && lease == 1) {
+        sqlite3_exec(app, "CREATE TABLE c(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+        f1 = scalar(app, "SELECT hpplite_flush()");
+        sqlite3_exec(app, "INSERT INTO c(v) VALUES('created, claimed and anchored on the treasury')", NULL, NULL, NULL);
+        f2 = scalar(app, "SELECT hpplite_flush()");
+        anchored = scalar(app, "SELECT hpplite_anchor()");
+        snprintf(path, sizeof path, "%s", status_text(app, "last_tx_path"));
+        spent = status_int(app, "relay_spent");
+        snprintf(err, sizeof err, "%s", status_text(app, "last_error"));
+    }
+    if (app) sqlite3_close(app);
+    if (contract[0]) {
+        snprintf(cmd, sizeof cmd, "curl -s -m 5 http://127.0.0.1:%d/sponsor/%s", rport, contract);
+        run_cmd(cmd, sp, sizeof sp);
+    }
+    /* a named database of the same key is another rollup, so another creation: its own message, at the nonce the
+    ** factory is at now (one message, one creation) */
+    if (contract[0] && lease == 1) {
+        snprintf(cmd, sizeof cmd, "python3 -I %s/../relay/sponsor.py http://127.0.0.1:%d --key-file " DIR "/sc_treasury.key --rollup-key-file " DIR "/sc_app.key create 1 2>&1",
+                 svc, rport);
+        signedNext = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"waiting\"") != NULL;
+        snprintf(extra, sizeof extra, "&dbname=named&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", sport, rport);
+        sqlite3 *second = open_db("sc_named.db", APPKEY, extra);
+        if (second) {
+            lease2 = status_int(second, "lease");
+            snprintf(named, sizeof named, "%s", status_text(second, "contract"));
+            sqlite3_exec(second, "CREATE TABLE n(id INTEGER PRIMARY KEY)", NULL, NULL, NULL);
+            nf = scalar(second, "SELECT hpplite_flush()");
+            if (lease2 != 1 || nf <= 0) snprintf(err, sizeof err, "%s", status_text(second, "last_error"));
+            sqlite3_close(second);
+        }
+        if (named[0]) {
+            snprintf(cmd, sizeof cmd, "curl -s -m 5 http://127.0.0.1:%d/sponsor/%s", rport, named);
+            run_cmd(cmd, sp2, sizeof sp2);
+        }
+    }
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 http://127.0.0.1:%d/account/%s", rport, tre);
+    run_cmd(cmd, acct, sizeof acct);
+    double treLeft = anvil_token_of(usdc, tre), appUsdc = anvil_token_of(usdc, appAddr);
+    long appEth = eth_balance_of(appAddr);
+    SC_CLEANUP();
+#undef SC_CLEANUP
+    printf("(create: %.200s; rollup %s, lease %lld, flushes %lld %lld, anchored %lld via %s, relay_spent %lld; named: %s, rollup %s, lease %lld, flush %lld;"
+           " the treasury pulled %.0f units%s%.200s) ",
+           signedFor ? "signed for" : tool, contract[0] ? contract : "-", lease, f1, f2, anchored, path, spent,
+           signedNext ? "signed for at nonce 1" : "not signed for", named[0] ? named : "-", lease2, nf, 5000000 - treLeft, err[0] ? "; " : "", err);
+    if (!signedFor) FAIL("the treasury signs for the app key's creation at the relay (red: the relay has no /sponsor/create)");
+    if (!contract[0] || lease != 1) FAIL("the key with nothing creates its rollup and takes the lease through the relay (red: 402, nothing to pay with)");
+    if (f1 <= 0 || f2 <= 0 || anchored <= 0 || strcmp(path, "relay") != 0) FAIL("the flushes to the store and the anchor through the relay");
+    if (spent != 0 || appEth != 0 || appUsdc != 0) FAILF("the app's key paid: relay_spent %lld, ETH %ld, USDC.e %.0f", spent, appEth, appUsdc);
+    if (!strstr(sp, tre) || !strstr(sp, "\"sponsored\"")) { printf("(%s) ", sp); FAIL("the rollup it created is sponsored by the treasury from its first call"); }
+    if (treLeft >= 5000000 || !strstr(acct, contract)) { printf("(%s) ", acct); FAIL("the treasury's account paid: a pull from its permit, the rollup listed"); }
+    if (!signedNext || !named[0] || strcmp(named, contract) == 0 || lease2 != 1 || nf <= 0 || !strstr(sp2, tre) || !strstr(sp2, "\"sponsored\"")) {
+        printf("(%s) ", sp2);
+        FAIL("the named database's own rollup: a second creation on a second message, sponsored by the treasury");
+    }
+    PASS();
+}
+
 static void test_sequencer_once(void) {
     TEST("hpplite-sequencer --once (#345): runs over a kept copy of an app's file send what changed as one height each, nothing when unchanged; an empty app's file is refused, a held copy left alone; a replica rebuilds the app's rows");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
@@ -3973,6 +4089,7 @@ int main(void) {
     if (wanted(61)) test_refusal_names_wallet();
     if (wanted(62)) test_rebuilt_other_sqlite();
     if (wanted(63)) test_tx_said();
+    if (wanted(64)) test_sponsored_create();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

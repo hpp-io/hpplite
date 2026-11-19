@@ -114,7 +114,10 @@ def generate():
     rmsgs = [("Sponsor", relay.SPONSOR_TYPE, [rollup, funder, 1800000000], 2),
              ("Sponsor", relay.SPONSOR_TYPE, [rollup, funder, 1800000000], 1),
              ("Unsponsor", relay.UNSPONSOR_TYPE, [rollup, funder, 1800000001], 2),
-             ("Cap", relay.CAP_TYPE, [rollup, 3, 1800000002], 2)]
+             ("Cap", relay.CAP_TYPE, [rollup, 3, 1800000002], 2),
+             # a creation paid by a funder (#376): the funder's signature, and the owner's over the same digest
+             ("SponsorCreate", relay.SPONSOR_CREATE_TYPE, [eth.address(key(1)).lower(), funder, 0, 1800000003], 2),
+             ("SponsorCreate", relay.SPONSOR_CREATE_TYPE, [eth.address(key(1)).lower(), funder, 0, 1800000003], 1)]
 
     # x402 upto (#358): what a payer signs - Permit2's PermitWitnessTransferFrom of a token to x402's upto proxy, the
     # witness naming who is paid and the facilitator; Permit2's own domain (a name, no version). The C node's signer is

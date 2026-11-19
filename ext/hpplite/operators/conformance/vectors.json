@@ -364,6 +364,32 @@
     "signature": "0xf6bb552202449cff56a58a1e9a1c7f00ca03f3dc14a68ca34e96b7410d148ebf5a6f7b5017eb13308abadb7b785c7e2f87af6ab14227acdcb28ef49ed6aa5b8a1c",
     "type": "Cap",
     "typeString": "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x5f37904a82bcbfa954e77629ec99a3eee0ed53b3e68258a581bb364e496c2a47",
+    "fields": [
+     "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     0,
+     1800000003
+    ],
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0xe7af4ebd285880e8b5ad97b33526f2e256c6b05465572ce324fd5e591ef0dd7979fbbbe8a01f14c063c89dbf617442e190d812cb3853d591cab745837b3ef6ef1b",
+    "type": "SponsorCreate",
+    "typeString": "SponsorCreate(address owner,address funder,uint256 nonce,uint256 issuedAt)"
+   },
+   {
+    "digest": "0x5f37904a82bcbfa954e77629ec99a3eee0ed53b3e68258a581bb364e496c2a47",
+    "fields": [
+     "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+     "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     0,
+     1800000003
+    ],
+    "key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+    "signature": "0x6ac079f29431bcc5a44f9bf641f6ade22891dd5c8726ec8d20cb12dcd917a9d711cb7af8bf3e3578f0588080ad046a680565326f6c65e757ce0ecb9c207aa49c1c",
+    "type": "SponsorCreate",
+    "typeString": "SponsorCreate(address owner,address funder,uint256 nonce,uint256 issuedAt)"
    }
   ],
   "payTo": "0x1111111111111111111111111111111111111111"

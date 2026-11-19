@@ -100,6 +100,7 @@ names the rollups it pays for; a call on a sponsored rollup is answered
 ```sh
 sponsor.py http://relay:8430 --key-file treasury.key permit 50000000
 sponsor.py http://relay:8430 --key-file treasury.key --rollup-key-file owner.key sponsor 0x<rollup>
+sponsor.py http://relay:8430 --key-file treasury.key --rollup-key-file app.key create      # before the app's rollup exists (#376)
 sponsor.py http://relay:8430 --key-file treasury.key cap 0x<rollup> 200      # calls a day
 sponsor.py http://relay:8430 --key-file treasury.key account
 sponsor.py http://relay:8430 sponsor-of 0x<rollup>
@@ -109,6 +110,15 @@ sponsor.py http://relay:8430 sponsor-of 0x<rollup>
   and one by the rollup's owner or sequencer, unless the funder is one of
   them. A funder alone gets `401`: otherwise anybody could take a rollup's
   sponsorship over with an empty account.
+- **A creation paid by the treasury (#376).** `create` is a
+  `SponsorCreate` for the key's `createRollupFor` at its `createNonce`
+  (0 by default), signed by the treasury and by that key. The creation is
+  then answered `200` with no `402`, charged to the treasury's account, and
+  the rollup it makes is sponsored by the treasury from its first call: an
+  app key that holds nothing creates its rollup, takes the lease and
+  anchors. One message pays one creation: a named database (`dbname=`) is
+  a second rollup of the key, signed for with `create 1` once the first
+  exists.
 - **Pulled before the call.** The relay pulls from the treasury with its
   own key (`permit` when the allowance is short, then `transferFrom`), at
   least `--min-pull` (1 USDC.e) at a time, and keeps the rest as the
@@ -140,3 +150,8 @@ and MockUSDC:
   `--min-pull`, the next paid from credit; a cap, the capped `402` and a
   caller paying it itself; a release; an x402 top-up. The treasury holds
   no ETH at the end.
+- A creation paid by a funder (#376): a `SponsorCreate` refused without
+  the owner's signature, with a stranger's, and at a spent nonce; taken, a
+  key with nothing creates its rollup with `200`, the account charged, the
+  rollup sponsored from its first call; the next creation and another
+  owner's get the `402`.

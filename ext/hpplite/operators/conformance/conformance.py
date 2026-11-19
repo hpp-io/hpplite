@@ -283,6 +283,20 @@ def relay(url):
             return st
         check(sponsor(nobody, secrets.token_bytes(32)) == 401, "a Sponsor not signed by its funder: 401")
         check(sponsor(nobody, fk) == 404, "a Sponsor of an address that is no rollup of the factory: 404")
+        # a creation paid by a funder (#376): the funder's signature and the owner's, or nothing is kept
+        ok, ctype = secrets.token_bytes(32), "SponsorCreate(address owner,address funder,uint256 nonce,uint256 issuedAt)"
+        owner = eth.address(ok).lower()
+
+        def sponsor_create(key, owner_key):
+            digest = eth.typed_digest(rdom, ctype, owner, funder, 0, now)
+            body = {"owner": owner, "funder": funder, "nonce": 0, "issuedAt": now, "signature": "0x" + eth.sign(key, digest).hex()}
+            if owner_key:
+                body["ownerSignature"] = "0x" + eth.sign(owner_key, digest).hex()
+            st, _, _ = request(url, "POST", "/sponsor/create", json.dumps(body).encode(), {"Content-Type": "application/json"})
+            return st
+        check(sponsor_create(secrets.token_bytes(32), ok) == 401, "a SponsorCreate not signed by its funder: 401")
+        check(sponsor_create(fk, None) == 401, "a SponsorCreate the owner did not sign: 401")
+        check(sponsor_create(fk, secrets.token_bytes(32)) == 401, "a SponsorCreate signed beside the funder by a key that is not the owner: 401")
         st, _, _ = request(url, "GET", "/account/" + funder)
         check(st == 404, "GET /account/<funder> of a wallet the relay never heard of: 404")
         st, _, _ = request(url, "GET", "/sponsor/" + nobody)

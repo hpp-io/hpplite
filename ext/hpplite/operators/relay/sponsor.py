@@ -7,6 +7,12 @@ plane does so its apps' keys need no money at the relay. Standard library plus .
                                                                          the funder pays for this rollup's calls; the
                                                                          rollup's owner or sequencer signs beside it
                                                                          unless the funder is one of them
+    sponsor.py <relay-url> --key-file FILE --rollup-key-file FILE create [nonce]
+                                                                         the funder pays for the creation of the rollup
+                                                                         of the key in --rollup-key-file, its owner, and
+                                                                         for the rollup from its first call (#376); nonce
+                                                                         is the factory's createNonce of the owner, 0
+                                                                         for a key that never created one this way
     sponsor.py <relay-url> --key-file FILE cap <rollup> <callsPerDay>    bound the rollup's day (0: no bound)
     sponsor.py <relay-url> --key-file FILE release <rollup>              stop paying for it
     sponsor.py <relay-url> --key-file FILE account                        the funder's account as the relay sees it
@@ -29,6 +35,7 @@ from x402seller import eth  # noqa: E402
 SPONSOR_TYPE = "Sponsor(address rollup,address funder,uint256 issuedAt)"
 UNSPONSOR_TYPE = "Unsponsor(address rollup,address funder,uint256 issuedAt)"
 CAP_TYPE = "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)"
+SPONSOR_CREATE_TYPE = "SponsorCreate(address owner,address funder,uint256 nonce,uint256 issuedAt)"
 PERMIT_TYPE = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
 
 
@@ -52,7 +59,7 @@ def main():
     ap.add_argument("--rollup-key-file", default=None, help="the rollup's owner or sequencer key, signing a sponsorship beside "
                     "the funder when the funder is neither; or HPPLITE_ROLLUP_KEY in the environment")
     ap.add_argument("--days", type=int, default=365, help="a permit's life")
-    ap.add_argument("action", choices=["permit", "sponsor", "cap", "release", "account", "sponsor-of"])
+    ap.add_argument("action", choices=["permit", "sponsor", "create", "cap", "release", "account", "sponsor-of"])
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
     url = a.relay.rstrip("/")
@@ -80,6 +87,17 @@ def main():
         d = eth.domain_separator(acc["assetDomain"]["name"], acc["assetDomain"]["version"], int(status["chainId"]), acc["asset"])
         sig = eth.sign(key, eth.typed_digest(d, PERMIT_TYPE, funder, acc["spender"], value, nonce, deadline))
         st, out = http("POST", url + "/account/%s/permit" % funder, {"value": value, "deadline": deadline, "signature": "0x" + sig.hex()})
+    elif a.action == "create":
+        dom = acc["domain"]
+        d = eth.domain_separator(dom["name"], dom["version"], int(dom["chainId"]), dom["verifyingContract"])
+        okey_hex = open(a.rollup_key_file).read().strip() if a.rollup_key_file else os.environ.get("HPPLITE_ROLLUP_KEY", "")
+        okey = bytes.fromhex(okey_hex[2:] if okey_hex.startswith("0x") else okey_hex) if okey_hex else key
+        owner, nonce = eth.address(okey).lower(), int(a.args[0]) if a.args else 0
+        digest = eth.typed_digest(d, SPONSOR_CREATE_TYPE, owner, funder, nonce, now)
+        body = {"owner": owner, "funder": funder, "nonce": nonce, "issuedAt": now, "signature": "0x" + eth.sign(key, digest).hex()}
+        if okey != key:
+            body["ownerSignature"] = "0x" + eth.sign(okey, digest).hex()
+        st, out = http("POST", url + "/sponsor/create", body)
     else:
         rollup = a.args[0].lower()
         dom = acc["domain"]

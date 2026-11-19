@@ -76,6 +76,9 @@ PROTOCOL = "hpplite-relay/1"        # the version of doc/relay-protocol.md this 
 SPONSOR_TYPE = "Sponsor(address rollup,address funder,uint256 issuedAt)"
 UNSPONSOR_TYPE = "Unsponsor(address rollup,address funder,uint256 issuedAt)"
 CAP_TYPE = "Cap(address rollup,uint256 callsPerDay,uint256 issuedAt)"
+# a creation paid by a funder (#376): the owner's createRollupFor at this createNonce, once
+SPONSOR_CREATE_TYPE = "SponsorCreate(address owner,address funder,uint256 nonce,uint256 issuedAt)"
+ROLLUP_CREATED = "0x" + eth.keccak256(b"RollupCreated(address,address,address,uint256)").hex()
 PERMIT_TYPE = "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
 ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 DAY = 86400
@@ -93,7 +96,7 @@ class Accounts:
         # the tokens it takes (#361): credit is in the first's units, a permit in any of them
         self.dir, self.tokens, self.assets, self.pay_to, self.min_pull = directory, tokens, assets, pay_to, min_pull
         self.lock = threading.Lock()
-        for sub in ("a", "s"):
+        for sub in ("a", "s", "c"):
             os.makedirs(os.path.join(directory, sub), exist_ok=True)
 
     def _path(self, sub, key):
@@ -219,21 +222,63 @@ class Accounts:
             if cap and t["calls"] + 1 > cap:
                 left = int(t["since"]) + DAY - now
                 return funder, "capped: %d of %d calls today; the window opens again in %d s" % (t["calls"], cap, max(left, 1))
-            a = self.account(funder, create=True)
-            if a.get("uncovered"):
-                return funder, "the sponsor's account is uncovered: %s" % a.get("why")
-            if a["credit"] < amount:
-                why = self._pull(a, amount, now)
-                self._save("a", funder, a)
-                if why:
-                    return funder, why
-            a["credit"] -= amount
+            why = self._charge(funder, amount, now)
+            if why:
+                return funder, why
             if counted:
                 t["calls"] += 1
             s["today"] = t
-            self._save("a", funder, a)
             self._save("s", rollup, s)
             return funder, None
+
+    def _charge(self, funder, amount, now):
+        """Under the lock: take `amount` from the funder's account, pulling from its permit first when the credit is
+        short. None when taken; else why not"""
+        a = self.account(funder, create=True)
+        if a.get("uncovered"):
+            return "the sponsor's account is uncovered: %s" % a.get("why")
+        if a["credit"] < amount:
+            why = self._pull(a, amount, now)
+            self._save("a", funder, a)
+            if why:
+                return why
+        a["credit"] -= amount
+        self._save("a", funder, a)
+        return None
+
+    def sponsor_create(self, owner, funder, nonce, issued):
+        """A funder pays for the owner's creation at this createNonce (#376): one message an owner, a newer one
+        replacing it"""
+        with self.lock:
+            last = (self._load("c", owner) or {}).get("issuedAt")
+            if not self.fresh(issued, last):
+                return 409, {"error": "a SponsorCreate no newer than the last taken", "last": last}
+            c = {"owner": owner.lower(), "funder": funder.lower(), "nonce": nonce, "issuedAt": issued}
+            self._save("c", owner, c)
+            self._save("a", funder, self.account(funder, create=True))
+            return 200, dict(c, state="waiting")
+
+    def cover_create(self, owner, nonce, amount):
+        """cover() for a createRollupFor: (None, None) unless a funder signed for this owner's creation at this nonce"""
+        with self.lock:
+            c = self._load("c", owner)
+            if not c or c.get("nonce") != nonce:
+                return None, None
+            return c["funder"], self._charge(c["funder"], amount, int(time.time()))
+
+    def created(self, owner, funder, rollup, da):
+        """The creation landed: its message is spent, and the rollup it made is the funder's from its first call"""
+        with self.lock:
+            c = self._load("c", owner)
+            mine = bool(c) and same(c.get("funder"), funder)      # not a newer message of another funder's
+            if mine:
+                try:
+                    os.remove(self._path("c", owner))
+                except OSError:
+                    pass
+            if rollup:
+                self._save("s", rollup, {"rollup": rollup.lower(), "da": da, "funder": funder.lower(),
+                                         "sponsoredAt": c["issuedAt"] if mine else int(time.time()), "cap": None, "capAt": 0})
 
     def refund(self, rollup, funder, amount, uncount=True):
         """the call did not land: nothing is charged for it, and it does not count in the day. uncount=False: the part
@@ -242,7 +287,7 @@ class Accounts:
             a = self.account(funder, create=True)
             a["credit"] += amount
             self._save("a", funder, a)
-            s = self._load("s", rollup)
+            s = self._load("s", rollup) if rollup else None      # a creation has no rollup yet (#376)
             if uncount and s and same(s.get("funder"), funder) and (s.get("today") or {}).get("calls", 0) > 0:
                 s["today"]["calls"] -= 1
                 self._save("s", rollup, s)
@@ -302,6 +347,23 @@ class Accounts:
             return None
         return {"rollup": s["rollup"], "da": s.get("da"), "funder": s.get("funder"), "cap": s.get("cap"), "today": self.today(s),
                 "state": "sponsored" if s.get("funder") else "released"}
+
+
+def create_args(data: str):
+    """(owner, nonce) of a createRollupFor's calldata, or None"""
+    words = data[10:]
+    if len(words) < 4 * 64:
+        return None
+    return "0x" + words[24:64].lower(), int(words[128:192], 16)
+
+
+def created_rollup(rcpt, factory):
+    """(rollup, da) from the factory's RollupCreated in a receipt, lowercase; (None, None) without one"""
+    for log in rcpt.get("logs") or []:
+        t = log.get("topics") or []
+        if same(log.get("address"), factory) and len(t) == 4 and t[0].lower() == ROLLUP_CREATED:
+            return "0x" + t[1][-40:].lower(), "0x" + t[2][-40:].lower()
+    return None, None
 
 
 def quote_key(relay_key: bytes) -> bytes:
@@ -636,6 +698,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "owner": owner, "sequencer": seq})
         return self.reply(*r.accounts.sponsor(rollup, da, funder, issued))
 
+    def post_sponsor_create(self):
+        """POST /sponsor/create (#376): the funder's account pays the owner's createRollupFor at this createNonce, and
+        the rollup it makes is sponsored by that funder. Both sign: nobody's creation is charged to a funder, and
+        nobody's new rollup put under a sponsor, without the two"""
+        req = self.body_json() or {}
+        r = self.relay
+        owner, funder = str(req.get("owner", "")).lower(), str(req.get("funder", "")).lower()
+        nonce, issued = req.get("nonce"), req.get("issuedAt")
+        if isinstance(nonce, str) and nonce.isdigit():
+            nonce = int(nonce)
+        sig = funder_sig_bytes(req.get("signature"))
+        if not ADDR_RE.match(owner) or not ADDR_RE.match(funder) or not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0 \
+                or not isinstance(issued, int) or not sig:
+            return self.reply(400, {"error": "a SponsorCreate is {owner, funder, nonce, issuedAt, signature, ownerSignature}"})
+        digest = eth.typed_digest(r.domain, SPONSOR_CREATE_TYPE, owner, funder, nonce, issued)
+        try:
+            funded = signed_by(r.chain, funder, digest, sig)
+        except ChainUnreadable as e:
+            return self.reply(503, {"error": "the chain cannot be read: %s" % e})
+        if not funded:
+            return self.reply(401, {"error": "the signature does not recover to the funder", "domain": r.status()["accounts"]["domain"]})
+        agreed = funder
+        if req.get("ownerSignature") is not None:
+            osig = sig_bytes(req.get("ownerSignature"))
+            if not osig:
+                return self.reply(400, {"error": "ownerSignature is a 65-byte signature, hex"})
+            agreed = eth.recover(digest, osig)
+        if not same(agreed, owner):
+            return self.reply(401, {"error": "the owner has not agreed: a SponsorCreate is signed by the funder and, in ownerSignature, by "
+                                             "the owner, unless the funder is the owner", "owner": owner})
+        try:
+            spent = int(r.chain.view(r.factory, "createNonce(address)", owner), 16)
+        except (RpcError, OSError, ValueError) as e:
+            return self.reply(503, {"error": "the chain cannot be read for the factory's createNonce: %s" % e})
+        if nonce < spent:
+            return self.reply(409, {"error": "the nonce is spent: the factory's createNonce of the owner is %d" % spent, "createNonce": spent})
+        return self.reply(*r.accounts.sponsor_create(owner, funder, nonce, issued))
+
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         if self.relay.per_minute > 0:
@@ -652,6 +752,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/account/(0x[0-9a-fA-F]{40})/(permit|pay)$", u.path)
         if m:
             return self.post_permit(m.group(1).lower()) if m.group(2) == "permit" else self.post_pay(m.group(1).lower(), urllib.parse.parse_qs(u.query))
+        if u.path == "/sponsor/create":
+            return self.post_sponsor_create()
         m = re.match(r"^/sponsor/(0x[0-9a-fA-F]{40})(/release|/cap)?$", u.path)
         if m:
             return self.post_sponsor(m.group(1).lower(), m.group(2) or "")
@@ -691,8 +793,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # a sponsored rollup (#276): its sponsor's account pays, taken before the call is sent and given back when it
         # does not land, and the caller is asked nothing; when the account cannot pay, the 402 says why and the caller
         # may still pay itself. A caller that sends a payment pays
-        sponsor, sponsor_why = (r.accounts.cover(rollup, amount)
-                                if (rollup and p.enabled and not header) else (None, None))
+        # a creation a funder signed for (#376) is charged the same way: there is no rollup yet, the message names the
+        # owner and the createNonce the call spends
+        create = create_args(data) if name == "createRollupFor" else None
+        sponsor, sponsor_why = None, None
+        if p.enabled and not header:
+            sponsor, sponsor_why = r.accounts.cover(rollup, amount) if rollup else r.accounts.cover_create(create[0], create[1], amount) if create else (None, None)
         if sponsor and not sponsor_why:
             if not r.lock.acquire(timeout=r.args.queue_wait if r.args.queue_wait > 0 else -1):
                 r.accounts.refund(rollup, sponsor, amount)
@@ -712,6 +818,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             used = min(amount, r.price(int(rcpt["gasUsed"], 16), int(rcpt.get("effectiveGasPrice") or "0x0", 16)))
             if used < amount:
                 r.accounts.refund(rollup, sponsor, amount - used, uncount=False)
+            if create:
+                r.accounts.created(create[0], sponsor, *created_rollup(rcpt, r.factory))
             return self.reply(200, {"tx": rcpt["transactionHash"], "block": int(rcpt["blockNumber"], 16), "gasUsed": int(rcpt["gasUsed"], 16),
                                     "call": name, "sponsor": sponsor, "charged": used})
         requirements = None
