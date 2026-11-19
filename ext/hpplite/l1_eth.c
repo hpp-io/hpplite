@@ -61,7 +61,7 @@ typedef struct EthL1 {
     HppliteStore *relay;
     const char *lastPath;      /* "relay" or "direct": how the last write went (NULL: none yet) */
 
-    char relayError[240];
+    char relayError[400];
 } EthL1;
 
 /* The backend's view of the l1 parameter */
@@ -1746,7 +1746,7 @@ static int eth_factory_create_rollup_for(const char *rpc_url, const char *factor
     uint8_t factory[20], owner[20], f[4 * 32], digest[32], sig[65], *data;
     uint64_t nonce, chainId;
     size_t n = 0;
-    char zErr[240], *zTx;
+    char zErr[400], *zTx;
     EthClient *eth;
     int rc = -1;
     init_selectors();

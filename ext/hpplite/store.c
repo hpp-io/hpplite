@@ -86,8 +86,10 @@ struct HppliteStore {
     uint64_t pricePerWrite;
     int64_t coveredUntil;           /* from the last statement or bucket read; -1: not known */
     char bucketState[16];
-    char error[256];
+    char error[400];
     char paidBy[128];               /* who signed the last payment and in what: said when the service refuses it (#372) */
+    int payOwn;                     /* a relay's payments are signed by the node key's own wallet: it paid where the funding wallet was refused (#371) */
+    int noFund;                     /* funder= (#272): this node has no funding wallet, and its relay is paid by the key's own */
     HppliteCrypto *crypto;
     /* reads fetched ahead, several at a time (#195): a GET's 200 answer by its path, taken once */
     struct { char *path; char *p; size_t n; time_t at; } aAhead[HPPLITE_STORE_AHEAD_MAX];
@@ -701,6 +703,9 @@ static uint64_t creditOf(HppliteStore *s, const char *zAsset, u128 amount) {
 }
 
 static long statusRead(HppliteStore *s);
+/* The funding wallet signs this handle's payments: a store's (/2, #214), and a relay's as well (#371) - one wallet holds
+** what the node spends - until the relay refused it and the node key's own wallet paid */
+static int fundPays(HppliteStore *s) { return s->hasFund && (s->v2 || (s->isRelay && !s->noFund && !s->payOwn)); }
 /* A payment for one 402: the PAYMENT-SIGNATURE value (sqlite3_mprintf), or NULL with the reason in s->error.
 ** *pAmount is what it pays, in credit (micro-USD) */
 static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount) {
@@ -779,8 +784,9 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         if (!s->hasKey) { snprintf(s->error, sizeof s->error, "the store asks %llu and this node has no key to pay with", (unsigned long long)amt); cJSON_Delete(req); return NULL; }
         PayOffer p;
         memset(&p, 0, sizeof p);
-        p.kp = s->v2 && s->hasFund ? &s->fundKp : &s->kp;          /* /2: the funding wallet pays (#214) */
-        p.from = s->v2 && s->hasFund ? s->fundAddr : s->address;
+        int fund = fundPays(s);
+        p.kp = fund ? &s->fundKp : &s->kp;
+        p.from = fund ? s->fundAddr : s->address;
         if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the %s asks %llu, %s is %llu: refused", who,
                                      (unsigned long long)amt, s->isRelay ? "HPPLITE_RELAY_CAP" : "HPPLITE_STORE_CAP", (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
         if (strncmp(network->valuestring, "eip155:", 7) == 0) p.chainId = strtoull(network->valuestring + 7, NULL, 10);
@@ -793,7 +799,7 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         p.takesPermit = cJSON_GetObjectItem(cJSON_GetObjectItem(req, "extensions"), "eip2612GasSponsoring") != NULL;
         lowerHex(p.from, 20, p.fromHex);
         snprintf(s->paidBy, sizeof s->paidBy, "asked of %s, %s, in %.40s", p.fromHex,
-                 s->v2 && s->hasFund ? "the node's funding wallet" : "the node key's own wallet", p.zName);
+                 fund ? "the node's funding wallet" : "the node key's own wallet", p.zName);
 
         /* the window the chain checks the authorization against is the chain's time, not this host's: a host clock off
         ** by minutes (stepped back, never synced) would have every payment refused with nothing pointing at the clock */
@@ -1302,6 +1308,11 @@ int hpplite_store_funder(HppliteStore *s, unsigned char out[20]) {
     return 0;
 }
 
+int hpplite_store_payer(HppliteStore *s, unsigned char out[20]) {
+    if (!s || !out || !s->hasKey) return -1;
+    memcpy(out, fundPays(s) ? s->fundAddr : s->address, 20);
+    return 0;
+}
 int64_t hpplite_store_covered_until(HppliteStore *s) { return s && s->v2 ? s->coveredUntil : -1; }
 void hpplite_store_set_funder(HppliteStore *s, const unsigned char funder[20]) {
     if (!s || !funder) return;
@@ -1454,7 +1465,7 @@ int hpplite_store_payment(HppliteStore *s, unsigned char asset[20], uint64_t *pC
     return 0;
 }
 
-void hpplite_store_set_relay(HppliteStore *s) { if (s) s->isRelay = 1; }
+void hpplite_store_set_relay(HppliteStore *s, int hasFunder) { if (s) { s->isRelay = 1; s->noFund = hasFunder; } }
 void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp) { if (s) s->spend = sp; }
 
 /* The protocols this build speaks (doc/store-protocol.md, doc/relay-protocol.md, #188): a service that names
@@ -1490,35 +1501,67 @@ static int protocolOk(HppliteStore *s) {
     return -1;
 }
 
-/* A POST the provider may charge for: a 402 paid over x402 (exact, or upto: storePay), once */
+/* A POST the provider may charge for: a 402 paid over x402 (exact, or upto: storePay), once. A relay that refuses
+** the payment is asked once more with the node's other wallet signing (#371): the funding wallet pays a relay as it
+** pays the store, and a node whose token is on its key's own wallet - what paid a relay before - still pays. A relay
+** verifies a payment before it sends anything, so a refused one has moved nothing. The wallet that paid is asked
+** first from then on, and the change is said. */
 static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, size_t len, const char *zHeader, Buf *out) {
-    char *zRequired = NULL, *zResponse = NULL;
+    char *zRequired = NULL, *zResponse = NULL, first[sizeof s->error] = "", why[104] = "", why2[64] = "";
     long status = storeRequest(s, "POST", path, body, len, zHeader, out, &zRequired, NULL);
-    if (status == 402 && zRequired) {
+    int other = 0;                                      /* the second wallet is being asked */
+    while (status == 402 && zRequired) {
         uint64_t amount = 0;
         char *zPay = storePay(s, zRequired, &amount), *zAgain = NULL;
-        if (zPay) {
-            free(out->p); out->p = NULL; out->n = 0;
-            if (zHeader) { char *z = sqlite3_mprintf("%s\n%s", zHeader, zPay); sqlite3_free(zPay); zPay = z; }
-            status = storeRequest(s, "POST", path, body, len, zPay, out, &zAgain, &zResponse);
-            sqlite3_free(zPay);
-            sqlite3_free(zRequired);
-            zRequired = zAgain;
-            if (status == 200) {
-                s->funderWait = 0;
-                s->spent += amount;
-                s->calls++;
-                hpplite_spend_add(s->spend, amount);
-            } else if (status == 402 && zRequired) {
-                size_t n = 0;
-                unsigned char *j = b64decode(zRequired, &n);
-                cJSON *r = j ? cJSON_Parse((const char *)j) : NULL;
-                const char *e = jstr(r, "error");
-                if (e) snprintf(s->error, sizeof s->error, "the %s refused the payment: %.100s (%s)", s->isRelay ? "relay" : "store", e, s->paidBy);
-                cJSON_Delete(r);
-                free(j);
+        const char *e = NULL;
+        if (!zPay) break;
+        free(out->p); out->p = NULL; out->n = 0;
+        if (zHeader) { char *z = sqlite3_mprintf("%s\n%s", zHeader, zPay); sqlite3_free(zPay); zPay = z; }
+        status = storeRequest(s, "POST", path, body, len, zPay, out, &zAgain, &zResponse);
+        sqlite3_free(zPay);
+        sqlite3_free(zRequired);
+        zRequired = zAgain;
+        if (status == 200) {
+            s->funderWait = 0;
+            s->spent += amount;
+            s->calls++;
+            hpplite_spend_add(s->spend, amount);
+            if (other) {
+                char a[43], f[43];
+                lowerHex(s->address, 20, a);
+                lowerHex(s->fundAddr, 20, f);
+                if (s->payOwn) fprintf(stderr, "hpplite: relay %s: the node key's own wallet %s paid instead of the funding wallet %s, which the relay refused (%s);"
+                                               " it is asked first from here on. The store is paid by the funding wallet alone: with the token there, one wallet pays both\n", s->url, a, f, why);
+                else fprintf(stderr, "hpplite: relay %s: the funding wallet %s paid instead of the node key's own wallet %s, which the relay refused (%s);"
+                                     " it is asked first from here on\n", s->url, f, a, why);
             }
+            other = 0;
+            break;
         }
+        if (status == 402 && zRequired) {
+            size_t n = 0;
+            unsigned char *j = b64decode(zRequired, &n);
+            cJSON *r = j ? cJSON_Parse((const char *)j) : NULL;
+            e = jstr(r, "error");
+            if (e) {
+                snprintf(s->error, sizeof s->error, "the %s refused the payment: %.100s (%s)", s->isRelay ? "relay" : "store", e, s->paidBy);
+                snprintf(other ? why2 : why, other ? sizeof why2 : sizeof why, "%s", e);
+            }
+            cJSON_Delete(r);
+            free(j);
+        }
+        if (other || status != 402 || !e || !s->isRelay || !s->hasFund || s->noFund) break;
+        snprintf(first, sizeof first, "%s", s->error);
+        s->payOwn = !s->payOwn;
+        other = 1;
+    }
+    if (other) {
+        /* neither paid: the wallet asked first stays the one asked first, and its refusal is the one said */
+        char a[43];
+        lowerHex(s->payOwn ? s->address : s->fundAddr, 20, a);
+        s->payOwn = !s->payOwn;
+        if (why2[0]) snprintf(s->error, sizeof s->error, "%s; %s %s was asked too (%s)", first, s->payOwn ? "the funding wallet" : "the node key's own wallet", a, why2);
+        else snprintf(s->error, sizeof s->error, "%s", first);
     }
     sqlite3_free(zRequired);
     sqlite3_free(zResponse);

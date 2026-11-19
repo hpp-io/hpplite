@@ -82,7 +82,11 @@ remembered between the `402` and the retry. An `accepted` whose quote does
 not verify is priced anew.
 
 A payment is settled only after the transaction succeeded, at the quoted
-amount.
+amount. It is verified before the call is sent, and one that does not
+verify is answered `402` again with `error`, nothing sent. The payer is the
+payment's signer and need not be the call's: the reference node pays from
+the funding wallet derived from its key, the one that pays its store, and
+asks its key's own wallet when that payment is refused (#371).
 
 ## Accounts and sponsorship
 

@@ -39,8 +39,12 @@ void hpplite_store_close(HppliteStore *store);
 ** The HTTP status (0: unreachable; 402: not paid, the reason in
 ** hpplite_store_error) and the answer's body (sqlite3_free) */
 long hpplite_store_paid_post(HppliteStore *s, const char *path, const uint8_t *body, size_t len, char **pzOut);
-/* The handle is a relay's (#126): what it says names the relay and HPPLITE_RELAY_CAP */
-void hpplite_store_set_relay(HppliteStore *s);
+/* The handle is a relay's (#126): what it says names the relay and HPPLITE_RELAY_CAP. Its payments are signed by the
+** funding wallet derived from the node's key, the wallet that pays the store, and by the key's own wallet where the
+** relay refuses that one (#371); hasFunder (funder=, #272): the node has no funding wallet and the key's own pays */
+void hpplite_store_set_relay(HppliteStore *s, int hasFunder);
+/* The wallet whose signature the next x402 payment carries: the token goes there. -1 without a key */
+int hpplite_store_payer(HppliteStore *s, unsigned char out[20]);
 /* The node's spend ledger (#173, spend.h): checked before signing (HPPLITE_SPEND_CAP), charges recorded. Not owned. */
 struct HppliteSpend;
 void hpplite_store_set_spend(HppliteStore *s, struct HppliteSpend *sp);

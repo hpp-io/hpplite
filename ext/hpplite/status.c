@@ -89,6 +89,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_SOFT_HEIGHT    39  /* a verifier with a store (#166): the height it applied to, soft batches included; NULL otherwise */
 #define STATUS_COL_SPEND_WARNING  38  /* what runs out and when at the recent rate (HPPLITE_LOW_BALANCE); NULL when nothing does */
 #define STATUS_COL_STORE_BUCKET   41  /* ...the bucket's state at the store: covered, parked, deleted; NULL before one is known */
+#define STATUS_COL_RELAY_PAYER    43  /* the wallet the relay's payments are asked of (#371): the funding wallet, or the node key's own once it paid instead */
 #define STATUS_COL_SNAPSHOT       42  /* the latest snapshot's height: the one this sequencer's anchors name, or a replica started from (#221, #222); NULL: none */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
@@ -107,7 +108,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
         " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_funder TEXT, store_covered_until INTEGER, spent_window INTEGER, spend_warning TEXT, soft_height INTEGER, soft_disagreements INTEGER,"
-        " store_bucket TEXT, snapshot_height INTEGER)");
+        " store_bucket TEXT, snapshot_height INTEGER, relay_payer TEXT)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -372,6 +373,17 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             unsigned char a[20];
             char hex[43];
             if (node->store && hpplite_store_funder(node->store, a) == 0) {
+                hex[0] = '0'; hex[1] = 'x';
+                hpplite_bytes_to_hex(a, 20, hex + 2);
+                for (int i = 2; i < 42; i++) if (hex[i] >= 'A' && hex[i] <= 'F') hex[i] += 32;
+                sqlite3_result_text(ctx, hex, 42, SQLITE_TRANSIENT);
+            }
+            break;
+        }
+        case STATUS_COL_RELAY_PAYER: {
+            unsigned char a[20];
+            char hex[43];
+            if (node->relay && hpplite_store_payer(node->relay, a) == 0) {
                 hex[0] = '0'; hex[1] = 'x';
                 hpplite_bytes_to_hex(a, 20, hex + 2);
                 for (int i = 2; i < 42; i++) if (hex[i] >= 'A' && hex[i] <= 'F') hex[i] += 32;

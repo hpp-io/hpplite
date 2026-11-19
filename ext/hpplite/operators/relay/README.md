@@ -1,8 +1,9 @@
 # Reference relay (#170)
 
 `relay.py` submits an HPPLite node's signed contract calls and pays their
-gas, charged over x402 in USDC.e. With it, a node whose wallet holds only
-USDC.e can create its rollup, take and renew its lease, and anchor. With the
+gas, charged over x402 in USDC.e. With it, a node whose funding wallet (the
+one that pays its store, #371) holds only USDC.e can create its rollup, take
+and renew its lease, and anchor. With the
 pin service beside it ([../store](../store/README.md)), it needs no ETH
 at all. Standard library Python. It shares `../x402seller` with the store:
 `eth.py` (keccak, secp256k1, EIP-712) and the x402 seller code.

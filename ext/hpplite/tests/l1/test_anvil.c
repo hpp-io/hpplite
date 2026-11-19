@@ -3949,6 +3949,135 @@ static void test_sponsored_create(void) {
     PASS();
 }
 
+/* 65. One wallet pays (#371). A node on a store and a relay paid from two wallets and nothing said so: the store asked
+** the funding wallet derived from the node's key (#214), the relay the node key's own wallet. An operator who put the
+** token on the funding wallet had the first relayed call refused (the mainnet canary of 2026-11-19); with HPP and CHIP
+** it was two balances a token. The funding wallet signs the relay's payments too. A node whose key's own wallet holds
+** the token - what paid a relay before - still pays: the wallet is asked when the funding wallet is refused, it is
+** said, and the wallet that paid is asked first from then on. */
+static void test_one_wallet(void) {
+    TEST("one wallet pays the store and the relay (#371): the funding wallet signs the relay's payments too; the node key's own wallet still pays where the funding wallet cannot, and it is said");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC");
+    static const char NKEY[] = "0x6666666666666666666666666666666666666666666666666666666666666666";
+    static const char OKEY[] = "0x6767676767676767676767676767676767676767676767676767676767676767";   /* the old way: the token on the key's own wallet */
+    static const char ZKEY[] = "0x6868686868686868686868686868686868686868686868686868686868686868";   /* nothing on either wallet */
+    if (!svc || !usdc || !usdc[0]) { printf("SKIP (no store or MockUSDC in the environment) "); PASS(); return; }
+    char cmd[2400], payTo[80], node[80], fund[80], old[80], out[600], extra[300], funder[80] = "", payer[80] = "", payer2[80] = "", err[400] = "", path[20] = "", said[1500] = "", none[1500] = "";
+    int sport = test_free_port(), rport = test_free_port();
+    long long lease = -1, f1 = -1, f2 = -1, anchored = -1, relaySpent = -1, storeSpent = -1, lease2 = -1;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    if (run_cmd(cmd, payTo, sizeof payTo) != 0) FAIL("cast wallet address");
+    payTo[strcspn(payTo, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", NKEY);
+    if (run_cmd(cmd, node, sizeof node) != 0) FAIL("cast wallet address");
+    node[strcspn(node, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", OKEY);
+    if (run_cmd(cmd, old, sizeof old) != 0) FAIL("cast wallet address");
+    old[strcspn(old, "\r\n")] = 0;
+    /* the funding wallet: keccak256("hpplite funding key" || key) */
+    snprintf(cmd, sizeof cmd, "cast wallet address $(cast keccak $(cast concat-hex $(cast from-utf8 'hpplite funding key') %s))", NKEY);
+    if (run_cmd(cmd, fund, sizeof fund) != 0 || strncmp(fund, "0x", 2) != 0) FAIL("the funding wallet's address");
+    fund[strcspn(fund, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 10000000 >/dev/null 2>&1"
+             " && cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 5000000 >/dev/null 2>&1", RPC, KEY0, usdc, fund, RPC, KEY0, usdc, old);
+    if (system(cmd) != 0) FAIL("MockUSDC to the funding wallet, and to the other node's own wallet");
+    if (eth_balance_of(node) != 0 || anvil_token_of(usdc, node) != 0 || eth_balance_of(fund) != 0) FAIL("the node key's own wallet should hold nothing, the funding wallet no ETH");
+    FILE *f = fopen(DIR "/ow_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    (void)!system("rm -rf " DIR "/ow_pins " DIR "/ow_node.db* " DIR "/ow_old.db* " DIR "/ow_none.db* " DIR "/ow_old.err " DIR "/ow_none.err");
+    pid_t store = fork();
+    if (store == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", sport);
+        snprintf(script, sizeof script, "%s/hpplite_store.py", svc);
+        int fd = open(DIR "/ow_store.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/ow_pins", "--signer-key", DIR "/ow_signer.key",
+               "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc,
+               "--network", "eip155:31337", "--price-per-write", "1000", "--price-per-mib-month", "0", "--min-pay", "3000",
+               "--pull-threshold", "1500", "--tick-interval", "0.5", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        if (!test_child_alive(store)) break;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", sport);
+        up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
+        if (!up) usleep(200 * 1000);
+    }
+    pid_t relay = up ? start_relay(svc, usdc, rport) : -1;
+#define STOP65() do { unsetenv("HPPLITE_STORE_VALID_FOR"); if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } \
+                      if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } } while (0)
+    if (!up || relay < 0) { STOP65(); FAIL("the store or the relay did not come up"); }
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
+    money_env("100000", "0", NULL, NULL, "200000000", NULL);            /* no bucket permit: the store's 402s over x402 */
+
+    /* the token on the funding wallet alone: the rollup's creation, the lease and the anchor at the relay, the writes at the store */
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", sport, rport);
+    sqlite3 *w = open_db("ow_node.db", NKEY, extra);
+    if (w) {
+        lease = status_int(w, "lease");
+        snprintf(funder, sizeof funder, "%s", status_text(w, "store_funder"));
+        snprintf(payer, sizeof payer, "%s", status_text(w, "relay_payer"));
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+    }
+    if (w && lease == 1) {
+        sqlite3_exec(w, "CREATE TABLE o(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+        f1 = scalar(w, "SELECT hpplite_flush()");
+        sqlite3_exec(w, "INSERT INTO o(v) VALUES('one wallet')", NULL, NULL, NULL);
+        f2 = scalar(w, "SELECT hpplite_flush()");
+        anchored = scalar(w, "SELECT hpplite_anchor()");
+        snprintf(path, sizeof path, "%s", status_text(w, "last_tx_path"));
+        relaySpent = status_int(w, "relay_spent");
+        storeSpent = status_int(w, "store_spent");
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+    }
+    if (w) sqlite3_close(w);
+    double fundLeft = anvil_token_of(usdc, fund), nodeUsdc = anvil_token_of(usdc, node);
+    long nodeEth = eth_balance_of(node);
+
+    /* the old way, a relay alone: the funding wallet holds nothing and the key's own wallet pays, said once */
+    if (lease == 1) {
+        int saved = dup(2), fd = open(DIR "/ow_old.err", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        fflush(stderr); dup2(fd, 2); close(fd);
+        snprintf(extra, sizeof extra, "&relay=http://127.0.0.1:%d&anchor=0", rport);
+        sqlite3 *o = open_db("ow_old.db", OKEY, extra);
+        if (o) { lease2 = status_int(o, "lease"); snprintf(payer2, sizeof payer2, "%s", status_text(o, "relay_payer")); sqlite3_close(o); }
+        fflush(stderr); dup2(saved, 2); close(saved);
+        f = fopen(DIR "/ow_old.err", "r");
+        if (f) { size_t got = fread(said, 1, sizeof said - 1, f); said[got] = 0; fclose(f); }
+    }
+    /* neither wallet holds the token: both are named, the funding wallet first */
+    if (lease == 1) {
+        int saved = dup(2), fd = open(DIR "/ow_none.err", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        fflush(stderr); dup2(fd, 2); close(fd);
+        sqlite3 *z = open_db("ow_none.db", ZKEY, extra);
+        if (z) sqlite3_close(z);
+        fflush(stderr); dup2(saved, 2); close(saved);
+        f = fopen(DIR "/ow_none.err", "r");
+        if (f) { size_t got = fread(none, 1, sizeof none - 1, f); none[got] = 0; fclose(f); }
+    }
+    double oldLeft = anvil_token_of(usdc, old);
+    STOP65();
+#undef STOP65
+    printf("(funding wallet %s: lease %lld, flushes %lld %lld, anchored %lld via %s, relay_spent %lld, store_spent %lld, %.0f units left of 10000000;"
+           " the key's own wallet: lease %lld, %.0f units left of 5000000%s%.300s) ",
+           fund, lease, f1, f2, anchored, path, relaySpent, storeSpent, fundLeft, lease2, oldLeft, err[0] ? "; last_error: " : "", err);
+    if (lease != 1) FAIL("the relay should be paid by the funding wallet, which holds the token (red: it asked the node key's own wallet, which holds nothing)");
+    if (strcasecmp(funder, fund) != 0) FAILF("store_funder %s is not keccak256(\"hpplite funding key\" || key)'s wallet %s", funder, fund);
+    if (strcasecmp(payer, fund) != 0 || strcasecmp(payer2, old) != 0) FAILF("relay_payer should name the wallet to fund: %s (the funding wallet %s), then %s (the key's own %s, once it paid)", payer, fund, payer2, old);
+    if (f1 <= 0 || f2 <= 0 || anchored <= 0 || strcmp(path, "relay") != 0 || relaySpent <= 0 || storeSpent <= 0) FAIL("the writes at the store and the anchor at the relay, both paid");
+    if (nodeEth != 0 || nodeUsdc != 0 || fundLeft >= 10000000) FAILF("one wallet should have paid it all: the node's own holds %ld wei and %.0f units, the funding wallet %.0f", nodeEth, nodeUsdc, fundLeft);
+    if (lease2 != 1 || oldLeft >= 5000000) FAIL("a node with the token on its key's own wallet should still pay the relay");
+    if (!strstr(said, "the node key's own wallet") || !strstr(said, "paid instead")) { printf("(said: %.600s) ", said); FAIL("the wallet that paid instead of the funding wallet should be said"); }
+    const char *nf = strstr(none, "the node's funding wallet"), *nw = nf ? strstr(nf, "the node key's own wallet 0x") : NULL, *nt = nw ? strstr(nw, "was asked too") : NULL;
+    printf("(said: %.500s; with nothing on either: %.700s) ", said, none);
+    if (!nf || !nw || !nt) FAIL("with the token on neither wallet the refusal should name the funding wallet, the one to fund, and say the key's own was asked too");
+    PASS();
+}
+
 static void test_sequencer_once(void) {
     TEST("hpplite-sequencer --once (#345): runs over a kept copy of an app's file send what changed as one height each, nothing when unchanged; an empty app's file is refused, a held copy left alone; a replica rebuilds the app's rows");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
@@ -4090,6 +4219,7 @@ int main(void) {
     if (wanted(62)) test_rebuilt_other_sqlite();
     if (wanted(63)) test_tx_said();
     if (wanted(64)) test_sponsored_create();
+    if (wanted(65)) test_one_wallet();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

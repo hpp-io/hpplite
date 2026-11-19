@@ -200,7 +200,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
         /* the relay (#126): an x402-paid service like the store, its /commit takes the signed forms */
         if (strncmp(node->config.relayUrl, "http://", 7) != 0 && strncmp(node->config.relayUrl, "https://", 8) != 0) node->relay = NULL;
         else node->relay = hpplite_store_open(node->config.relayUrl, config->hasPrivkey ? config->privkey : NULL, config->relayCap);
-        if (node->relay) { hpplite_store_set_relay(node->relay); hpplite_store_set_chain_time(node->relay, node_chain_time, node); hpplite_store_set_rpc(node->relay, config->rpcUrl); }
+        if (node->relay) { hpplite_store_set_relay(node->relay, config->hasFunder); hpplite_store_set_chain_time(node->relay, node_chain_time, node); hpplite_store_set_rpc(node->relay, config->rpcUrl); }
         if (!node->relay) {
             fprintf(stderr, "hpplite: relay=%s: not a relay URL (http://host:port of operators/relay or a service like it)\n", node->config.relayUrl);
             return -1;
