@@ -12,6 +12,18 @@
 #include <signal.h>
 #include <fcntl.h>
 
+/* an AddressSanitizer build (gcc says __SANITIZE_ADDRESS__; clang __has_feature, which gcc cannot parse in one #if) */
+#if defined(__SANITIZE_ADDRESS__)
+#define MEMORY_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define MEMORY_ASAN 1
+#endif
+#endif
+#ifndef MEMORY_ASAN
+#define MEMORY_ASAN 0
+#endif
+
 #define DIR "/tmp/hpplite_test_memory"
 #define DB_MB 64
 #define BOUND_MB 24              /* +13 to +16 MB measured (macOS, Linux): the queue, the root, SQLite's cache */
@@ -265,7 +277,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     printf("=== HPPLite memory against the database's size ===\n");
-#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+#if MEMORY_ASAN
     /* ASan keeps freed memory in quarantine and maps shadow memory: RSS says nothing of the node's own use */
     printf("SKIP (an AddressSanitizer build: RSS is not the node's)\n");
     return 77;
