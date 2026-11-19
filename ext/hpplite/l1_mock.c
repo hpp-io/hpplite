@@ -5,6 +5,7 @@
 ** Implements lease-based sequencer coordination.
 */
 
+#include <sys/stat.h>
 #include "l1_backend.h"
 #include "crypto.h"
 #include "hpplite_sqlite.h"
@@ -74,9 +75,9 @@ typedef struct MockL1 {
     uint8_t *batchData[MAX_BATCHES];
     size_t batchLen[MAX_BATCHES];
     /* a height whose bytes live in a store (#11): the chain's commitment to them.
-    ** batchData is NULL there. In memory only: a directory-backed mock forgets them */
+    ** batchData is NULL there. A directory-backed mock keeps them as commit-<h>.bin (#364) */
     struct MockCommit { uint8_t hash[32]; char *ref; uint8_t *receipt; size_t nReceipt; } *commits[MAX_BATCHES];
-    /* ranges (#164): one commitment for every batch a store holds since the last; in memory only */
+    /* ranges (#164): one commitment for every batch a store holds since the last; kept as range-<i>.bin in a directory (#364) */
     HppliteRange *ranges;
     int nRanges, nRangesAlloc;
 
@@ -148,8 +149,41 @@ static void mockSaveState(HppliteL1 *l1) {
              (unsigned long long)self->nBatches, self->hasSequencer, wallet, inst,
              (unsigned long long)self->leaseExpiry, self->nCheckpoints,
              (unsigned long long)self->lastCheckpointHeight, (unsigned long long)self->lastCheckpointTime, root);
+    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "ranges %d\n", self->nRanges);
     snprintf(path, sizeof(path), "%s/state", self->dir);
     mockWriteFile(path, buf, strlen(buf));
+}
+/* a store commitment as a file: hash, the reference's length and bytes, the receipt */
+static void mockSaveCommit(HppliteL1 *l1, uint64_t height) {
+    char path[1024];
+    struct MockCommit *c = self->commits[height - 1];
+    size_t nRef, n;
+    uint8_t *buf;
+    if (!self->dir || !c) return;
+    nRef = c->ref ? strlen(c->ref) : 0;
+    n = 32 + 4 + nRef + c->nReceipt;
+    if (!(buf = malloc(n))) return;
+    memcpy(buf, c->hash, 32);
+    buf[32] = (uint8_t)(nRef >> 24); buf[33] = (uint8_t)(nRef >> 16); buf[34] = (uint8_t)(nRef >> 8); buf[35] = (uint8_t)nRef;
+    if (nRef) memcpy(buf + 36, c->ref, nRef);
+    if (c->nReceipt) memcpy(buf + 36 + nRef, c->receipt, c->nReceipt);
+    snprintf(path, sizeof(path), "%s/commit-%llu.bin", self->dir, (unsigned long long)height);
+    mockWriteFile(path, buf, n);
+    free(buf);
+}
+/* a range as a file: its heights, chain hash, root and manifest, then its receipt */
+static void mockSaveRange(HppliteL1 *l1, int i) {
+    char path[1024];
+    const HppliteRange *k = &self->ranges[i];
+    size_t n = 16 + 96 + k->nReceipt;
+    uint8_t *buf;
+    if (!self->dir || !(buf = malloc(n))) return;
+    memcpy(buf, &k->fromHeight, 8); memcpy(buf + 8, &k->toHeight, 8);
+    memcpy(buf + 16, k->chainHashAfter, 32); memcpy(buf + 48, k->stateRoot, 32); memcpy(buf + 80, k->manifestDigest, 32);
+    if (k->nReceipt) memcpy(buf + 112, k->receipt, k->nReceipt);
+    snprintf(path, sizeof(path), "%s/range-%d.bin", self->dir, i);
+    mockWriteFile(path, buf, n);
+    free(buf);
 }
 static void mockSaveBatch(HppliteL1 *l1, uint64_t height) {
     char path[1024];
@@ -184,10 +218,55 @@ static void mockLoad(HppliteL1 *l1) {
         self->lastCheckpointHeight = cph;
         self->lastCheckpointTime = cpt;
         mockUnhex(root, self->lastStateRoot, 32);
+        {
+            /* the ranges first: the heights they cover need no bytes or commitment of their own */
+            const char *zr = strstr((char *)txt, "ranges ");
+            int nr = zr ? atoi(zr + 7) : 0;
+            for (int i = 0; i < nr; i++) {
+                size_t n = 0;
+                uint8_t *raw;
+                HppliteRange *k;
+                snprintf(path, sizeof(path), "%s/range-%d.bin", self->dir, i);
+                raw = mockReadFile(path, &n);
+                if (!raw || n < 112) { free(raw); break; }
+                if (self->nRanges == self->nRangesAlloc) {
+                    int na = self->nRangesAlloc ? self->nRangesAlloc * 2 : 16;
+                    HppliteRange *grown = realloc(self->ranges, (size_t)na * sizeof(HppliteRange));
+                    if (!grown) { free(raw); break; }
+                    self->ranges = grown; self->nRangesAlloc = na;
+                }
+                k = &self->ranges[self->nRanges];
+                memset(k, 0, sizeof(*k));
+                memcpy(&k->fromHeight, raw, 8); memcpy(&k->toHeight, raw + 8, 8);
+                memcpy(k->chainHashAfter, raw + 16, 32); memcpy(k->stateRoot, raw + 48, 32); memcpy(k->manifestDigest, raw + 80, 32);
+                if (n > 112 && (k->receipt = sqlite3_malloc((int)(n - 112)))) { memcpy(k->receipt, raw + 112, n - 112); k->nReceipt = n - 112; }
+                free(raw);
+                self->nRanges++;
+            }
+        }
         for (unsigned long long h = 1; h <= nb && h <= MAX_BATCHES; h++) {
+            int covered = self->nRanges > 0 && h <= self->ranges[self->nRanges - 1].toHeight;
             snprintf(path, sizeof(path), "%s/batch-%llu.bin", self->dir, h);
-            self->batchData[h - 1] = mockReadFile(path, &self->batchLen[h - 1]);
-            if (!self->batchData[h - 1]) break;           /* announced but missing: history ends here */
+            self->batchData[h - 1] = covered ? NULL : mockReadFile(path, &self->batchLen[h - 1]);
+            if (!covered && !self->batchData[h - 1]) {
+                /* a commitment to bytes at a store */
+                size_t n = 0;
+                uint8_t *raw;
+                snprintf(path, sizeof(path), "%s/commit-%llu.bin", self->dir, h);
+                raw = mockReadFile(path, &n);
+                if (raw && n >= 36) {
+                    size_t nRef = ((size_t)raw[32] << 24) | ((size_t)raw[33] << 16) | ((size_t)raw[34] << 8) | raw[35];
+                    struct MockCommit *c = nRef <= n - 36 ? calloc(1, sizeof *c) : NULL;
+                    if (c) {
+                        memcpy(c->hash, raw, 32);
+                        c->ref = sqlite3_mprintf("%.*s", (int)nRef, (const char *)raw + 36);
+                        if (n > 36 + nRef && (c->receipt = sqlite3_malloc((int)(n - 36 - nRef)))) { memcpy(c->receipt, raw + 36 + nRef, n - 36 - nRef); c->nReceipt = n - 36 - nRef; }
+                        self->commits[h - 1] = c;
+                    }
+                }
+                free(raw);
+                if (!self->commits[h - 1]) break;           /* announced but missing: history ends here */
+            }
             self->nBatches = h;
         }
         for (int i = 0; i < ncp && i < MAX_CHECKPOINTS; i++) {
@@ -244,6 +323,7 @@ HppliteL1 *hpplite_l1_create_mock_dir(const char *dir) {
     HppliteL1 *l1 = hpplite_l1_create_mock();
     if (!l1 || !dir) return l1;
     self->dir = strdup(dir);
+    mkdir(dir, 0755);                                   /* a fresh directory: the first save writes into it */
     mockSetAddress(l1, dir, 0);
     mockLoad(l1);
     return l1;
@@ -1061,6 +1141,7 @@ static char *mock_commit_batch(HppliteL1 *l1, const uint8_t instanceId[32], uint
     self->batchLen[idx] = 0;
     if (self->failAfterPlus1 > 1) self->failAfterPlus1--;
     if (height > self->nBatches) self->nBatches = height;
+    mockSaveCommit(l1, height);
     mockSaveState(l1);
     if (self->loseConfirmation) return NULL;
     return sqlite3_mprintf("0x%016llx", (unsigned long long)height);
@@ -1110,6 +1191,7 @@ static char *mock_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], cons
         if (k->receipt) { memcpy(k->receipt, r->receipt, r->nReceipt); k->nReceipt = r->nReceipt; }
     }
     self->nRanges++;
+    mockSaveRange(l1, self->nRanges - 1);
     for (h = r->fromHeight; h <= r->toHeight; h++) {
         size_t idx = h - 1;
         free(self->batchData[idx]); self->batchData[idx] = NULL; self->batchLen[idx] = 0;

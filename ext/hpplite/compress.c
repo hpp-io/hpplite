@@ -6,6 +6,7 @@
 #include <zlib.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 uint8_t *hpplite_deflate_level(const uint8_t *in, size_t n, int level, size_t *pOut) {
     uLongf bound;
@@ -76,6 +77,63 @@ int hpplite_deflate_stream_finish(HppliteDeflateStream *d) {
 }
 
 void hpplite_deflate_stream_free(HppliteDeflateStream *d) { if (d) { deflateEnd(&d->z); free(d); } }
+
+struct HppliteInflateStream {
+    z_stream z;
+    int (*xOut)(void *, const uint8_t *, size_t);
+    void *pArg;
+    uint8_t len[4]; unsigned nLen;      /* the original's length, as the form says it first */
+    uint64_t want, got;
+    int ended;
+    uint8_t out[DSTREAM_OUT];
+};
+
+HppliteInflateStream *hpplite_inflate_stream_new(int (*xOut)(void *, const uint8_t *, size_t), void *pArg) {
+    HppliteInflateStream *d = malloc(sizeof(*d));
+    if (!d || !xOut) { free(d); return NULL; }
+    memset(d, 0, offsetof(HppliteInflateStream, out));
+    if (inflateInit(&d->z) != Z_OK) { free(d); return NULL; }
+    d->xOut = xOut; d->pArg = pArg;
+    return d;
+}
+
+int hpplite_inflate_stream_write(HppliteInflateStream *d, const uint8_t *in, size_t n) {
+    while (n > 0 && d->nLen < 4) {
+        d->len[d->nLen++] = *in++; n--;
+        if (d->nLen == 4) d->want = ((uint64_t)d->len[0] << 24) | ((uint64_t)d->len[1] << 16) | ((uint64_t)d->len[2] << 8) | d->len[3];
+    }
+    while (n > 0) {
+        uInt k = n > 0x40000000u ? 0x40000000u : (uInt)n;
+        int zrc;
+        if (d->ended) return -1;                                     /* bytes past the stream's end */
+        d->z.next_in = (Bytef *)in; d->z.avail_in = k;
+        do {
+            size_t made;
+            d->z.next_out = d->out; d->z.avail_out = DSTREAM_OUT;
+            zrc = inflate(&d->z, Z_NO_FLUSH);
+            if (zrc != Z_OK && zrc != Z_STREAM_END && zrc != Z_BUF_ERROR) return -1;
+            made = DSTREAM_OUT - d->z.avail_out;
+            d->got += made;
+            if (d->got > d->want) return -1;                          /* more than it said */
+            if (made && d->xOut(d->pArg, d->out, made) != 0) return -1;
+            if (zrc == Z_STREAM_END) { d->ended = 1; break; }
+            if (zrc == Z_BUF_ERROR && made == 0) break;              /* no progress: all the input taken in */
+        } while (d->z.avail_out == 0 || d->z.avail_in > 0);
+        if (!d->ended && d->z.avail_in > 0) return -1;               /* input it could not take: corrupt */
+        if (d->ended && d->z.avail_in > 0) return -1;
+        in += k; n -= k;
+    }
+    return 0;
+}
+
+int hpplite_inflate_stream_finish(HppliteInflateStream *d) {
+    int ok = d->ended && d->nLen == 4 && d->got == d->want && d->want > 0;
+    inflateEnd(&d->z);
+    free(d);
+    return ok ? 0 : -1;
+}
+
+void hpplite_inflate_stream_free(HppliteInflateStream *d) { if (d) { inflateEnd(&d->z); free(d); } }
 
 uint8_t *hpplite_inflate(const uint8_t *in, size_t n, size_t *pOut) {
     size_t len;

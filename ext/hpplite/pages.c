@@ -297,6 +297,30 @@ HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n) {
   return b;
 }
 
+HpplitePageBatch *hpplite_pagebatch_decode_ends(const unsigned char *head, size_t nHead, const unsigned char *tail, size_t nTail,
+                                                uint64_t len, size_t *pRecOff) {
+  HpplitePageBatch *b;
+  unsigned hdr;
+  size_t rec, nEnd;
+  if (!hpplite_pagebatch_is(head, nHead)) return NULL;
+  hdr = r32(head + 4) == 1u ? PB_HEADER_V1 : PB_HEADER;
+  if (nHead < hdr) return NULL;
+  b = sqlite3_malloc64(sizeof(*b));
+  if (!b) return NULL;
+  memset(b, 0, sizeof(*b));
+  b->pageSize = r32(head + 8); b->commitSize = r32(head + 12); b->firstCommit = r64(head + 16); b->lastCommit = r64(head + 24);
+  b->salt1 = r32(head + 32); b->salt2 = r32(head + 36); b->timestampMs = r64(head + 40); b->nPages = r32(head + 48); b->nName = r32(head + 52);
+  if (hdr == PB_HEADER) { b->piece = r32(head + 56); b->bMore = r32(head + 60) & 1u; }
+  if (b->pageSize < 512 || b->pageSize > 65536 || (b->pageSize & (b->pageSize - 1)) || b->nName > 255) { sqlite3_free(b); return NULL; }
+  rec = 6 + (size_t)b->pageSize;
+  nEnd = PB_TRAILER + b->nName;
+  if (len != (uint64_t)hdr + (uint64_t)rec * b->nPages + nEnd || nTail < nEnd) { sqlite3_free(b); return NULL; }
+  memcpy(b->root, tail + nTail - nEnd, 32); b->crc = r64(tail + nTail - nEnd + 32);
+  b->zName = b->nName ? (const char *)(tail + nTail - nEnd + PB_TRAILER) : NULL;
+  *pRecOff = hdr;
+  return b;
+}
+
 void hpplite_pagebatch_free(HpplitePageBatch *b) {
   if (!b) return;
   sqlite3_free(b->aPage); sqlite3_free(b);

@@ -128,6 +128,23 @@ static int child_snapshot(const char *url) {
     return a > 0 && snap == (long long)a ? 0 : 4;
 }
 
+/* child: a new replica starts from that snapshot, in a process of its own, measured over its whole start */
+static int child_replica(const char *url) {
+    static const unsigned char kseq[32] = { [31] = 0x4d };
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(DIR "/l1s");
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "mem_snap_r", .privkey = kseq, .verifyOnly = 1, .fromSnapshot = 1,
+                       .checkpointInterval = TEST_INTERVAL_1000 };
+    long long before = peak_kb(), snap, rows;
+    HppliteNode *r = test_open_node(DIR "/r.db", l1, &o);
+    if (!r) return 2;
+    snap = status_int(r->db, "snapshot_height");
+    rows = count_rows(r->db, "t");
+    printf("RISE_KB %lld FROM %lld ROWS %lld\n", peak_kb() - before, snap, rows);
+    r->ownsL1 = 1;
+    hpplite_node_destroy(r);
+    return snap > 0 && rows == SNAP_MB * 256 ? 0 : 4;
+}
+
 static const char *self;
 static pid_t g_store;
 static const char *g_url;
@@ -222,11 +239,17 @@ static void test_snapshot_is_not_the_database(const char *storeDir) {
     g_url = url;
     if (run_child("snapsetup", line, sizeof line) < 0) { g_url = NULL; stop_store(); FAIL("the database not posted"); }
     rise = run_child("snapshot", line, sizeof line);
+    printf("(%s) ", line[0] ? strtok(line, "\n") : "no output");
+    if (rise < 0) { g_url = NULL; stop_store(); FAIL("the child (no snapshot made?)"); }
+    if (rise > SNAP_BOUND_MB * 1024) { g_url = NULL; stop_store(); FAILF("+%lld MB: the snapshot is built in memory", rise / 1024); }
+    PASS();
+    TEST("a new replica starting from that snapshot raises its peak memory by a chunk, not the database (#364)");
+    rise = run_child("replica", line, sizeof line);
     g_url = NULL;
     stop_store();
     printf("(%s) ", line[0] ? strtok(line, "\n") : "no output");
-    if (rise < 0) FAIL("the child (no snapshot made?)");
-    if (rise > SNAP_BOUND_MB * 1024) FAILF("+%lld MB: the snapshot is built in memory", rise / 1024);
+    if (rise < 0) FAIL("the replica (not from the snapshot?)");
+    if (rise > SNAP_BOUND_MB * 1024) FAILF("+%lld MB: the snapshot is read into memory", rise / 1024);
     PASS();
 }
 
@@ -238,6 +261,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[2], "backlog") == 0) return child_backlog();
         if (strcmp(argv[2], "snapshot") == 0) return child_snapshot(argc > 3 ? argv[3] : "");
         if (strcmp(argv[2], "snapsetup") == 0) return child_snapsetup(argc > 3 ? argv[3] : "");
+        if (strcmp(argv[2], "replica") == 0) return child_replica(argc > 3 ? argv[3] : "");
         return 2;
     }
     printf("=== HPPLite memory against the database's size ===\n");
@@ -245,6 +269,6 @@ int main(int argc, char **argv) {
     test_open_is_not_the_database();
     test_backlog_is_not_in_memory();
     test_snapshot_is_not_the_database(argc > 1 ? argv[1] : NULL);
-    remove_dir();
+    if (!getenv("MEM_KEEP")) remove_dir();
     return test_report();
 }

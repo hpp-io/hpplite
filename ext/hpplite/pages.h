@@ -76,6 +76,11 @@ size_t hpplite_pagebatch_head(const HpplitePageBatch *b, unsigned char *p);
 size_t hpplite_pagebatch_rec(unsigned pgno, unsigned flags, unsigned char *p);
 size_t hpplite_pagebatch_tail(const HpplitePageBatch *b, unsigned char *p);
 size_t hpplite_pagebatch_size(const HpplitePageBatch *b);
+/* A batch known by its ends (#364, an image in a file): head its first bytes (64 at least), tail its last (the trailer
+** and name at least, name pointing into it), len the whole's length; no records (aPage NULL), *pRecOff where they
+** start. NULL when the ends do not describe a batch of that length; sqlite3_free the batch */
+HpplitePageBatch *hpplite_pagebatch_decode_ends(const unsigned char *head, size_t nHead, const unsigned char *tail, size_t nTail,
+                                                uint64_t len, size_t *pRecOff);
 /* a batch from its bytes: the records point into p, which must outlive it; sqlite3_free the batch */
 HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n);
 void hpplite_pagebatch_free(HpplitePageBatch *b);

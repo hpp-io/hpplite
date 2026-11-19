@@ -147,6 +147,43 @@ HppliteSealStream *hpplite_seal_stream_new_pk(const HppliteCipher *cipher, const
   return st;
 }
 
+HppliteSealStream *hpplite_envelope_open_stream_pk(const uint8_t privkey[32], uint64_t height, const uint8_t *head,
+                                                  size_t avail, uint64_t len, size_t *pHeadLen, int *pEncoding, int *pForeign) {
+  const HppliteCipher *cipher;
+  uint8_t myPub[33], myFp[4], dek[32], wk[32], zeroNonce[12] = {0}, ad[AD_MAX], wad[12];
+  const uint8_t *ephPub, *wraps, *nonce;
+  size_t wrapLen, headLen, adLen;
+  int n, i, found = 0;
+  HppliteSealStream *st;
+  if (pForeign) *pForeign = 0;
+  if (!hpplite_envelope_is_pk(head, avail)) return NULL;
+  cipher = hpplite_cipher_by_id(head[HPPLITE_ENVELOPE_MAGIC_LEN]);
+  if (!cipher || cipher->nonceLen < 12 || cipher->id != HPPLITE_CIPHER_CHACHA20POLY1305.id) return NULL;
+  n = head[HPPLITE_ENVELOPE_MAGIC_LEN + 2];
+  wrapLen = HPPLITE_PK_FP_LEN + WRAP_PT + cipher->tagLen;
+  headLen = HDR + 33 + (size_t)n * wrapLen + cipher->nonceLen;
+  if (n < 1 || avail < headLen || len < headLen + cipher->tagLen) return NULL;
+  ephPub = head + HDR;
+  wraps = ephPub + 33;
+  nonce = wraps + (size_t)n * wrapLen;
+  if (!privkey || hpplite_pk_pubkey(privkey, myPub) != 0) { if (pForeign) *pForeign = 1; return NULL; }
+  hpplite_pk_fingerprint(myPub, myFp);
+  for (i = 0; i < n && !found; i++) {
+    const uint8_t *w = wraps + (size_t)i * wrapLen;
+    if (memcmp(w, myFp, 4) != 0) continue;
+    if (wrapKey(ephPub, privkey, ephPub, wk) != 0) continue;
+    adLen = adWrap(wad, w, height);
+    if (cipher->open(wk, zeroNonce, wad, adLen, w + HPPLITE_PK_FP_LEN, WRAP_PT + cipher->tagLen, dek) == 0) found = 1;
+    memset(wk, 0, 32);
+  }
+  if (!found) { if (pForeign) *pForeign = 1; return NULL; }
+  adLen = adPayload(ad, cipher->id, head[HPPLITE_ENVELOPE_MAGIC_LEN + 1], height, ephPub);
+  st = hpplite_seal_stream_raw(dek, nonce, ad, adLen);
+  memset(dek, 0, 32);
+  if (st) { *pHeadLen = headLen; *pEncoding = head[HPPLITE_ENVELOPE_MAGIC_LEN + 1]; }
+  return st;
+}
+
 int hpplite_envelope_is_pk(const uint8_t *data, size_t len) {
   return data && len >= HDR && memcmp(data, HPPLITE_ENVELOPE_MAGIC_V3, HPPLITE_ENVELOPE_MAGIC_LEN) == 0;
 }

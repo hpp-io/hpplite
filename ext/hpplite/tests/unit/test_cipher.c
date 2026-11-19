@@ -152,6 +152,38 @@ static void test_seal_stream(void) {
     PASS();
 }
 
+/* Opened as a stream (#364, a snapshot read from a file): the tag checked in a MAC-only pass, then opened in uneven
+** pieces back to the payload; one flipped byte fails the tag */
+static void test_open_stream(void) {
+    TEST("an envelope opened as a stream: the MAC pass takes its tag, the pieces open to the payload, a flipped byte fails (#364)");
+    const HppliteCipher *c = hpplite_cipher_default();
+    uint8_t key[32];
+    size_t n = 70001, len = 0, hl = 0, off, piece;
+    int enc = -1;
+    uint8_t *payload = malloc(n), *env, *out = malloc(n);
+    HppliteSealStream *st;
+    int ok = 1;
+    for (size_t i = 0; i < 32; i++) key[i] = (uint8_t)(i + 3);
+    for (size_t i = 0; i < n; i++) payload[i] = (uint8_t)(i * 7);
+    env = hpplite_envelope_seal(c, key, 5, HPPLITE_ENCODING_DEFLATE, payload, n, &len);
+    st = env ? hpplite_envelope_open_stream(key, 5, env, len, len, &hl, &enc, NULL) : NULL;
+    if (!st || enc != HPPLITE_ENCODING_DEFLATE) { free(env); free(payload); free(out); FAIL("open the stream"); }
+    hpplite_open_stream_mac(st, env + hl, len - hl - 16);
+    ok = hpplite_open_stream_final(st, env + len - 16) == 0;
+    st = hpplite_envelope_open_stream(key, 5, env, len, len, &hl, &enc, NULL);
+    for (off = 0, piece = 1; st && off < n; off += piece, piece = piece * 5 + 3) {
+        if (piece > n - off) piece = n - off;
+        hpplite_open_stream_update(st, env + hl + off, out + off, piece);
+    }
+    ok = ok && st && hpplite_open_stream_final(st, env + len - 16) == 0 && memcmp(out, payload, n) == 0;
+    env[hl + 100] ^= 1;
+    st = hpplite_envelope_open_stream(key, 5, env, len, len, &hl, &enc, NULL);
+    if (st) { hpplite_open_stream_mac(st, env + hl, len - hl - 16); ok = ok && hpplite_open_stream_final(st, env + len - 16) != 0; }
+    free(env); free(payload); free(out);
+    if (!ok) FAIL("the streamed open does not match the seal");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Cipher Tests ===\n");
     test_rfc8439_aead();
@@ -159,5 +191,6 @@ int main(void) {
     test_hmac();
     test_envelope();
     test_seal_stream();
+    test_open_stream();
     return test_report();
 }

@@ -104,6 +104,9 @@ int hpplite_store_statement_verify(const uint8_t *st, size_t n, uint64_t chainId
 
 /* Get the bytes a reference names: malloc'd, terminated, *pLen set; NULL when not there */
 uint8_t *hpplite_store_get(HppliteStore *store, const char *zRef, size_t *pLen);
+/* The same, the bytes handed to xSink as they come instead of held (#364, a snapshot's chunks); nonzero from xSink stops
+** it. 0 for a 200 answer (the bytes before another answer may have reached the sink: the caller discards them), -1 */
+int hpplite_store_get_to(HppliteStore *s, const char *zRef, int (*xSink)(void *, const uint8_t *, size_t), void *pArg, size_t *pLen);
 
 /* The key given after open (#17): pays from here on. 0, or -1 when it is not a key */
 int hpplite_store_set_key(HppliteStore *store, const uint8_t privkey[32]);

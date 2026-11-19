@@ -82,7 +82,8 @@ struct HppliteStore {
     int nAhead;
 };
 
-typedef struct Buf { char *p; size_t n; } Buf;
+/* a response's bytes, kept; or handed to xSink as they come (#364: a snapshot's chunk is never held whole) */
+typedef struct Buf { char *p; size_t n; int (*xSink)(void *, const uint8_t *, size_t); void *pSinkArg; } Buf;
 
 static void deriveFund(HppliteStore *s, const uint8_t privkey[32]);
 static int ensureBucket(HppliteStore *s);
@@ -108,7 +109,9 @@ static void storeBusy(HppliteStore *s, const char *zBody) {
 static size_t bufWrite(void *data, size_t size, size_t nmemb, void *arg) {
     Buf *b = (Buf *)arg;
     size_t n = size * nmemb;
-    char *q = realloc(b->p, b->n + n + 1);
+    char *q;
+    if (b->xSink) { if (b->xSink(b->pSinkArg, (const uint8_t *)data, n) != 0) return 0; b->n += n; return n; }
+    q = realloc(b->p, b->n + n + 1);
     if (!q) return 0;
     memcpy(q + b->n, data, n);
     b->n += n;
@@ -220,7 +223,7 @@ void hpplite_store_prefetch_names(HppliteStore *s, const char *const *zNames, in
 
 static long storeRequest(HppliteStore *s, const char *method, const char *path, const uint8_t *body, size_t bodyLen,
                          const char *extraHeader, Buf *out, char **pzPaymentRequired, char **pzPaymentResponse) {
-    if (!body && !extraHeader && !pzPaymentRequired && strcmp(method, "GET") == 0 && s->nAhead && aheadTake(s, path, out)) {
+    if (!body && !extraHeader && !pzPaymentRequired && strcmp(method, "GET") == 0 && s->nAhead && !(out && out->xSink) && aheadTake(s, path, out)) {
         s->lastStatus = 200;                    /* fetched ahead (#195) */
         s->retryAfter = 0;
         return 200;
@@ -1419,6 +1422,25 @@ uint8_t *hpplite_store_get(HppliteStore *s, const char *zRef, size_t *pLen) {
     if (pLen) *pLen = out.n;
     if (out.p) s->nOk++;
     return (uint8_t *)out.p;                      /* malloc'd, terminated */
+}
+
+int hpplite_store_get_to(HppliteStore *s, const char *zRef, int (*xSink)(void *, const uint8_t *, size_t), void *pArg, size_t *pLen) {
+    Buf out = {0};
+    char path[600];
+    long status;
+    if (pLen) *pLen = 0;
+    if (!s || !zRef || !zRef[0] || strlen(zRef) > 500 || strchr(zRef, '/') || !xSink) return -1;
+    s->error[0] = 0;
+    out.xSink = xSink; out.pSinkArg = pArg;
+    snprintf(path, sizeof path, "/get/%s", zRef);
+    status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+    if (status != 200) {
+        if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to get %s", status, zRef);
+        return -1;
+    }
+    if (pLen) *pLen = out.n;
+    s->nOk++;
+    return 0;
 }
 
 /* the last answer's Retry-After when it was a 429, in seconds (somaro#48: wait that long, not the next flush); 0 none */

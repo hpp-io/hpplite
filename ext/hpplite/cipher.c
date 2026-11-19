@@ -426,6 +426,33 @@ void hpplite_seal_stream_final(HppliteSealStream *s, uint8_t tag[16]) {
 
 void hpplite_seal_stream_free(HppliteSealStream *s) { if (s) { memset(s, 0, sizeof(*s)); free(s); } }
 
+/* Opening, streamed: the MAC over the ciphertext as it comes (in may be out), then the keystream */
+void hpplite_open_stream_update(HppliteSealStream *s, const uint8_t *in, uint8_t *out, size_t n) {
+  size_t j, k;
+  poly1305_update(&s->mac, in, n);
+  s->ctLen += n;
+  while (n > 0) {
+    if (s->used == 64) { chacha20_block(s->st, s->block); s->st[12]++; s->used = 0; }
+    k = 64 - s->used < n ? 64 - s->used : n;
+    for (j = 0; j < k; j++) out[j] = in[j] ^ s->block[s->used + j];
+    s->used += k; in += k; out += k; n -= k;
+  }
+}
+/* ...or the MAC alone: a pass that checks the tag before anything is opened */
+void hpplite_open_stream_mac(HppliteSealStream *s, const uint8_t *ct, size_t n) {
+  poly1305_update(&s->mac, ct, n);
+  s->ctLen += n;
+}
+int hpplite_open_stream_final(HppliteSealStream *s, const uint8_t tag[16]) {
+  uint8_t want[16];
+  int ok;
+  if (!s) return -1;
+  hpplite_seal_stream_final(s, want);                           /* the same tag the seal computes, the stream freed */
+  ok = ct_equal(want, tag, 16);
+  memset(want, 0, sizeof(want));
+  return ok ? 0 : -1;
+}
+
 HppliteSealStream *hpplite_seal_stream_new(const HppliteCipher *cipher, const uint8_t key[32], uint64_t height,
                                            uint8_t encoding, uint8_t *hdr, size_t *pHdrLen) {
   uint8_t ad[10];
@@ -452,6 +479,24 @@ int hpplite_envelope_is_sealed(const uint8_t *data, size_t len) {
 int hpplite_envelope_encoding(const uint8_t *data, size_t len) {
   if (!envelope_is_sealed(data, len)) return -1;
   return len > HPPLITE_ENVELOPE_MAGIC_LEN + 1 ? data[HPPLITE_ENVELOPE_MAGIC_LEN + 1] : -1;
+}
+
+HppliteSealStream *hpplite_envelope_open_stream(const uint8_t key[32], uint64_t height, const uint8_t *head, size_t avail,
+                                               uint64_t len, size_t *pHeadLen, int *pEncoding, const HppliteCipher **pScheme) {
+  const HppliteCipher *cipher;
+  size_t headLen, adLen;
+  uint8_t ad[10];
+  if (pScheme) *pScheme = NULL;
+  if (!envelope_is_sealed(head, avail)) return NULL;
+  cipher = hpplite_cipher_by_id(head[HPPLITE_ENVELOPE_MAGIC_LEN]);
+  if (pScheme) *pScheme = cipher;
+  if (!cipher || cipher->id != HPPLITE_CIPHER_CHACHA20POLY1305.id) return NULL;
+  headLen = HPPLITE_ENVELOPE_HEADER_LEN + cipher->nonceLen;
+  if (avail < headLen || len < headLen + cipher->tagLen) return NULL;
+  *pEncoding = head[HPPLITE_ENVELOPE_MAGIC_LEN + 1];
+  *pHeadLen = headLen;
+  adLen = envelope_ad(ad, cipher->id, head[HPPLITE_ENVELOPE_MAGIC_LEN + 1], height);
+  return hpplite_seal_stream_raw(key, head + HPPLITE_ENVELOPE_HEADER_LEN, ad, adLen);
 }
 
 uint8_t *hpplite_envelope_open(const uint8_t key[32], uint64_t height,

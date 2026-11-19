@@ -91,6 +91,15 @@ HppliteSealStream *hpplite_seal_stream_raw(const uint8_t key[32], const uint8_t 
 void hpplite_seal_stream_update(HppliteSealStream *s, const uint8_t *in, uint8_t *out, size_t n);
 void hpplite_seal_stream_final(HppliteSealStream *s, uint8_t tag[16]);
 void hpplite_seal_stream_free(HppliteSealStream *s);
+/* Opening an envelope streamed (#364, a snapshot read from a file): _open_stream reads its header (avail bytes of it
+** at head; len the whole envelope's) and starts the stream (its length and encoding said); then the ciphertext through
+** _update (opened) or _mac (the tag only, a pass before anything is used), and _final with the envelope's last 16
+** bytes: 0 when they are its tag. The stream is freed by _final */
+HppliteSealStream *hpplite_envelope_open_stream(const uint8_t key[32], uint64_t height, const uint8_t *head, size_t avail,
+                                               uint64_t len, size_t *pHeadLen, int *pEncoding, const HppliteCipher **pScheme);
+void hpplite_open_stream_update(HppliteSealStream *s, const uint8_t *in, uint8_t *out, size_t n);
+void hpplite_open_stream_mac(HppliteSealStream *s, const uint8_t *ct, size_t n);
+int hpplite_open_stream_final(HppliteSealStream *s, const uint8_t tag[16]);
 
 /* Bytes the envelope adds around the (encoded) payload */
 size_t hpplite_envelope_overhead(const HppliteCipher *cipher);

@@ -17,11 +17,14 @@
 #include "hpplite_int.h"
 #include "store.h"
 #include "compress.h"
+#include "sha256.h"
 #include "pagemode.h"
 #include "pages.h"
 #include "walread.h"
 
 static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch);
+typedef struct PageSrc PageSrc;
+static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, HpplitePageBatch *b, PageSrc *src);
 static int node_start_pages(HppliteNode *node, const char *zFile);
 static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch);
 static void node_ck_open(HppliteNode *node);
@@ -1658,8 +1661,46 @@ static void test_crash_point(const char *zName) {
 ** so the connections reading the file notice, all under SQLite's exclusive
 ** lock taken through a connection of our own; then the root, compared with
 ** the batch's trailer, and the meta row. */
+/* A batch's records, one at a time (#364): from a batch in memory, or read from a file (a snapshot's image, never whole
+** in memory). xNext: 1 and the record (its body valid until the next call), or -1 */
+struct PageSrc {
+    int (*xNext)(PageSrc *, unsigned *pPgno, unsigned *pFlags, const unsigned char **pBody);
+    const HpplitePageBatch *b; unsigned i;                     /* in memory */
+    int fd; sqlite3_int64 off; unsigned pageSize;               /* or a file: the records from off */
+    unsigned char *buf; size_t n, at; unsigned last;            /* ...read a few at a time; the page before, for the order */
+};
+static int pagesrc_mem(PageSrc *s, unsigned *pPgno, unsigned *pFlags, const unsigned char **pBody) {
+    const HpplitePageRec *r = &s->b->aPage[s->i++];
+    *pPgno = r->pgno; *pFlags = r->flags; *pBody = r->body;
+    return 1;
+}
+#define PAGESRC_RECS 64
+static int pagesrc_file(PageSrc *s, unsigned *pPgno, unsigned *pFlags, const unsigned char **pBody) {
+    size_t rec = 6 + (size_t)s->pageSize;
+    unsigned char *r;
+    if (s->at >= s->n) {
+        ssize_t k = pread(s->fd, s->buf, PAGESRC_RECS * rec, (off_t)s->off);
+        if (k < (ssize_t)rec) return -1;
+        s->n = (size_t)k - (size_t)k % rec; s->at = 0; s->off += (sqlite3_int64)s->n;
+    }
+    r = s->buf + s->at; s->at += rec;
+    *pPgno = ((unsigned)r[0] << 24) | ((unsigned)r[1] << 16) | ((unsigned)r[2] << 8) | r[3];
+    *pFlags = ((unsigned)r[4] << 8) | r[5];
+    *pBody = r + 6;
+    if (*pPgno == 0 || *pPgno <= s->last) return -1;           /* in page order, as the decoder holds a batch in memory */
+    s->last = *pPgno;
+    return 1;
+}
+
 static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     HpplitePageBatch *b = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
+    PageSrc src;
+    memset(&src, 0, sizeof src);
+    src.xNext = pagesrc_mem; src.b = b;
+    return node_apply_pagesrc(node, batch, b, &src);
+}
+
+static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, HpplitePageBatch *b, PageSrc *src) {
     const char *zFile = sqlite3_db_filename(node->db, "main");
     sqlite3 *adb = NULL;
     sqlite3_file *pf = NULL;
@@ -1721,17 +1762,20 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     page = sqlite3_malloc64((sqlite3_uint64)b->pageSize);
     if (rc == SQLITE_OK && (!pf || !pf->pMethods || !page)) rc = SQLITE_ERROR;
     for (i = 0; rc == SQLITE_OK && i < b->nPages; i++) {
-        sqlite3_int64 off = (sqlite3_int64)(b->aPage[i].pgno - 1) * (sqlite3_int64)b->pageSize;
-        unsigned k;
-        if (b->aPage[i].flags & HPPLITE_PAGE_DIFF) {
+        unsigned rPgno = 0, rFlags = 0, k;
+        const unsigned char *rBody = NULL;
+        sqlite3_int64 off;
+        if (src->xNext(src, &rPgno, &rFlags, &rBody) != 1) { rc = SQLITE_CORRUPT; break; }
+        off = (sqlite3_int64)(rPgno - 1) * (sqlite3_int64)b->pageSize;
+        if (rFlags & HPPLITE_PAGE_DIFF) {
             rc = pf->pMethods->xRead(pf, page, (int)b->pageSize, off);
             if (rc == SQLITE_IOERR_SHORT_READ) rc = SQLITE_OK;          /* a diff onto a page the file does not have yet reads as zeros */
             if (rc != SQLITE_OK) break;
-            for (k = 0; k < b->pageSize; k++) page[k] ^= b->aPage[i].body[k];
-        } else memcpy(page, b->aPage[i].body, b->pageSize);
-        if (b->aPage[i].pgno == 1) { counter = ((unsigned)page[24] << 24) | ((unsigned)page[25] << 16) | ((unsigned)page[26] << 8) | page[27]; page[18] = page[19] = 1; }
+            for (k = 0; k < b->pageSize; k++) page[k] ^= rBody[k];
+        } else memcpy(page, rBody, b->pageSize);
+        if (rPgno == 1) { counter = ((unsigned)page[24] << 24) | ((unsigned)page[25] << 16) | ((unsigned)page[26] << 8) | page[27]; page[18] = page[19] = 1; }
         rc = pf->pMethods->xWrite(pf, page, (int)b->pageSize, off);
-        if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, b->aPage[i].pgno, page);
+        if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, rPgno, page);
     }
     if (rc == SQLITE_OK) {
         /* page 1 as the file has it: the counters moved, rollback-journal mode */
@@ -2411,14 +2455,125 @@ static uint8_t *node_store_get_checked(HppliteNode *node, const char *zRef, cons
 ** 1 started there; 0 not (from batch 1; why said when a snapshot was
 ** refused); -1 the file could not be written.
 */
+/* A file written as bytes come */
+#define PB_TAIL_MAX (40 + 255)                  /* a page batch's trailer and its longest name */
+typedef struct SnapFile { int fd; uint64_t off; } SnapFile;
+static int snap_file_out(void *pArg, const uint8_t *p, size_t n) {
+    SnapFile *f = pArg;
+    size_t put = 0;
+    while (put < n) {
+        ssize_t k = pwrite(f->fd, p + put, n - put, (off_t)(f->off + put));
+        if (k <= 0) return -1;
+        put += (size_t)k;
+    }
+    f->off += n;
+    return 0;
+}
+/* a chunk as it comes: hashed and written at its place in the file */
+typedef struct SnapChunk { SnapFile f; SHA256_CTX sha; int failed; } SnapChunk;
+static int snap_chunk_out(void *pArg, const uint8_t *p, size_t n) {
+    SnapChunk *c = pArg;
+    hpplite_sha256_update(&c->sha, p, n);
+    if (snap_file_out(&c->f, p, n) != 0) { c->failed = 1; return -1; }
+    return 0;
+}
+static int read_full(int fd, uint8_t *p, size_t n, uint64_t off) {
+    size_t got = 0;
+    while (got < n) {
+        ssize_t k = pread(fd, p + got, n - got, (off_t)(off + got));
+        if (k <= 0) return -1;
+        got += (size_t)k;
+    }
+    return 0;
+}
+
+/* A snapshot's posted bytes, kept in a file, opened into its image in another (#364: never whole in memory): the keys as
+** node_decode_batch tries them, the tag checked over the whole before a byte of it is used, then opened and inflated as
+** a stream. NULL, and *pImgLen the image's length; or why not */
+static const char *node_snapshot_open_file(HppliteNode *node, uint64_t h, const char *zSealed, uint64_t len, const char *zImage, uint64_t *pImgLen) {
+    int fd = open(zSealed, O_RDONLY | O_CLOEXEC), encoding = HPPLITE_ENCODING_NONE, foreign = 0, rc;
+    uint8_t head[4096], tag[16], *buf = NULL;
+    size_t avail = 0, headLen = 0, tagLen = 0, n;
+    HppliteSealStream *mac = NULL, *dec = NULL;
+    const HppliteCipher *scheme = NULL;
+    HppliteInflateStream *inf = NULL;
+    SnapFile out = { -1, 0 };
+    uint64_t at, end = 0;
+    const char *why = NULL;
+    *pImgLen = 0;
+    if (fd < 0) return "its chunks could not be read back";
+    avail = len < sizeof head ? (size_t)len : sizeof head;
+    if (read_full(fd, head, avail, 0) != 0) why = "its chunks could not be read back";
+    else if (hpplite_envelope_is_pk(head, avail)) {
+        /* sealed to readers' keys (#15): the wallet's key, then a viewing key */
+        const uint8_t *aKey[2] = { node->config.hasPrivkey ? node->config.privkey : NULL, node->hasViewKey ? node->viewKey : NULL };
+        int k;
+        for (k = 0; k < 2 && !mac; k++) {
+            if (!aKey[k]) continue;
+            mac = hpplite_envelope_open_stream_pk(aKey[k], h, head, avail, len, &headLen, &encoding, &foreign);
+            if (mac) dec = hpplite_envelope_open_stream_pk(aKey[k], h, head, avail, len, &headLen, &encoding, &foreign);
+        }
+        if (!mac || !dec) why = "it is sealed to readers this node's keys are not among";
+        tagLen = 16;
+    } else if (hpplite_envelope_is_sealed(head, avail)) {
+        if (!node->hasEncKey) why = "it is encrypted and this node has no key";
+        else {
+            mac = hpplite_envelope_open_stream(node->encKey, h, head, avail, len, &headLen, &encoding, &scheme);
+            dec = hpplite_envelope_open_stream(node->encKey, h, head, avail, len, &headLen, &encoding, &scheme);
+            if (!mac || !dec) why = scheme ? "it does not open with this node's keys" : "an unknown encryption scheme";
+        }
+        tagLen = 16;
+    } else if (node->cipher) why = "it is plaintext on an encrypting rollup";
+    else if (hpplite_is_plain_compressed(head, avail)) { headLen = HPPLITE_PLAIN_MAGIC_LEN; encoding = HPPLITE_ENCODING_DEFLATE; }
+    if (!why && len < headLen + tagLen) why = "it is too short";
+    if (!why && encoding != HPPLITE_ENCODING_DEFLATE && encoding != HPPLITE_ENCODING_NONE) why = "it uses an encoding this version does not know";
+    if (!why && !(buf = malloc(1 << 20))) why = "out of memory";
+    end = len - tagLen;
+    if (!why && mac) {
+        /* the tag over the whole first: nothing is written from bytes it does not cover */
+        for (at = headLen; !why && at < end; at += n) {
+            n = end - at < (1u << 20) ? (size_t)(end - at) : (1u << 20);
+            if (read_full(fd, buf, n, at) != 0) why = "its chunks could not be read back";
+            else hpplite_open_stream_mac(mac, buf, n);
+        }
+        if (!why && read_full(fd, tag, 16, end) != 0) why = "its chunks could not be read back";
+        rc = why ? -1 : hpplite_open_stream_final(mac, tag);
+        if (why) hpplite_seal_stream_free(mac);
+        mac = NULL;
+        if (!why && rc != 0) why = "it does not open with this node's keys";
+    }
+    if (!why && (out.fd = open(zImage, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)) < 0) why = "its image could not be written to disk";
+    if (!why && encoding == HPPLITE_ENCODING_DEFLATE && !(inf = hpplite_inflate_stream_new(snap_file_out, &out))) why = "out of memory";
+    for (at = headLen; !why && at < end; at += n) {
+        n = end - at < (1u << 20) ? (size_t)(end - at) : (1u << 20);
+        if (read_full(fd, buf, n, at) != 0) { why = "its chunks could not be read back"; break; }
+        if (dec) hpplite_open_stream_update(dec, buf, buf, n);
+        if ((inf ? hpplite_inflate_stream_write(inf, buf, n) : snap_file_out(&out, buf, n)) != 0) why = inf ? "its compressed bytes do not inflate" : "its image could not be written to disk";
+    }
+    if (inf) { rc = hpplite_inflate_stream_finish(inf); inf = NULL; if (!why && rc != 0) why = "its compressed bytes do not inflate"; }
+    hpplite_seal_stream_free(mac);
+    hpplite_seal_stream_free(dec);                         /* its tag was checked by the pass before */
+    free(buf);
+    close(fd);
+    if (out.fd >= 0) { if (!why && fsync(out.fd) != 0) {} close(out.fd); }
+    (void)foreign;
+    *pImgLen = out.off;
+    return why;
+}
+
 static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, int earliest) {
     HppliteCtx *ctx = node->ctx;
     cJSON *m, *ix = NULL, *chunks = NULL, *c;
     uint64_t h = 0;
     int64_t at = 0;
     char zIndex[64];
-    uint8_t *text = NULL, *all = NULL;
-    size_t n = 0, total = 0, want = 0;
+    uint8_t *text = NULL;
+    size_t n = 0, total = 0, want = 0, recOff = 0;
+    char *zSealed = NULL, *zImage = NULL;
+    uint64_t imgLen = 0;
+    int fdImg = -1;
+    HpplitePageBatch *pb = NULL;
+    const char *zDb = sqlite3_db_filename(node->db, "main");
     unsigned char root[32], chain[32], block[32], ixSha[32];
     HppliteRange r;
     HppliteBatch *batch = NULL;
@@ -2454,43 +2609,73 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
     }
     hpplite_l1_range_clear(&r);
     if (!why) {
+        /* the chunks to a file beside the database, one in memory at a time (#364), each checked by its sha-256 */
+        int fd;
+        zSealed = sqlite3_mprintf("%s-hpplite-snapshot", zDb);
+        zImage = sqlite3_mprintf("%s-hpplite-image", zDb);
+        fd = zSealed && zImage ? open(zSealed, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1;
+        if (fd < 0) why = "its chunks could not be kept on disk";
         cJSON_ArrayForEach(c, chunks) {
             const cJSON *ref = cJSON_GetObjectItemCaseSensitive(c, "ref"), *sha = cJSON_GetObjectItemCaseSensitive(c, "sha256");
             unsigned char d[32];
-            uint8_t *part = NULL, *grown;
-            if (cJSON_IsString(ref) && json_hex32(sha, d))
-                part = node_store_get_checked(node, ref->valuestring, d, &n);
-            if (!part) { why = "a chunk is not at the store, or not the one the index names"; break; }
-            grown = realloc(all, total + n);
-            if (!grown) { free(part); why = "out of memory"; break; }
-            all = grown; memcpy(all + total, part, n); total += n; free(part);
+            SnapChunk sc;
+            unsigned char got[32];
+            if (why) break;
+            memset(&sc, 0, sizeof sc);
+            sc.f.fd = fd; sc.f.off = total;
+            hpplite_sha256_init(&sc.sha);
+            n = 0;
+            if (!cJSON_IsString(ref) || !json_hex32(sha, d) || hpplite_store_get_to(node->store, ref->valuestring, snap_chunk_out, &sc, &n) != 0 || sc.failed)
+                { why = sc.failed ? "its chunks could not be kept on disk" : "a chunk is not at the store, or not the one the index names"; break; }
+            hpplite_sha256_final(&sc.sha, got);
+            if (memcmp(got, d, 32) != 0) { why = "a chunk is not at the store, or not the one the index names"; break; }
+            total += n;
         }
+        if (fd >= 0) close(fd);
         if (!why && total != want) why = "its chunks do not add up to its size";
     }
-    if (!why && !(batch = node_decode_batch(node, h, all, total))) why = "it does not open with this node's keys";
-    if (!why && !batch->bPages) why = "it is not a page image";
+    if (!why) why = node_snapshot_open_file(node, h, zSealed, total, zImage, &imgLen);
+    if (zSealed) unlink(zSealed);
     if (!why) {
-        HpplitePageBatch *pb = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
-        /* every page, but the lock-byte page within the file (#363) */
-        if (!pb || pb->nPages + (hpplite_lock_page((int)pb->pageSize) <= pb->commitSize) != pb->commitSize || pb->bMore || memcmp(pb->root, root, 32) != 0) why = "its image is not the anchored state";
-        if (pb) hpplite_pagebatch_free(pb);
+        /* the image's header and trailer: every page, but the lock-byte page within the file (#363), at the anchored root */
+        uint8_t head[64], tail[PB_TAIL_MAX];
+        size_t nHead = imgLen < sizeof head ? (size_t)imgLen : sizeof head, nTail = imgLen < sizeof tail ? (size_t)imgLen : sizeof tail;
+        fdImg = open(zImage, O_RDONLY | O_CLOEXEC);
+        if (fdImg < 0 || read_full(fdImg, head, nHead, 0) != 0 || read_full(fdImg, tail, nTail, imgLen - nTail) != 0
+            || !(pb = hpplite_pagebatch_decode_ends(head, nHead, tail, nTail, imgLen, &recOff)))
+            why = "it is not a page image";
+        else if (pb->nPages + (hpplite_lock_page((int)pb->pageSize) <= pb->commitSize) != pb->commitSize || pb->bMore || memcmp(pb->root, root, 32) != 0)
+            why = "its image is not the anchored state";
+        if (pb) pb->zName = NULL;                            /* it pointed into tail */
     }
-    free(all);
     cJSON_Delete(ix);
+    if (!why && !(batch = sqlite3_malloc64(sizeof(*batch)))) why = "out of memory";
     if (why) {
-        if (batch) hpplite_batch_free(batch);
+        hpplite_pagebatch_free(pb);
+        if (fdImg >= 0) close(fdImg);
+        if (zImage) unlink(zImage);
+        sqlite3_free(zSealed); sqlite3_free(zImage);
         fprintf(stderr, "hpplite: the snapshot at height %llu is not used (%s): replaying from batch 1\n", (unsigned long long)h, why);
         return 0;
     }
-    batch->height = h;
+    memset(batch, 0, sizeof(*batch));
+    batch->height = h; batch->bPages = 1;
     node->snapApply = 1; memcpy(node->snapChain, chain, 32); memcpy(node->snapBlock, block, 32);
-    if (node_apply_pages(node, batch) != SQLITE_OK) {
+    {
+        PageSrc src;
+        int arc;
+        memset(&src, 0, sizeof src);
+        src.xNext = pagesrc_file; src.fd = fdImg; src.off = (sqlite3_int64)recOff; src.pageSize = pb->pageSize;
+        src.buf = malloc(PAGESRC_RECS * (6 + (size_t)pb->pageSize));
+        arc = src.buf ? node_apply_pagesrc(node, batch, pb, &src) : (hpplite_pagebatch_free(pb), SQLITE_NOMEM);   /* it frees pb */
+        free(src.buf);
+        close(fdImg);
+        unlink(zImage);
+        sqlite3_free(zSealed); sqlite3_free(zImage);
         node->snapApply = 0;
         hpplite_batch_free(batch);
-        return -1;
+        if (arc != SQLITE_OK) return -1;
     }
-    node->snapApply = 0;
-    hpplite_batch_free(batch);
     hpplite_set_checkpoint(ctx, h, root);           /* the root the chain anchored there: as a checkpoint */
     node->lastCheckpointHeight = h;
     node->snapHeight = h;

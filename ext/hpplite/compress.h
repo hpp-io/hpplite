@@ -34,6 +34,13 @@ HppliteDeflateStream *hpplite_deflate_stream_new(uint64_t totalLen, int level, i
 int hpplite_deflate_stream_write(HppliteDeflateStream *d, const uint8_t *in, size_t n);
 int hpplite_deflate_stream_finish(HppliteDeflateStream *d);
 void hpplite_deflate_stream_free(HppliteDeflateStream *d);
+/* ...and inflated streamed: the form's bytes in pieces (its 4-byte length first), the original to xOut as it comes;
+** _finish returns 0 only when the stream ended at exactly the length it said, and frees it */
+typedef struct HppliteInflateStream HppliteInflateStream;
+HppliteInflateStream *hpplite_inflate_stream_new(int (*xOut)(void *, const uint8_t *, size_t), void *pArg);
+int hpplite_inflate_stream_write(HppliteInflateStream *d, const uint8_t *in, size_t n);
+int hpplite_inflate_stream_finish(HppliteInflateStream *d);
+void hpplite_inflate_stream_free(HppliteInflateStream *d);
 /* the same at a chosen zlib level: 1 for page diffs, mostly zeros, where speed matters (#146) */
 uint8_t *hpplite_deflate_level(const uint8_t *in, size_t n, int level, size_t *pOut);
 
