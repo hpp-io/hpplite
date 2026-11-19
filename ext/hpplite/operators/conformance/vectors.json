@@ -252,6 +252,54 @@
    }
   ]
  },
+ "permit2Messages": {
+  "chainId": 181228,
+  "messages": [
+   {
+    "authorization": {
+     "deadline": "1800000120",
+     "from": "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     "nonce": "136925200606433371772746074862717622148",
+     "permitted": {
+      "amount": "300000000000000000",
+      "token": "0xb48334e7938367bc24fe1f19000d6f06c622e6c7"
+     },
+     "spender": "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002",
+     "witness": {
+      "facilitator": "0xaA03c7BD2fAf554db507D78CD3bF126a3DD2E033",
+      "to": "0x9797979797979797979797979797979797979797",
+      "validAfter": "1799999400"
+     }
+    },
+    "digest": "0x9f51e37161730f841655fc0fa025e4f5e41b045379dc31c3ccd8e5275f2f3928",
+    "key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+    "signature": "0xfedd028b65927f8233f2d4f1c4f8aea5db4057094bf84e56e26c8671c6903dcc7f465368d060ca9847ecba2da1464d33db285fd88e9077118a13d0306d8f516a1c",
+    "type": "PermitWitnessTransferFrom"
+   },
+   {
+    "authorization": {
+     "deadline": "1831536000",
+     "from": "0x17c5185167401ed00cf5f5b2fc97d9bbfdb7d025",
+     "nonce": "1",
+     "permitted": {
+      "amount": "100000000000000000000",
+      "token": "0x0Ac610E77ec39AB5c6B402B376548Ac02ACc5a48"
+     },
+     "spender": "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002",
+     "witness": {
+      "facilitator": "0xaA03c7BD2fAf554db507D78CD3bF126a3DD2E033",
+      "to": "0x9797979797979797979797979797979797979797",
+      "validAfter": "0"
+     }
+    },
+    "digest": "0x0dc85c614743313594b080011b72045054d1ba5021b8d6f961333d7c84b33c5c",
+    "key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+    "signature": "0x5af2d5e48a27548690f5d3d389b015db26049576fb463b3f0889b941a3b55b9f6bbb6f59bb575143f0a9f6b07a881fe33c80ff63ee83a5d42eed01f532f7ecaa1c",
+    "type": "PermitWitnessTransferFrom"
+   }
+  ],
+  "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+ },
  "relayCalls": {
   "factoryVersion": 10,
   "selectors": {

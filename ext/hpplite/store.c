@@ -471,9 +471,9 @@ static void permitDigestW(const char *zName, const char *zVersion, uint64_t chai
     typedHash(domain, h, out);
 }
 
-void hpplite_eip712_transfer_digest(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
-                                    const unsigned char from[20], const unsigned char to[20], uint64_t value, uint64_t validAfter,
-                                    uint64_t validBefore, const unsigned char nonce[32], unsigned char out[32]) {
+static void transferDigestW(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
+                            const unsigned char from[20], const unsigned char to[20], const unsigned char valueW[32], uint64_t validAfter,
+                            uint64_t validBefore, const unsigned char nonce[32], unsigned char out[32]) {
     static const char zTransferType[] = "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)";
     unsigned char w[32 * 7], domain[32], c[32], h[32];
     memset(c, 0, 32); memcpy(c + 12, asset, 20);
@@ -481,11 +481,57 @@ void hpplite_eip712_transfer_digest(const char *zName, const char *zVersion, uin
     hpplite_keccak256((const unsigned char *)zTransferType, sizeof(zTransferType) - 1, w);
     memset(w + 32, 0, 32); memcpy(w + 44, from, 20);
     memset(w + 64, 0, 32); memcpy(w + 76, to, 20);
-    wordInt(value, w + 96);
+    memcpy(w + 96, valueW, 32);
     wordInt(validAfter, w + 128);
     wordInt(validBefore, w + 160);
     memcpy(w + 192, nonce, 32);
     hpplite_keccak256(w, sizeof w, h);
+    typedHash(domain, h, out);
+}
+void hpplite_eip712_transfer_digest(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
+                                    const unsigned char from[20], const unsigned char to[20], uint64_t value, uint64_t validAfter,
+                                    uint64_t validBefore, const unsigned char nonce[32], unsigned char out[32]) {
+    unsigned char v[32];
+    wordInt(value, v);
+    transferDigestW(zName, zVersion, chainId, asset, from, to, v, validAfter, validBefore, nonce, out);
+}
+
+/* x402 upto (#358): the canonical Permit2 and x402's upto proxy, at these addresses on every chain */
+static const char zPermit2[] = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+static const char zUptoProxy[] = "0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002";
+
+/* What an upto payment signs: Permit2's PermitWitnessTransferFrom of the token to x402's upto proxy, the witness
+** naming who is paid and the facilitator that may settle it. Permit2's domain has a name and no version */
+void hpplite_eip712_permit2_upto_digest(uint64_t chainId, const unsigned char token[20], const unsigned char amountW[32],
+                                        const unsigned char nonceW[32], uint64_t deadline, const unsigned char to[20],
+                                        const unsigned char facilitator[20], uint64_t validAfter, unsigned char out[32]) {
+    static const char zDomainType[] = "EIP712Domain(string name,uint256 chainId,address verifyingContract)";
+    static const char zTokenType[] = "TokenPermissions(address token,uint256 amount)";
+    static const char zWitnessType[] = "Witness(address to,address facilitator,uint256 validAfter)";
+    static const char zType[] = "PermitWitnessTransferFrom(TokenPermissions permitted,address spender,uint256 nonce,uint256 deadline,Witness witness)"
+                                "TokenPermissions(address token,uint256 amount)Witness(address to,address facilitator,uint256 validAfter)";
+    unsigned char w[32 * 6], domain[32], tp[32], wh[32], h[32];
+    hpplite_keccak256((const unsigned char *)zDomainType, sizeof zDomainType - 1, w);
+    hpplite_keccak256((const unsigned char *)"Permit2", 7, w + 32);
+    wordInt(chainId, w + 64);
+    wordAddress(zPermit2, w + 96);
+    hpplite_keccak256(w, 32 * 4, domain);
+    hpplite_keccak256((const unsigned char *)zTokenType, sizeof zTokenType - 1, w);
+    memset(w + 32, 0, 32); memcpy(w + 44, token, 20);
+    memcpy(w + 64, amountW, 32);
+    hpplite_keccak256(w, 32 * 3, tp);
+    hpplite_keccak256((const unsigned char *)zWitnessType, sizeof zWitnessType - 1, w);
+    memset(w + 32, 0, 32); memcpy(w + 44, to, 20);
+    memset(w + 64, 0, 32); memcpy(w + 76, facilitator, 20);
+    wordInt(validAfter, w + 96);
+    hpplite_keccak256(w, 32 * 4, wh);
+    hpplite_keccak256((const unsigned char *)zType, sizeof zType - 1, w);
+    memcpy(w + 32, tp, 32);
+    wordAddress(zUptoProxy, w + 64);
+    memcpy(w + 96, nonceW, 32);
+    wordInt(deadline, w + 128);
+    memcpy(w + 160, wh, 32);
+    hpplite_keccak256(w, 32 * 6, h);
     typedHash(domain, h, out);
 }
 
@@ -501,32 +547,195 @@ static uint64_t jnum(cJSON *o, const char *k) {
     return 0;
 }
 
-/* A payment for one 402: the PAYMENT-SIGNATURE value (sqlite3_mprintf), or NULL with the reason in s->error */
+/* One word read from the chain (#358): a token's view of one or two addresses - nonces(owner),
+** allowance(owner, spender). 0 and the word, or -1 */
+static int chainWord(HppliteStore *s, uint64_t chainId, const unsigned char token[20], uint32_t selector, const unsigned char *a,
+                     const unsigned char *b, unsigned char out[32]) {
+    unsigned char call[68], *res;
+    size_t n = 0, len = 4;
+    EthClient *e;
+    if (!s->rpc || !(e = eth_client_create(s->rpc, chainId))) return -1;
+    call[0] = (unsigned char)(selector >> 24); call[1] = (unsigned char)(selector >> 16); call[2] = (unsigned char)(selector >> 8); call[3] = (unsigned char)selector;
+    if (a) { memset(call + len, 0, 12); memcpy(call + len + 12, a, 20); len += 32; }
+    if (b) { memset(call + len, 0, 12); memcpy(call + len + 12, b, 20); len += 32; }
+    res = eth_client_call(e, token, call, len, &n);
+    eth_client_destroy(e);
+    if (!res || n < 32) { free(res); return -1; }
+    memcpy(out, res, 32);
+    free(res);
+    return 0;
+}
+/* A token's permit nonce read from the chain (#358): nonces(owner). 0 and the nonce, or -1 */
+static int chainNonce(HppliteStore *s, uint64_t chainId, const unsigned char token[20], const unsigned char owner[20], uint64_t *pNonce) {
+    unsigned char w[32];
+    int i;
+    if (chainWord(s, chainId, token, 0x7ecebe00, owner, NULL, w) != 0) return -1;
+    *pNonce = 0;
+    for (i = 24; i < 32; i++) *pNonce = (*pNonce << 8) | w[i];
+    return 0;
+}
+
+/* A 402's offer as a payment takes it */
+typedef struct PayOffer {
+    const char *zAsset, *zAmount, *zPayTo, *zName, *zVersion, *zFacilitator;
+    unsigned char assetW[32], payToW[32], amtW[32], nonce[32];
+    uint64_t chainId, now, maxTimeout;
+    int takesPermit;                /* the 402 declares eip2612GasSponsoring: the facilitator sends the wallet's approval of Permit2 */
+    HppliteKeypair *kp;             /* who pays */
+    const unsigned char *from;
+    char fromHex[43];
+} PayOffer;
+
+/* exact: an EIP-3009 TransferWithAuthorization of the amount, in the token's own domain. 0, or -1 and s->error */
+static int payExact(HppliteStore *s, const PayOffer *p, cJSON *inner) {
+    uint64_t validAfter = p->now - 60, validBefore = p->now + s->validFor;
+    unsigned char digest[32], sig[65];
+    char nonceHex[67], sigHex[133], num[32];
+    cJSON *auth;
+    transferDigestW(p->zName, p->zVersion, p->chainId, p->assetW + 12, p->from, p->payToW + 12, p->amtW, validAfter, validBefore, p->nonce, digest);
+    if (signWith(s, p->kp, digest, sig) != 0) { snprintf(s->error, sizeof s->error, "could not sign the payment"); return -1; }
+    lowerHex(p->nonce, 32, nonceHex);
+    lowerHex(sig, 65, sigHex);                              /* r, s, then v: the 65-byte form ecrecover expects */
+    auth = cJSON_CreateObject();
+    cJSON_AddStringToObject(auth, "from", p->fromHex);
+    cJSON_AddStringToObject(auth, "to", p->zPayTo);
+    cJSON_AddStringToObject(auth, "value", p->zAmount);
+    snprintf(num, sizeof num, "%llu", (unsigned long long)validAfter);
+    cJSON_AddStringToObject(auth, "validAfter", num);
+    snprintf(num, sizeof num, "%llu", (unsigned long long)validBefore);
+    cJSON_AddStringToObject(auth, "validBefore", num);
+    cJSON_AddStringToObject(auth, "nonce", nonceHex);
+    cJSON_AddStringToObject(inner, "signature", sigHex);
+    cJSON_AddItemToObject(inner, "authorization", auth);
+    return 0;
+}
+
+/* upto (#358), as @x402/evm makes it: a Permit2 PermitWitnessTransferFrom of the amount to x402's upto proxy, the
+** witness naming payTo and the facilitator. Permit2 moves the token on the wallet's allowance to it: where that is
+** short, the wallet's EIP-2612 permit to Permit2 goes with the payment and the facilitator sends it, when the 402
+** says it takes one - a wallet with the token and no ETH pays. 0, or -1 and s->error */
+static int payUpto(HppliteStore *s, const PayOffer *p, cJSON *inner, cJSON *exts) {
+    const char *who = s->isRelay ? "relay" : "store";
+    uint64_t deadline = p->now + (p->maxTimeout > s->validFor ? p->maxTimeout : s->validFor), validAfter = p->now - 600;
+    unsigned char facW[32], p2W[32], nonceW[32], allowW[32], digest[32], sig[65];
+    char sigHex[133], num[48], deadlineNum[32];
+    cJSON *auth, *o;
+    u128 nv = 0;
+    int i;
+    if (wordAddress(p->zFacilitator, facW) != 0) { snprintf(s->error, sizeof s->error, "the %s's upto offer names no facilitator", who); return -1; }
+    wordAddress(zPermit2, p2W);
+    if (chainWord(s, p->chainId, p->assetW + 12, 0xdd62ed3e, p->from, p2W + 12, allowW) != 0) {      /* allowance(owner, spender) */
+        snprintf(s->error, sizeof s->error, "paying the %s in %s (upto) reads the wallet's allowance to Permit2 from the chain, and it could not be read", who, p->zName);
+        return -1;
+    }
+    snprintf(deadlineNum, sizeof deadlineNum, "%llu", (unsigned long long)deadline);
+    if (memcmp(allowW, p->amtW, 32) < 0) {
+        uint64_t permitNonce = 0;
+        cJSON *info;
+        if (!p->takesPermit) {
+            snprintf(s->error, sizeof s->error, "the wallet %s has not approved Permit2 (%s) for %s, and the %s takes no approval with the payment: approve it from the wallet once",
+                     p->fromHex, zPermit2, p->zName, who);
+            return -1;
+        }
+        if (chainNonce(s, p->chainId, p->assetW + 12, p->from, &permitNonce) != 0) {
+            snprintf(s->error, sizeof s->error, "paying the %s in %s (upto) reads the token's permit nonce from the chain, and it could not be read", who, p->zName);
+            return -1;
+        }
+        permitDigestW(p->zName, p->zVersion, p->chainId, p->assetW + 12, p->from, p2W + 12, p->amtW, permitNonce, deadline, digest);
+        if (signWith(s, p->kp, digest, sig) != 0) { snprintf(s->error, sizeof s->error, "could not sign the payment"); return -1; }
+        lowerHex(sig, 65, sigHex);
+        info = cJSON_CreateObject();
+        cJSON_AddStringToObject(info, "from", p->fromHex);
+        cJSON_AddStringToObject(info, "asset", p->zAsset);
+        cJSON_AddStringToObject(info, "spender", zPermit2);
+        cJSON_AddStringToObject(info, "amount", p->zAmount);
+        snprintf(num, sizeof num, "%llu", (unsigned long long)permitNonce);
+        cJSON_AddStringToObject(info, "nonce", num);
+        cJSON_AddStringToObject(info, "deadline", deadlineNum);
+        cJSON_AddStringToObject(info, "signature", sigHex);
+        cJSON_AddStringToObject(info, "version", "1");
+        o = cJSON_CreateObject();
+        cJSON_AddItemToObject(o, "info", info);
+        cJSON_AddItemToObject(exts, "eip2612GasSponsoring", o);
+    }
+    /* Permit2's nonces are unordered, any unused uint256: 128 bits of the hash, a decimal in the payload */
+    memset(nonceW, 0, 16); memcpy(nonceW + 16, p->nonce, 16);
+    for (i = 16; i < 32; i++) nv = (nv << 8) | nonceW[i];
+    hpplite_eip712_permit2_upto_digest(p->chainId, p->assetW + 12, p->amtW, nonceW, deadline, p->payToW + 12, facW + 12, validAfter, digest);
+    if (signWith(s, p->kp, digest, sig) != 0) { snprintf(s->error, sizeof s->error, "could not sign the payment"); return -1; }
+    lowerHex(sig, 65, sigHex);
+    auth = cJSON_CreateObject();
+    cJSON_AddStringToObject(auth, "from", p->fromHex);
+    o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "token", p->zAsset);
+    cJSON_AddStringToObject(o, "amount", p->zAmount);
+    cJSON_AddItemToObject(auth, "permitted", o);
+    cJSON_AddStringToObject(auth, "spender", zUptoProxy);
+    fmtU128(nv, num);
+    cJSON_AddStringToObject(auth, "nonce", num);
+    cJSON_AddStringToObject(auth, "deadline", deadlineNum);
+    o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "to", p->zPayTo);
+    cJSON_AddStringToObject(o, "facilitator", p->zFacilitator);
+    snprintf(num, sizeof num, "%llu", (unsigned long long)validAfter);
+    cJSON_AddStringToObject(o, "validAfter", num);
+    cJSON_AddItemToObject(auth, "witness", o);
+    cJSON_AddStringToObject(inner, "signature", sigHex);
+    cJSON_AddItemToObject(inner, "permit2Authorization", auth);
+    return 0;
+}
+
+/* What a token amount is in credit, micro-USD: the unit of the caps and of the ledger. The first asset's units are
+** credit; HPPLITE_PAY_ASSET's token is at the service's rate for it, rounded up (#358: 1 HPP is 1e18 units) */
+static uint64_t creditOf(HppliteStore *s, const char *zAsset, u128 amount) {
+    char payHex[43];
+    u128 scale = 1, c;
+    int i;
+    if (s->payHave) lowerHex(s->payAsset, 20, payHex);
+    if (!s->payHave || !zAsset || strcasecmp(zAsset, payHex) != 0) return amount > UINT64_MAX ? UINT64_MAX : (uint64_t)amount;
+    for (i = 0; i < s->payDecimals; i++) scale *= 10;
+    if (amount > (~(u128)0 - scale) / s->payUnitsPerToken) return UINT64_MAX;
+    c = (amount * s->payUnitsPerToken + scale - 1) / scale;
+    return c > UINT64_MAX ? UINT64_MAX : (uint64_t)c;
+}
+
+static long statusRead(HppliteStore *s);
+/* A payment for one 402: the PAYMENT-SIGNATURE value (sqlite3_mprintf), or NULL with the reason in s->error.
+** *pAmount is what it pays, in credit (micro-USD) */
 static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount) {
     size_t n = 0;
     unsigned char *json = b64decode(zRequired, &n);
     cJSON *req = json ? cJSON_Parse((const char *)json) : NULL;
-    cJSON *accepts = req ? cJSON_GetObjectItem(req, "accepts") : NULL, *acc = NULL, *it;
-    char *result = NULL;
+    cJSON *accepts = req ? cJSON_GetObjectItem(req, "accepts") : NULL, *acc = NULL, *accUpto = NULL, *it;
+    const char *who = s->isRelay ? "relay" : "store";
+    char *result = NULL, payHex[43] = "";
+    u128 amtTok = 0;
+    uint64_t amt = 0;
+    int upto = 0;
     free(json);
     if (!req) { snprintf(s->error, sizeof s->error, "402 without a readable PAYMENT-REQUIRED"); return NULL; }
+    if (s->payHave) lowerHex(s->payAsset, 20, payHex);
     cJSON_ArrayForEach(it, accepts) {
-        cJSON *scheme = cJSON_GetObjectItem(it, "scheme"), *ex = cJSON_GetObjectItem(it, "extra");
-        if (!scheme || !cJSON_IsString(scheme) || strcmp(scheme->valuestring, "exact") != 0 || acc) continue;
-        /* the token this node pays in (HPPLITE_PAY_ASSET, #358): that one's offer, else the first */
-        if (!s->payWant[0] || payMatches(s->payWant, jstr(ex, "name"), jstr(it, "asset"))) acc = it;
+        const char *sc = jstr(it, "scheme"), *za = jstr(it, "asset");
+        int isExact = sc && strcmp(sc, "exact") == 0, isUpto = sc && strcmp(sc, "upto") == 0;
+        if (!isExact && !isUpto) continue;
+        /* the token this node pays in (HPPLITE_PAY_ASSET, #358): that one's offers, else the first exact one */
+        if (s->payWant[0] && !(s->payHave ? (za && strcasecmp(za, payHex) == 0) : payMatches(s->payWant, jstr(cJSON_GetObjectItem(it, "extra"), "name"), za))) continue;
+        if (isExact && !acc) acc = it;
+        if (isUpto && !accUpto) accUpto = it;
     }
+    /* exact where the token has it (EIP-3009: one signature, no chain read); upto (Permit2) where that is all the
+    ** token has: HPP */
+    if (!acc && s->payWant[0] && accUpto) { acc = accUpto; upto = 1; }
+    if (acc && upto && !s->payHave) statusRead(s);         /* the service did not answer at open: its tokens' rates now */
     if (!acc && s->payWant[0]) {
-        /* the token is offered by upto only (HPP, Permit2), or not at all: said, nothing paid */
-        int upto = 0;
-        cJSON_ArrayForEach(it, accepts) {
-            cJSON *scheme = cJSON_GetObjectItem(it, "scheme"), *ex = cJSON_GetObjectItem(it, "extra");
-            if (scheme && cJSON_IsString(scheme) && strcmp(scheme->valuestring, "upto") == 0 && payMatches(s->payWant, jstr(ex, "name"), jstr(it, "asset"))) upto = 1;
-        }
-        snprintf(s->error, sizeof s->error, upto ? "the %s takes %s over x402 only by upto (Permit2), which this node does not sign yet (#358): a permit pays the store in it"
-                                                 : "the %s offers no x402 payment in %s (HPPLITE_PAY_ASSET)", s->isRelay ? "relay" : "store", s->payWant);
+        snprintf(s->error, sizeof s->error, "the %s offers no x402 payment in %s (HPPLITE_PAY_ASSET)", who, s->payWant);
         cJSON_Delete(req);
         return NULL;
+    }
+    if (acc) {
+        amtTok = parseU128(jstr(acc, "amount"));
+        amt = creditOf(s, jstr(acc, "asset"), amtTok);
     }
     if (acc && s->external) {
         /* funder= (#272): the account is the platform's; a 402 means it is not covered, and this node pays nothing */
@@ -534,17 +743,22 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
         const char *za = jstr(acc, "amount");
         lowerHex(s->fundAddr, 20, fund);
         snprintf(s->error, sizeof s->error, "waiting for the funder %s to cover the bucket: the %s asks %s (the node pays nothing with funder=)", fund,
-                 s->isRelay ? "relay" : "store", za ? za : "a top-up");
+                 who, za ? za : "a top-up");
         s->funderWait = 1;
+        cJSON_Delete(req);
+        return NULL;
+    }
+    if (acc && upto && !s->payHave) {
+        /* the caps are credit: without the token's rate from /status an upto amount cannot be held against them */
+        snprintf(s->error, sizeof s->error, "the %s's /status does not give %s's rate: its upto offer is not paid", who, s->payWant);
         cJSON_Delete(req);
         return NULL;
     }
     if (acc && s->spend) {
         /* HPPLITE_SPEND_CAP (#173): over the window's cap, nothing is signed; the batch waits as over HPPLITE_STORE_CAP */
-        uint64_t asked = strtoull(jstr(acc, "amount") ? jstr(acc, "amount") : "0", NULL, 10);
         char why[200];
-        if (hpplite_spend_allow(s->spend, asked, why, sizeof why) != 0) {
-            snprintf(s->error, sizeof s->error, "the %s asks %llu: %s; refused", s->isRelay ? "relay" : "store", (unsigned long long)asked, why);
+        if (hpplite_spend_allow(s->spend, amt, why, sizeof why) != 0) {
+            snprintf(s->error, sizeof s->error, "the %s asks %llu: %s; refused", who, (unsigned long long)amt, why);
             cJSON_Delete(req);
             return NULL;
         }
@@ -555,27 +769,33 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
               *payTo = cJSON_GetObjectItem(acc, "payTo"), *network = cJSON_GetObjectItem(acc, "network"),
               *extra = cJSON_GetObjectItem(acc, "extra");
         cJSON *name = extra ? cJSON_GetObjectItem(extra, "name") : NULL, *version = extra ? cJSON_GetObjectItem(extra, "version") : NULL;
-        uint64_t amt, chainId = 0;
         if (!amount || !cJSON_IsString(amount) || !asset || !cJSON_IsString(asset) || !payTo || !cJSON_IsString(payTo)
             || !network || !cJSON_IsString(network) || !name || !cJSON_IsString(name) || !version || !cJSON_IsString(version)) {
             snprintf(s->error, sizeof s->error, "the 402's offer is incomplete");
             cJSON_Delete(req);
             return NULL;
         }
-        amt = strtoull(amount->valuestring, NULL, 10);
         if (!s->hasKey) { snprintf(s->error, sizeof s->error, "the store asks %llu and this node has no key to pay with", (unsigned long long)amt); cJSON_Delete(req); return NULL; }
-        HppliteKeypair *payKp = s->v2 && s->hasFund ? &s->fundKp : &s->kp;          /* /2: the funding wallet pays (#214) */
-        const unsigned char *payAddr = s->v2 && s->hasFund ? s->fundAddr : s->address;
-        if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the %s asks %llu, %s is %llu: refused", s->isRelay ? "relay" : "store",
+        PayOffer p;
+        memset(&p, 0, sizeof p);
+        p.kp = s->v2 && s->hasFund ? &s->fundKp : &s->kp;          /* /2: the funding wallet pays (#214) */
+        p.from = s->v2 && s->hasFund ? s->fundAddr : s->address;
+        if (amt > s->cap) { snprintf(s->error, sizeof s->error, "the %s asks %llu, %s is %llu: refused", who,
                                      (unsigned long long)amt, s->isRelay ? "HPPLITE_RELAY_CAP" : "HPPLITE_STORE_CAP", (unsigned long long)s->cap); cJSON_Delete(req); return NULL; }
-        if (strncmp(network->valuestring, "eip155:", 7) == 0) chainId = strtoull(network->valuestring + 7, NULL, 10);
-        unsigned char assetW[32], payToW[32], digest[32], nonce[32], sig[65];
-        if (wordAddress(asset->valuestring, assetW) != 0) { snprintf(s->error, sizeof s->error, "bad asset address in the 402"); cJSON_Delete(req); return NULL; }
+        if (strncmp(network->valuestring, "eip155:", 7) == 0) p.chainId = strtoull(network->valuestring + 7, NULL, 10);
+        if (wordAddress(asset->valuestring, p.assetW) != 0) { snprintf(s->error, sizeof s->error, "bad asset address in the 402"); cJSON_Delete(req); return NULL; }
+        if (wordAddress(payTo->valuestring, p.payToW) != 0) { snprintf(s->error, sizeof s->error, "bad payTo in the 402"); cJSON_Delete(req); return NULL; }
+        wordU128(amtTok, p.amtW);
+        p.zAsset = asset->valuestring; p.zAmount = amount->valuestring; p.zPayTo = payTo->valuestring;
+        p.zName = name->valuestring; p.zVersion = version->valuestring; p.zFacilitator = jstr(extra, "facilitatorAddress");
+        p.maxTimeout = jnum(acc, "maxTimeoutSeconds");
+        p.takesPermit = cJSON_GetObjectItem(cJSON_GetObjectItem(req, "extensions"), "eip2612GasSponsoring") != NULL;
+        lowerHex(p.from, 20, p.fromHex);
 
         /* the window the chain checks the authorization against is the chain's time, not this host's: a host clock off
         ** by minutes (stepped back, never synced) would have every payment refused with nothing pointing at the clock */
         uint64_t host = (uint64_t)time(NULL), chainNow = s->xChainTime ? s->xChainTime(s->pChainTimeArg) : 0;
-        uint64_t now = chainNow ? chainNow : host, validAfter = now - 60, validBefore = now + s->validFor;
+        p.now = chainNow ? chainNow : host;
         if (!s->clockSaid && s->xChainTime && !chainNow) {
             fprintf(stderr, "hpplite: the chain's time could not be read for a payment to %s: its validity window is from this host's clock\n", s->url);
             s->clockSaid = 1;
@@ -587,52 +807,31 @@ static char *storePay(HppliteStore *s, const char *zRequired, uint64_t *pAmount)
             /* a nonce used once: time, the address, a counter and this store's identity, hashed (uniqueness, not secrecy) */
             unsigned char seed[84];
             static unsigned counter;
-            wordInt(now, seed);
-            memcpy(seed + 32, payAddr, 20);
+            wordInt(p.now, seed);
+            memcpy(seed + 32, p.from, 20);
             wordInt(++counter + (uint64_t)(uintptr_t)s, seed + 52);
-            hpplite_keccak256(seed, sizeof seed, nonce);
-        }
-        if (wordAddress(payTo->valuestring, payToW) != 0) { snprintf(s->error, sizeof s->error, "bad payTo in the 402"); cJSON_Delete(req); return NULL; }
-        hpplite_eip712_transfer_digest(name->valuestring, version->valuestring, chainId, assetW + 12, payAddr, payToW + 12, amt,
-                                       validAfter, validBefore, nonce, digest);
-        {
-            HppliteSignature hs;
-            unsigned char v;
-            if (hpplite_crypto_sign(s->crypto, payKp, digest, &hs) != 0) { snprintf(s->error, sizeof s->error, "could not sign the payment"); cJSON_Delete(req); return NULL; }
-            hpplite_sig_to_eth_format(&hs, &v, sig, sig + 32);   /* r, s, then v: the 65-byte form ecrecover expects */
-            sig[64] = v;
+            hpplite_keccak256(seed, sizeof seed, p.nonce);
         }
         /* the payload, as the spec lays it out */
         {
-            char fromHex[43], nonceHex[67], sigHex[133], *payloadJson, *b64;
-            cJSON *payload = cJSON_CreateObject(), *inner = cJSON_CreateObject(), *auth = cJSON_CreateObject();
-            char num[32];
-            snprintf(fromHex, sizeof fromHex, "0x");
-            hpplite_bytes_to_hex(payAddr, 20, fromHex + 2);
-            snprintf(nonceHex, sizeof nonceHex, "0x");
-            hpplite_bytes_to_hex(nonce, 32, nonceHex + 2);
-            snprintf(sigHex, sizeof sigHex, "0x");
-            hpplite_bytes_to_hex(sig, 65, sigHex + 2);
-            cJSON_AddNumberToObject(payload, "x402Version", 2);
-            if (cJSON_GetObjectItem(req, "resource")) cJSON_AddItemToObject(payload, "resource", cJSON_Duplicate(cJSON_GetObjectItem(req, "resource"), 1));
-            cJSON_AddItemToObject(payload, "accepted", cJSON_Duplicate(acc, 1));
-            cJSON_AddStringToObject(auth, "from", fromHex);
-            cJSON_AddStringToObject(auth, "to", payTo->valuestring);
-            cJSON_AddStringToObject(auth, "value", amount->valuestring);
-            snprintf(num, sizeof num, "%llu", (unsigned long long)validAfter);
-            cJSON_AddStringToObject(auth, "validAfter", num);
-            snprintf(num, sizeof num, "%llu", (unsigned long long)validBefore);
-            cJSON_AddStringToObject(auth, "validBefore", num);
-            cJSON_AddStringToObject(auth, "nonce", nonceHex);
-            cJSON_AddStringToObject(inner, "signature", sigHex);
-            cJSON_AddItemToObject(inner, "authorization", auth);
-            cJSON_AddItemToObject(payload, "payload", inner);
-            cJSON_AddItemToObject(payload, "extensions", cJSON_CreateObject());
-            payloadJson = cJSON_PrintUnformatted(payload);
-            cJSON_Delete(payload);
-            b64 = payloadJson ? b64encode((const unsigned char *)payloadJson, strlen(payloadJson)) : NULL;
-            free(payloadJson);
-            if (b64) { result = sqlite3_mprintf("PAYMENT-SIGNATURE: %s", b64); sqlite3_free(b64); }
+            cJSON *inner = cJSON_CreateObject(), *exts = cJSON_CreateObject();
+            if ((upto ? payUpto(s, &p, inner, exts) : payExact(s, &p, inner)) != 0) {
+                cJSON_Delete(inner);
+                cJSON_Delete(exts);
+            } else {
+                char *payloadJson, *b64;
+                cJSON *payload = cJSON_CreateObject();
+                cJSON_AddNumberToObject(payload, "x402Version", 2);
+                if (cJSON_GetObjectItem(req, "resource")) cJSON_AddItemToObject(payload, "resource", cJSON_Duplicate(cJSON_GetObjectItem(req, "resource"), 1));
+                cJSON_AddItemToObject(payload, "accepted", cJSON_Duplicate(acc, 1));
+                cJSON_AddItemToObject(payload, "payload", inner);
+                cJSON_AddItemToObject(payload, "extensions", exts);
+                payloadJson = cJSON_PrintUnformatted(payload);
+                cJSON_Delete(payload);
+                b64 = payloadJson ? b64encode((const unsigned char *)payloadJson, strlen(payloadJson)) : NULL;
+                free(payloadJson);
+                if (b64) { result = sqlite3_mprintf("PAYMENT-SIGNATURE: %s", b64); sqlite3_free(b64); }
+            }
         }
         if (pAmount) *pAmount = amt;
     }
@@ -672,6 +871,23 @@ static void cidOf(const uint8_t *data, size_t len, char out[64]) {
 }
 
 /* === The API === */
+
+/* HPPLITE_PAY_ASSET (#358) against a service's list of tokens (/status buckets.assets, a relay's accounts.assets):
+** the token of that name or address, with its EIP-712 domain and its rate */
+static void payResolve(HppliteStore *s, cJSON *assets) {
+    cJSON *it;
+    s->payHave = 0;
+    cJSON_ArrayForEach(it, assets) {
+        const char *za = jstr(it, "asset"), *zn = jstr(it, "name"), *zv = jstr(it, "version");
+        if (s->payHave || !za || strlen(za) != 42 || !zn || !zv || !payMatches(s->payWant, zn, za)) continue;
+        if (hpplite_hex_to_bytes(za + 2, s->payAsset, 20) < 0) continue;
+        snprintf(s->payName, sizeof s->payName, "%s", zn);
+        snprintf(s->payVersion, sizeof s->payVersion, "%s", zv);
+        s->payDecimals = (int)jnum(it, "decimals");
+        s->payUnitsPerToken = jnum(it, "unitsPerToken");
+        s->payHave = s->payUnitsPerToken > 0 && s->payDecimals >= 0 && s->payDecimals <= 30;
+    }
+}
 
 /* The provider's /status: its protocol, which key signs, in which domain, what it charges. The HTTP status */
 static long statusRead(HppliteStore *s) {
@@ -713,19 +929,7 @@ static long statusRead(HppliteStore *s) {
             snprintf(s->assetName, sizeof s->assetName, "%s", jstr(ad, "name") ? jstr(ad, "name") : "Bridged USDC");
             snprintf(s->assetVersion, sizeof s->assetVersion, "%s", jstr(ad, "version") ? jstr(ad, "version") : "2");
             if (s->payWant[0]) {
-                /* HPPLITE_PAY_ASSET (#358): the store's token of that name or address, with its domain and its rate */
-                cJSON *as = bk ? cJSON_GetObjectItem(bk, "assets") : NULL, *it;
-                s->payHave = 0;
-                cJSON_ArrayForEach(it, as) {
-                    const char *za = jstr(it, "asset"), *zn = jstr(it, "name"), *zv = jstr(it, "version");
-                    if (s->payHave || !za || strlen(za) != 42 || !zn || !zv || !payMatches(s->payWant, zn, za)) continue;
-                    if (hpplite_hex_to_bytes(za + 2, s->payAsset, 20) < 0) continue;
-                    snprintf(s->payName, sizeof s->payName, "%s", zn);
-                    snprintf(s->payVersion, sizeof s->payVersion, "%s", zv);
-                    s->payDecimals = (int)jnum(it, "decimals");
-                    s->payUnitsPerToken = jnum(it, "unitsPerToken");
-                    s->payHave = s->payUnitsPerToken > 0 && s->payDecimals >= 0 && s->payDecimals <= 30;
-                }
+                payResolve(s, bk ? cJSON_GetObjectItem(bk, "assets") : NULL);
                 if (!s->payHave) fprintf(stderr, "hpplite: HPPLITE_PAY_ASSET=%s: the store %s takes no such token; its first asset is used\n", s->payWant, s->url);
             }
             s->pricePerWrite = jnum(bk, "pricePerWrite");
@@ -739,6 +943,11 @@ static long statusRead(HppliteStore *s) {
                 cJSON *cid = domain ? cJSON_GetObjectItem(domain, "chainId") : NULL;
                 if (cid && cJSON_IsNumber(cid)) s->payChainId = (uint64_t)cid->valuedouble;
             }
+        }
+        if (strncmp(s->protocol, "hpplite-relay", 13) == 0 && s->payWant[0]) {
+            /* a relay's tokens (#358): accounts.assets, each with its rate */
+            payResolve(s, cJSON_GetObjectItem(cJSON_GetObjectItem(st, "accounts"), "assets"));
+            if (!s->payHave) fprintf(stderr, "hpplite: HPPLITE_PAY_ASSET=%s: the relay %s lists no such token\n", s->payWant, s->url);
         }
         cJSON *chainId = domain ? cJSON_GetObjectItem(domain, "chainId") : NULL;
         cJSON *contract = domain ? cJSON_GetObjectItem(domain, "verifyingContract") : NULL;
@@ -896,24 +1105,6 @@ static long postJson(HppliteStore *s, const char *path, cJSON *body, Buf *out) {
     return status;
 }
 
-/* A token's permit nonce read from the chain (#358): nonces(owner). 0 and the nonce, or -1 */
-static int chainNonce(HppliteStore *s, const unsigned char token[20], const unsigned char owner[20], uint64_t *pNonce) {
-    unsigned char call[36], *res;
-    size_t n = 0;
-    EthClient *e;
-    int i;
-    if (!s->rpc || !(e = eth_client_create(s->rpc, s->chainId))) return -1;
-    call[0] = 0x7e; call[1] = 0xce; call[2] = 0xbe; call[3] = 0x00;        /* nonces(address) */
-    memset(call + 4, 0, 12); memcpy(call + 16, owner, 20);
-    res = eth_client_call(e, token, call, sizeof call, &n);
-    eth_client_destroy(e);
-    if (!res || n < 32) { free(res); return -1; }
-    *pNonce = 0;
-    for (i = 24; i < 32; i++) *pNonce = (*pNonce << 8) | res[i];
-    free(res);
-    return 0;
-}
-
 /* The permit: given when there is none, it nears its deadline (30 days) or its allowance runs low (a quarter). In the
 ** token HPPLITE_PAY_ASSET names (#358): HPPLITE_STORE_PERMIT is credit (micro-USD), in the token's units at its rate */
 static void ensurePermit(HppliteStore *s) {
@@ -954,7 +1145,7 @@ static void ensurePermit(HppliteStore *s) {
         /* the nonce the store says is its permit token's: the chosen token's when that is the one, else the chain's */
         const char *aa = a ? jstr(a, "asset") : NULL;
         nonce = a ? jnum(a, "permitNonce") : 0;
-        if (s->payHave && (!aa || strcasecmp(aa, assetHex) != 0) && chainNonce(s, tok, s->fundAddr, &nonce) != 0) {
+        if (s->payHave && (!aa || strcasecmp(aa, assetHex) != 0) && chainNonce(s, s->chainId, tok, s->fundAddr, &nonce) != 0) {
             fprintf(stderr, "hpplite: a permit in %s needs the token's nonce from the chain, and it could not be read (rpc=?): not given\n", zName);
             cJSON_Delete(a);
             s->permitChecked = 0;
@@ -1296,7 +1487,7 @@ static int protocolOk(HppliteStore *s) {
     return -1;
 }
 
-/* A POST the provider may charge for: a 402 paid in x402's exact scheme, once */
+/* A POST the provider may charge for: a 402 paid over x402 (exact, or upto: storePay), once */
 static long paidPost(HppliteStore *s, const char *path, const uint8_t *body, size_t len, const char *zHeader, Buf *out) {
     char *zRequired = NULL, *zResponse = NULL;
     long status = storeRequest(s, "POST", path, body, len, zHeader, out, &zRequired, NULL);

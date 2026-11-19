@@ -91,6 +91,11 @@ void hpplite_eip712_permit_digest(const char *zName, const char *zVersion, uint6
 void hpplite_eip712_transfer_digest(const char *zName, const char *zVersion, uint64_t chainId, const unsigned char asset[20],
                                     const unsigned char from[20], const unsigned char to[20], uint64_t value, uint64_t validAfter,
                                     uint64_t validBefore, const unsigned char nonce[32], unsigned char out[32]);
+/* x402 upto's (#358): Permit2's PermitWitnessTransferFrom of the token to x402's upto proxy, the witness naming who is
+** paid and the facilitator; amountW and nonceW are the uint256 words */
+void hpplite_eip712_permit2_upto_digest(uint64_t chainId, const unsigned char token[20], const unsigned char amountW[32],
+                                        const unsigned char nonceW[32], uint64_t deadline, const unsigned char to[20],
+                                        const unsigned char facilitator[20], uint64_t validAfter, unsigned char out[32]);
 int64_t hpplite_store_covered_until(HppliteStore *store);
 const char *hpplite_store_bucket_state(HppliteStore *store);
 int hpplite_store_statement(HppliteStore *store, uint8_t out[HPPLITE_STATEMENT_SIZE]);

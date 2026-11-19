@@ -3463,6 +3463,108 @@ static void test_pay_asset(void) {
     PASS();
 }
 
+/* 60. x402 upto (#358): HPP is paid over x402 by Permit2 only (no EIP-3009), so a node that holds nothing but HPP could
+** pay neither a relay nor a store's 402 - "takes HPP over x402 only by upto (Permit2), which this node does not sign
+** yet". A wallet with HPP and no ETH, HPPLITE_PAY_ASSET=hpp, no bucket permit: the relay's 402s (the rollup, the lease,
+** the anchor) and the store's are paid by Permit2 signatures, the wallet's approval of Permit2 an EIP-2612 permit carried
+** with the payment and sent by the facilitator; neither wallet ever holds ETH */
+static double anvil_token_of(const char *token, const char *addr) {
+    char cmd[400], out[200];
+    snprintf(cmd, sizeof cmd, "cast call %s 'balanceOf(address)(uint256)' %s --rpc-url %s", token, addr, RPC);
+    return run_cmd(cmd, out, sizeof out) == 0 ? strtod(out, NULL) : -1;
+}
+static void test_pay_upto(void) {
+    TEST("x402 upto (#358): a wallet with HPP and no ETH pays the relay and the store's 402s by Permit2 signatures, its approval of Permit2 a permit carried with the payment");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *usdc = getenv("HPPLITE_ANVIL_USDC"), *hpp = getenv("HPPLITE_ANVIL_HPP");
+    static const char UKEY[] = "0x6060606060606060606060606060606060606060606060606060606060606060";
+    if (!svc || !usdc || !usdc[0] || !hpp || !hpp[0]) { printf("SKIP (no store or mock tokens in the environment) "); PASS(); return; }
+    char cmd[2400], payTo[80], relayPay[80], wallet[80], fund[80] = "", out[600], extra[300], hppArg[200];
+    int sport = test_free_port(), rport = test_free_port();
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY1);
+    if (run_cmd(cmd, payTo, sizeof payTo) != 0) FAIL("cast wallet address");
+    payTo[strcspn(payTo, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", KEY9);
+    if (run_cmd(cmd, relayPay, sizeof relayPay) != 0) FAIL("cast wallet address");
+    relayPay[strcspn(relayPay, "\r\n")] = 0;
+    snprintf(cmd, sizeof cmd, "cast wallet address %s", UKEY);
+    if (run_cmd(cmd, wallet, sizeof wallet) != 0) FAIL("cast wallet address");
+    wallet[strcspn(wallet, "\r\n")] = 0;
+    /* 100000 HPP, $1000 at the services' $0.01: anvil's base fee, and the relay's quotes with it, climb over the suite */
+    snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 100000000000000000000000 >/dev/null", RPC, KEY0, hpp, wallet);
+    if (system(cmd) != 0) FAIL("fund the wallet with HPP");
+    if (eth_balance_of(wallet) != 0) FAIL("the wallet should start with no ETH");
+    FILE *f = fopen(DIR "/pu_signer.key", "w");
+    if (!f) FAIL("signer key file");
+    fprintf(f, "%s\n", KEY3);
+    fclose(f);
+    (void)!system("rm -rf " DIR "/pu_pins " DIR "/pu_writer.db*");
+    snprintf(hppArg, sizeof hppArg, "%s,HousePartyProtocol,1,18,10000,upto", hpp);
+    pid_t store = fork();
+    if (store == 0) {
+        char portStr[16], script[600];
+        snprintf(portStr, sizeof portStr, "%d", sport);
+        snprintf(script, sizeof script, "%s/hpplite_store.py", svc);
+        int fd = open(DIR "/pu_store.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", DIR "/pu_pins", "--signer-key", DIR "/pu_signer.key",
+               "--pay-to", payTo, "--facilitator", FACIL, "--rpc", RPC, "--asset", usdc, "--extra-asset", hppArg,
+               "--network", "eip155:31337", "--price-per-write", "1000", "--price-per-mib-month", "0", "--min-pay", "3000",
+               "--pull-threshold", "1500", "--tick-interval", "0.5", (char *)NULL);
+        _exit(127);
+    }
+    int up = 0;
+    for (int i = 0; i < 50 && !up; i++) {
+        if (!test_child_alive(store)) break;
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status", sport);
+        up = run_cmd(cmd, out, sizeof out) == 0 && strstr(out, "\"signer\"") != NULL;
+        if (!up) usleep(200 * 1000);
+    }
+    gAssetArgs[0] = "--extra-asset"; gAssetArgs[1] = hppArg;
+    pid_t relay = up ? start_relay(svc, usdc, rport) : -1;
+    memset(gAssetArgs, 0, sizeof gAssetArgs);
+#define STOP60() do { unsetenv("HPPLITE_PAY_ASSET"); unsetenv("HPPLITE_STORE_VALID_FOR"); if (relay > 0) { kill(relay, SIGTERM); waitpid(relay, NULL, 0); } \
+                      if (store > 0) { kill(store, SIGTERM); waitpid(store, NULL, 0); } } while (0)
+    if (!up || relay < 0) { STOP60(); FAIL("the store or the relay did not come up"); }
+    double storeBefore = anvil_token_of(hpp, payTo), relayBefore = anvil_token_of(hpp, relayPay), storeAfter, relayAfter;
+    setenv("HPPLITE_STORE_VALID_FOR", "315360000", 1);      /* anvil's clock is days ahead after the lease scenarios */
+    setenv("HPPLITE_PAY_ASSET", "hpp", 1);
+    money_env("100000", "0", NULL, NULL, "200000000", NULL);            /* no bucket permit: the store's 402s over x402 */
+    snprintf(extra, sizeof extra, "&dbname=pay-upto&store=http://127.0.0.1:%d&relay=http://127.0.0.1:%d&anchor=0", sport, rport);
+    sqlite3 *w = open_db("pu_writer.db", UKEY, extra);
+    long long lease = w ? status_int(w, "lease") : -1, f1 = -1, f2 = -1, anchored = -1, spent = -1, storeSpent = -1;
+    char err[300] = "", path[20] = "";
+    if (w) {
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+        /* the store is paid from the node's funding wallet (#214): HPP there too, and no ETH */
+        snprintf(fund, sizeof fund, "%s", status_text(w, "store_funder"));
+        snprintf(cmd, sizeof cmd, "cast send --rpc-url %s --private-key %s %s 'transfer(address,uint256)' %s 1000000000000000000000 >/dev/null", RPC, KEY0, hpp, fund);
+        if (system(cmd) != 0) printf("(could not fund the funding wallet with HPP) ");
+    }
+    if (w && lease == 1) {
+        sqlite3_exec(w, "CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+        f1 = scalar(w, "SELECT hpplite_flush()");
+        sqlite3_exec(w, "INSERT INTO u(v) VALUES('paid in hpp, by permit2')", NULL, NULL, NULL);
+        f2 = scalar(w, "SELECT hpplite_flush()");
+        anchored = scalar(w, "SELECT hpplite_anchor()");
+        snprintf(path, sizeof path, "%s", status_text(w, "last_tx_path"));
+        spent = status_int(w, "relay_spent");
+        storeSpent = status_int(w, "store_spent");
+        snprintf(err, sizeof err, "%s", status_text(w, "last_error"));
+    }
+    if (w) sqlite3_close(w);
+    storeAfter = anvil_token_of(hpp, payTo);
+    relayAfter = anvil_token_of(hpp, relayPay);
+    long ethWallet = eth_balance_of(wallet), ethFund = fund[0] ? eth_balance_of(fund) : -1;
+    STOP60();
+#undef STOP60
+    printf("(lease %lld, flushes %lld %lld, anchored %lld via %s, relay_spent %lld, store_spent %lld micro-USD; HPP: the relay's payee +%.2f, the store's +%.2f%s%.160s) ",
+           lease, f1, f2, anchored, path, spent, storeSpent, (relayAfter - relayBefore) / 1e18, (storeAfter - storeBefore) / 1e18, err[0] ? "; " : "", err);
+    if (lease != 1 || anchored <= 0 || strcmp(path, "relay") != 0 || spent <= 0 || relayAfter <= relayBefore) FAIL("the relay paid in HPP by upto: the rollup, the lease and the anchor");
+    if (f1 <= 0 || f2 <= 0 || storeSpent <= 0 || storeAfter <= storeBefore) FAIL("the store's 402s paid in HPP by upto");
+    if (ethWallet != 0 || ethFund != 0) FAILF("the wallets' ETH is %ld and %ld, want 0 and 0", ethWallet, ethFund);
+    PASS();
+}
+
 /* 58. rpc= without chainid= (#369, somaro#352): the node asks the RPC its chain and signs for that, not for HPP Sepolia's
 ** 181228 - before, anvil refused every transaction, the factory's create waited 60 s and the open came back unconnected
 ** without a word. A chainid= the RPC contradicts is said at open, both numbers */
@@ -3631,6 +3733,7 @@ int main(void) {
     if (wanted(57)) test_sequencer_once();
     if (wanted(58)) test_chain_from_rpc();
     if (wanted(59)) test_pay_asset();
+    if (wanted(60)) test_pay_upto();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

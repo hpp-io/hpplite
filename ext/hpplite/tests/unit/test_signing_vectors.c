@@ -122,6 +122,40 @@ static void test_payment_messages(void) {
     PASS();
 }
 
+/* a decimal past 2^64 as its word (#358: token amounts with 18 decimals, Permit2's nonces) */
+static int decWord(const char *z, unsigned char out[32]) {
+    unsigned __int128 v = 0;
+    int i;
+    if (!z || !*z) return -1;
+    for (; *z; z++) { if (*z < '0' || *z > '9') return -1; v = v * 10 + (unsigned)(*z - '0'); }
+    memset(out, 0, 32);
+    for (i = 0; i < 16; i++) out[31 - i] = (unsigned char)(v >> (8 * i));
+    return 0;
+}
+
+static void test_permit2_messages(void) {
+    TEST("x402 upto's Permit2 PermitWitnessTransferFrom (#358), amounts past 2^64: the digests and signatures of vectors.json");
+    cJSON *sect = cJSON_GetObjectItem(g_vectors, "permit2Messages"), *m;
+    uint64_t chainId;
+    int n = 0;
+    if (!sect) FAIL("no permit2Messages in vectors.json");
+    chainId = (uint64_t)cJSON_GetObjectItem(sect, "chainId")->valuedouble;
+    cJSON_ArrayForEach(m, cJSON_GetObjectItem(sect, "messages")) {
+        cJSON *a = cJSON_GetObjectItem(m, "authorization"), *p = cJSON_GetObjectItem(a, "permitted"), *w = cJSON_GetObjectItem(a, "witness");
+        unsigned char token[20], to[20], fac[20], amountW[32], nonceW[32], digest[32];
+        if (!a || !p || !w || hexTo(cJSON_GetObjectItem(p, "token")->valuestring, token, 20) || hexTo(cJSON_GetObjectItem(w, "to")->valuestring, to, 20)
+            || hexTo(cJSON_GetObjectItem(w, "facilitator")->valuestring, fac, 20) || decWord(cJSON_GetObjectItem(p, "amount")->valuestring, amountW)
+            || decWord(cJSON_GetObjectItem(a, "nonce")->valuestring, nonceW)) FAIL("a Permit2 message: unreadable");
+        hpplite_eip712_permit2_upto_digest(chainId, token, amountW, nonceW, strtoull(cJSON_GetObjectItem(a, "deadline")->valuestring, NULL, 10), to, fac,
+                                           strtoull(cJSON_GetObjectItem(w, "validAfter")->valuestring, NULL, 10), digest);
+        if (!digestIs(m, digest)) FAILF("Permit2 message %d: digest differs", n);
+        if (!signsAs(m, digest)) FAILF("Permit2 message %d: signature differs", n);
+        n++;
+    }
+    if (n < 2) FAILF("%d Permit2 messages: the vectors changed shape", n);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "operators/conformance/vectors.json";
     FILE *f = fopen(path, "rb");
@@ -141,6 +175,7 @@ int main(int argc, char **argv) {
     if (!g_vectors || !g_crypto) { printf("vectors.json unreadable, or no crypto\n"); return 1; }
     test_store_messages();
     test_payment_messages();
+    test_permit2_messages();
     cJSON_Delete(g_vectors);
     hpplite_crypto_free(g_crypto);
     return test_report();

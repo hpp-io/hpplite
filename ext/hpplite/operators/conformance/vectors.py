@@ -22,7 +22,7 @@ sys.path.insert(0, here)
 from x402seller import eth  # noqa: E402
 import hpplite_store  # noqa: E402
 import relay  # noqa: E402
-from buyer import TRANSFER_TYPE  # noqa: E402
+from buyer import TRANSFER_TYPE, PERMIT2, UPTO_PROXY, permit2_upto_digest  # noqa: E402
 
 PATH = os.path.join(here, "vectors.json")
 KEYS = ["0x" + (bytes([i]) * 32).hex() for i in (1, 2, 0x42)]
@@ -115,6 +115,22 @@ def generate():
              ("Sponsor", relay.SPONSOR_TYPE, [rollup, funder, 1800000000], 1),
              ("Unsponsor", relay.UNSPONSOR_TYPE, [rollup, funder, 1800000001], 2),
              ("Cap", relay.CAP_TYPE, [rollup, 3, 1800000002], 2)]
+
+    # x402 upto (#358): what a payer signs - Permit2's PermitWitnessTransferFrom of a token to x402's upto proxy, the
+    # witness naming who is paid and the facilitator; Permit2's own domain (a name, no version). The C node's signer is
+    # checked against these; amounts and nonces are decimals, past 2^64 (HPP has 18 decimals)
+    hpp, facilitator = "0xb48334e7938367bc24fe1f19000d6f06c622e6c7", "0xaA03c7BD2fAf554db507D78CD3bF126a3DD2E033"
+    umsgs = [({"from": funder, "permitted": {"token": hpp, "amount": str(3 * 10 ** 17)}, "spender": UPTO_PROXY,
+               "nonce": str(int.from_bytes(eth.keccak256(b"nonce three")[:16], "big")), "deadline": "1800000120",
+               "witness": {"to": pay, "facilitator": facilitator, "validAfter": "1799999400"}}, 2),
+             ({"from": funder, "permitted": {"token": chip, "amount": str(10 ** 20)}, "spender": UPTO_PROXY,
+               "nonce": "1", "deadline": "1831536000",
+               "witness": {"to": pay, "facilitator": facilitator, "validAfter": "0"}}, 1)]
+    v["permit2Messages"] = {"chainId": 181228, "permit2": PERMIT2, "messages": [
+        {"type": "PermitWitnessTransferFrom", "authorization": a, "key": KEYS[k],
+         "digest": "0x" + permit2_upto_digest(181228, a).hex(),
+         "signature": "0x" + eth.sign(key(k), permit2_upto_digest(181228, a)).hex()}
+        for a, k in umsgs]}
 
     v["relayMessages"] = {"chainId": 181228, "payTo": pay_to, "messages": [
         {"type": t, "typeString": ts, "fields": [("0x" + f.hex()) if isinstance(f, bytes) else f for f in fields], "key": KEYS[k],
