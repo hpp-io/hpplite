@@ -70,10 +70,40 @@ static void test_many(void) {
     PASS();
 }
 
+/* streamed (#364): the same envelope, its payload in pieces; the recipient opens it */
+static void test_stream(void) {
+    TEST("a per-recipient envelope sealed as a stream opens for its recipient, with the DEK it was sealed under (#364)");
+    uint8_t dek[32], priv[32], pub[33], tag[16], got[32];
+    uint8_t payload[5000], *hdr = NULL, *env, *pt;
+    size_t hl = 0, outLen = 0, off;
+    int foreign = -1;
+    HppliteSealStream *st;
+    for (off = 0; off < sizeof payload; off++) payload[off] = (uint8_t)(off * 13);
+    memset(dek, 0x22, 32);
+    keyN(3, priv);
+    if (hpplite_pk_pubkey(priv, pub) != 0) FAIL("pubkey");
+    st = hpplite_seal_stream_new_pk(hpplite_cipher_default(), dek, pub, 1, 4, HPPLITE_ENCODING_NONE, &hdr, &hl);
+    if (!st || !hdr) FAIL("stream");
+    env = malloc(hl + sizeof payload + 16);
+    memcpy(env, hdr, hl); free(hdr);
+    for (off = 0; off < sizeof payload; off += 777) {
+        size_t k = sizeof payload - off < 777 ? sizeof payload - off : 777;
+        hpplite_seal_stream_update(st, payload + off, env + hl + off, k);
+    }
+    hpplite_seal_stream_final(st, tag);
+    memcpy(env + hl + sizeof payload, tag, 16);
+    pt = hpplite_envelope_open_pk(priv, 4, env, hl + sizeof payload + 16, &outLen, &foreign, got);
+    int ok = pt && outLen == sizeof payload && memcmp(pt, payload, sizeof payload) == 0 && memcmp(got, dek, 32) == 0;
+    free(pt); free(env);
+    if (!ok) FAIL("the streamed envelope does not open for its recipient");
+    PASS();
+}
+
 int main(void) {
     printf("=== Public-key envelope (#15) ===\n");
     test_suite_init("envelope_pk", NULL, NULL);
     test_roundtrip();
     test_many();
+    test_stream();
     return test_report();
 }

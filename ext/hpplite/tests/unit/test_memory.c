@@ -9,6 +9,8 @@
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <signal.h>
+#include <fcntl.h>
 
 #define DIR "/tmp/hpplite_test_memory"
 #define DB_MB 64
@@ -85,7 +87,82 @@ static int child_backlog(void) {
     return 0;
 }
 
+/* children: a sequencer posts a SNAP_MB database and stops without anchoring; restarted in a process of its own (a
+** peak RSS not raised by the writes), it anchors with a snapshot (store at argv), measured over the anchor alone */
+#define SNAP_MB 32
+#define SNAP_BOUND_MB 24
+static HppliteNode *snap_node(const char *url) {
+    static const unsigned char kseq[32] = { [31] = 0x4d };
+    HppliteL1 *l1 = hpplite_l1_create_mock_dir(DIR "/l1s");   /* the chain kept between the two processes; it holds only commitments */
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "mem_snap", .privkey = kseq, .snapshotMs = 3600 * 1000,
+                       .checkpointInterval = TEST_INTERVAL_1000, .noAnchorAtClose = 1 };
+    HppliteNode *n = test_open_node(DIR "/s.db", l1, &o);
+    if (n) n->ownsL1 = 1;
+    return n;
+}
+static int child_snapsetup(const char *url) {
+    HppliteNode *n = snap_node(url);
+    int k;
+    if (!n) return 2;
+    hpplite_node_exec(n, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_flush_batch(n);                        /* batch 1 on its own: no snapshot is used at height 1 */
+    for (k = 0; k < SNAP_MB / 4; k++) {
+        hpplite_node_exec(n, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1024) INSERT INTO t(v) SELECT randomblob(4000) FROM c", NULL);
+        while (hpplite_node_pending_count(n) > 0) if (hpplite_node_flush_batch(n) == 0) return 3;
+    }
+    printf("RISE_KB 0 POSTED %lld\n", (long long)status_int(n->db, "height"));
+    hpplite_node_destroy(n);
+    return 0;
+}
+static int child_snapshot(const char *url) {
+    HppliteNode *n = snap_node(url);
+    long long before, snap, rise;
+    uint64_t a;
+    if (!n) return 2;
+    before = peak_kb();
+    a = hpplite_node_anchor(n);
+    snap = status_int(n->db, "snapshot_height");
+    rise = peak_kb() - before;
+    printf("RISE_KB %lld ANCHOR %llu SNAPSHOT %lld\n", rise, (unsigned long long)a, snap);
+    hpplite_node_destroy(n);
+    return a > 0 && snap == (long long)a ? 0 : 4;
+}
+
 static const char *self;
+static pid_t g_store;
+static const char *g_url;
+
+/* the reference store, as test_store starts it */
+static int start_store(const char *dir, int port) {
+    char portStr[16], storeDir[600], keyPath[600], script[600];
+    FILE *f;
+    snprintf(portStr, sizeof portStr, "%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/pins", DIR);
+    snprintf(keyPath, sizeof keyPath, "%s/signer.key", DIR);
+    snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
+    f = fopen(keyPath, "w");
+    if (!f) return -1;
+    fputs("0x2020202020202020202020202020202020202020202020202020202020202020\n", f);
+    fclose(f);
+    g_store = fork();
+    if (g_store == 0) {
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
+        execlp("python3", "python3", "-I", script, "--port", portStr, "--dir", storeDir, "--signer-key", keyPath,
+               "--pay-to", "0x1111111111111111111111111111111111111111", "--price-per-write", "0", "--price-per-mib-month", "0",
+               "--max-bytes", "1073741824", (char *)NULL);
+        _exit(127);
+    }
+    for (int i = 0; i < 50; i++) {
+        char cmd[200];
+        if (!test_child_alive(g_store)) { g_store = 0; return -1; }
+        snprintf(cmd, sizeof cmd, "curl -s -m 2 http://127.0.0.1:%d/status 2>/dev/null | grep -q signer", port);
+        if (system(cmd) == 0) return 0;
+        usleep(200 * 1000);
+    }
+    return -1;
+}
+static void stop_store(void) { if (g_store > 0) { kill(g_store, SIGTERM); waitpid(g_store, NULL, 0); g_store = 0; } }
 
 /* the scenario in a child; its RISE_KB, or -1 */
 static long long run_child(const char *which, char *line, size_t cap) {
@@ -99,7 +176,7 @@ static long long run_child(const char *which, char *line, size_t cap) {
     pid = fork();
     if (pid == 0) {
         dup2(fd[1], 1); close(fd[0]); close(fd[1]);
-        execl(self, self, "child", which, (char *)NULL);
+        execl(self, self, "child", which, g_url ? g_url : "", (char *)NULL);
         _exit(127);
     }
     close(fd[1]);
@@ -133,18 +210,41 @@ static void test_backlog_is_not_in_memory(void) {
     PASS();
 }
 
+static void test_snapshot_is_not_the_database(const char *storeDir) {
+    TEST("a snapshot of a 32 MB database at an anchor raises the node's peak memory by a chunk, not the database (#364)");
+    char line[256], url[64];
+    long long rise;
+    int port;
+    if (!storeDir) { printf("SKIP (the store directory is not given) "); PASS(); return; }
+    port = test_free_port();
+    if (start_store(storeDir, port) != 0) { stop_store(); FAIL("the store did not start"); }
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    g_url = url;
+    if (run_child("snapsetup", line, sizeof line) < 0) { g_url = NULL; stop_store(); FAIL("the database not posted"); }
+    rise = run_child("snapshot", line, sizeof line);
+    g_url = NULL;
+    stop_store();
+    printf("(%s) ", line[0] ? strtok(line, "\n") : "no output");
+    if (rise < 0) FAIL("the child (no snapshot made?)");
+    if (rise > SNAP_BOUND_MB * 1024) FAILF("+%lld MB: the snapshot is built in memory", rise / 1024);
+    PASS();
+}
+
 int main(int argc, char **argv) {
     self = argv[0];
     test_suite_init("memory", NULL, DIR);
     if (argc > 2 && strcmp(argv[1], "child") == 0) {
         if (strcmp(argv[2], "open") == 0) return child_open();
         if (strcmp(argv[2], "backlog") == 0) return child_backlog();
+        if (strcmp(argv[2], "snapshot") == 0) return child_snapshot(argc > 3 ? argv[3] : "");
+        if (strcmp(argv[2], "snapsetup") == 0) return child_snapsetup(argc > 3 ? argv[3] : "");
         return 2;
     }
     printf("=== HPPLite memory against the database's size ===\n");
     reset_dir();
     test_open_is_not_the_database();
     test_backlog_is_not_in_memory();
+    test_snapshot_is_not_the_database(argc > 1 ? argv[1] : NULL);
     remove_dir();
     return test_report();
 }

@@ -55,8 +55,11 @@ void hpplite_pagemode_failed(HpplitePageMode *pm);
 ** root that batch's. A snapshot (#221). SQLITE_BUSY: a whole file is queued and
 ** not yet finalized; the flush thread's, between batches. */
 int hpplite_pagemode_image(HpplitePageMode *pm, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]);
-/* the same, head bytes into a malloc'd buffer with tail bytes after (#233: a snapshot sealed in place); free() */
-int hpplite_pagemode_image_room(HpplitePageMode *pm, size_t head, size_t tail, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]);
+/* The image streamed (#364: never whole in memory): _begin says its length and root (SQLITE_BUSY: a whole file still
+** queued); _stream hands its bytes to xOut in order - the header, every page from the posted file a few at a time,
+** the trailer (nonzero from xOut: SQLITE_ABORT). The same bytes as hpplite_pagemode_image's */
+int hpplite_pagemode_image_begin(HpplitePageMode *pm, uint64_t *pLen, unsigned char root[32]);
+int hpplite_pagemode_image_stream(HpplitePageMode *pm, int (*xOut)(void *, const unsigned char *, size_t), void *pArg);
 /* the root after the last finalized batch */
 void hpplite_pagemode_root(HpplitePageMode *pm, unsigned char out[32]);
 int hpplite_pagemode_page_size(HpplitePageMode *pm);

@@ -70,8 +70,12 @@ unsigned char *hpplite_pagebatch_encode(const HpplitePageBatch *b, size_t *pLen)
 unsigned hpplite_lock_page(int pageSize);
 /* where record i's body lies in an encoded batch (a record whose body is NULL is encoded empty, for the caller to fill) */
 size_t hpplite_pagebatch_body_at(unsigned i, unsigned pageSize);
-/* the same bytes head bytes into a malloc'd buffer with tail bytes after (#233: a snapshot sealed in place); free() */
-unsigned char *hpplite_pagebatch_encode_room(const HpplitePageBatch *b, size_t head, size_t tail, size_t *pLen);
+/* A batch written in parts (#364, the image streamed): its header (64 bytes), each record's head (6, then the body),
+** its trailer (40 bytes and the name; room for 40 + 255), and the whole's length */
+size_t hpplite_pagebatch_head(const HpplitePageBatch *b, unsigned char *p);
+size_t hpplite_pagebatch_rec(unsigned pgno, unsigned flags, unsigned char *p);
+size_t hpplite_pagebatch_tail(const HpplitePageBatch *b, unsigned char *p);
+size_t hpplite_pagebatch_size(const HpplitePageBatch *b);
 /* a batch from its bytes: the records point into p, which must outlive it; sqlite3_free the batch */
 HpplitePageBatch *hpplite_pagebatch_decode(const unsigned char *p, size_t n);
 void hpplite_pagebatch_free(HpplitePageBatch *b);

@@ -422,18 +422,65 @@ void hpplite_pagemode_root(HpplitePageMode *pm, unsigned char out[32]) { hpplite
 
 static uint64_t now_ms(void) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000; }
 
-static int pagemode_image(HpplitePageMode *pm, size_t head, size_t tail, int bRoom, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]);
+/* the image's batch, its pages not yet read: every page of the file but the lock-byte page (#363), each posted */
+static int image_batch(HpplitePageMode *pm, HpplitePageBatch *b, unsigned *pLock) {
+  unsigned i, n, lock, nRec = 0;
+  if (!pm || !pm->pRoot || pm->pageSize <= 0 || pm->pBuilding) return SQLITE_MISUSE;
+  n = pm->sizeThen;
+  lock = hpplite_lock_page(pm->pageSize);
+  for (i = 1; i <= n; i++) {
+    if (i == lock) continue;
+    if (!prevHas(pm, i)) return SQLITE_BUSY;                    /* a whole file queued, not yet finalized */
+    nRec++;
+  }
+  memset(b, 0, sizeof(*b));
+  b->pageSize = (unsigned)pm->pageSize; b->commitSize = n;
+  b->firstCommit = b->lastCommit = pm->nFinalized;
+  b->timestampMs = now_ms();
+  b->nPages = nRec;
+  hpplite_pageroot_get(pm->pRoot, b->root); b->crc = hpplite_pageroot_crc(pm->pRoot);
+  *pLock = lock;
+  return SQLITE_OK;
+}
+
+int hpplite_pagemode_image_begin(HpplitePageMode *pm, uint64_t *pLen, unsigned char root[32]) {
+  HpplitePageBatch b;
+  unsigned lock;
+  int rc = image_batch(pm, &b, &lock);
+  if (rc != SQLITE_OK) return rc;
+  *pLen = (uint64_t)hpplite_pagebatch_size(&b);
+  memcpy(root, b.root, 32);
+  return SQLITE_OK;
+}
+
+#define IMAGE_RECS 64                                           /* records read from the posted file at a time */
+int hpplite_pagemode_image_stream(HpplitePageMode *pm, int (*xOut)(void *, const unsigned char *, size_t), void *pArg) {
+  HpplitePageBatch b;
+  unsigned lock, i;
+  size_t ps, rec, o, cap;
+  unsigned char *buf;
+  int rc = image_batch(pm, &b, &lock);
+  if (rc != SQLITE_OK) return rc;
+  ps = (size_t)pm->pageSize; rec = 6 + ps; cap = IMAGE_RECS * rec;
+  buf = sqlite3_malloc64(cap);
+  if (!buf) return SQLITE_NOMEM;
+  o = hpplite_pagebatch_head(&b, buf);
+  if (xOut(pArg, buf, o) != 0) { sqlite3_free(buf); return SQLITE_ABORT; }
+  o = 0;
+  for (i = 1; i <= b.commitSize; i++) {
+    if (i == lock) continue;
+    o += hpplite_pagebatch_rec(i, HPPLITE_PAGE_FULL, buf + o);
+    if (!prevRead(pm, i, buf + o)) { sqlite3_free(buf); return SQLITE_IOERR; }
+    o += ps;
+    if (o + rec > cap) { if (xOut(pArg, buf, o) != 0) { sqlite3_free(buf); return SQLITE_ABORT; } o = 0; }
+  }
+  o += hpplite_pagebatch_tail(&b, buf + o);                    /* 40 bytes: within a record's room */
+  rc = xOut(pArg, buf, o) != 0 ? SQLITE_ABORT : SQLITE_OK;
+  sqlite3_free(buf);
+  return rc;
+}
 
 int hpplite_pagemode_image(HpplitePageMode *pm, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]) {
-  return pagemode_image(pm, 0, 0, 0, ppBytes, pLen, root);
-}
-
-/* the image head bytes into a malloc'd buffer, tail bytes after it (#233: sealed in place); free() */
-int hpplite_pagemode_image_room(HpplitePageMode *pm, size_t head, size_t tail, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]) {
-  return pagemode_image(pm, head, tail, 1, ppBytes, pLen, root);
-}
-
-static int pagemode_image(HpplitePageMode *pm, size_t head, size_t tail, int bRoom, unsigned char **ppBytes, size_t *pLen, unsigned char root[32]) {
   HpplitePageBatch b;
   HpplitePageRec *recs;
   unsigned i, n, nRec = 0, lock;
@@ -452,11 +499,10 @@ static int pagemode_image(HpplitePageMode *pm, size_t head, size_t tail, int bRo
   b.nPages = nRec; b.aPage = recs;
   hpplite_pageroot_get(pm->pRoot, b.root); b.crc = hpplite_pageroot_crc(pm->pRoot);
   memcpy(root, b.root, 32);
-  *ppBytes = bRoom ? hpplite_pagebatch_encode_room(&b, head, tail, pLen) : hpplite_pagebatch_encode(&b, pLen);
+  *ppBytes = hpplite_pagebatch_encode(&b, pLen);
   if (*ppBytes) {
-    unsigned char *base = *ppBytes + (bRoom ? head : 0);
-    for (i = 0; i < nRec; i++) if (!prevRead(pm, recs[i].pgno, base + hpplite_pagebatch_body_at(i, b.pageSize))) break;
-    if (i < nRec) { if (bRoom) free(*ppBytes); else sqlite3_free(*ppBytes); *ppBytes = NULL; *pLen = 0; sqlite3_free(recs); return SQLITE_IOERR; }
+    for (i = 0; i < nRec; i++) if (!prevRead(pm, recs[i].pgno, *ppBytes + hpplite_pagebatch_body_at(i, b.pageSize))) break;
+    if (i < nRec) { sqlite3_free(*ppBytes); *ppBytes = NULL; *pLen = 0; sqlite3_free(recs); return SQLITE_IOERR; }
   }
   sqlite3_free(recs);
   return *ppBytes ? SQLITE_OK : SQLITE_NOMEM;

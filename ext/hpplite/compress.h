@@ -25,6 +25,15 @@ extern "C" {
 
 /* Compress: malloc'd [length][zlib]; NULL on failure or for empty input */
 uint8_t *hpplite_deflate(const uint8_t *in, size_t n, size_t *pOut);
+
+/* The same form streamed (#364): the original's length (at most 4 GiB - 1) is said first, its bytes come in pieces,
+** and the deflated bytes go to xOut as they are made (nonzero from it: stop). _write and _finish return 0, or -1;
+** _finish frees the stream, and _free abandons one */
+typedef struct HppliteDeflateStream HppliteDeflateStream;
+HppliteDeflateStream *hpplite_deflate_stream_new(uint64_t totalLen, int level, int (*xOut)(void *, const uint8_t *, size_t), void *pArg);
+int hpplite_deflate_stream_write(HppliteDeflateStream *d, const uint8_t *in, size_t n);
+int hpplite_deflate_stream_finish(HppliteDeflateStream *d);
+void hpplite_deflate_stream_free(HppliteDeflateStream *d);
 /* the same at a chosen zlib level: 1 for page diffs, mostly zeros, where speed matters (#146) */
 uint8_t *hpplite_deflate_level(const uint8_t *in, size_t n, int level, size_t *pOut);
 

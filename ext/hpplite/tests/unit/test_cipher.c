@@ -120,25 +120,35 @@ static void test_envelope(void) {
     PASS();
 }
 
-/* Sealed in place (#233, a snapshot's image): the payload encrypted where it lies, the header before it and the tag
-** after - the same envelope as hpplite_envelope_seal's, opened by the same open */
-static void test_envelope_inplace(void) {
-    TEST("an envelope sealed in place opens to its payload, at the length hpplite_envelope_seal gives (#233)");
+/* A streamed seal (#364, a snapshot never whole in memory): the payload in pieces of uneven sizes, some across
+** ChaCha20's 64-byte blocks, one empty - the envelope hpplite_envelope_open reads, as long as the copying seal's */
+static void test_seal_stream(void) {
+    TEST("an envelope sealed as a stream, in uneven pieces, opens to its payload at the copying seal's length (#364)");
     const HppliteCipher *c = hpplite_cipher_default();
-    uint8_t key[32];
-    size_t head = hpplite_envelope_head_len(c), n = 100000, outLen = 0, openLen = 0, refLen = 0;
-    uint8_t *payload = malloc(n), *buf = malloc(head + n + c->tagLen), *ref, *opened;
+    uint8_t key[32], hdr[64], tag[16];
+    size_t n = 100003, hl = 0, off = 0, openLen = 0, refLen = 0, piece = 1;
+    uint8_t *payload = malloc(n), *env = malloc(64 + n + 16), *ref, *opened;
+    HppliteSealStream *st;
     for (size_t i = 0; i < 32; i++) key[i] = (uint8_t)(i * 7 + 1);
     for (size_t i = 0; i < n; i++) payload[i] = (uint8_t)(i * 31 + (i >> 8));
-    memcpy(buf + head, payload, n);
-    if (hpplite_envelope_seal_inplace(c, key, 9, HPPLITE_ENCODING_DEFLATE, buf, n, &outLen) != 0) { free(payload); free(buf); FAIL("seal in place"); }
+    st = hpplite_seal_stream_new(c, key, 9, HPPLITE_ENCODING_DEFLATE, hdr, &hl);
+    if (!st) { free(payload); free(env); FAIL("stream"); }
+    memcpy(env, hdr, hl);
+    hpplite_seal_stream_update(st, payload, env + hl, 0);
+    while (off < n) {
+        size_t k = piece < n - off ? piece : n - off;
+        hpplite_seal_stream_update(st, payload + off, env + hl + off, k);
+        off += k; piece = piece * 3 + 1;
+    }
+    hpplite_seal_stream_final(st, tag);
+    memcpy(env + hl + n, tag, 16);
     ref = hpplite_envelope_seal(c, key, 9, HPPLITE_ENCODING_DEFLATE, payload, n, &refLen);
-    opened = hpplite_envelope_open(key, 9, buf, outLen, &openLen, NULL);
-    int ok = opened && openLen == n && memcmp(opened, payload, n) == 0 && ref && refLen == outLen
-             && memcmp(buf + head, payload, 64) != 0 && hpplite_envelope_encoding(buf, outLen) == HPPLITE_ENCODING_DEFLATE
-             && hpplite_envelope_open(key, 10, buf, outLen, &openLen, NULL) == NULL;
-    free(opened); free(ref); free(payload); free(buf);
-    if (!ok) FAIL("the in-place envelope is not the one hpplite_envelope_seal makes");
+    opened = hpplite_envelope_open(key, 9, env, hl + n + 16, &openLen, NULL);
+    int ok = opened && openLen == n && memcmp(opened, payload, n) == 0 && ref && refLen == hl + n + 16
+             && hpplite_envelope_encoding(env, hl + n + 16) == HPPLITE_ENCODING_DEFLATE
+             && hpplite_envelope_open(key, 10, env, hl + n + 16, &openLen, NULL) == NULL;
+    free(opened); free(ref); free(payload); free(env);
+    if (!ok) FAIL("the streamed envelope is not the one hpplite_envelope_seal makes");
     PASS();
 }
 
@@ -148,6 +158,6 @@ int main(void) {
     test_rfc5869_hkdf();
     test_hmac();
     test_envelope();
-    test_envelope_inplace();
+    test_seal_stream();
     return test_report();
 }

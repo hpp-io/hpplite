@@ -80,10 +80,17 @@ uint8_t *hpplite_envelope_seal(const HppliteCipher *cipher, const uint8_t key[32
                                uint64_t height, uint8_t encoding,
                                const uint8_t *payload, size_t payloadLen,
                                size_t *pOutLen);
-/* sealed in place (#233): buf = [hpplite_envelope_head_len(cipher) free][payload][cipher->tagLen free] */
-size_t hpplite_envelope_head_len(const HppliteCipher *cipher);
-int hpplite_envelope_seal_inplace(const HppliteCipher *cipher, const uint8_t key[32], uint64_t height, uint8_t encoding,
-                                  uint8_t *buf, size_t payloadLen, size_t *pOutLen);
+/* A streamed seal (#364): the same envelope, its payload in pieces. _new writes the header into hdr (room for
+** HPPLITE_ENVELOPE_HEADER_LEN + nonceLen) and says its length; each _update encrypts n bytes (in may be out);
+** _final gives the tag that ends the envelope and frees the stream (_free: abandoned). NULL: no such cipher, no
+** randomness, no memory */
+typedef struct HppliteSealStream HppliteSealStream;
+HppliteSealStream *hpplite_seal_stream_new(const HppliteCipher *cipher, const uint8_t key[32], uint64_t height,
+                                           uint8_t encoding, uint8_t *hdr, size_t *pHdrLen);
+HppliteSealStream *hpplite_seal_stream_raw(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *ad, size_t adLen);
+void hpplite_seal_stream_update(HppliteSealStream *s, const uint8_t *in, uint8_t *out, size_t n);
+void hpplite_seal_stream_final(HppliteSealStream *s, uint8_t tag[16]);
+void hpplite_seal_stream_free(HppliteSealStream *s);
 
 /* Bytes the envelope adds around the (encoded) payload */
 size_t hpplite_envelope_overhead(const HppliteCipher *cipher);

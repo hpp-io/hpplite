@@ -23,6 +23,60 @@ uint8_t *hpplite_deflate_level(const uint8_t *in, size_t n, int level, size_t *p
 
 uint8_t *hpplite_deflate(const uint8_t *in, size_t n, size_t *pOut) { return hpplite_deflate_level(in, n, 6, pOut); }
 
+#define DSTREAM_OUT (256 * 1024)
+struct HppliteDeflateStream {
+    z_stream z;
+    int (*xOut)(void *, const uint8_t *, size_t);
+    void *pArg;
+    uint8_t out[DSTREAM_OUT];
+};
+
+HppliteDeflateStream *hpplite_deflate_stream_new(uint64_t totalLen, int level, int (*xOut)(void *, const uint8_t *, size_t), void *pArg) {
+    HppliteDeflateStream *d;
+    uint8_t len[4];
+    if (totalLen == 0 || totalLen > 0xFFFFFFFFull || !xOut) return NULL;
+    d = malloc(sizeof(*d));
+    if (!d) return NULL;
+    memset(&d->z, 0, sizeof(d->z));
+    if (deflateInit(&d->z, level) != Z_OK) { free(d); return NULL; }
+    d->xOut = xOut; d->pArg = pArg;
+    len[0] = (uint8_t)(totalLen >> 24); len[1] = (uint8_t)(totalLen >> 16); len[2] = (uint8_t)(totalLen >> 8); len[3] = (uint8_t)totalLen;
+    if (xOut(pArg, len, 4) != 0) { deflateEnd(&d->z); free(d); return NULL; }
+    return d;
+}
+
+static int dstream_run(HppliteDeflateStream *d, int flush) {
+    int zrc;
+    do {
+        d->z.next_out = d->out; d->z.avail_out = DSTREAM_OUT;
+        zrc = deflate(&d->z, flush);
+        if (zrc == Z_STREAM_ERROR) return -1;
+        if (DSTREAM_OUT - d->z.avail_out > 0 && d->xOut(d->pArg, d->out, DSTREAM_OUT - d->z.avail_out) != 0) return -1;
+    } while (d->z.avail_out == 0);
+    return flush == Z_FINISH && zrc != Z_STREAM_END ? -1 : 0;
+}
+
+int hpplite_deflate_stream_write(HppliteDeflateStream *d, const uint8_t *in, size_t n) {
+    while (n > 0) {
+        uInt k = n > 0x40000000u ? 0x40000000u : (uInt)n;
+        d->z.next_in = (Bytef *)in; d->z.avail_in = k;
+        if (dstream_run(d, Z_NO_FLUSH) != 0) return -1;
+        in += k; n -= k;
+    }
+    return 0;
+}
+
+int hpplite_deflate_stream_finish(HppliteDeflateStream *d) {
+    int rc;
+    d->z.next_in = NULL; d->z.avail_in = 0;
+    rc = dstream_run(d, Z_FINISH);
+    deflateEnd(&d->z);
+    free(d);
+    return rc;
+}
+
+void hpplite_deflate_stream_free(HppliteDeflateStream *d) { if (d) { deflateEnd(&d->z); free(d); } }
+
 uint8_t *hpplite_inflate(const uint8_t *in, size_t n, size_t *pOut) {
     size_t len;
     uLongf outLen;

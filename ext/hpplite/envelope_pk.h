@@ -43,6 +43,11 @@ uint8_t *hpplite_envelope_seal_pk(const HppliteCipher *cipher, const uint8_t dek
                                   const uint8_t *aRecipients, int nRecipients,
                                   uint64_t height, uint8_t encoding,
                                   const uint8_t *payload, size_t payloadLen, size_t *pOutLen);
+/* The same envelope streamed (#364): its header malloc'd into *ppHdr (free it), then the payload through the
+** hpplite_seal_stream_* calls of cipher.h */
+HppliteSealStream *hpplite_seal_stream_new_pk(const HppliteCipher *cipher, const uint8_t dek[32],
+                                              const uint8_t *aRecipients, int nRecipients, uint64_t height,
+                                              uint8_t encoding, uint8_t **ppHdr, size_t *pHdrLen);
 
 /* Open a v3 envelope with a reader's private key: malloc'd, terminated payload, or NULL when
 ** no wrap is for this key (*pForeign = 1: the envelope is well-formed and sealed to others) or

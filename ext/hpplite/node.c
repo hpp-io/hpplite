@@ -2057,54 +2057,63 @@ static uint8_t *node_seal_at(HppliteNode *node, uint64_t height, const uint8_t *
     return out;
 }
 
-/* The room a payload sealed in place needs before and after it (#233): the envelope's header and tag, or the plain
-** form's magic */
-static void node_seal_room(HppliteNode *node, size_t *pHead, size_t *pTail) {
-    *pHead = node->cipher ? hpplite_envelope_head_len(node->cipher) : HPPLITE_PLAIN_MAGIC_LEN;
-    *pTail = node->cipher ? node->cipher->tagLen : 0;
-}
+/* A snapshot streamed to the store (#364): the image's bytes deflated, sealed and cut into chunks as they come, one
+** chunk in memory at a time - the bytes node_seal_at would make of the whole, but always deflated (the stream cannot
+** know in advance whether that is smaller; incompressible pages cost zlib's stored blocks, 0.03%) */
+typedef struct SnapStream {
+    HppliteNode *node;
+    uint64_t height;
+    uint8_t *chunk; size_t nChunk;      /* the chunk being filled, HPPLITE_SNAPSHOT_CHUNK bytes */
+    cJSON *chunks;                      /* the index's chunks: each one's ref and sha-256 */
+    uint64_t total;                     /* bytes put */
+    HppliteSealStream *seal;            /* NULL: not sealed */
+    HppliteDeflateStream *deflate;      /* NULL: not deflated */
+} SnapStream;
 
-/* As node_seal_at, for a payload that is not needed after (a snapshot's image, #233): buf is malloc'd, the payload at
-** buf + head with tail bytes free after it (node_seal_room), and this takes it. The deflated copy replaces it as soon
-** as it is made, and the envelope is sealed where the payload lies: about one copy alive at a time beyond the deflate's,
-** where node_seal_at held three. The bytes are node_seal_at's. Returns the sealed bytes (free()), or NULL */
-static uint8_t *node_seal_owned(HppliteNode *node, uint64_t height, uint8_t *buf, size_t len, int level, size_t *pLen) {
-    size_t head, tail, outLen = 0;
-    uint8_t encoding = HPPLITE_ENCODING_NONE;
-    node_seal_room(node, &head, &tail);
-    *pLen = 0;
-    if (!buf) return NULL;
-    if (!node->config.noCompress) {
-        size_t n = 0;
-        uint8_t *c = hpplite_deflate_level(buf + head, len, level, &n);
-        if (c && n + HPPLITE_PLAIN_MAGIC_LEN < len) {
-            uint8_t *room;
-            free(buf);                                  /* the image goes as its deflated copy takes its place */
-            room = realloc(c, head + n + tail);
-            if (!room) { free(c); return NULL; }
-            memmove(room + head, room, n);
-            buf = room; len = n; encoding = HPPLITE_ENCODING_DEFLATE;
-        } else free(c);
+static int snap_put_chunk(SnapStream *s) {
+    char *zRef, hx[67];
+    unsigned char d[32];
+    cJSON *ch;
+    if (s->nChunk == 0) return 0;
+    zRef = hpplite_store_put_at(s->node->store, s->height, s->chunk, s->nChunk);
+    if (!zRef) { hpplite_error(s->node->ctx, "snapshot at %llu: the store did not take a chunk: %s", (unsigned long long)s->height, hpplite_store_error(s->node->store)); return -1; }
+    /* each chunk with its sha-256: a reader checks what any store serves */
+    ch = cJSON_CreateObject();
+    hpplite_store_sha256(s->chunk, s->nChunk, d);
+    cJSON_AddStringToObject(ch, "ref", zRef);
+    hex32(d, hx); cJSON_AddStringToObject(ch, "sha256", hx);
+    cJSON_AddItemToArray(s->chunks, ch);
+    sqlite3_free(zRef);
+    s->total += s->nChunk; s->nChunk = 0;
+    return 0;
+}
+/* the posted bytes, as they come: into chunks */
+static int snap_emit(SnapStream *s, const uint8_t *p, size_t n) {
+    while (n > 0) {
+        size_t k = HPPLITE_SNAPSHOT_CHUNK - s->nChunk < n ? HPPLITE_SNAPSHOT_CHUNK - s->nChunk : n;
+        memcpy(s->chunk + s->nChunk, p, k);
+        s->nChunk += k; p += k; n -= k;
+        if (s->nChunk == HPPLITE_SNAPSHOT_CHUNK && snap_put_chunk(s) != 0) return -1;
     }
-    if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
-        /* several readers: the per-recipient envelope, a copy (rare for a snapshot) */
-        uint8_t *aTo = NULL, dek[32], *out = NULL;
-        int nTo = node_recipients(node, &aTo);
-        hpplite_random_bytes(dek, 32);
-        if (aTo && nTo > 1) out = hpplite_envelope_seal_pk(node->cipher, dek, aTo, nTo, height, encoding, buf + head, len, &outLen);
-        free(aTo);
-        free(buf);
-        *pLen = out ? outLen : 0;
-        return out;
+    return 0;
+}
+/* the payload's bytes (deflated or not): sealed, then into chunks */
+static int snap_payload(void *pArg, const uint8_t *p, size_t n) {
+    SnapStream *s = pArg;
+    uint8_t buf[16384];
+    if (!s->seal) return snap_emit(s, p, n);
+    while (n > 0) {
+        size_t k = n < sizeof buf ? n : sizeof buf;
+        hpplite_seal_stream_update(s->seal, p, buf, k);
+        if (snap_emit(s, buf, k) != 0) return -1;
+        p += k; n -= k;
     }
-    if (node->cipher) {
-        if (hpplite_envelope_seal_inplace(node->cipher, node->encKey, height, encoding, buf, len, &outLen) != 0) { free(buf); return NULL; }
-        *pLen = outLen;
-        return buf;
-    }
-    if (encoding == HPPLITE_ENCODING_DEFLATE) { memcpy(buf, HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN); *pLen = HPPLITE_PLAIN_MAGIC_LEN + len; }
-    else { memmove(buf, buf + head, len); *pLen = len; }
-    return buf;
+    return 0;
+}
+/* the image's bytes: deflated, or the payload as they are */
+static int snap_image(void *pArg, const unsigned char *p, size_t n) {
+    SnapStream *s = pArg;
+    return s->deflate ? hpplite_deflate_stream_write(s->deflate, p, n) : snap_payload(s, p, n);
 }
 
 /* A rollup's name from its latest snapshot (#226): batch 1, which names it (#160), may be pruned (keep=, #223).
@@ -2149,30 +2158,28 @@ done:
 */
 static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned char root[32]) {
     HppliteCtx *ctx = node->ctx;
-    unsigned char *image = NULL, imgRoot[32];
-    uint8_t *sealed = NULL;
-    const uint8_t *payload;
-    size_t len = 0, payloadLen, off;
-    cJSON *ix = NULL, *chunks;
+    unsigned char imgRoot[32];
+    uint64_t imgLen = 0;
+    uint8_t encoding;
+    SnapStream ss;
+    cJSON *ix = NULL;
     char *text = NULL, *zRef = NULL, hx[67];
     const char *why = NULL;
     int rc = -1, prc;
+    memset(&ss, 0, sizeof ss);
     if (!node->pm) why = "the rollup is not in page mode (capture=pages)";
     else if (ctx->blockHeight != height + 1 || ctx->openTxnId) why = "a commit is cut over batches at the anchored height";
-    {
-        size_t head, tail;
-        node_seal_room(node, &head, &tail);       /* encoded with room to be sealed where it lies (#233) */
-        if (!why && (prc = hpplite_pagemode_image_room(node->pm, head, tail, &image, &len, imgRoot)) != SQLITE_OK) why = prc == SQLITE_BUSY ? "the whole file is still queued" : "the image could not be built";
-    }
+    if (!why && (prc = hpplite_pagemode_image_begin(node->pm, &imgLen, imgRoot)) != SQLITE_OK) why = prc == SQLITE_BUSY ? "the whole file is still queued" : "the image could not be built";
     if (!why && memcmp(imgRoot, root, 32) != 0) why = "the image's root is not the anchored one";
     if (why) {
         if (!node->warnedSnapshot) { fprintf(stderr, "hpplite: no snapshot at height %llu: %s\n", (unsigned long long)height, why); node->warnedSnapshot = 1; }
-        free(image);
         return -1;
     }
-    payload = sealed = node_seal_owned(node, height, image, len, 6, &payloadLen);
-    image = NULL;                                 /* taken by the seal */
-    if (!payload) goto done;
+    /* deflated unless compression is off or the image passes the form's 4-byte length */
+    encoding = !node->config.noCompress && imgLen <= 0xFFFFFFFFull ? HPPLITE_ENCODING_DEFLATE : HPPLITE_ENCODING_NONE;
+    ss.node = node; ss.height = height;
+    ss.chunk = malloc(HPPLITE_SNAPSHOT_CHUNK);
+    if (!ss.chunk) goto done;
     ix = cJSON_CreateObject();
     cJSON_AddNumberToObject(ix, "v", 1);
     cJSON_AddNumberToObject(ix, "height", (double)height);
@@ -2180,24 +2187,37 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
     hex32(ctx->chainHash, hx); cJSON_AddStringToObject(ix, "chain", hx);
     hex32(ctx->prevBlockHash, hx); cJSON_AddStringToObject(ix, "block", hx);
     cJSON_AddNumberToObject(ix, "at", (double)time(NULL));
-    cJSON_AddNumberToObject(ix, "bytes", (double)payloadLen);
-    chunks = cJSON_AddArrayToObject(ix, "chunks");
+    ss.chunks = cJSON_AddArrayToObject(ix, "chunks");
     node_store_bucket(node);
-    for (off = 0; off < payloadLen; off += HPPLITE_SNAPSHOT_CHUNK) {
-        size_t n = payloadLen - off < HPPLITE_SNAPSHOT_CHUNK ? payloadLen - off : HPPLITE_SNAPSHOT_CHUNK;
-        zRef = hpplite_store_put_at(node->store, height, payload + off, n);
-        if (!zRef) { hpplite_error(ctx, "snapshot at %llu: the store did not take a chunk: %s", (unsigned long long)height, hpplite_store_error(node->store)); goto done; }
-        {
-            /* each chunk with its sha-256: a reader checks what any store serves (a Kubo CID of a large file is not one) */
-            cJSON *ch = cJSON_CreateObject();
-            unsigned char d[32];
-            hpplite_store_sha256(payload + off, n, d);
-            cJSON_AddStringToObject(ch, "ref", zRef);
-            hex32(d, hx); cJSON_AddStringToObject(ch, "sha256", hx);
-            cJSON_AddItemToArray(chunks, ch);
-        }
-        sqlite3_free(zRef); zRef = NULL;
+    /* the envelope's header first - per recipient, one key - or the plain form's magic before deflated bytes */
+    if (node->cipher && node->config.hasPrivkey && node_recipients(node, NULL) > 1) {
+        uint8_t *aTo = NULL, dek[32], *hdr = NULL;
+        size_t hl = 0;
+        int nTo = node_recipients(node, &aTo);
+        hpplite_random_bytes(dek, 32);                  /* its own data key, as node_seal_at's */
+        if (aTo && nTo > 1) ss.seal = hpplite_seal_stream_new_pk(node->cipher, dek, aTo, nTo, height, encoding, &hdr, &hl);
+        free(aTo);
+        memset(dek, 0, sizeof dek);
+        if (!ss.seal || snap_emit(&ss, hdr, hl) != 0) { free(hdr); goto done; }
+        free(hdr);
+    } else if (node->cipher) {
+        uint8_t hdr[64];
+        size_t hl = 0;
+        ss.seal = hpplite_seal_stream_new(node->cipher, node->encKey, height, encoding, hdr, &hl);
+        if (!ss.seal || snap_emit(&ss, hdr, hl) != 0) goto done;
+    } else if (encoding == HPPLITE_ENCODING_DEFLATE) {
+        if (snap_emit(&ss, (const uint8_t *)HPPLITE_PLAIN_MAGIC, HPPLITE_PLAIN_MAGIC_LEN) != 0) goto done;
     }
+    if (encoding == HPPLITE_ENCODING_DEFLATE && !(ss.deflate = hpplite_deflate_stream_new(imgLen, 6, snap_payload, &ss))) goto done;
+    if (hpplite_pagemode_image_stream(node->pm, snap_image, &ss) != SQLITE_OK) goto done;
+    if (ss.deflate) { int drc = hpplite_deflate_stream_finish(ss.deflate); ss.deflate = NULL; if (drc != 0) goto done; }
+    if (ss.seal) {
+        uint8_t tag[16];
+        hpplite_seal_stream_final(ss.seal, tag); ss.seal = NULL;
+        if (snap_emit(&ss, tag, node->cipher->tagLen) != 0) goto done;
+    }
+    if (snap_put_chunk(&ss) != 0) goto done;
+    cJSON_AddNumberToObject(ix, "bytes", (double)ss.total);
     if (ctx->zDbName && ctx->zDbName[0]) {
         /* the database's name (#160) as batch 1 carries it, sealed: a named rollup is found by it once
         ** batch 1 is pruned (#226) - a page batch with no pages, small to read for a lookup */
@@ -2251,7 +2271,7 @@ done:
     sqlite3_free(zRef);
     free(text);
     cJSON_Delete(ix);
-    free(image); free(sealed);
+    hpplite_deflate_stream_free(ss.deflate); hpplite_seal_stream_free(ss.seal); free(ss.chunk);
     return rc;
 }
 

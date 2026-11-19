@@ -74,13 +74,12 @@ size_t hpplite_envelope_pk_overhead(const HppliteCipher *cipher, int nRecipients
          + cipher->nonceLen + cipher->tagLen;
 }
 
-uint8_t *hpplite_envelope_seal_pk(const HppliteCipher *cipher, const uint8_t dek[32],
-                                  const uint8_t *aRecipients, int nRecipients,
-                                  uint64_t height, uint8_t encoding,
-                                  const uint8_t *payload, size_t payloadLen, size_t *pOutLen) {
-  uint8_t ephPriv[32], ephPub[33], zeroNonce[12] = {0}, ad[AD_MAX];
+/* The per-recipient envelope's header, nonce last, malloc'd; the payload's associated data into ad */
+static uint8_t *pk_header(const HppliteCipher *cipher, const uint8_t dek[32], const uint8_t *aRecipients, int nRecipients,
+                          uint64_t height, uint8_t encoding, size_t *pHeadLen, uint8_t ad[AD_MAX], size_t *pAdLen) {
+  uint8_t ephPriv[32], ephPub[33], zeroNonce[12] = {0};
   size_t wrapLen = HPPLITE_PK_FP_LEN + WRAP_PT + cipher->tagLen;
-  size_t headLen, outLen, adLen;
+  size_t headLen, adLen;
   uint8_t *out, *p;
   int i;
   if (!cipher || !dek || !aRecipients || nRecipients < 1 || nRecipients > HPPLITE_PK_MAX_RECIPIENTS || cipher->nonceLen < 12) return NULL;
@@ -88,8 +87,7 @@ uint8_t *hpplite_envelope_seal_pk(const HppliteCipher *cipher, const uint8_t dek
     if (hpplite_random_bytes(ephPriv, 32) != 0) return NULL;
   } while (hpplite_pk_pubkey(ephPriv, ephPub) != 0);
   headLen = HDR + HPPLITE_PK_PUBKEY_LEN + (size_t)nRecipients * wrapLen + cipher->nonceLen;
-  outLen = headLen + payloadLen + cipher->tagLen;
-  out = malloc(outLen);
+  out = malloc(headLen);
   if (!out) { memset(ephPriv, 0, 32); return NULL; }
   p = out;
   memcpy(p, HPPLITE_ENVELOPE_MAGIC_V3, HPPLITE_ENVELOPE_MAGIC_LEN); p += HPPLITE_ENVELOPE_MAGIC_LEN;
@@ -110,10 +108,43 @@ uint8_t *hpplite_envelope_seal_pk(const HppliteCipher *cipher, const uint8_t dek
   }
   memset(ephPriv, 0, 32);
   if (hpplite_random_bytes(p, cipher->nonceLen) != 0) { free(out); return NULL; }
-  adLen = adPayload(ad, cipher->id, encoding, height, ephPub);
-  if (cipher->seal(dek, p, ad, adLen, payload, payloadLen, p + cipher->nonceLen) != 0) { free(out); return NULL; }
-  if (pOutLen) *pOutLen = outLen;
+  *pAdLen = adPayload(ad, cipher->id, encoding, height, ephPub);
+  *pHeadLen = headLen;
   return out;
+}
+
+uint8_t *hpplite_envelope_seal_pk(const HppliteCipher *cipher, const uint8_t dek[32],
+                                  const uint8_t *aRecipients, int nRecipients,
+                                  uint64_t height, uint8_t encoding,
+                                  const uint8_t *payload, size_t payloadLen, size_t *pOutLen) {
+  uint8_t ad[AD_MAX];
+  size_t headLen = 0, adLen = 0;
+  uint8_t *head = pk_header(cipher, dek, aRecipients, nRecipients, height, encoding, &headLen, ad, &adLen), *out;
+  if (!head) return NULL;
+  out = malloc(headLen + payloadLen + cipher->tagLen);
+  if (!out) { free(head); return NULL; }
+  memcpy(out, head, headLen);
+  free(head);
+  if (cipher->seal(dek, out + headLen - cipher->nonceLen, ad, adLen, payload, payloadLen, out + headLen) != 0) { free(out); return NULL; }
+  if (pOutLen) *pOutLen = headLen + payloadLen + cipher->tagLen;
+  return out;
+}
+
+HppliteSealStream *hpplite_seal_stream_new_pk(const HppliteCipher *cipher, const uint8_t dek[32],
+                                              const uint8_t *aRecipients, int nRecipients, uint64_t height,
+                                              uint8_t encoding, uint8_t **ppHdr, size_t *pHdrLen) {
+  uint8_t ad[AD_MAX];
+  size_t headLen = 0, adLen = 0;
+  uint8_t *head;
+  HppliteSealStream *st;
+  *ppHdr = NULL;
+  if (!cipher || cipher->id != HPPLITE_CIPHER_CHACHA20POLY1305.id) return NULL;
+  head = pk_header(cipher, dek, aRecipients, nRecipients, height, encoding, &headLen, ad, &adLen);
+  if (!head) return NULL;
+  st = hpplite_seal_stream_raw(dek, head + headLen - cipher->nonceLen, ad, adLen);
+  if (!st) { free(head); return NULL; }
+  *ppHdr = head; *pHdrLen = headLen;
+  return st;
 }
 
 int hpplite_envelope_is_pk(const uint8_t *data, size_t len) {

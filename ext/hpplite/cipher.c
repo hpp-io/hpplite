@@ -368,24 +368,76 @@ uint8_t *hpplite_envelope_seal(const HppliteCipher *cipher, const uint8_t key[32
   return out;
 }
 
-/* The same envelope sealed where its payload lies (#233): buf holds hpplite_envelope_head_len(cipher) bytes, then the
-** payload, then cipher->tagLen bytes; the header is written before the payload, which is encrypted in place (ChaCha20
-** XORs block by block), and the tag after it. 0, and *pOutLen the envelope's length from buf; -1 */
-size_t hpplite_envelope_head_len(const HppliteCipher *cipher) { return HPPLITE_ENVELOPE_HEADER_LEN + cipher->nonceLen; }
+/* ---------------------------------------------------------------------
+** A streamed seal (#364): the envelope hpplite_envelope_seal(_pk) makes, its payload encrypted in pieces of any size
+** (ChaCha20 at its block counter, Poly1305 over the ciphertext as it goes), so a snapshot is never whole in memory
+*/
+struct HppliteSealStream {
+  uint32_t st[16];            /* ChaCha20 at its next block */
+  uint8_t block[64];          /* the keystream block in use */
+  size_t used;                /* ...bytes of it used (64: none left) */
+  Poly1305 mac;
+  size_t adLen;
+  uint64_t ctLen;
+};
 
-int hpplite_envelope_seal_inplace(const HppliteCipher *cipher, const uint8_t key[32], uint64_t height, uint8_t encoding,
-                                  uint8_t *buf, size_t payloadLen, size_t *pOutLen) {
-  size_t headLen = hpplite_envelope_head_len(cipher);
+HppliteSealStream *hpplite_seal_stream_raw(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *ad, size_t adLen) {
+  static const uint8_t zero[16] = {0};
+  uint8_t polyKey[32];
+  HppliteSealStream *s = malloc(sizeof(*s));
+  if (!s) return NULL;
+  memset(s, 0, sizeof(*s));
+  aead_poly_key(key, nonce, polyKey);
+  poly1305_init(&s->mac, polyKey);
+  memset(polyKey, 0, sizeof(polyKey));
+  poly1305_update(&s->mac, ad, adLen);
+  if (adLen % 16) poly1305_update(&s->mac, zero, 16 - (adLen % 16));
+  s->adLen = adLen;
+  chacha20_init(s->st, key, 1, nonce);
+  s->used = 64;
+  return s;
+}
+
+void hpplite_seal_stream_update(HppliteSealStream *s, const uint8_t *in, uint8_t *out, size_t n) {
+  uint8_t *start = out;
+  size_t total = n, j, k;
+  while (n > 0) {
+    if (s->used == 64) { chacha20_block(s->st, s->block); s->st[12]++; s->used = 0; }
+    k = 64 - s->used < n ? 64 - s->used : n;
+    for (j = 0; j < k; j++) out[j] = in[j] ^ s->block[s->used + j];
+    s->used += k; in += k; out += k; n -= k;
+  }
+  poly1305_update(&s->mac, start, total);
+  s->ctLen += total;
+}
+
+void hpplite_seal_stream_final(HppliteSealStream *s, uint8_t tag[16]) {
+  static const uint8_t zero[16] = {0};
+  uint8_t lens[16];
+  if (!s) return;
+  if (s->ctLen % 16) poly1305_update(&s->mac, zero, 16 - (size_t)(s->ctLen % 16));
+  store64le(lens, (uint64_t)s->adLen);
+  store64le(lens + 8, s->ctLen);
+  poly1305_update(&s->mac, lens, 16);
+  poly1305_finish(&s->mac, tag);
+  memset(s, 0, sizeof(*s));
+  free(s);
+}
+
+void hpplite_seal_stream_free(HppliteSealStream *s) { if (s) { memset(s, 0, sizeof(*s)); free(s); } }
+
+HppliteSealStream *hpplite_seal_stream_new(const HppliteCipher *cipher, const uint8_t key[32], uint64_t height,
+                                           uint8_t encoding, uint8_t *hdr, size_t *pHdrLen) {
   uint8_t ad[10];
   size_t adLen;
-  memcpy(buf, HPPLITE_ENVELOPE_MAGIC, HPPLITE_ENVELOPE_MAGIC_LEN);
-  buf[HPPLITE_ENVELOPE_MAGIC_LEN] = cipher->id;
-  buf[HPPLITE_ENVELOPE_MAGIC_LEN + 1] = encoding;
-  if (hpplite_random_bytes(buf + HPPLITE_ENVELOPE_HEADER_LEN, cipher->nonceLen) != 0) return -1;
+  if (!cipher || cipher->id != HPPLITE_CIPHER_CHACHA20POLY1305.id) return NULL;
+  memcpy(hdr, HPPLITE_ENVELOPE_MAGIC, HPPLITE_ENVELOPE_MAGIC_LEN);
+  hdr[HPPLITE_ENVELOPE_MAGIC_LEN] = cipher->id;
+  hdr[HPPLITE_ENVELOPE_MAGIC_LEN + 1] = encoding;
+  if (hpplite_random_bytes(hdr + HPPLITE_ENVELOPE_HEADER_LEN, cipher->nonceLen) != 0) return NULL;
   adLen = envelope_ad(ad, cipher->id, encoding, height);
-  if (cipher->seal(key, buf + HPPLITE_ENVELOPE_HEADER_LEN, ad, adLen, buf + headLen, payloadLen, buf + headLen) != 0) return -1;
-  if (pOutLen) *pOutLen = headLen + payloadLen + cipher->tagLen;
-  return 0;
+  *pHdrLen = HPPLITE_ENVELOPE_HEADER_LEN + cipher->nonceLen;
+  return hpplite_seal_stream_raw(key, hdr + HPPLITE_ENVELOPE_HEADER_LEN, ad, adLen);
 }
 
 /* "HPE2" and at least the scheme byte; nothing else is an envelope (#249: the pre-release "HPE1" is not read) */
