@@ -456,7 +456,7 @@ if(HPPLITE_BUILD_TESTS)
 
         # the same harness on the directory backend (l1=file://, #35)
         add_test(NAME test_crash_dir COMMAND crash_hpplite --l1 dir)
-        set_tests_properties(test_crash test_crash_dir PROPERTIES RESOURCE_LOCK test_crash)
+        set_tests_properties(test_crash test_crash_dir test_crash_store PROPERTIES RESOURCE_LOCK test_crash)   # one directory, /tmp/hpplite_crash (#225)
 
     # Docs must name the same factory address as the hpp-sepolia alias in da_uri.c
     add_test(NAME docs_factory_address
