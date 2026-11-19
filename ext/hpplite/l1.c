@@ -26,6 +26,9 @@ const char *hpplite_l1_backend_name(HppliteL1 *l1) {
 static uint64_t g_defaultChainId = 181228;
 void hpplite_l1_set_default_chain_id(uint64_t chainId) { if (chainId) g_defaultChainId = chainId; }
 uint64_t hpplite_l1_default_chain_id(void) { return g_defaultChainId; }
+uint64_t hpplite_l1_rpc_chain_id(const char *endpoint) {
+    return backendFor(endpoint) == &hppliteL1EthOps ? hpplite_l1_eth_rpc_chain_id(endpoint) : 0;   /* a mock or a directory has none */
+}
 
 void hpplite_l1_system_config_free(HppliteSystemConfig *config) {
     if (!config) return;

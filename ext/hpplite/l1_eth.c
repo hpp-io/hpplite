@@ -1835,3 +1835,13 @@ const HppliteL1Ops hppliteL1EthOps = {
     .relay_error = eth_relay_error,
     .factory_create_rollup_for = eth_factory_create_rollup_for,
 };
+
+/* The chain an Ethereum RPC says it is (#369): 0 when it does not answer */
+uint64_t hpplite_l1_eth_rpc_chain_id(const char *rpc_url) {
+    EthClient *eth = rpc_url ? eth_client_create(rpc_url, hpplite_l1_default_chain_id()) : NULL;
+    uint64_t id;
+    if (!eth) return 0;
+    id = eth_client_rpc_chain_id(eth);
+    eth_client_destroy(eth);
+    return id;
+}

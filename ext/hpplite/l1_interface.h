@@ -197,6 +197,8 @@ int hpplite_l1_is_lease_active(HppliteL1 *l1);
 */
 void hpplite_l1_set_default_chain_id(uint64_t chainId);
 uint64_t hpplite_l1_default_chain_id(void);
+/* The chain an endpoint says it is (#369): eth_chainId for an Ethereum RPC; 0 for a mock, a directory, or no answer */
+uint64_t hpplite_l1_rpc_chain_id(const char *endpoint);
 
 /*
 ** Addresses of the rollup's coordinator and DA contracts as 0x-hex strings

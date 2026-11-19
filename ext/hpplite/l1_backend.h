@@ -107,6 +107,7 @@ struct HppliteL1Ops {
 };
 
 extern const HppliteL1Ops hppliteL1EthOps;    /* l1_eth.c */
+uint64_t hpplite_l1_eth_rpc_chain_id(const char *rpc_url);   /* l1_eth.c */
 extern const HppliteL1Ops hppliteL1MockOps;   /* l1_mock.c */
 extern const HppliteL1Ops hppliteL1DirOps;    /* l1_dir.c: file:///path */
 

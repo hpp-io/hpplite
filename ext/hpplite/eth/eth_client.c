@@ -483,6 +483,17 @@ int eth_client_balance(EthClient *client, const uint8_t address[20], double *pWe
     return rc;
 }
 
+uint64_t eth_client_rpc_chain_id(EthClient *client) {
+    cJSON *response = rpc_call(client, "eth_chainId", NULL);
+    cJSON *result;
+    uint64_t id = 0;
+    if (!response) return 0;
+    result = cJSON_GetObjectItem(response, "result");
+    if (result && cJSON_IsString(result)) id = strtoull(result->valuestring, NULL, 16);
+    cJSON_Delete(response);
+    return id;
+}
+
 uint64_t eth_client_gas_price(EthClient *client) {
     cJSON *response = rpc_call(client, "eth_gasPrice", NULL);
     if (!response) return (uint64_t)-1;

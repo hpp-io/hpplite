@@ -669,6 +669,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     memcpy(nc->contract, cfg->contract, 20);
     nc->hasContract = cfg->hasContract;
     nc->chainId = cfg->chainId;
+    nc->chainIdGiven = cfg->chainIdSource != 0;
     nc->batchIntervalMs = cfg->batchIntervalMs;
     nc->noEncrypt = !cfg->encrypt;
     nc->noCompress = !cfg->compress;

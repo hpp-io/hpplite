@@ -71,6 +71,7 @@ typedef struct HppliteNodeConfig {
     int checkpointInterval;         /* Batches between L1 checkpoints */
     int batchIntervalMs;            /* Auto-flush interval (0 = disabled) */
     uint64_t chainId;               /* L1 chain id for signing (0 = library default, HPP Sepolia) */
+    int chainIdGiven;               /* chainid= or an l1= alias said it (#369): else the RPC says it */
     size_t maxBatchBytes;           /* DA size limit (0 = from L1 / default 128 KB) */
     int noEncrypt;                  /* Post plaintext batches (default: sealed when a key exists) */
     int noCompress;                 /* compress=off: post the batch JSON as is (#12); default: deflate when it shrinks */

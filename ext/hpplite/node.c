@@ -705,7 +705,19 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
 static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
     if (node->follower) return;
     if (!config->rpcUrl) return;
-    if (config->chainId) hpplite_l1_set_default_chain_id(config->chainId);
+    if (config->hasContract || config->hasFactory) {
+        /* the chain to sign for is the RPC's (#369): not given, it is asked - a bare rpc= once signed for HPP Sepolia's
+        ** 181228 whatever the chain, and every transaction was refused; given, the RPC must agree */
+        uint64_t rpcChain = hpplite_l1_rpc_chain_id(config->rpcUrl);
+        if (rpcChain && !config->chainIdGiven) node->config.chainId = rpcChain;
+        else if (rpcChain && config->chainId && rpcChain != config->chainId) {
+            node->wantsL1 = 1;
+            hpplite_error(node->ctx, "chainid=%llu but the RPC at %s is chain %llu: not connected (give the RPC's chain id, or none)",
+                          (unsigned long long)config->chainId, config->rpcUrl, (unsigned long long)rpcChain);
+            return;
+        }
+    }
+    if (node->config.chainId) hpplite_l1_set_default_chain_id(node->config.chainId);
     if (!config->hasContract && !config->hasFactory) return;
     node->wantsL1 = 1;
 

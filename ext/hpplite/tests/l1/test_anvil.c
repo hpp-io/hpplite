@@ -3360,6 +3360,38 @@ static long long once_replica(const char *key, const char *storeUrl, const char 
     if (r) { v = scalar(r, sql); sqlite3_close(r); }
     return v;
 }
+/* 58. rpc= without chainid= (#369, somaro#352): the node asks the RPC its chain and signs for that, not for HPP Sepolia's
+** 181228 - before, anvil refused every transaction, the factory's create waited 60 s and the open came back unconnected
+** without a word. A chainid= the RPC contradicts is said at open, both numbers */
+static void test_chain_from_rpc(void) {
+    TEST("rpc= without chainid= (#369): the chain id is the RPC's - the rollup created, the lease taken; a chainid= the RPC contradicts is said at open");
+    static const char *K = "0x6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c";
+    char addr[48], cmd[600], out[400], uri[1024], contract[80], err[400];
+    sqlite3 *db = NULL;
+    int lease;
+    (void)!system("rm -f " DIR "/cfr_a.db* " DIR "/cfr_b.db*");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", K);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    snprintf(uri, sizeof uri, "file:" DIR "/cfr_a.db?hpplite=on&rpc=%s&factory=%s&privkey=%s&datadir=" DIR "&interval=0", RPC, FACTORY, K);
+    if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(db); FAIL("open"); }
+    snprintf(contract, sizeof contract, "%s", status_text(db, "contract"));
+    lease = (int)scalar(db, "SELECT lease FROM hpplite_status");
+    printf("(contract %s, lease %d) ", contract[0] ? contract : "-", lease);
+    sqlite3_close(db);
+    if (!contract[0] || lease != 1) FAIL("no rollup or no lease: the transactions were signed for another chain");
+    snprintf(uri, sizeof uri, "file:" DIR "/cfr_b.db?hpplite=on&rpc=%s&factory=%s&chainid=1&privkey=%s&datadir=" DIR "&interval=0", RPC, FACTORY, K);
+    db = NULL;
+    if (sqlite3_open_v2(uri, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) != SQLITE_OK) { sqlite3_close(db); FAIL("open with chainid=1"); }
+    snprintf(err, sizeof err, "%s", status_text(db, "last_error"));
+    sqlite3_close(db);
+    printf("(chainid=1: %s) ", err[0] ? err : "-");
+    if (!strstr(err, "chainid=1") || !strstr(err, "31337")) FAIL("a chainid= the RPC contradicts is not said");
+    PASS();
+}
+
 static void test_sequencer_once(void) {
     TEST("hpplite-sequencer --once (#345): runs over a kept copy of an app's file send what changed as one height each, nothing when unchanged; an empty app's file is refused, a held copy left alone; a replica rebuilds the app's rows");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
@@ -3494,6 +3526,7 @@ int main(void) {
     /* 42-53, 56: fleet mode, gone with it (#352, decision 0003; on the branch fleet-experiment) */
     if (wanted(55)) test_paid_in_chip();
     if (wanted(57)) test_sequencer_once();
+    if (wanted(58)) test_chain_from_rpc();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

@@ -28,6 +28,8 @@ int eth_client_set_signer(EthClient *client, EthSignFn fn, void *arg, const uint
 
 /* Get chain ID */
 uint64_t eth_client_chain_id(EthClient *client);
+/* The chain the RPC says it is (eth_chainId, #369); 0 when it does not answer */
+uint64_t eth_client_rpc_chain_id(EthClient *client);
 
 /* === Read operations (eth_call) === */
 
