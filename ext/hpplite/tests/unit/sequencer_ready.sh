@@ -15,6 +15,7 @@ export HPPLITE_PARAMS="l1=file://$d/chain&interval=200ms&datadir=$d&privkey=0x01
 
 # starts: the sequencer on a fresh file; the line must appear while it runs
 start() {
+    : >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
     "$bin" "$d/app.db" >"$d/out" 2>"$d/err" &
     pid=$!
     i=0

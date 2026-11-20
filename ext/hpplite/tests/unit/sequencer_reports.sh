@@ -13,6 +13,7 @@ command -v sqlite3 >/dev/null 2>&1 || { echo "sequencer_reports: SKIP (no sqlite
 export HPPLITE_PARAMS="l1=file://$d/chain&interval=200ms&datadir=$d&store=http://127.0.0.1:9&privkey=0x0202020202020202020202020202020202020202020202020202020202020202"
 export HPPLITE_STUCK_SECONDS=3          # the 30 s, shortened for the test
 export HPPLITE_STORE_FALLBACK=off       # the chain does not carry the bytes meanwhile: they stay pending
+: >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
 "$bin" "$d/app.db" >"$d/out" 2>"$d/err" &
 pid=$!
 i=0
@@ -45,6 +46,7 @@ i=0
 while [ $i -lt 50 ] && ! [ -s "$d/port" ]; do sleep 0.1; i=$((i + 1)); done
 [ -s "$d/port" ] || fail "the test's mute store did not start"
 mkdir "$d/slow"
+: >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
 HPPLITE_PARAMS="l1=file://$d/slow/chain&interval=200ms&datadir=$d/slow&store=http://127.0.0.1:$(cat "$d/port")&privkey=0x0303030303030303030303030303030303030303030303030303030303030303" \
     "$bin" "$d/slow/app.db" >"$d/out" 2>"$d/err" &
 pid=$!

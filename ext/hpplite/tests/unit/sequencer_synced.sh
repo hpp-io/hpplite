@@ -23,6 +23,7 @@ waitline() {    # <file> <pattern> <tenths>: the line is there within the time
 # a rollup with a history: a host sequences three commits and stops
 history() {     # <dir>
     mkdir "$1/h1"
+    : >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
     HPPLITE_PARAMS="l1=file://$1/chain&interval=200ms&datadir=$1/h1&privkey=$key" "$bin" "$1/h1/app.db" >"$d/out" 2>"$d/err" &
     pid=$!
     waitline "$d/out" "synced height 1" 150 || fail "the first host did not say it was synced"
@@ -49,6 +50,7 @@ appcloses() { echo ".quit" >&9; exec 9>&-; wait "$app"; app=; }
 mkdir "$d/one"
 history "$d/one"
 restored "$d/one"
+: >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
 HPPLITE_PARAMS="l1=file://$d/one/chain&interval=200ms&datadir=$d/one/h2&privkey=$key" "$bin" "$d/one/h2/app.db" >"$d/out" 2>"$d/err" &
 pid=$!
 waitline "$d/err" "pages cannot be applied while other connections hold the file in WAL mode" 150 || fail "the node did not say why the history was not applied"
@@ -69,6 +71,7 @@ mkdir "$d/many" "$d/many/dir"
 history "$d/many"
 restored "$d/many"
 ( umask 077; printf 'db=%s\nparams=contract=0x00000000000000000000000000000000000000a1&l1=file://%s/chain&interval=200ms&datadir=%s\nprivkey=%s\n' "$d/many/h2/app.db" "$d/many" "$d/many/h2" "$key" > "$d/many/dir/a.conf" )
+: >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
 "$bin" --dir "$d/many/dir" >"$d/out" 2>"$d/err" &
 pid=$!
 waitline "$d/out" "^a: not synced: .*pages cannot be applied" 150 || fail "--dir: no '<name>: not synced: <the node's error>' line"

@@ -30,6 +30,7 @@ replace() {
 # --- one file: the process exits 4 after the node's line
 mkdir "$d/one"
 export HPPLITE_PARAMS="l1=file://$d/one/chain&interval=200ms&datadir=$d/one&privkey=$key"
+: >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
 "$bin" "$d/one/app.db" >"$d/out" 2>"$d/err" &
 pid=$!
 waitline "$d/out" "synced height" 150 || fail "no 'synced height' line"
@@ -44,6 +45,7 @@ wait "$pid"; rc=$?; pid=
 [ "$rc" = 4 ] || fail "the exit should be 4 after the file was replaced, not $rc"
 [ "$(sqlite3 "$d/one/app.db" "SELECT count(*) FROM restored")" = 1 ] || fail "the file there now was touched by the stopping sequencer"
 # the restart a supervisor makes: on the file there now
+: >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
 "$bin" "$d/one/app.db" >"$d/out" 2>"$d/err" &
 pid=$!
 waitline "$d/out" "synced height" 150 || fail "the restart on the file there now did not say it was synced"
@@ -55,6 +57,7 @@ mkdir "$d/dir" "$d/a" "$d/b"
 for n in a b; do
     ( umask 077; printf 'db=%s\nparams=contract=0x00000000000000000000000000000000000000a1&l1=file://%s/chain&interval=200ms&datadir=%s\nprivkey=%s\n' "$d/$n/app.db" "$d/$n" "$d/$n" "$key" > "$d/dir/$n.conf" )
 done
+: >"$d/out"; : >"$d/err"          # emptied here, not by the background job: nothing the run before said is read (#385)
 "$bin" --dir "$d/dir" >"$d/out" 2>"$d/err" &
 pid=$!
 waitline "$d/out" "^a: synced height" 150 || fail "--dir: a did not open"
