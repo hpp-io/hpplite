@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(here, "..", "conformance"))
 sys.path.insert(0, here)
 from x402seller import eth  # noqa: E402
 from buyer import Buyer  # noqa: E402
-from hpplite_store import BIND_TYPE, CONTENT_TYPE, batch_digest  # noqa: E402
+from hpplite_store import BIND_TYPE, CONTENT_TYPE, PRUNE_TYPE, batch_digest, cid_of  # noqa: E402
 
 CHAIN_ID = 181228                  # the store's default network
 fails = 0
@@ -293,6 +293,80 @@ def main():
         check(acct4.get("state") == "covered" and b4.get("state") == "covered" and warned,
               "a pull whose simulation the RPC rate-limits: the store's failure - covered, a warning, nothing parked (#220)")
         ROLLUP["limit_sends"] = False
+
+        # --- a bucket of many objects: a put costs what it costs into an empty one (#401) ---
+        # A store's directory as it was before #401 - every object of the bucket in its record's "content" map - is
+        # taken over at the start: 50,000 objects, each still found by its CID and by its height; then a put into
+        # that bucket is timed beside a put into an empty one, turn about.
+        rpc_mode["value"] = "error"
+        p5, url5 = start_store(work, "many", "--price-per-write", "0", "--price-per-mib-month", "0")
+        procs.append(p5)
+        dom5 = eth.domain_separator("HPPLiteStore", "2", CHAIN_ID, http_("GET", url5 + "/status")[1]["domain"]["verifyingContract"])
+        seq5, fund5 = secrets.token_bytes(32), secrets.token_bytes(32)
+        big, small = eth.address(secrets.token_bytes(32)).lower(), eth.address(secrets.token_bytes(32)).lower()
+
+        def put5(url, da, data, height):
+            sig = eth.sign(seq5, eth.typed_digest(dom5, CONTENT_TYPE, da, height, eth.keccak256(data)))
+            t = time.monotonic()
+            code, out = http_("POST", "%s/put?bucket=%s&height=%d" % (url, da, height), data, {"X-HPPLite-Signature": "0x" + sig.hex()})
+            return code, out if isinstance(out, dict) else {}, time.monotonic() - t
+
+        N = 50000
+        for da in (big, small):
+            code, _ = http_("POST", url5 + "/bucket/" + da, bind_body(dom5, da, seq5, fund5, int(time.time())))
+            check(code == 200, "bound")
+        code, out, _ = put5(url5, big, b"held before the restart", N + 1)
+        check(code == 200 and out.get("held") is False, "one object in the bucket (%s)" % code)
+        p5.terminate()
+        p5.wait()
+        procs.remove(p5)
+        rec_path = os.path.join(work, "many", "b", big, "bucket.json")
+        rec = json.load(open(rec_path))
+        seeded = {cid_of(b"object %d" % i): {"height": i, "bytes": len(b"object %d" % i)} for i in range(1, N + 1)}
+        rec.setdefault("content", {}).update(seeded)
+        rec["objects"] += N
+        rec["bytes"] += sum(e["bytes"] for e in seeded.values())
+        want_objects, want_bytes = rec["objects"], rec["bytes"]
+        with open(rec_path, "w") as f:
+            json.dump(rec, f, sort_keys=True)
+        p5, url5 = start_store(work, "many", "--price-per-write", "0", "--price-per-mib-month", "0")
+        procs.append(p5)
+        b5 = http_("GET", url5 + "/bucket/" + big)[1]
+        check(b5.get("objects") == want_objects and b5.get("bytes") == want_bytes,
+              "a directory with the objects in the bucket's record is taken over: %s objects, %s bytes (%d, %d)"
+              % (b5.get("objects"), b5.get("bytes"), want_objects, want_bytes))
+        held = [put5(url5, big, d, h)[1].get("held") for d, h in ((b"held before the restart", N + 1), (b"object 17", 17), (b"object %d" % N, N))]
+        check(held == [True, True, True], "each is found by its CID: the one put before, the 17th, the last (%s)" % held)
+        first = sorted(list(seeded) + [cid_of(b"held before the restart")])[:5]
+        pg1 = http_("GET", "%s/bucket/%s/objects?limit=3" % (url5, big))[1]
+        pg2 = http_("GET", "%s/bucket/%s/objects?limit=2&after=%s" % (url5, big, pg1.get("next") or ""))[1]
+        listed = [o["cid"] for o in pg1.get("objects", []) + pg2.get("objects", [])]
+        check(listed == first and pg2.get("next") == first[4], "the listing pages through them by CID")
+        tb, ts, done = [], [], True
+        for i in range(15):
+            cb, ob, t1 = put5(url5, big, b"a new object %d" % i, N + 2 + i)
+            cs, osm, t2 = put5(url5, small, b"a new object %d" % i, 1 + i)
+            done = done and cb == 200 and cs == 200 and ob.get("held") is False and osm.get("held") is False
+            tb.append(t1)
+            ts.append(t2)
+        check(done, "15 new objects put into each bucket")
+        mb, ms = sorted(tb)[7], sorted(ts)[7]
+        print("          (a put, the median of 15: %.1f ms into the bucket of %d, %.1f ms into the empty one)" % (mb * 1000, want_objects, ms * 1000))
+        check(mb < 3 * ms, "a put into a bucket of %d objects costs what one into an empty bucket does: %.1f ms and %.1f ms"
+              % (want_objects, mb * 1000, ms * 1000))
+        issued5 = int(time.time())
+        psig = eth.sign(seq5, eth.typed_digest(dom5, PRUNE_TYPE, big, N - 9, issued5))
+        code, out = http_("POST", "%s/bucket/%s/prune" % (url5, big), json.dumps({"height": N - 9, "issuedAt": issued5, "signature": "0x" + psig.hex()}).encode())
+        b5 = http_("GET", url5 + "/bucket/" + big)[1]
+        kept = sorted([cid_of(b"object %d" % i) for i in range(N - 9, N + 1)] + [cid_of(b"held before the restart")]
+                      + [cid_of(b"a new object %d" % i) for i in range(15)])
+        left, after = [], ""
+        while after is not None and len(left) < 100:
+            pg = http_("GET", "%s/bucket/%s/objects?limit=7&after=%s" % (url5, big, after))[1]
+            left += [o["cid"] for o in pg.get("objects", [])]
+            after = pg.get("next")
+        check(code == 200 and b5.get("objects") == 26 and left == kept,
+              "a prune lets go of them by height: %s objects left of %d, the 26 at or past the prune's height (%s)" % (b5.get("objects"), want_objects + 15, code))
     finally:
         for p in procs:
             p.terminate()

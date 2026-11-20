@@ -21,6 +21,7 @@ Layout (a directory standing for an object store):
   c/<cid>            content bytes;  c/<cid>.refs  {da: height} - the buckets holding it
   b/<da>/bucket.json the bucket;     b/<da>/n/<height>  a name: the instance (32), the signature (65), the bytes' CID
   (a name's bytes are content: a name and a content put of the same bytes hold them once)
+  index.db           what each bucket holds, a row an object: its CID, the height it was put at, its bytes (#401)
   a/<funder>.json    the account
 """
 import argparse
@@ -32,6 +33,7 @@ import os
 import re
 import shutil
 import socketserver
+import sqlite3
 import sys
 import threading
 import time
@@ -150,6 +152,60 @@ class Disk:
         except FileNotFoundError:
             return []
 
+
+
+class Index:
+    """What each bucket holds (#401), a row an object, found by its CID and by its height: a put, a read and a prune
+    cost the same whatever the bucket holds. The bucket's record carries the counters; an object's row is written
+    before the record that counts it."""
+
+    def __init__(self, path):
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS content (da TEXT NOT NULL, cid TEXT NOT NULL, height INTEGER NOT NULL,"
+                        " bytes INTEGER NOT NULL, PRIMARY KEY (da, cid)) WITHOUT ROWID")
+        self.db.execute("CREATE INDEX IF NOT EXISTS content_height ON content (da, height)")
+
+    def _all(self, sql, *args):
+        with self.lock:
+            return self.db.execute(sql, args).fetchall()
+
+    def get(self, da, cid):
+        """{height, bytes} of an object the bucket holds, else None"""
+        rows = self._all("SELECT height, bytes FROM content WHERE da = ? AND cid = ?", da, cid)
+        return {"height": rows[0][0], "bytes": rows[0][1]} if rows else None
+
+    def add(self, da, entries):
+        """entries: (cid, height, bytes), all of them or none"""
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.executemany("INSERT OR REPLACE INTO content (da, cid, height, bytes) VALUES (?, ?, ?, ?)",
+                                ((da, c, h, n) for c, h, n in entries))
+            self.db.execute("COMMIT")
+
+    def remove(self, da, cid):
+        self._all("DELETE FROM content WHERE da = ? AND cid = ?", da, cid)
+
+    def below(self, da, height):
+        """(cid, bytes) of the bucket's objects put before `height`"""
+        return self._all("SELECT cid, bytes FROM content WHERE da = ? AND height < ?", da, height)
+
+    def remove_below(self, da, height):
+        self._all("DELETE FROM content WHERE da = ? AND height < ?", da, height)
+
+    def cids(self, da):
+        return [r[0] for r in self._all("SELECT cid FROM content WHERE da = ?", da)]
+
+    def clear(self, da):
+        self._all("DELETE FROM content WHERE da = ?", da)
+
+    def page(self, da, after, limit):
+        """up to `limit` objects past the CID `after`, ascending"""
+        return [{"cid": c, "height": h, "bytes": n} for c, h, n in
+                self._all("SELECT cid, height, bytes FROM content WHERE da = ? AND cid > ? ORDER BY cid LIMIT ?", da, after, limit)]
+
 # ============ The chain ============
 
 
@@ -192,10 +248,26 @@ class Ledger:
         # the tokens it takes (#357): credit is in the first's units, the others converted at their unitsPerToken
         self.rollups, self.tokens, self.assets = rollups, tokens, assets
         self.lock = threading.RLock()
+        self.index = Index(disk.path("index.db"))
+        self.adopt_records()
         self.warnings = {}
         self.seen = {}          # funder -> (what its permit could pull, when): the last read that worked
 
     # --- records ---
+    def adopt_records(self):
+        """a directory from before #401 kept a bucket's objects in its record ("content": CID -> height, bytes),
+        read and written whole at every put: they go to the index, once, and the record is written without them"""
+        for da in self.disk.list("b"):
+            b = self.bucket(da)
+            if not b or ("content" not in b and "names" not in b):
+                continue
+            held = b.pop("content", None) or {}
+            b.pop("names", None)
+            self.index.add(da, ((cid, int(e["height"]), int(e["bytes"])) for cid, e in held.items()))
+            self.save_bucket(b)
+            if held:
+                sys.stderr.write("hpplite_store: %s: the %d objects in the bucket's record are in index.db now (#401)\n" % (da, len(held)))
+
     def bucket(self, da):
         return self.disk.json("b/%s/bucket.json" % da)
 
@@ -454,10 +526,11 @@ class Ledger:
 
     def delete_bucket(self, b):
         da = b["da"]
-        for cid in list(b.get("content", {})):
+        for cid in self.index.cids(da):
             self.unref(cid, da)
+        self.index.clear(da)
         shutil.rmtree(self.disk.path("b/%s/n" % da), ignore_errors=True)
-        b.update({"state": "deleted", "bytes": 0, "objects": 0, "content": {}, "names": {}, "deletedAt": int(time.time())})
+        b.update({"state": "deleted", "bytes": 0, "objects": 0, "deletedAt": int(time.time())})
         self.save_bucket(b)
 
     def unref(self, cid, da):
@@ -734,10 +807,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             return self.reply(400, {"error": "limit: a number up to %d" % UNPIN_MAX})
         after = (query.get("after") or [""])[0]
-        cids = sorted(c for c in b.get("content", {}) if c > after)
-        page = cids[:limit]
-        objs = [{"cid": c, "height": b["content"][c]["height"], "bytes": b["content"][c]["bytes"]} for c in page]
-        return self.reply(200, {"da": da, "objects": objs, "next": page[-1] if len(cids) > limit else None})
+        objs = self.L.index.page(da, after, limit + 1)
+        more, objs = len(objs) > limit, objs[:limit]
+        return self.reply(200, {"da": da, "objects": objs, "next": objs[-1]["cid"] if more else None})
 
     def account_view(self, a):
         L = self.L
@@ -829,7 +901,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(409, {"error": "a binding no newer than the last taken", "last": b.get("boundAt")})
             now = int(time.time())
             if not b or b["state"] == "deleted":
-                b = {"da": da, "bytes": 0, "objects": 0, "height": 0, "pruneHeight": 0, "content": {}, "names": {},
+                b = {"da": da, "bytes": 0, "objects": 0, "height": 0, "pruneHeight": 0,
                      "created": now, "accruedAt": now, "pruneAt": 0}
             else:
                 self.L.accrue(b, now)                   # what accrued so far stays with the old funder
@@ -956,15 +1028,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def hold(self, da, cid, data, height):
         """the bytes in the bucket, once: written first, then the reference (without one, a sweep takes them)"""
-        b = self.L.bucket(da)
-        if cid in b.get("content", {}):
+        if self.L.index.get(da, cid):
             return
+        b = self.L.bucket(da)
         if self.service.disk.read("c/%s" % cid) is None:
             self.service.disk.write("c/%s" % cid, data)
         refs = self.service.disk.json("c/%s.refs" % cid) or {}
         refs[da] = height
         self.service.disk.set_json("c/%s.refs" % cid, refs)
-        b.setdefault("content", {})[cid] = {"height": height, "bytes": len(data)}
+        self.L.index.add(da, [(cid, height, len(data))])
         b["bytes"] += len(data)
         b["objects"] += 1
         self.L.save_bucket(b)
@@ -995,7 +1067,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if bad:
             return self.reply(*bad)
         cid = cid_of(body)
-        if cid in b.get("content", {}):
+        if self.L.index.get(da, cid):
             return self.reply(200, {"cid": cid, "bytes": len(body), "held": True})
 
         def work():
@@ -1024,12 +1096,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.service.disk.delete("b/%s/n/%s" % (da, f))
                     b["bytes"] -= 97
                     b["objects"] -= 1
-            for cid, e in list(b.get("content", {}).items()):
-                if e["height"] < h:
-                    self.L.unref(cid, da)
-                    del b["content"][cid]
-                    b["bytes"] -= e["bytes"]
-                    b["objects"] -= 1
+            for cid, nbytes in self.L.index.below(da, h):
+                self.L.unref(cid, da)
+                b["bytes"] -= nbytes
+                b["objects"] -= 1
+            self.L.index.remove_below(da, h)
             self.L.accrue(b, int(time.time()))
             b["pruneHeight"], b["pruneAt"] = max(b.get("pruneHeight", 0), h), req["issuedAt"]
             self.L.save_bucket(b)
@@ -1058,10 +1129,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.L.accrue(b, int(time.time()))                 # what was held until now is charged
             missing, n = [], 0
             for cid in cids:
-                e = b.get("content", {}).pop(cid, None)
+                e = self.L.index.get(da, cid)
                 if e is None:
                     missing.append(cid)
                     continue
+                self.L.index.remove(da, cid)
                 self.L.unref(cid, da)
                 b["bytes"] -= e["bytes"]
                 b["objects"] -= 1

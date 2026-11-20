@@ -64,9 +64,18 @@ A directory standing for an object store:
 | `b/<da>/bucket.json` | the bucket: funder, state, bytes, height, prune point |
 | `b/<da>/n/<height>` | a name: the instance (32 bytes), the signature (65), the bytes' CID |
 | `a/<funder>.json` | the account: credit, the permit, the last pull, why it is uncovered |
+| `index.db` | what each bucket holds, a row an object: its CID, the height it was put at, its bytes |
 
 The reference is one process (its ledger under one lock); the canonical
 store keeps the ledger in Durable Objects.
+
+`index.db` is a SQLite file (#401). Before it a bucket's objects were a map
+in `bucket.json`, read and written whole at every put: a put cost in
+proportion to what the bucket held (170 ms into a bucket of 50,000 objects,
+16 ms into an empty one). A directory from before is taken over at the
+start - the map's entries go to `index.db`, once, and the store says so; a
+store from before #401 must not be run on the directory afterwards (it
+would find the buckets empty and count every object again).
 
 ## Tests
 
