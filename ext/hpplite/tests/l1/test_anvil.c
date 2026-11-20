@@ -3543,7 +3543,8 @@ static void test_store_away_at_start(void) {
 /* 69. An anchor asked of hpplite-sequencer from outside (#396): the sequencer is a process of its own beside the
 ** application, anchor=24h, and nothing outside it could ask for an anchor - SIGUSR2's default ended the process. It
 ** flushes what is pending and anchors what the store holds now: "anchored to height N" on stderr, the process up, a
-** rebuild to a time (hpplite-verify --at, which reaches the last anchor) has the rows; asked again with nothing new
+** rebuild to a time (hpplite-verify --at) has the rows as anchored ones - before the signal it has them as the
+** store's, past the anchor (#390: it stayed at the last anchor then, and had none); asked again with nothing new
 ** it says so and sends no transaction; a commit made just before the next one is in it */
 static int g_askStatus;             /* how the sequencer ended, where anchor_line saw it end */
 static long anchor_line(const char *path, const char *what, int nth, pid_t pid, double secs) {
@@ -3564,24 +3565,29 @@ static long anchor_line(const char *path, const char *what, int nth, pid_t pid, 
     } while (now_s() - t0 < secs);
     return -1;
 }
-static long long rows_at(const char *vparams, long long at, const char *dir, const char *sql, int *pRc) {
-    char extra[300], path[300], out[4096] = "", cmd[300];
+static long long rows_at_said(const char *vparams, long long at, const char *dir, const char *sql, int *pRc, char *out, size_t nOut) {
+    char extra[300], path[300], cmd[300];
     sqlite3 *kept = NULL;
     long long rows = -1;
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
     (void)!system(cmd);
     snprintf(extra, sizeof extra, "--at %lld --keep %s", at, dir);
-    *pRc = run_verify_with(vparams, extra, out, sizeof out);
+    out[0] = 0;
+    *pRc = run_verify_with(vparams, extra, out, nOut);
     snprintf(path, sizeof path, "%s/rebuilt.db", dir);
     if (access(path, R_OK) == 0 && sqlite3_open_v2(path, &kept, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) rows = scalar(kept, sql);
     sqlite3_close(kept);
     return rows;
 }
+static long long rows_at(const char *vparams, long long at, const char *dir, const char *sql, int *pRc) {
+    char out[4096];
+    return rows_at_said(vparams, at, dir, sql, pRc, out, sizeof out);
+}
 static void test_anchor_asked(void) {
     TEST("SIGUSR2 to hpplite-sequencer anchors now (#396): anchor=24h, the heights at the store alone; the signal - 'anchored to height N' on stderr, the process up, hpplite-verify --at has the rows; again with nothing new: said, no transaction; a commit just before the next is in it");
     const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
     static const char *WKEY = "0x6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d";
-    char addr[48], cmd[600], out[400], contract[80], params[900], vparams[500];
+    char addr[48], cmd[600], out[400], contract[80], params[900], vparams[500], saidB[4096] = "", said1[4096] = "";
     long h, a1, none, a2;
     long long before, after1, after2, n1, n2, n3, at;
     int port, rcB = -2, rc1 = -2, rc2 = -2, stop;
@@ -3616,7 +3622,7 @@ static void test_anchor_asked(void) {
     if (plain_exec(DIR "/host13/app.db", "INSERT INTO notes(body) VALUES('and this one')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); ASK_END(); FAIL("the app writes again"); }
     sleep(3);
     at = (long long)time(NULL);
-    before = rows_at(vparams, at, DIR "/ask_keep0", "SELECT count(*) FROM notes", &rcB);        /* nothing anchored: the rebuild to a time has no row */
+    before = rows_at_said(vparams, at, DIR "/ask_keep0", "SELECT count(*) FROM notes", &rcB, saidB, sizeof saidB);   /* nothing anchored: the rows are the store's, past the anchor (#390) */
     n1 = nonce_of(addr);
 
     kill(side, SIGUSR2);
@@ -3631,7 +3637,7 @@ static void test_anchor_asked(void) {
         FAIL("SIGUSR2: no 'anchored to height N' line on stderr");
     }
     n2 = nonce_of(addr);
-    after1 = rows_at(vparams, at, DIR "/ask_keep1", "SELECT count(*) FROM notes", &rc1);
+    after1 = rows_at_said(vparams, at, DIR "/ask_keep1", "SELECT count(*) FROM notes", &rc1, said1, sizeof said1);
 
     kill(side, SIGUSR2);                                          /* nothing new: said, and no transaction */
     none = anchor_line(side_path(13, 1, "err"), "/host13/app.db nothing to anchor past height ", 1, side, 60);
@@ -3646,8 +3652,10 @@ static void test_anchor_asked(void) {
 #undef ASK_END
     printf("(synced at %ld; --at before the signal: exit %d, rows %lld; anchored to %ld in %lld transaction(s), --at: exit %d, rows %lld; nothing new: past %ld, %lld transaction(s); a commit and the signal: anchored to %ld, --at: exit %d, rows %lld; stop %d) ",
            h, rcB, before, a1, n2 - n1, rc1, after1, none, n3 - n2, a2, rc2, after2, stop);
-    if (before == 2) FAIL("the test's premise: with anchor=24h nothing is anchored before the signal");
-    if (a1 < 2 || n2 != n1 + 1 || rc1 != 0 || after1 != 2) FAIL("the signal should anchor the store's heights in one transaction, and a rebuild to the time have both rows");
+    if (rcB != 0 || before != 2 || !strstr(saidB, "are the store's, each signed by the rollup's sequencer") || strstr(saidB, "every batch rebuilt is anchored on the chain"))
+        FAILF("the test's premise: with anchor=24h nothing is anchored before the signal, and --at has the rows as the store's, past the anchor (#390)\n%s", saidB);
+    if (a1 < 2 || n2 != n1 + 1 || rc1 != 0 || after1 != 2 || !strstr(said1, "every batch rebuilt is anchored on the chain"))
+        FAILF("the signal should anchor the store's heights in one transaction, and a rebuild to the time have both rows as anchored ones\n%s", said1);
     if (none != a1 || n3 != n2) FAIL("asked again with nothing new, it should say 'nothing to anchor past height N' and send nothing");
     if (a2 <= a1 || rc2 != 0 || after2 != 3) FAIL("a commit made just before the signal should be flushed and in the anchor");
     if (stop != 0) FAIL("the sequencer should stop clean");
@@ -4063,6 +4071,92 @@ static void test_stop_nearest_snapshot(void) {
         FAILF("--to 2, below the first snapshot, is read from batch 1; exit %d, rows %lld\n%s", rc[3], rows[3], out[3]);
     if (rc[4] != 0 || rows[4] != 7 || strstr(out[4], "from the snapshot") || !strstr(out[4], "chain hash over 7 batches: matches"))
         FAILF("without a stop every batch from batch 1 is read; exit %d, rows %lld\n%s", rc[4], rows[4], out[4]);
+    PASS();
+}
+
+/* 73. A stop past the last anchor (#390): hpplite-verify --to/--at stayed at the anchored history - the newest point
+** a rebuild reached was the last anchor, and the moment a platform's user wants to go back to is nearly always in
+** the unanchored part. The store's batches past the anchor are read up to the stop, each signed by the rollup's
+** sequencer and applied on the anchored history, and with a stop one line in every case says which part of what
+** was rebuilt rests on the chain: "anchored to H, rebuilt to N". --to past the store's last batch cannot be met;
+** a batch there that is not the sequencer's stops the rebuild before it. */
+static void test_stop_past_anchor(void) {
+    TEST("a stop past the last anchor (#390): anchored to 3 with a snapshot there, batches 4, 5 and 6 at the store alone; hpplite-verify --to 5, --at a moment between 4 and 5 and --at a moment after 6 read the store's batches up to the stop and say 'anchored to 3, rebuilt to N'; --to 3 and --to 2 the same line with nothing of the store's; --to 9 refused; batch 4's bytes under the name of 6: --to 6 exit 1");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char *NKEY = "0x7171717171717171717171717171717171717171717171717171717171717171";
+    char addr[48], cmd[600], extra[300], vparams[500], contract[80] = "", atMid[60], atEnd[60], out[9][8192];
+    long long tMid = 0, tEnd = 0, rows[9];
+    int port, rc[9], k;
+    pid_t pid;
+    sqlite3 *w;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    (void)!system("rm -rf " DIR "/store_pins73 " DIR "/sp_writer.db* " DIR "/sp_keep*");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", NKEY);
+    if (run_cmd(cmd, out[0], sizeof out[0]) != 0 || strncmp(out[0], "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out[0]);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    port = test_free_port();
+    pid = start_pin_service_dir(svc, port, DIR "/store_pins73");
+    if (pid < 0) FAIL("the store did not come up");
+#define SP_END() do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } while (0)
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms&anchorclose=off", port);
+    w = open_db("sp_writer.db", NKEY, extra);
+    if (!w) { SP_END(); FAIL("open writer"); }
+    sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    for (k = 1; k <= 6; k++) {
+        /* --at takes whole seconds: a moment after batch 4 and before batch 5 */
+        if (k == 5) { sleep(2); tMid = (long long)time(NULL); sleep(2); }
+        sqlite3_exec(w, "INSERT INTO n(v) VALUES(hex(randomblob(500)))", NULL, NULL, NULL);
+        if (scalar(w, "SELECT hpplite_flush()") != k) { printf("(batch %d: %s) ", k, status_text(w, "last_error")); sqlite3_close(w); SP_END(); FAIL("a batch through the store"); }
+        if (k == 3 && (scalar(w, "SELECT hpplite_anchor()") != 3 || scalar(w, "SELECT snapshot_height FROM hpplite_status") != 3)) {
+            printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); SP_END(); FAIL("the anchor of 1-3 with a snapshot at 3");
+        }
+    }
+    sleep(2); tEnd = (long long)time(NULL);
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    sqlite3_close(w);                                   /* anchorclose=off: 4, 5 and 6 stay at the store alone */
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", RPC, contract, NKEY, port);
+    snprintf(atMid, sizeof atMid, "--at %lld", tMid);
+    snprintf(atEnd, sizeof atEnd, "--at %lld", tEnd);
+    rows[0] = stop_rows(vparams, "--to 5", DIR "/sp_keep0", out[0], sizeof out[0], &rc[0]);
+    rows[1] = stop_rows(vparams, atMid, DIR "/sp_keep1", out[1], sizeof out[1], &rc[1]);
+    rows[2] = stop_rows(vparams, atEnd, DIR "/sp_keep2", out[2], sizeof out[2], &rc[2]);
+    rows[3] = stop_rows(vparams, "--to 3", DIR "/sp_keep3", out[3], sizeof out[3], &rc[3]);
+    rows[4] = stop_rows(vparams, "--to 2", DIR "/sp_keep4", out[4], sizeof out[4], &rc[4]);
+    rows[5] = stop_rows(vparams, "--to 9", DIR "/sp_keep5", out[5], sizeof out[5], &rc[5]);
+    rows[6] = stop_rows(vparams, "", DIR "/sp_keep6", out[6], sizeof out[6], &rc[6]);
+    /* the store serves, under the name of batch 6, bytes the sequencer did not sign for that height (batch 4's) */
+    if (system("cp " DIR "/store_pins73/b/0x*/n/4 " DIR "/store_pins73/b/0x*/n/6") != 0) { SP_END(); FAIL("batch 4's name file over batch 6's"); }
+    rows[7] = stop_rows(vparams, "--to 6", DIR "/sp_keep7", out[7], sizeof out[7], &rc[7]);
+    rows[8] = stop_rows(vparams, "--to 5", DIR "/sp_keep8", out[8], sizeof out[8], &rc[8]);
+    SP_END();
+#undef SP_END
+    printf("(exit/rows: --to 5: %d/%lld, --at between 4 and 5: %d/%lld, --at after 6: %d/%lld, --to 3: %d/%lld, --to 2: %d/%lld, --to 9: %d, no stop: %d/%lld; "
+           "with batch 6 not the sequencer's: --to 6: %d/%lld, --to 5: %d/%lld) ",
+           rc[0], rows[0], rc[1], rows[1], rc[2], rows[2], rc[3], rows[3], rc[4], rows[4], rc[5], rc[6], rows[6], rc[7], rows[7], rc[8], rows[8]);
+    if (rc[0] != 0 || rows[0] != 5 || !strstr(out[0], "anchored to 3, rebuilt to 5: batches 4 to 5 are the store's, each signed by the rollup's sequencer")
+        || !strstr(out[0], "verified from the snapshot at 3, the newest at or before the stop") || !strstr(out[0], "2 batches were replayed after it")
+        || !strstr(out[0], "the database as of batch 5: state root") || !strstr(out[0], "posted at that height and matched") || !strstr(out[0], "anchored root at 3:"))
+        FAILF("--to 5 should read the store's batches 4 and 5 past the anchor at 3 and say which part rests on the chain; exit %d, rows %lld\n%s", rc[0], rows[0], out[0]);
+    if (rc[1] != 0 || rows[1] != 4 || !strstr(out[1], "anchored to 3, rebuilt to 4: batch 4 is the store's, signed by the rollup's sequencer") || !strstr(out[1], "through batch 4, written"))
+        FAILF("--at a moment between batches 4 and 5 is through batch 4; exit %d, rows %lld\n%s", rc[1], rows[1], out[1]);
+    if (rc[2] != 0 || rows[2] != 6 || !strstr(out[2], "anchored to 3, rebuilt to 6: batches 4 to 6 are the store's") || !strstr(out[2], "through batch 6, written"))
+        FAILF("--at a moment after batch 6 is the last batch the store holds; exit %d, rows %lld\n%s", rc[2], rows[2], out[2]);
+    if (rc[3] != 0 || rows[3] != 3 || !strstr(out[3], "anchored to 3, rebuilt to 3: every batch rebuilt is anchored on the chain") || strstr(out[3], "are the store's"))
+        FAILF("--to 3, the anchor: the same line, nothing of the store's; exit %d, rows %lld\n%s", rc[3], rows[3], out[3]);
+    if (rc[4] != 0 || rows[4] != 2 || !strstr(out[4], "anchored to 3, rebuilt to 2: every batch rebuilt is anchored on the chain"))
+        FAILF("--to 2, before the anchor: the same line; exit %d, rows %lld\n%s", rc[4], rows[4], out[4]);
+    if (rc[5] != 2 || !strstr(out[5], "--to 9 is past the store's last batch 6 (anchored to 3)"))
+        FAILF("--to 9 is past what the store holds: exit 2, both heights named; exit %d\n%s", rc[5], out[5]);
+    if (rc[6] != 0 || rows[6] != 6 || !strstr(out[6], "stored to 6, anchored to 3") || strstr(out[6], "rebuilt to"))
+        FAILF("without a stop: as before, 'stored to 6, anchored to 3'; exit %d, rows %lld\n%s", rc[6], rows[6], out[6]);
+    if (rc[7] != 1 || rows[7] != 5 || !strstr(out[7], "batch 6 at the store, past the anchor, is not the sequencer's or does not apply on this history: the rebuild stops before it")
+        || !strstr(out[7], "anchored to 3, rebuilt to 5"))
+        FAILF("--to 6 with batch 6 not the sequencer's: exit 1, the batch named, rebuilt to 5; exit %d, rows %lld\n%s", rc[7], rows[7], out[7]);
+    if (rc[8] != 0 || rows[8] != 5 || !strstr(out[8], "anchored to 3, rebuilt to 5"))
+        FAILF("--to 5 does not reach batch 6: exit 0; exit %d, rows %lld\n%s", rc[8], rows[8], out[8]);
     PASS();
 }
 
@@ -5076,6 +5170,7 @@ int main(void) {
     if (wanted(70)) test_rewind_and_go_on();
     if (wanted(71)) test_rewind_pruned();
     if (wanted(72)) test_stop_nearest_snapshot();
+    if (wanted(73)) test_stop_past_anchor();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

@@ -793,6 +793,24 @@ A moment the snapshot itself answers - after it was made, before the next
 batch - says `through batch <h>, the snapshot's` (#400). For every step
 since genesis checked, run it without a stop: that reads every batch from
 batch 1, the stop's height among them.
+A stop past the last anchor (#390), on a rollup at a store: the batches the
+store holds past the anchor are read up to the stop, each signed by the
+rollup's sequencer and applied on the anchored history - `--to 5` on a
+rollup anchored to 3 is the database as of batch 5, `--at` a moment after
+the last anchor every batch written by then. With a stop one line says, in
+every case, which part of what was rebuilt rests on the chain: `anchored to
+<H>, rebuilt to <N>: every batch rebuilt is anchored on the chain` where the
+stop is at or before the anchor, `anchored to <H>, rebuilt to <N>: batches
+<H+1> to <N> are the store's, each signed by the rollup's sequencer and
+applied on the anchored history; no anchor on the chain covers them yet`
+past it - the exit code is 0 for both, and the roots those batches carry
+are compared like any other's. `--to` past the store's last batch cannot be
+met: `--to 9 is past the store's last batch 6 (anchored to 3)`, exit 2;
+`--at` after the last batch is the last batch the store holds. A batch past
+the anchor that is not the sequencer's, or does not apply on the history,
+stops the rebuild before it: the batch is named, the line says how far the
+rebuild came, and the exit code is 1. A rollup without a store has nothing
+past the chain's height, and `--to` past it is refused as before.
 A history pruned at the store (`keep=`, #223) has no batch 1 to read: the
 rebuild then starts from the oldest snapshot the last anchor still names
 (#224) - its root checked against the one the chain anchored
@@ -1011,7 +1029,10 @@ back to a moment and written from there, on its own rollup:
 
 Of what `--keep` leaves in `<dir>`, `rebuilt.db` alone is carried: the
 other files are the verifier's bookkeeping, and a file with bookkeeping
-beside it is not adopted (a line says so, #398). `rebuilt.db` is in SQLite's rollback mode
+beside it is not adopted (a line says so, #398). The moment may be past the
+last anchor: `--at` reads the store's batches up to it (#390), and its line
+`anchored to <H>, rebuilt to <N>` says which part of the file rests on the
+chain; the anchor asked for first makes that all of it. `rebuilt.db` is in SQLite's rollback mode
 (`journal_mode` says `delete`); an application that runs in WAL switches
 it as it does a new file, before its sequencer starts or after. The
 history stays one line: the heights left behind are in it, the file as of
@@ -1047,12 +1068,14 @@ pages as they are (not through `sqlite3_backup`, which would move the
 schema cookie the next diff of page 1 lands on), with page 1's change
 counter moved so the replica's readers notice, and the sidecar by
 `sqlite3_backup`. `soft_disagreements` counts these events. With `syncto=`
-or `syncat=` (`hpplite-verify --to`, `--at`) a verifier stays at the hard
-tier: the soft tier is past the anchor, and a stop asks for the history as
-of a point (#255).
+or `syncat=` (`hpplite-verify --to`, `--at`) a verifier reads the soft tier
+up to the stop and no further (#390): a stop asks for the history as of a
+point, and the point is as often past the last anchor as before it.
 
 `hpplite-verify` verifies the hard tier as before. It then reports the soft
-tier ("stored to S, anchored to H"), or nothing past the anchor.
+tier ("stored to S, anchored to H"), or nothing past the anchor; with a
+stop, "anchored to H, rebuilt to N" and whether the batches past the anchor
+are the store's.
 
 What it costs: one anchor on HPP Sepolia is 73.5k gas (the first of a
 rollup 124.8k, its slots written for the first time), about what one

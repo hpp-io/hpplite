@@ -172,6 +172,7 @@ typedef struct HppliteNode {
     unsigned char softBase[32];     /* the chain hash before softFirst: at the anchored height, the contract's (#286) */
     size_t nSoft, nSoftAlloc;
     int softStopped;                /* the soft tier disagreed with the chain: not followed (#166) */
+    uint64_t softRefused;           /* a batch at the store past the anchor that is not the sequencer's or does not apply; the soft tier stopped before it (#390). 0: none */
     int softDisagreements;          /* ...times it did, each followed by a rebuild (status soft_disagreements) */
     uint8_t storeBalance[32];       /* the wallet's balance of the store's asset, as last read (status row); 30 s old at most */
     int storeBucketSet;             /* the store told the rollup its bucket is for (#214) */

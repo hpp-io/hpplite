@@ -154,7 +154,7 @@ static void refuse_from(void) {
     snprintf(gConfigError, sizeof(gConfigError), "from= is gone (v0.8, #255): a replica starts from the latest snapshot the anchors name; a verifier (role=verify) from batch 1, and from the oldest snapshot kept when the store has pruned it");
 }
 static void refuse_soft(void) {
-    snprintf(gConfigError, sizeof(gConfigError), "soft= is gone (v0.8, #255): a verifier follows the store's batches past the anchor (hpplite-verify reports them as the soft tier); with syncto= or syncat= it stays at the hard tier");
+    snprintf(gConfigError, sizeof(gConfigError), "soft= is gone (v0.8, #255): a verifier follows the store's batches past the anchor (hpplite-verify reports them as the soft tier); with syncto= or syncat= it reads them up to the stop (#390)");
 }
 
 /* fleet= is gone (#352, decision 0003): the shared rollup was an experiment set aside; a database opened with it

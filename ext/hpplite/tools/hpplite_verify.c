@@ -34,6 +34,14 @@
 ** carries; a transaction in flight at that moment is completed, never left
 ** halfway. With --keep, the database as of that time stays.
 **
+** A stop past the last anchor (#390): the store's batches past it are read up
+** to the stop, each signed by the rollup's sequencer and applied on the
+** anchored history, and with a stop one line says which part of what was
+** rebuilt rests on the chain: "anchored to H, rebuilt to N". --to past the
+** store's last batch cannot be met (exit 2); --at after it answers with the
+** last batch the store holds. A batch there that is not the sequencer's or
+** does not apply stops the rebuild before it (exit 1).
+**
 ** Exit 0: verified (and the live file equals the chain, with --db);
 ** 1: a root mismatch, a sync that stopped short, or a live file that
 ** differs; 2: cannot run (parameters, chain, no rollup).
@@ -232,8 +240,8 @@ int main(int argc, char **argv) {
         }
     }
     /* the verifier's own datadir, first so it wins over one in the parameters. The node reads batch 1 and, when the
-    ** store has pruned it, starts from the oldest snapshot kept (#224, #255); with --to/--at it stays at the hard
-    ** tier, else the store's batches past the anchor follow as the soft tier, reported below (#166) */
+    ** store has pruned it, starts from the oldest snapshot kept (#224, #255); the store's batches past the anchor
+    ** follow as the soft tier (#166), with --to/--at up to the stop (#390), reported below */
     sqlite3 *db;
     { char to[40] = "";
       if (stopAt) snprintf(to, sizeof to, "&syncto=%llu", (unsigned long long)stopAt);    /* the stop, from the first sync at open */
@@ -284,19 +292,34 @@ int main(int argc, char **argv) {
     char contract[43] = "", da[43] = "";
     hpplite_l1_get_addresses(node->l1, contract, da);
 
-    if (stopAt && stopAt > onChain) {
+    /* past the last anchor (#390): the store's batches the node applied up to the stop (soft_height; height stays
+    ** the anchored). `reached` is the last batch in the rebuilt file, `rebuilt` the anchored part of it */
+    int softTier = node->store && hpplite_l1_has_ranges(node->l1);
+    uint64_t reached = rebuilt;
+    if ((stopAt || atMs) && softTier && rebuilt >= onChain) {
+        sqlite3_int64 soft = scalar(db, "SELECT soft_height FROM hpplite_status");
+        if (soft > 0 && (uint64_t)soft - 1 > reached) reached = (uint64_t)soft - 1;
+    }
+    /* a batch at the store past the anchor that is not the sequencer's or does not apply, between the rebuild and the stop */
+    int refused = softTier && rebuilt >= onChain && node->softRefused && ((stopAt && stopAt > reached) || (atMs && !node->syncAtReached));
+    if (stopAt && stopAt > onChain && !softTier) {
         fprintf(stderr, "hpplite-verify: --to %llu is past the chain's height %llu\n", (unsigned long long)stopAt, (unsigned long long)onChain);
         rc = 2;
         goto close;
     }
-    printf("rollup %s: %llu batches on chain, %llu replayed", contract, (unsigned long long)onChain, (unsigned long long)rebuilt);
+    if (stopAt && stopAt > reached && rebuilt >= onChain && !refused) {
+        fprintf(stderr, "hpplite-verify: --to %llu is past the store's last batch %llu (anchored to %llu)\n", (unsigned long long)stopAt, (unsigned long long)reached, (unsigned long long)onChain);
+        rc = 2;
+        goto close;
+    }
+    printf("rollup %s: %llu batches on chain, %llu replayed", contract, (unsigned long long)onChain, (unsigned long long)reached);
     if (stopAt) printf(" (--to %llu)", (unsigned long long)stopAt);
     if (fromSnap > 0 && rebuilt >= target && (stopAt || atMs) && !node->triedOldestSnapshot) {
         /* a stop (#391): the state at a point is what is asked for, and the rebuild began at the newest snapshot at or
         ** before it; the batches before it were not read, pruned or not. #232's claim, from that snapshot */
         printf("\nverified from the snapshot at %lld, the newest at or before the stop: the batches before it were not read (without a stop every batch from batch 1 is); "
                "its root is the one the chain anchored there, and %llu batches were replayed after it",
-               (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
+               (long long)fromSnap, (unsigned long long)(reached - (uint64_t)fromSnap));
     } else if (fromSnap > 0 && rebuilt >= target) {
         /* without a stop a verifier starts from a snapshot only when batch 1 could not be read (#239, #255): the prune is the node's finding */
         printf("\nverified from the snapshot at %lld: the batches below it are pruned at the store (keep=); its root is the one the chain anchored there, and %llu batches were replayed after it",
@@ -309,10 +332,10 @@ int main(int argc, char **argv) {
         else if (node->lastAppliedMs == 0) {
             /* a start from a snapshot with no batch replayed after it (#400): the snapshot's own batch is not read,
             ** so there is no writer's time to give */
-            printf("\nthe database as of %s: through batch %llu, the snapshot's: no batch after it was written by then", want, (unsigned long long)rebuilt);
+            printf("\nthe database as of %s: through batch %llu, the snapshot's: no batch after it was written by then", want, (unsigned long long)reached);
         } else {
             fmt_time(node->lastAppliedMs, wrote, sizeof wrote);
-            printf("\nthe database as of %s: through batch %llu, written %s%s", want, (unsigned long long)rebuilt, wrote,
+            printf("\nthe database as of %s: through batch %llu, written %s%s", want, (unsigned long long)reached, wrote,
                    node->lastAppliedMs > atMs ? " (it completes a transaction in flight at that time)" : "");
         }
     }
@@ -323,6 +346,11 @@ int main(int argc, char **argv) {
         rc = 2;
     } else if (rebuilt < target) {
         printf("\nhpplite-verify: sync stopped at batch %llu: %s\n", (unsigned long long)rebuilt + 1, zErr[0] ? zErr : zState);
+        rc = 1;
+    } else if (refused) {
+        /* the stop is past it (#390): what was rebuilt is the state before that batch, not the state asked for */
+        printf("\nhpplite-verify: batch %llu at the store, past the anchor, is not the sequencer's or does not apply on this history: the rebuild stops before it, "
+               "short of the stop\n", (unsigned long long)node->softRefused);
         rc = 1;
     } else {
         printf("\n");
@@ -337,7 +365,7 @@ int main(int argc, char **argv) {
     int anchored = onChain > 0 && hpplite_l1_get_range(node->l1, onChain, &lastRange) == 0;
     {
         HppliteL1State *st = hpplite_l1_get_state(node->l1);
-        if (stopAt && rebuilt == stopAt) {
+        if (stopAt && reached == stopAt) {
             /* the database as of the stop height: its own root, if one was posted there, else the last checked */
             unsigned char at[32];
             char got[65];
@@ -462,7 +490,17 @@ int main(int argc, char **argv) {
 
     /* the soft tier (#166): what the store holds under the rollup's names past the anchor, signed by the
     ** sequencer and applied on the rebuilt history by the node itself (soft_height; height stays the anchored) */
-    if (rc == 0 && !stopAt && !atMs && node->store && hpplite_l1_has_ranges(node->l1)) {
+    if (stopAt || atMs) {
+        /* with a stop (#390), one line in every case: which part of what was rebuilt rests on the chain. Past the
+        ** anchor it is the sequencer's signed batches as the store holds them; no root on the chain covers them */
+        if (reached == onChain + 1)
+            printf("anchored to %llu, rebuilt to %llu: batch %llu is the store's, signed by the rollup's sequencer and applied on the anchored history; "
+                   "no anchor on the chain covers it yet\n", (unsigned long long)onChain, (unsigned long long)reached, (unsigned long long)reached);
+        else if (reached > onChain)
+            printf("anchored to %llu, rebuilt to %llu: batches %llu to %llu are the store's, each signed by the rollup's sequencer and applied on the anchored history; "
+                   "no anchor on the chain covers them yet\n", (unsigned long long)onChain, (unsigned long long)reached, (unsigned long long)onChain + 1, (unsigned long long)reached);
+        else printf("anchored to %llu, rebuilt to %llu: every batch rebuilt is anchored on the chain\n", (unsigned long long)onChain, (unsigned long long)reached);
+    } else if (rc == 0 && node->store && hpplite_l1_has_ranges(node->l1)) {
         sqlite3_int64 soft = scalar(db, "SELECT soft_height FROM hpplite_status");   /* the next batch number past the soft tier */
         uint64_t stored = soft > 0 ? (uint64_t)soft - 1 : onChain;
         if (stored > onChain) printf("stored to %llu, anchored to %llu: %llu batches at the store past the anchor, signed by the sequencer, applied on this history\n",

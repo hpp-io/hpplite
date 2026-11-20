@@ -3809,8 +3809,8 @@ static int node_soft_walk(HppliteNode *node) {
 ** this replica's soft state is not the rollup's.
 */
 static int node_soft_follows(HppliteNode *node) {
-    /* not with a stop (#206, #205): --to and --at ask for the hard history as of a point; the soft tier is past the anchor */
-    return node && node->config.verifyOnly && !node->syncTo && !node->syncAtMs && node->store && node->l1 && !node->softStopped && hpplite_l1_has_ranges(node->l1);
+    /* with a stop too (#390): --to and --at past the last anchor read the store's batches up to the stop */
+    return node && node->config.verifyOnly && node->store && node->l1 && !node->softStopped && hpplite_l1_has_ranges(node->l1);
 }
 
 static int node_soft_push(HppliteNode *node, uint64_t h, const unsigned char before[32], const unsigned char after[32]) {
@@ -4037,6 +4037,7 @@ static int node_soft_follow(HppliteNode *node) {
     if (!node_soft_follows(node) || !(st = hpplite_l1_get_state(node->l1))) return 0;
     memcpy(seq, st->sequencerWallet, 20);
     hpplite_l1_state_free(st);
+    node->softRefused = 0;
     for (;;) {
         uint64_t h = node->ctx->blockHeight, chainId = hpplite_l1_chain_id(node->l1);
         size_t n = 0;
@@ -4044,16 +4045,27 @@ static int node_soft_follow(HppliteNode *node) {
         HppliteBatch *batch;
         int rc;
         if (!chainId) chainId = hpplite_l1_default_chain_id();
+        if ((node->syncTo && h > node->syncTo) || node->syncAtReached) break;    /* a verifier's stop (#390), as on the chain */
         if (applied) node_names_ahead(node, h, 0);    /* past the first new batch, the rest together (#195); an idle sync asks for one */
         if (node_store_name(node, h, name, da) != 0 || !(data = hpplite_store_get_named(node->store, name, &n, sig, inst))) break;
         if (hpplite_store_batch_signer(da, chainId, inst, h, data, n, sig, who) != 0 || memcmp(who, seq, 20) != 0) {
             fprintf(stderr, "hpplite: batch %llu at the store is not signed by the rollup's sequencer: the soft tier stops before it\n", (unsigned long long)h);
             free(data);
+            node->softRefused = h;
             break;
         }
         batch = node_decode_batch(node, h, data, n);
-        if (!batch) { free(data); break; }
+        if (!batch) { free(data); node->softRefused = h; break; }
         batch->pPosted = data; batch->nPosted = n; batch->bOwnsPosted = 1;
+        if (node->syncAtMs) {
+            /* a stop by time (#205), past the anchor (#390): the same rule as for the chain's batches */
+            uint64_t ms = 0;
+            int more = 0;
+            hpplite_pagebatch_meta(batch->pPagesRaw, batch->nPagesRaw, &ms, &more);
+            if (ms > node->syncAtMs && !node->syncAtInFlight) { hpplite_batch_free(batch); node->syncAtReached = 1; break; }
+            node->syncAtInFlight = more;
+            node->lastAppliedMs = ms;
+        }
         hpplite_keccak256(data, n, k);
         memcpy(before, node->ctx->chainHash, 32);
         hpplite_chain_hash_next(before, h, k, after);
@@ -4061,6 +4073,7 @@ static int node_soft_follow(HppliteNode *node) {
         hpplite_batch_free(batch);
         if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
             fprintf(stderr, "hpplite: batch %llu at the store does not apply on this history (rc=%d): the soft tier stops before it\n", (unsigned long long)h, rc);
+            node->softRefused = h;
             break;
         }
         if (node_soft_push(node, h, before, after) != 0) break;

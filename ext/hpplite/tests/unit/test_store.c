@@ -2031,6 +2031,83 @@ static void test_stop_nearest_snapshot(const char *url) {
     PASS();
 }
 
+/* A stop past the last anchor (#390): with a stop (hpplite-verify --to/--at) a verifier stayed at the hard tier - the
+** newest point a rebuild reached was the last anchor, and the moment a platform's user wants to go back to is nearly
+** always in the unanchored part. The store's batches past the anchor are read up to the stop, checked as without one:
+** each signed by the rollup's sequencer and applying on the anchored history. */
+static uint64_t soft_stop_case(const char *url, HppliteL1 *l1, const unsigned char *key, const char *id, uint64_t to, uint64_t atMs, int *pRows, long long *pHard, long long *pSoft) {
+    TestNodeOpts vo = { .storeUrl = url, .verifyOnly = 1, .nodeId = id, .privkey = key, .syncTo = to, .syncAtMs = atMs };
+    char file[64];
+    HppliteNode *v;
+    snprintf(file, sizeof file, "%s.db", id);
+    v = test_open_node(tpath(file), l1, &vo);
+    uint64_t refused;
+    if (!v) { *pRows = -2; *pHard = *pSoft = -2; return 0; }
+    *pRows = count_rows(v->db, "t");
+    *pHard = status_int(v->db, "height");
+    *pSoft = status_int(v->db, "soft_height");
+    refused = v->softRefused;
+    v->l1 = NULL;
+    hpplite_node_destroy(v);
+    return refused;
+}
+static uint64_t now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+}
+static void test_stop_past_anchor(const char *url) {
+    TEST("a stop past the last anchor (#390): anchored to 3, batches 4, 5 and 6 at the store alone; a verifier to 5 and to 4 reads the store's batches up to the stop, to 3 and to 2 none of them, to a time between 4 and 5 through 4, to a time after 6 through 6, to 9 what the store holds; then batch 4's bytes under the name of 6: to 6 stops before it and says which");
+    static const unsigned char kseq[32] = { [31] = 0x97 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "sp_w", .privkey = kseq, .noAnchorAtClose = 1 };
+    HppliteNode *w = test_open_node(tpath("sp_w.db"), l1, &o);
+    uint64_t tMid, tEnd, refused[3];
+    char c[43], d[43], cmd[1400];
+    int i, rows[10], bad = 0;
+    long long hard[10], soft[10];
+    static const int wantRows[8] = { 5, 4, 3, 2, 4, 6, 6, 6 };
+    static const long long wantHard[8] = { 4, 4, 4, 3, 4, 4, 4, 4 }, wantSoft[8] = { 6, 5, 4, 3, 5, 7, 7, 7 };
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('one of the first three')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 3) { hpplite_node_destroy(w); FAIL("the anchor 1-3"); }
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four, at the store alone')", NULL);
+    if (hpplite_node_flush_batch(w) != 4) { hpplite_node_destroy(w); FAIL("batch 4"); }
+    usleep(300 * 1000); tMid = now_ms(); usleep(300 * 1000);
+    for (i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('five and six, at the store alone')", NULL); hpplite_node_flush_batch(w); }
+    usleep(300 * 1000); tEnd = now_ms();
+    soft_stop_case(url, l1, kseq, "sp_to5", 5, 0, &rows[0], &hard[0], &soft[0]);
+    soft_stop_case(url, l1, kseq, "sp_to4", 4, 0, &rows[1], &hard[1], &soft[1]);
+    soft_stop_case(url, l1, kseq, "sp_to3", 3, 0, &rows[2], &hard[2], &soft[2]);
+    soft_stop_case(url, l1, kseq, "sp_to2", 2, 0, &rows[3], &hard[3], &soft[3]);
+    soft_stop_case(url, l1, kseq, "sp_mid", 0, tMid, &rows[4], &hard[4], &soft[4]);
+    soft_stop_case(url, l1, kseq, "sp_end", 0, tEnd, &rows[5], &hard[5], &soft[5]);
+    soft_stop_case(url, l1, kseq, "sp_to9", 9, 0, &rows[6], &hard[6], &soft[6]);
+    refused[0] = soft_stop_case(url, l1, kseq, "sp_all", 0, 0, &rows[7], &hard[7], &soft[7]);
+    /* the store serves, under the name of batch 6, bytes its sequencer did not sign for that height (batch 4's):
+    ** the rebuild stops before it, and the node says which batch it was */
+    hpplite_l1_get_addresses(l1, c, d);
+    for (char *p = d[0] ? d : c; *p; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+    snprintf(cmd, sizeof cmd, "cp '%s/pins/b/0x%.40s/n/4' '%s/pins/b/0x%.40s/n/6'", test_dir(), (d[0] ? d : c) + 2, test_dir(), (d[0] ? d : c) + 2);
+    if (system(cmd) != 0) { w->ownsL1 = 0; hpplite_node_destroy(w); hpplite_l1_disconnect(l1); FAIL("batch 4's name file over batch 6's"); }
+    refused[1] = soft_stop_case(url, l1, kseq, "sp_bad6", 6, 0, &rows[8], &hard[8], &soft[8]);
+    refused[2] = soft_stop_case(url, l1, kseq, "sp_bad5", 5, 0, &rows[9], &hard[9], &soft[9]);
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    printf("(rows/height/soft_height: to 5: %d/%lld/%lld, to 4: %d/%lld/%lld, to 3: %d/%lld/%lld, to 2: %d/%lld/%lld, at a time between 4 and 5: %d/%lld/%lld, at a time after 6: %d/%lld/%lld, to 9: %d/%lld/%lld, no stop: %d/%lld/%lld) ",
+           rows[0], hard[0], soft[0], rows[1], hard[1], soft[1], rows[2], hard[2], soft[2], rows[3], hard[3], soft[3],
+           rows[4], hard[4], soft[4], rows[5], hard[5], soft[5], rows[6], hard[6], soft[6], rows[7], hard[7], soft[7]);
+    for (i = 0; i < 8; i++) if (rows[i] != wantRows[i] || hard[i] != wantHard[i] || soft[i] != wantSoft[i]) bad = 1;
+    if (bad) FAIL("the store's batches past the anchor should be read up to the stop: 5/4/6, 4/4/5, 3/4/4, 2/3/3, 4/4/5, 6/4/7, 6/4/7; no stop 6/4/7");
+    printf("(batch 4's bytes under the name of 6: to 6: rows %d, soft_height %lld, refused %llu; to 5: rows %d, refused %llu; before it, no stop: refused %llu) ",
+           rows[8], soft[8], (unsigned long long)refused[1], rows[9], (unsigned long long)refused[2], (unsigned long long)refused[0]);
+    if (rows[8] != 5 || soft[8] != 6 || refused[1] != 6 || rows[9] != 5 || refused[2] != 0 || refused[0] != 0)
+        FAIL("a batch past the anchor that is not the sequencer's: the rebuild to 6 stops before it at 5 and names it; a stop at 5 does not reach it");
+    PASS();
+}
+
 /* adopt=on onto a history pruned at the store (#395): the adopt read the history from height 1, and a rollup that
 ** prunes (keep=) has no batch 1 - a platform's tier with a bounded history could not go back in place, nor restore
 ** its copy onto a new host. The adopt writes none of the history to the file; it needs where the history ends. It
@@ -2494,6 +2571,7 @@ int main(int argc, char **argv) {
     test_adopt_with_bookkeeping(url);
     test_adopt_pruned(url);
     test_stop_nearest_snapshot(url);
+    test_stop_past_anchor(url);
     test_recovery_file_held(url);
     test_restart_with_commits(url);
     test_soft_replica(url);
