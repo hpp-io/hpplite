@@ -188,6 +188,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `anchor` | No | With `store=` on a chain that takes ranges (VERSION 9 and later, #164, the `hpp-sepolia` factory): how often the batches the store holds are anchored on the chain in one commitment: `5m`, `30m` (default: HPP's cadence), `1h`, counted from the last anchor on chain, not from the process's start, so a sequencer restarted more often than this still anchors (#308); `0` = at close and on `hpplite_anchor()` only (`anchorclose=off` takes the close out too). Also `HPPLITE_ANCHOR`. See Stores and commitments |
 | `keeplease` | No | `on`: a sequencer closing as the last connection to its file leaves its lease running instead of releasing it (#265). For a sidecar whose app sleeps and wakes: the next open is the same instance (the id is the file's and the host's), finds the lease its own and sends nothing while over half of it is left, so a cycle costs no claim and no release; a database rebuilt into a fresh file or moved to another host waits the lease out, unless its platform gives the instance (`instancefile=`, #378) or the owner expires the lease (`hpplite_expire_lease()`, #267). Default `off`. Also `HPPLITE_KEEP_LEASE` |
 | `instancefile` | No | A file with the sequencer's instance, given by a platform (#378): 32 bytes, or 64 hex digits. It takes the place of the random seed beside the database, and the machine's host name is left out of the id, so the id is keccak(seed) wherever the sequencer runs (`HPPLITE_HOST_NAME`, where set, still enters). A host rebuilt on an empty volume with the same key and the same file is the instance the chain's lease names: it claims nothing, waits for nothing, and what its app writes is at the store within a flush. The seed is no secret (an instance is of use only with the wallet's key) and is kept beside the database from then on; a file that cannot be read or is no seed is said on stderr and the instance is the one beside the database. One instance is one running host: that the old one is gone is the platform's to know - two live hosts with one instance both post. Also `HPPLITE_INSTANCE_FILE` |
+| `adopt` | No | `on`, for one start: a sequencer's file that is not its rollup's history - a platform's copy restored onto a new host, a key that sequenced another file before - is taken as the state (#380). It acts where the file has no bookkeeping beside it (`<file>-hpplite.db`), holds at least one table, and the rollup has a history: the history is read and kept, none of it is written to the file, and the file goes whole as the next height, the application's connection open throughout. Without it the history is written over the file, or, with the application's connection open, the sequencer stops. It is the owner's word that this file is the database: rows the history held and the file does not are in no state after it. Elsewhere it changes nothing - a file with its bookkeeping, an empty file (rebuilt from the history), a new rollup, a replica. See [A restored file](#a-restored-file-380). Also `HPPLITE_ADOPT` |
 | `anchorclose` | No | `on` (default): a close with batches at the store since the last anchor anchors them. `off`: the close flushes what is pending to the store and leaves the anchor to the timer (`anchor=`) or `hpplite_anchor()` (#266) - for an app that sleeps and wakes, one anchor a day (`anchor=24h`) instead of one per cycle; until the timer, the last day's writes rest on the store alone, the soft tier `hpplite-verify` reports; what a run left at the store waits for the next run's cadence too (with the default, a run that died before its close-anchor is anchored soon after the next open, #270). Also `HPPLITE_ANCHOR_CLOSE` |
 | `datadir` | No | Where the per-wallet spending ledger `spend-<wallet>.json` lives (`HPPLITE_SPEND_CAP`, #173). It spans every database the wallet writes, so it cannot live in a database's sidecar, where everything else HPPLite keeps is. Default `/tmp/hpplite`. Also `HPPLITE_DATA_DIR` |
 | `keep` | No | With `snapshot=`: how long the store keeps the history behind a snapshot - `all` (default: every batch, an audit log) or `7d`, `24h`, `30m` (#223). After each anchor the sequencer signs a `Prune` at the newest snapshot made at least that long ago; the store lets go of the batches and older snapshots below it. Each manifest names the latest snapshot and the oldest still kept; the ones between are the sequencer's own bookkeeping, in its sidecar (#257: no list to overflow, any `keep` with any `snapshot=` opens). The current state stays provable (that snapshot's root is anchored, then the batches after it); what is lost is replaying how the state got there, and `hpplite-verify --to`/`--at` before it. Also `HPPLITE_KEEP` |
@@ -217,6 +218,7 @@ What the node may spend is the deployment's, like its key: it is set in the envi
 | `HPPLITE_CA_BUNDLE` | The certificate file (PEM) both HTTPS clients trust - the chain RPC's and the store's (#269). Unset, libcurl's own default applies (the system bundle on a stock build); where the file libcurl was compiled to look for is not there - the static binary, compiled on Alpine, in a Debian or an Ubuntu image - the first of the distributions' usual files that is: `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, `/etc/ssl/ca-bundle.pem` (#377). Set it for an image that keeps its own bundle elsewhere, or has none and a bundle copied in. A certificate that could not be checked is said with the host and what it was checked against, in the node's error and `last_error`: `the certificate of <host> could not be checked: no CA bundle found; set HPPLITE_CA_BUNDLE` |
 | `HPPLITE_HOST_NAME` | The host name in the sequencer's instance id (keccak of the seed beside the file and the host name), where a platform keeps one across machines; default the machine's, or none where the seed is given (`instancefile=`) |
 | `HPPLITE_INSTANCE_FILE` | `instancefile=` from the environment (#378): the file with the instance's seed, given by a platform whose hosts are rebuilt on empty volumes |
+| `HPPLITE_ADOPT` | `adopt=` from the environment (#380): `on` for the one start on a restored file that is to be the state; not left set |
 
 ## Building
 
@@ -891,6 +893,38 @@ that rebuilds hosts gives the instance (`instancefile=`, #378): the
 successor is then the instance the lease names, waits for nothing, and its
 writes are at the store within a flush. Where it cannot, the owner expires
 the lease (`hpplite_expire_lease()`, #267).
+
+<a id="a-restored-file-380"></a>
+**A restored file (#380).** Recovery rebuilds a lost file from the history.
+A platform that keeps its own copies has the other case: its newest copy,
+restored onto a new host, is the database, and the key's rollup has a
+history that is not this file's - the lost host's, or a trial's. Such a
+file has no bookkeeping beside it (`<file>-hpplite.db`), so its sequencer
+is behind the chain and applies the history over it; with the
+application's connection open it cannot, and stops ("pages cannot be
+applied while other connections hold the file in WAL mode"). `adopt=on`,
+given for that one start, says the file is the state. The history is read
+as a recovery reads it - the chain's batches against the chain hash, then
+the store's past the last anchor, signed by this wallet, kept for the next
+anchor - and none of it is written to the file. The file then goes whole
+as the next height, and what the application commits meanwhile follows
+it. One line on stderr says so:
+
+    hpplite: <file> adopted as the state after height N (adopt=on): the history is kept, the file goes whole as height N+1
+
+The history is not rewritten and no new rollup is made. A replica, or
+`hpplite-verify`, reading from height 1 passes through the old heights,
+each root compared as posted, takes every page of the file at height N+1,
+and arrives at the adopted file: the roots hold across the adopted
+height, and a host rebuilt on an empty volume afterwards (no `adopt=`)
+gets the adopted file and what was written since. A history that ends
+between two pieces of a commit its sequencer never finished is adopted
+onto the same way. What `adopt=on` does not do: it changes nothing where
+the file has its bookkeeping (a second start with it is an ordinary
+start), where the file has no table (it is rebuilt from the history, and
+a line says so), on a new rollup, or on a replica. It reads the history
+from height 1 and does not start from a snapshot: a rollup whose old
+batches are pruned (`keep=`) is not adopted onto yet.
 
 **The soft tier for a replica (#166).** A `role=verify` connection with
 `store=` doesn't wait for the anchor. Past the anchored height, it reads the

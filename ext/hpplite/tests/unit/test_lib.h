@@ -90,6 +90,7 @@ typedef struct TestNodeOpts {
     int64_t keepSeconds;                     /* keep= (#223): the history behind a snapshot this old is pruned */
     int keepLease;                           /* keeplease=on (#265): the lease is left running at a close alone */
     const unsigned char *instanceSeed;       /* instancefile= (#378): the instance's 32-byte seed, given; NULL: the one beside the file */
+    int adopt;                               /* adopt=on (#380): a file that is not its bookkeeping's state is taken as the state */
     int noAnchorAtClose;                     /* anchorclose=off (#266): the close anchors nothing */
     int intervalMs;                          /* interval=: the timer (0: none, flush by hand) */
     int anchorMs;                            /* anchor=: the timer's anchor cadence (0: at close and by hand) */

@@ -3321,6 +3321,115 @@ static void test_instance_given(void) {
     PASS();
 }
 
+/* 67. adopt=on (#380): a platform restores its newest copy of the app's file onto a new host, and the key's rollup has
+** a history - the lost host's, anchored on the chain and past the last anchor at the store. Without adopt= the new
+** host's sequencer applies that history over the file, and with the app's connection open it cannot ("pages cannot be
+** applied while other connections hold the file in WAL mode") and stops. With adopt=on the file is the state: the
+** history read and kept, the file whole as the next height, the app's connection open all the while; hpplite-verify
+** from height 1 passes through the old history and arrives at the file; a host on an empty volume rebuilds it. */
+static void test_adopt_file(void) {
+    TEST("adopt=on (#380): a restored file on a rollup with a history (heights anchored, heights at the store alone), the app's connection open in WAL: the sequencer syncs, the app's rows stay, the file goes whole as the next height; hpplite-verify from height 1 says verified against the file; an empty host rebuilds it");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char *AKEY = "0x6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a";
+    static const char *SEED = "38003800380038003800380038003800380038003800380038003800380038ab";
+    char addr[48], cmd[600], out[400], contract[80], base[700], params[900], vparams[500], vout[4096] = "", err[1600] = "";
+    sqlite3 *app = NULL;
+    long h8a, h8b, h9, h10;
+    long long mine = -1, notes = -1, mine10 = -1, notes10 = -1;
+    int port, rc9 = -1, rc10 = -1, vrc = -2, said = 0;
+    pid_t store, side;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!bin || access(bin, X_OK) != 0) FAIL("hpplite-sequencer not beside hpplite-verify (HPPLITE_VERIFY_BIN)");
+    unsetenv("HPPLITE_HOST_NAME");
+    (void)!system("rm -rf " DIR "/host8 " DIR "/host9 " DIR "/host10 " DIR "/adopt_owner.db* && mkdir -p " DIR "/host8 " DIR "/host9 " DIR "/host10");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", AKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    {
+        FILE *f = fopen(DIR "/adopt.seed", "w");
+        if (!f) FAIL("the seed file");
+        fprintf(f, "0x%s\n", SEED);
+        fclose(f);
+    }
+    {
+        sqlite3 *owner = open_db("adopt_owner.db", AKEY, NULL);
+        if (!owner) FAIL("create the rollup");
+        snprintf(contract, sizeof contract, "%s", status_text(owner, "contract"));
+        sqlite3_close(owner);
+        if (!contract[0]) FAIL("the rollup's address");
+    }
+    port = test_free_port();
+    store = start_pin_service_free(svc, port);
+    if (store < 0) FAIL("the store did not come up");
+#define AD_CLEANUP() do { if (app) sqlite3_close(app); kill(store, SIGTERM); waitpid(store, NULL, 0); } while (0)
+    snprintf(base, sizeof base, "rpc=%s&contract=%s&chainid=31337&privkey=%s&interval=300ms&store=http://127.0.0.1:%d&keeplease=on&anchor=24h&instancefile=" DIR "/adopt.seed",
+             RPC, contract, AKEY, port);
+
+    /* the lost host: a row anchored at its stop, then a row at the store alone, and it is gone */
+    snprintf(params, sizeof params, "%s&datadir=" DIR "/host8", base);
+    side = spawn_sidecar(bin, DIR "/host8/app.db", params, side_path(8, 1, "out"), side_path(8, 1, "err"));
+    h8a = wait_synced(side_path(8, 1, "out"), side, 60);
+    if (h8a < 0) { if (h8a == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); AD_CLEANUP(); FAILF("the lost host's sequencer did not say it was synced (%ld)", h8a); }
+    if (plain_exec(DIR "/host8/app.db", "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('anchored')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); AD_CLEANUP(); FAIL("the lost host's app writes"); }
+    sleep(3);
+    if (stop_sidecar(side, SIGTERM, 60) != 0) { AD_CLEANUP(); FAIL("the lost host's first stop (its anchor)"); }
+    snprintf(params, sizeof params, "%s&datadir=" DIR "/host8&anchorclose=off", base);
+    side = spawn_sidecar(bin, DIR "/host8/app.db", params, side_path(8, 2, "out"), side_path(8, 2, "err"));
+    h8b = wait_synced(side_path(8, 2, "out"), side, 60);
+    if (h8b < 0) { if (h8b == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); AD_CLEANUP(); FAILF("the lost host's sequencer did not say it was synced again (%ld)", h8b); }
+    if (plain_exec(DIR "/host8/app.db", "INSERT INTO notes(body) VALUES('at the store alone')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); AD_CLEANUP(); FAIL("the lost host's app writes again"); }
+    sleep(3);
+    stop_sidecar(side, SIGKILL, 5);
+
+    /* the new host: the platform's restored copy, the app on it with its connection open in WAL */
+    if (sqlite3_open_v2(DIR "/host9/app.db", &app, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK) { AD_CLEANUP(); FAIL("the app opens its restored file"); }
+    sqlite3_busy_timeout(app, 10000);
+    if (sqlite3_exec(app, "PRAGMA journal_mode=WAL; CREATE TABLE mine(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO mine(v) VALUES('restored')", NULL, NULL, NULL) != SQLITE_OK) { AD_CLEANUP(); FAIL("the restored file's rows"); }
+    snprintf(params, sizeof params, "%s&datadir=" DIR "/host9&adopt=on", base);
+    side = spawn_sidecar(bin, DIR "/host9/app.db", params, side_path(9, 1, "out"), side_path(9, 1, "err"));
+    h9 = wait_synced(side_path(9, 1, "out"), side, 90);
+    if (h9 >= 0) {
+        mine = scalar(app, "SELECT count(*) FROM mine");
+        notes = scalar(app, "SELECT count(*) FROM sqlite_schema WHERE name = 'notes'");
+        if (sqlite3_exec(app, "INSERT INTO mine(v) VALUES('after the adopt')", NULL, NULL, NULL) != SQLITE_OK) mine = -2;
+        sleep(3);
+        rc9 = stop_sidecar(side, SIGTERM, 60);                   /* its stop anchors: the file's height is on the chain */
+    } else { if (h9 == -1) kill(side, SIGKILL); waitpid(side, NULL, WNOHANG); }
+    {
+        FILE *f = fopen(side_path(9, 1, "err"), "r");
+        if (f) { size_t got = fread(err, 1, sizeof err - 1, f); err[got] = 0; fclose(f); }
+        said = strstr(err, "/host9/app.db adopted as the state after height ") != NULL && strstr(err, "(adopt=on): the history is kept, the file goes whole as height ") != NULL;
+    }
+    if (h9 < 0 || mine != 1 || notes != 0 || rc9 != 0 || !said) {
+        AD_CLEANUP();
+        printf("(the new host said: %.900s) ", err);
+        FAILF("the new host should sync with its file as it was (synced %ld, mine %lld, the history's table %lld), say the adopt (%d) and stop clean (%d)", h9, mine, notes, said, rc9);
+    }
+    sqlite3_close(app); app = NULL;
+
+    /* a verifier from height 1: through the lost host's history, to the file */
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", RPC, contract, AKEY, port);
+    vrc = run_verify_with(vparams, "--db " DIR "/host9/app.db", vout, sizeof vout);
+    if (vrc != 0 || !strstr(vout, "\nverified") || strstr(vout, "MISMATCH") || strstr(vout, "from the snapshot")) { AD_CLEANUP(); printf("\n%s", vout); FAILF("hpplite-verify from height 1 should say verified against the adopted file (exit %d)", vrc); }
+
+    /* a host on an empty volume, no adopt=: rebuilt from the history, the adopted file's rows */
+    snprintf(params, sizeof params, "%s&datadir=" DIR "/host10", base);
+    side = spawn_sidecar(bin, DIR "/host10/app.db", params, side_path(10, 1, "out"), side_path(10, 1, "err"));
+    h10 = wait_synced(side_path(10, 1, "out"), side, 90);
+    if (h10 >= 0) {
+        mine10 = plain_count(DIR "/host10/app.db", "SELECT count(*) FROM mine");
+        notes10 = plain_count(DIR "/host10/app.db", "SELECT count(*) FROM sqlite_schema WHERE name = 'notes'");
+        rc10 = stop_sidecar(side, SIGTERM, 60);
+    } else { if (h10 == -1) kill(side, SIGKILL); waitpid(side, NULL, WNOHANG); }
+    AD_CLEANUP();
+#undef AD_CLEANUP
+    printf("(the lost host synced at %ld and %ld; the new host at %ld; the rebuilt host at %ld: mine %lld, the history's table %lld) ", h8a, h8b, h9, h10, mine10, notes10);
+    if (h10 < 0 || mine10 != 2 || notes10 != 0 || rc10 != 0) FAILF("a host on an empty volume should rebuild the adopted file and what was written after (synced %ld, mine %lld, the history's table %lld, stop %d)", h10, mine10, notes10, rc10);
+    PASS();
+}
+
 /* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
 ** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
 ** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
@@ -4325,6 +4434,7 @@ int main(void) {
     if (wanted(64)) test_sponsored_create();
     if (wanted(65)) test_one_wallet();
     if (wanted(66)) test_instance_given();
+    if (wanted(67)) test_adopt_file();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

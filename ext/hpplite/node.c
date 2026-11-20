@@ -193,6 +193,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.storeFallback = config->storeFallback;
     node->config.anchorIntervalMs = config->anchorIntervalMs;
     node->config.keepLease = config->keepLease;
+    node->config.adopt = config->adopt;
     node->config.noAnchorAtClose = config->noAnchorAtClose;
     node->config.snapshotIntervalMs = config->snapshotIntervalMs;
     node->config.fromSnapshot = config->fromSnapshot;
@@ -501,6 +502,41 @@ static void node_pages_decide_snapshot(HppliteNode *node) {
         hpplite_pagemode_snapshot(node->pm);
     }
     node->pagesSnapshotDecided = 1;
+}
+
+/* adopt=on (#380): is the file to be taken as it is? Asked where a sequencer is behind the chain and the history would
+** be written over the file. Decided once: the file is adopted where no bookkeeping
+** stands beside it (a copy restored onto a new host, a key that was used before) and it holds something. A file with
+** no table is rebuilt from the history, as without the parameter; so is a file with its bookkeeping, which says what
+** the file was when it was last sent */
+static int node_adopting(HppliteNode *node) {
+    sqlite3_stmt *st = NULL;
+    int nSchema = 0;
+    if (node->adoptDecided) return node->adopting;
+    node->adoptDecided = 1;
+    if (!node->config.adopt || !node->pm || node->config.verifyOnly || node->follower || node->lockFd < 0 || node->ctx->blockHeight != 1) return 0;
+    if (sqlite3_prepare_v2(node->db, "SELECT count(*) FROM sqlite_schema", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW) nSchema = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    if (nSchema == 0) {
+        fprintf(stderr, "hpplite: adopt=on: %s holds nothing to adopt: the history is applied to it, as without the parameter\n", sqlite3_db_filename(node->db, "main"));
+        return 0;
+    }
+    node->adopting = 1;
+    return 1;
+}
+/* ...the history read, none of it written to the file: said once, and the file is the state from here - the first
+** flush's decision finds its root is not the last height's and queues it whole */
+static void node_adopt_done(HppliteNode *node) {
+    unsigned char have[32];
+    const char *zFile = sqlite3_db_filename(node->db, "main");
+    unsigned long long last = (unsigned long long)(node->ctx->blockHeight - 1);
+    if (!node->adopting) return;
+    node->adopting = 0;
+    if (last == 0) return;                               /* no history: a new rollup, the file its first height as ever */
+    hpplite_pagemode_root(node->pm, have);
+    if (memcmp(have, node->ctx->stateRoot, 32) != 0)
+        fprintf(stderr, "hpplite: %s adopted as the state after height %llu (adopt=on): the history is kept, the file goes whole as height %llu\n", zFile, last, last + 1);
+    else fprintf(stderr, "hpplite: %s adopted as the state after height %llu (adopt=on): it is the history's last state, nothing is sent\n", zFile, last);
 }
 
 /* The file against what this sequencer last sent, while it runs (after #327): the check its start makes, so a
@@ -1968,6 +2004,15 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
                 sqlite3_free(bytes2);
             }
         }
+        hpplite_pagebatch_free(b);
+        return rc;
+    }
+    if (node_adopting(node)) {
+        /* adopt=on (#380): the file is what its owner says the state is. The batch moves the bookkeeping - the
+        ** height, the chain hash, its root - and the file is left; once the history is read its root is not the
+        ** file's, and the file goes whole as the next height. What the application commits meanwhile is captured and
+        ** follows it */
+        rc = hppliteAdvanceMetaPages(node->ctx, batch->height, batch->pPosted, batch->nPosted, b->root, b->bMore);
         hpplite_pagebatch_free(b);
         return rc;
     }
@@ -3883,8 +3928,10 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
     }
 
     if (node->config.fromSnapshot && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2
-        && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0) {
-        /* a new replica: from the latest snapshot rather than batch 1 (#222) */
+        && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0
+        && !(node->lockFd >= 0 && node_adopting(node))) {
+        /* a new replica: from the latest snapshot rather than batch 1 (#222); not a file that is adopted, which is
+        ** not written over (#380) */
         int started = node_start_from_snapshot(node, lastBatch, 0);
         if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
         if (started > 0) synced++;
@@ -3967,9 +4014,12 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         }
     }
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
-    if (!node->config.verifyOnly && node->ctx->blockHeight == lastBatch + 1 && hpplite_node_pending_count(node) == 0)
-        synced += node_soft_walk(node);             /* what the store holds past the chain (#167), before anything of ours */
+    if (!node->config.verifyOnly && node->ctx->blockHeight == lastBatch + 1
+        && (hpplite_node_pending_count(node) == 0 || (node->pm && node->lockFd >= 0 && node_adopting(node))))
+        synced += node_soft_walk(node);             /* what the store holds past the chain (#167), before anything of ours;
+                                                    ** an adopted file's commits made meanwhile wait behind it (#380) */
     if (node->ctx->blockHeight >= lastBatch + 1) synced += node_soft_follow(node);   /* a verifier's soft tier (#166) */
+    node_adopt_done(node);                          /* adopt=on: the history is read (#380) */
     node_pages_decide_snapshot(node);               /* the chain seen: is the file ahead of it? */
     if (node->pagesWalSuspended && !node->pieceDb) {
         /* the pages applied: back to WAL for this node's own writes, the file as

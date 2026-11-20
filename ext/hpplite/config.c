@@ -281,6 +281,8 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; } }
     val = getenv("HPPLITE_KEEP_LEASE");
     if (val) cfg->keepLease = parse_on(val);
+    val = getenv("HPPLITE_ADOPT");
+    if (val) cfg->adopt = parse_on(val);
     val = getenv("HPPLITE_ANCHOR_CLOSE");
     if (val) cfg->anchorClose = !parse_off(val);
     val = getenv(HPPLITE_ENV_FROM);
@@ -542,6 +544,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
     }
     if (get_uri_param(uri, "keeplease", buf, sizeof(buf))) cfg->keepLease = parse_on(buf);
+    if (get_uri_param(uri, "adopt", buf, sizeof(buf))) cfg->adopt = parse_on(buf);
     if (get_uri_param(uri, "anchorclose", buf, sizeof(buf))) cfg->anchorClose = !parse_off(buf);
     if (get_uri_param(uri, HPPLITE_URI_SNAPSHOT, buf, sizeof(buf))) {
         int ms = parse_duration_ms(buf);
@@ -730,6 +733,8 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     }
     val = sqlite3_uri_parameter(filename, "keeplease");
     if (val) cfg->keepLease = parse_on(val);
+    val = sqlite3_uri_parameter(filename, "adopt");
+    if (val) cfg->adopt = parse_on(val);
     val = sqlite3_uri_parameter(filename, "anchorclose");
     if (val) cfg->anchorClose = !parse_off(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SNAPSHOT);

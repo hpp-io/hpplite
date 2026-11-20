@@ -793,6 +793,157 @@ static void test_backup_into_the_file_sends_only_changed_pages(void) {
     PASS();
 }
 
+/* #380: a platform restores its newest copy of the app's file onto a new host; the key's rollup has a history (the
+** lost host's, a trial's). Without adopt= the history is written over the file. adopt=on takes the file as the state:
+** the history is read and kept, nothing of it is written, and the file goes whole as the next height. A replica that
+** reads from height 1 passes through the old history and arrives at the adopted file */
+static void test_adopt_the_file_as_the_state(void) {
+    TEST("adopt=on: a file with no bookkeeping on a rollup with a history is the state - its rows stay, it goes whole as the next height, a replica from height 1 equals it; an empty file is rebuilt from the history; a second start changes nothing");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .noEncrypt = 1, .noCompress = 1, .checkpointInterval = TEST_INTERVAL_1000 };
+    TestNodeOpts oa = o, ov = o;
+    oa.adopt = 1; ov.verifyOnly = 1;
+    HppliteNode *a = test_open_node(DIR "/ad_lost.db", l1, &o);
+    if (!a) FAIL("open the first host");
+    hpplite_node_exec(a, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(a) != 1) FAIL("flush 1");
+    hpplite_node_exec(a, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(a) != 2) FAIL("flush 2");
+    hpplite_node_destroy(a);
+    /* the restored copy: a plain SQLite file, nothing of HPPLite's beside it */
+    sqlite3 *plain = NULL;
+    if (sqlite3_open(DIR "/ad.db", &plain) != SQLITE_OK) FAIL("plain open");
+    exec_sql(plain, "CREATE TABLE mine(v TEXT); INSERT INTO mine VALUES('restored'); CREATE TABLE more(n INTEGER); "
+                    "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 500) INSERT INTO more SELECT i FROM s");
+    sqlite3_close(plain);
+    HppliteNode *b = test_open_node(DIR "/ad.db", l1, &oa);
+    if (!b) FAIL("open the restored file with adopt=on");
+    int errB = b->state == HPPLITE_STATE_ERROR;
+    int mine = count_rows(b->db, "mine"), more = count_rows(b->db, "more"), old = count_rows(b->db, "t");
+    long long pend = status_int(b->db, "pending");
+    printf("(after the open: mine %d, more %d, the history's table %d, pending %lld%s%s) ", mine, more, old, pend, errB ? ", error: " : "", errB ? b->ctx->zLastError : "");
+    if (errB) { hpplite_node_destroy(b); FAIL("the adopting sequencer is in error"); }
+    if (mine != 1 || more != 500 || old != -1) { hpplite_node_destroy(b); FAILF("the file is not the one restored: mine %d, more %d, the history's table %d", mine, more, old); }
+    uint64_t h3 = hpplite_node_flush_batch(b);
+    if (h3 != 3) { hpplite_node_destroy(b); FAILF("the file should go as height 3 (flush %llu)", (unsigned long long)h3); }
+    {   /* height 3 is the file whole: every record a full page */
+        size_t len = 0;
+        uint8_t *raw = hpplite_l1_get_batch(l1, 3, &len);
+        HpplitePageBatch *p = raw ? hpplite_pagebatch_decode(raw, len) : NULL;
+        unsigned i, diffs = 0, n = p ? p->nPages : 0, size = p ? p->commitSize : 0;
+        for (i = 0; p && i < p->nPages; i++) if (p->aPage[i].flags & HPPLITE_PAGE_DIFF) diffs++;
+        if (p) hpplite_pagebatch_free(p);
+        free(raw);
+        printf("(height 3: %u records of a file of %u pages, %u diffs) ", n, size, diffs);
+        if (n == 0 || n != size || diffs) { hpplite_node_destroy(b); FAIL("height 3 is not the file whole"); }
+    }
+    hpplite_node_exec(b, "INSERT INTO mine VALUES('after')", NULL);
+    if (hpplite_node_flush_batch(b) != 4) { hpplite_node_destroy(b); FAIL("flush 4"); }
+    /* a verifier from height 1: through the old history, to the adopted file */
+    HppliteNode *v = test_open_node(DIR "/ad_v.db", l1, &ov);
+    if (!v) { hpplite_node_destroy(b); FAIL("open the verifier"); }
+    int errV = v->state == HPPLITE_STATE_ERROR, same = same_root(b, v);
+    int vmine = count_rows(v->db, "mine"), vold = count_rows(v->db, "t");
+    long long compared = status_int(v->db, "roots_compared"), mism = status_int(v->db, "root_mismatches");
+    printf("(verifier: mine %d, the history's table %d, roots compared %lld, mismatches %lld%s%s) ", vmine, vold, compared, mism, errV ? ", error: " : "", errV ? v->ctx->zLastError : "");
+    hpplite_node_destroy(v);
+    hpplite_node_destroy(b);
+    if (errV || !same || vmine != 2 || vold != -1 || mism != 0) FAIL("the verifier from height 1 does not arrive at the adopted file");
+    /* the same file started again with adopt=on: its bookkeeping stands, nothing is adopted or sent */
+    b = test_open_node(DIR "/ad.db", l1, &oa);
+    if (!b) FAIL("reopen with adopt=on");
+    long long pend2 = status_int(b->db, "pending");
+    uint64_t h5 = hpplite_node_flush_batch(b);
+    int mine2 = count_rows(b->db, "mine");
+    hpplite_node_destroy(b);
+    size_t len5 = 0;
+    uint8_t *b5 = hpplite_l1_get_batch(l1, 5, &len5);
+    free(b5);
+    printf("(a second start: pending %lld, flush %llu, mine %d, a height 5 %d) ", pend2, (unsigned long long)h5, mine2, b5 != NULL);
+    if (pend2 != 0 || mine2 != 2 || b5 != NULL) FAIL("a second start with adopt=on sent something");
+    /* an empty file with adopt=on: rebuilt from the history, as without it */
+    HppliteNode *e = test_open_node(DIR "/ad_empty.db", l1, &oa);
+    if (!e) FAIL("open an empty file with adopt=on");
+    int emine = count_rows(e->db, "mine"), errE = e->state == HPPLITE_STATE_ERROR;
+    long long pendE = status_int(e->db, "pending");
+    hpplite_node_destroy(e);
+    hpplite_l1_disconnect(l1);
+    printf("(an empty file: mine %d, pending %lld) ", emine, pendE);
+    if (errE || emine != 2 || pendE != 0) FAIL("an empty file with adopt=on is not rebuilt from the history");
+    PASS();
+}
+
+/* #380, the application at work: its connection is open in WAL and it commits while the sequencer reads the history;
+** and a history whose last commit was cut over batches and never finished (its sequencer died between two pieces) */
+static void test_adopt_with_the_app_writing(void) {
+    TEST("adopt=on with the app's connection open and a commit of its own before the history is read: adopted, the commit follows the file; after a history that ends between two pieces of a commit: adopted, a replica from height 1 equals");
+#ifndef HPPLITE_TEST_HOOKS
+    printf("SKIP (no test hooks) "); PASS(); return;
+#else
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .noEncrypt = 1, .noCompress = 1, .maxBatchBytes = 16 * 1024, .checkpointInterval = TEST_INTERVAL_1000 };
+    TestNodeOpts oa = o, ov = o;
+    oa.adopt = 1; oa.noSync = 1; ov.verifyOnly = 1;
+    /* the history: a commit in pieces, the third piece on the chain and the process gone */
+    HppliteNode *a = test_open_node(DIR "/aw_lost.db", l1, &o);
+    if (!a) FAIL("open the first host");
+    hpplite_node_exec(a, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)", NULL);
+    if (hpplite_node_flush_batch(a) == 0) FAIL("flush 1");
+    hpplite_node_exec(a, "BEGIN; WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 30) INSERT INTO t(v) SELECT randomblob(3500) FROM s; COMMIT", NULL);
+    hpplite_test_fail_commits = 1;
+    uint64_t hStop = hpplite_node_flush_batch(a);
+    hpplite_test_fail_commits = 0;
+    hpplite_pagemode_stop(a->pm); a->pm = NULL;      /* the process dies */
+    hpplite_node_destroy(a);
+    {   /* the last batch on the chain is a piece with more to come */
+        size_t len = 0;
+        uint8_t *raw = NULL;
+        uint64_t h = 1;
+        int more = 0;
+        while (h < 50) { uint8_t *r = hpplite_l1_get_batch(l1, h + 1, &len); if (!r) break; free(r); h++; }
+        raw = hpplite_l1_get_batch(l1, h, &len);
+        HpplitePageBatch *pb = raw ? hpplite_pagebatch_decode(raw, len) : NULL;
+        if (pb) { more = pb->bMore; hpplite_pagebatch_free(pb); }
+        free(raw);
+        printf("(the history: %llu heights, the last a piece with more after it %d) ", (unsigned long long)h, more);
+        if (!more) FAIL("the history should end between two pieces of a commit");
+    }
+    /* the restored file, the app on it */
+    sqlite3 *app = NULL;
+    if (sqlite3_open(DIR "/aw.db", &app) != SQLITE_OK) FAIL("the app's open");
+    sqlite3_busy_timeout(app, 5000);
+    if (exec_sql(app, "PRAGMA journal_mode=WAL; CREATE TABLE mine(v TEXT); INSERT INTO mine VALUES('restored')") != SQLITE_OK) { sqlite3_close(app); FAIL("the app's rows"); }
+    HppliteNode *b = test_open_node(DIR "/aw.db", l1, &oa);
+    if (!b) { sqlite3_close(app); FAIL("open the restored file with adopt=on"); }
+    int w1 = exec_sql(app, "INSERT INTO mine VALUES('while the history is read')");
+    int seen = hpplite_node_pending_count(b);         /* the node has seen the app's commit: it is captured, and waits */
+    int synced = hpplite_node_sync_from_l1(b, 1);
+    int errB = b->state == HPPLITE_STATE_ERROR;
+    char whyB[300];
+    snprintf(whyB, sizeof whyB, "%s", b->ctx->zLastError);
+    int w2 = exec_sql(app, "INSERT INTO mine VALUES('after')");
+    uint64_t hB = hpplite_node_flush_batch(b);
+    long long mine = scalar(app, "SELECT count(*) FROM mine"), old = scalar(app, "SELECT count(*) FROM sqlite_schema WHERE name = 't'");
+    (void)hStop;
+    printf("(the app's writes %d %d, %d captured before the history was read; synced %d; flush to %llu; mine %lld, the history's table %lld%s%s) ",
+           w1, w2, seen, synced, (unsigned long long)hB, mine, old, errB ? ", error: " : "", errB ? whyB : "");
+    if (errB || w1 != SQLITE_OK || w2 != SQLITE_OK || seen < 1 || hB == 0 || mine != 3 || old != 0) { hpplite_node_destroy(b); sqlite3_close(app); FAIL("the adopting sequencer did not take the file and the app's commits"); }
+    HppliteNode *v = test_open_node(DIR "/aw_v.db", l1, &ov);
+    if (!v) { hpplite_node_destroy(b); sqlite3_close(app); FAIL("open the verifier"); }
+    int errV = v->state == HPPLITE_STATE_ERROR, same = same_root(b, v), vmine = count_rows(v->db, "mine");
+    long long mism = status_int(v->db, "root_mismatches");
+    printf("(verifier: mine %d, mismatches %lld%s%s) ", vmine, mism, errV ? ", error: " : "", errV ? v->ctx->zLastError : "");
+    hpplite_node_destroy(v);
+    hpplite_node_destroy(b);
+    sqlite3_close(app);
+    hpplite_l1_disconnect(l1);
+    if (errV || !same || vmine != 3 || mism != 0) FAIL("the verifier from height 1 does not arrive at the adopted file");
+    PASS();
+#endif
+}
+
 int main(void) {
     printf("=== HPPLite page mode ===\n");
     test_suite_init("pagemode", NULL, DIR);
@@ -819,6 +970,8 @@ int main(void) {
     test_pending_counts_foreign_commits();
     test_follower_reports_pages();
     test_backup_into_the_file_sends_only_changed_pages();
+    test_adopt_the_file_as_the_state();
+    test_adopt_with_the_app_writing();
     remove_dir();
     return test_report();
 }

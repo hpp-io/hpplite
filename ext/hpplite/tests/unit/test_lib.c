@@ -162,6 +162,7 @@ HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpt
     config.storeFallback = !o->storeFallbackOff;
     config.keepLease = o->keepLease;
     if (o->instanceSeed) { memcpy(config.instanceSeed, o->instanceSeed, 32); config.hasInstance = 1; }
+    config.adopt = o->adopt;
     config.noAnchorAtClose = o->noAnchorAtClose;
     config.batchIntervalMs = o->intervalMs;
     config.anchorIntervalMs = o->anchorMs;

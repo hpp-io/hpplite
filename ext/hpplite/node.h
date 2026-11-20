@@ -98,6 +98,8 @@ typedef struct HppliteNodeConfig {
     int snapshotIntervalMs;         /* snapshot=: a snapshot at an anchor when the last is older than this (#221); 0: never */
     int anchorIntervalMs;           /* anchor=: how often the batches at the store are anchored on the chain (#164) */
     int keepLease;                  /* keeplease=on: a sequencer closing alone lets its lease run instead of releasing it (#265) */
+    int adopt;                      /* adopt=on: a sequencer's file that is not the state its bookkeeping names (none: a restored copy, a key used
+                                    ** before) is taken as the state - the history read and not applied, the file whole as the next height (#380) */
     int noAnchorAtClose;            /* anchorclose=off: the close flushes to the store and leaves the anchor to the timer or hpplite_anchor() (#266) */
     uint64_t maxTxGas;              /* Gas cap per transaction (0 = by chain id, else unknown) */
 } HppliteNodeConfig;
@@ -140,6 +142,8 @@ typedef struct HppliteNode {
     struct HpplitePageMode *pm;     /* page mode (#146): the commits queued and the batches built from them */
     unsigned pageDeflateRatio;      /* raw page bytes per posted byte seen on the last page batch: the next build's budget */
     int pagesSnapshotDecided;       /* the first flush decided whether the file goes whole first */
+    int adoptDecided, adopting;     /* adopt=on (#380), decided once where the node is behind the chain: the history's batches move the
+                                    ** bookkeeping and leave the file */
     int64_t fileCheckAt;            /* the next check of the file against what was last sent, while running (ms) */
     uint64_t fileKey[4];            /* ...the file's stat (dev, inode, size, mtime ns) when it last matched */
     int fileMatched;                /* ...and whether fileKey is set */

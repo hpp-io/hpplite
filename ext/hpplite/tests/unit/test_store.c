@@ -1662,6 +1662,70 @@ static void test_recovery(const char *url) {
     PASS();
 }
 
+/* 10b. adopt=on at a store (#380): the lost sequencer's batches are at the store, none anchored; the successor's file
+** is a restored copy with the app on it, and the app commits before the history is read. The store's batches are
+** walked and kept for the anchor, none written to the file; the file goes whole as the next height, the app's
+** commit after it; a verifier from height 1 arrives at the file */
+static void test_recovery_adopt(const char *url) {
+    TEST("adopt=on at a store: three batches at the store, none anchored; a restored file with a commit of the app's waiting: the batches are walked and kept for the anchor, the file goes whole as height 4, a verifier from height 1 equals it");
+    static const unsigned char kseq[32] = { [31] = 0x7a };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "ad_a", .privkey = kseq };
+    HppliteNode *w = test_open_node(tpath("ad_a.db"), l1, &o), *w2;
+    sqlite3 *app = NULL;
+    int i, seen, mine, old;
+    long long height, unanchored;
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3; i++) {
+        char sql[80];
+        snprintf(sql, sizeof sql, "INSERT INTO t(v) VALUES('the lost host %d')", i);
+        hpplite_node_exec(w, sql, NULL);
+        if (hpplite_node_flush_batch(w) < 1) { printf("(%s) ", status_text(w->db, "last_error")); hpplite_node_destroy(w); FAIL("a flush"); }
+    }
+    hpplite_node_stop_timer(w);                                   /* the machine is gone: no close, no anchor */
+    w->ownsL1 = 0;
+    w->l1 = NULL;
+    hpplite_node_destroy(w);
+    hpplite_l1_mock_advance_time(l1, 400);                        /* the dead one's lease runs out */
+    if (sqlite3_open(tpath("ad_b.db"), &app) != SQLITE_OK) { hpplite_l1_disconnect(l1); FAIL("the app's open"); }
+    sqlite3_busy_timeout(app, 5000);
+    exec_sql(app, "PRAGMA journal_mode=WAL; CREATE TABLE mine(v TEXT); INSERT INTO mine VALUES('restored')");
+    {
+        TestNodeOpts o2 = { .storeUrl = url, .nodeId = "ad_b", .privkey = kseq, .adopt = 1, .noSync = 1 };
+        w2 = test_open_node(tpath("ad_b.db"), l1, &o2);
+    }
+    if (!w2) { sqlite3_close(app); hpplite_l1_disconnect(l1); FAIL("open the successor"); }
+    exec_sql(app, "INSERT INTO mine VALUES('while the history is read')");
+    seen = hpplite_node_pending_count(w2);                        /* the app's commit is captured, and waits */
+    hpplite_node_sync_from_l1(w2, 1);
+    height = status_int(w2->db, "height");
+    unanchored = scalar(w2->ctx->bkDb, "SELECT count(*) FROM _hpplite_unanchored");
+    mine = count_rows(w2->db, "mine"); old = count_rows(w2->db, "t");
+    printf("(the app's commit captured %d; after the sync: height %lld, unanchored %lld, mine %d, the history's table %d) ", seen, height, unanchored, mine, old);
+    if (seen < 1 || height != 4 || unanchored != 3 || mine != 2 || old != -1) {
+        printf("(last_error '%s') ", status_text(w2->db, "last_error"));
+        sqlite3_close(app); w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1); FAIL("the successor should walk the store's three batches and leave its file");
+    }
+    if (hpplite_node_flush_batch(w2) < 4 || hpplite_node_anchor(w2) < 4) {
+        printf("(%s) ", status_text(w2->db, "last_error")); sqlite3_close(app); w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1); FAIL("the file as the next height, then one anchor over all of it");
+    }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "ad_r", .privkey = kseq };
+        HppliteNode *r = test_open_node(tpath("ad_r.db"), l1, &ro);
+        int rows = r ? count_rows(r->db, "mine") : -1, rold = r ? count_rows(r->db, "t") : 0, same = r ? same_root(w2, r) : 0;
+        long long mism = r ? status_int(r->db, "root_mismatches") : -1;
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); }
+        printf("(verifier: mine %d, the history's table %d, same root %d, mismatches %lld) ", rows, rold, same, mism);
+        if (rows != 2 || rold != -1 || !same || mism != 0) { sqlite3_close(app); w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1); FAIL("a verifier from height 1 arrives at the adopted file"); }
+    }
+    sqlite3_close(app);
+    w2->ownsL1 = 0;
+    hpplite_node_destroy(w2);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 /* 11. The soft tier (#166): a verifier with the store follows the sequencer's batches as they reach the
 ** store, before any anchor, and they turn hard when the anchor names what it applied. */
 static void test_soft_replica(const char *url) {
@@ -1910,6 +1974,7 @@ int main(int argc, char **argv) {
     test_anchor_deadline_across_runs(url);
     test_anchor_idle_deadline(url);
     test_recovery(url);
+    test_recovery_adopt(url);
     test_soft_replica(url);
     test_soft_past_ring(url);
     test_soft_disagreement(url);
