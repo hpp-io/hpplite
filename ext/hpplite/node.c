@@ -2747,7 +2747,7 @@ static const char *node_snapshot_open_file(HppliteNode *node, uint64_t h, const 
     return why;
 }
 
-static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, int earliest) {
+static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, int earliest, int adopting) {
     HppliteCtx *ctx = node->ctx;
     cJSON *m, *ix = NULL, *chunks = NULL, *c;
     uint64_t h = 0;
@@ -2794,6 +2794,21 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
         if (cJSON_IsNumber(jn)) want = (size_t)jn->valuedouble;
     }
     hpplite_l1_range_clear(&r);
+    if (!why && adopting) {
+        /* adopt=on (#395): the file is the state and none of the history is written to it; what the adopt needs is
+        ** where the history ends, and a history pruned at the store (keep=) has no batch 1 to begin from. The
+        ** bookkeeping begins where a new replica's does - the snapshot's height, with the root and the chain hash the
+        ** chain anchored there - and no chunk of the snapshot is read */
+        int rc = hppliteSetMetaAt(ctx, h, block, chain, root);
+        cJSON_Delete(ix);
+        if (rc != SQLITE_OK) return -1;
+        hpplite_set_checkpoint(ctx, h, root);
+        node->lastCheckpointHeight = h;
+        node->snapHeight = h;
+        fprintf(stderr, "hpplite: adopt=on: the history is read from the snapshot at height %llu (its root and chain hash are the ones the chain anchored there); "
+                        "the snapshot's pages are not read, the file is left\n", (unsigned long long)h);
+        return 1;
+    }
     if (!why) {
         /* the chunks to a file beside the database, one in memory at a time (#364), each checked by its sha-256 */
         int fd;
@@ -2870,8 +2885,8 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
 }
 
 static int node_start_from_snapshot(HppliteNode *node, uint64_t lastBatch, int earliest) {
-    int rc = node_start_from_snapshot_at(node, lastBatch, earliest);
-    if (rc == 0 && earliest) rc = node_start_from_snapshot_at(node, lastBatch, 0);   /* the oldest was not usable: the latest (#224) */
+    int rc = node_start_from_snapshot_at(node, lastBatch, earliest, 0);
+    if (rc == 0 && earliest) rc = node_start_from_snapshot_at(node, lastBatch, 0, 0);   /* the oldest was not usable: the latest (#224) */
     return rc;
 }
 
@@ -4042,12 +4057,12 @@ static int node_sync_from_l1(HppliteNode *node, int *pHead) {
         }
     }
 
-    if (node->config.fromSnapshot && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2
-        && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0
-        && !(node->lockFd >= 0 && node_adopting(node))) {
-        /* a new replica: from the latest snapshot rather than batch 1 (#222); not a file that is adopted, which is
-        ** not written over (#380) */
-        int started = node_start_from_snapshot(node, lastBatch, 0);
+    if (node->config.fromSnapshot && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2 && hpplite_l1_has_ranges(node->l1)
+        && ((node->lockFd >= 0 && node_adopting(node)) || (hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0))) {
+        /* a new replica: from the latest snapshot rather than batch 1 (#222). A file that is adopted is not written
+        ** over (#380): its bookkeeping begins at that snapshot's height, whatever its application has committed
+        ** meanwhile, and the batches after it are read as from batch 1 (#395) */
+        int started = node->adopting ? node_start_from_snapshot_at(node, lastBatch, 0, 1) : node_start_from_snapshot(node, lastBatch, 0);
         if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
         if (started > 0) synced++;
     }

@@ -1971,6 +1971,92 @@ static int restart_other_batch(const char *url) {
     hpplite_l1_disconnect(l1);
     return f0 == 0 && s0 == 0 && strstr(e0, "the store holds batch 4 past the anchor") && strstr(e0, "adopt=on") && rows == 4 && other == 1;
 }
+/* adopt=on onto a history pruned at the store (#395): the adopt read the history from height 1, and a rollup that
+** prunes (keep=) has no batch 1 - a platform's tier with a bounded history could not go back in place, nor restore
+** its copy onto a new host. The adopt writes none of the history to the file; it needs where the history ends. It
+** begins where a new replica does: at the latest snapshot the anchors name, its root and chain hash the ones the
+** chain anchored at its height - the index alone, no chunk read - then the batches after it and the store's past
+** the anchor */
+static void test_adopt_pruned(const char *url) {
+    TEST("adopt=on onto a pruned history (#395): batch 1 gone at the store, snapshots at 3 and 5, a batch at the store past the anchor; a restored file with adopt=on: the bookkeeping from the snapshot at 5, batch 6 kept for the anchor, the file whole as height 7; a verifier from the oldest snapshot kept equals it");
+    static const unsigned char kseq[32] = { [31] = 0x7c };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "ap_a", .privkey = kseq, .snapshotMs = 1, .keepSeconds = 3 };
+    HppliteNode *w = test_open_node(tpath("ap_a.db"), l1, &o), *w2;
+    HppliteStore *rs;
+    sqlite3 *app = NULL;
+    char b1[128] = "", said[1200] = "", e[300];
+    long long height, unanchored;
+    int i, mine, old, saved, fd, gone;
+    uint64_t f7, a7;
+    if (!w) FAIL("open");
+    rs = hpplite_store_open(url, NULL, 0);
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('one of the first three')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 3 || range_batch_ref(l1, rs, 3, 1, b1) != 0) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 1-3 with a snapshot at 3"); }
+    sleep(4);                                   /* keep=3s, by whole seconds: a margin over the boundary */
+    for (i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four and five')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 5) { hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("the anchor 4-5 with a snapshot at 5"); }
+    gone = !store_has(rs, b1);
+    hpplite_store_close(rs);
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('six, at the store alone')", NULL);
+    if (!gone || hpplite_node_flush_batch(w) != 6) { hpplite_node_destroy(w); FAIL("batch 1 pruned, and a sixth batch at the store"); }
+    hpplite_node_stop_timer(w);                                   /* the machine is gone: no close, no anchor */
+    w->ownsL1 = 0; w->l1 = NULL;
+    hpplite_node_destroy(w);
+    hpplite_l1_mock_advance_time(l1, 400);
+    if (sqlite3_open(tpath("ap_b.db"), &app) != SQLITE_OK) { hpplite_l1_disconnect(l1); FAIL("the app's open"); }
+    sqlite3_busy_timeout(app, 5000);
+    exec_sql(app, "PRAGMA journal_mode=WAL; CREATE TABLE mine(v TEXT); INSERT INTO mine VALUES('restored')");
+    fflush(stderr);
+    saved = dup(2);
+    fd = open(tpath("ap_said.txt"), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (saved < 0 || fd < 0 || dup2(fd, 2) < 0) { sqlite3_close(app); hpplite_l1_disconnect(l1); FAIL("stderr to a file"); }
+    close(fd);
+    {
+        TestNodeOpts o2 = { .storeUrl = url, .nodeId = "ap_a", .privkey = kseq, .adopt = 1, .fromSnapshot = 1, .snapshotMs = 1, .keepSeconds = 3, .noSync = 1 };
+        w2 = test_open_node(tpath("ap_b.db"), l1, &o2);
+    }
+    if (w2) hpplite_node_sync_from_l1(w2, 1);
+    fflush(stderr);
+    dup2(saved, 2); close(saved);
+    if (!w2) { sqlite3_close(app); hpplite_l1_disconnect(l1); FAIL("open the new host"); }
+    {
+        FILE *f = fopen(tpath("ap_said.txt"), "r");
+        if (f) { size_t got = fread(said, 1, sizeof said - 1, f); said[got] = 0; fclose(f); }
+    }
+    height = status_int(w2->db, "height");
+    unanchored = scalar(w2->ctx->bkDb, "SELECT count(*) FROM _hpplite_unanchored");
+    mine = count_rows(w2->db, "mine"); old = count_rows(w2->db, "t");
+    snprintf(e, sizeof e, "%s", status_text(w2->db, "last_error"));
+    printf("(after the sync: height %lld, unanchored %lld, mine %d, the history's table %d, synced %lld, '%.200s'; said: '%.500s') ", height, unanchored, mine, old, (long long)status_int(w2->db, "synced"), e, said);
+    if (height != 7 || unanchored != 1 || mine != 1 || old != -1 || !strstr(said, "adopted as the state after height 6") || !strstr(said, "from the snapshot at height 5")) {
+        sqlite3_close(app); w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1);
+        FAIL("the new host should take the bookkeeping from the snapshot at 5, keep batch 6 for the anchor and leave its file");
+    }
+    f7 = hpplite_node_flush_batch(w2); a7 = hpplite_node_anchor(w2);
+    if (f7 != 7 || a7 != 7) {
+        printf("(flush %llu, anchor %llu, %s) ", (unsigned long long)f7, (unsigned long long)a7, status_text(w2->db, "last_error")); sqlite3_close(app); w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1); FAIL("the file as height 7, then one anchor over 6 and 7");
+    }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "ap_r", .privkey = kseq }, so = { .storeUrl = url, .verifyOnly = 1, .fromSnapshot = 1, .nodeId = "ap_s", .privkey = kseq };
+        HppliteNode *r = test_open_node(tpath("ap_r.db"), l1, &ro), *sp;
+        int rows = r ? count_rows(r->db, "mine") : -1, rold = r ? count_rows(r->db, "t") : 0, same = r ? same_root(w2, r) : 0, rows2, same2;
+        long long mism = r ? status_int(r->db, "root_mismatches") : -1;
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); }
+        sp = test_open_node(tpath("ap_s.db"), l1, &so);
+        rows2 = sp ? count_rows(sp->db, "mine") : -1; same2 = sp ? same_root(w2, sp) : 0;
+        if (sp) { sp->l1 = NULL; hpplite_node_destroy(sp); }
+        printf("(verifier: mine %d, the history's table %d, same root %d, mismatches %lld; a replica from the latest snapshot: mine %d, same root %d) ", rows, rold, same, mism, rows2, same2);
+        if (rows != 1 || rold != -1 || !same || mism != 0 || rows2 != 1 || !same2) { sqlite3_close(app); w2->ownsL1 = 0; hpplite_node_destroy(w2); hpplite_l1_disconnect(l1); FAIL("a verifier from the oldest snapshot kept, and a replica from the latest, arrive at the adopted file"); }
+    }
+    sqlite3_close(app);
+    w2->ownsL1 = 0;
+    hpplite_node_destroy(w2);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 /* adopt=on beside a file's bookkeeping (#398): a file carried with its sidecar - the directory hpplite-verify --keep
 ** leaves moved whole, a copy of a sequencer's file and sidecar from an earlier day - is not adopted (#380 is for a file
 ** with no bookkeeping), and the history past the bookkeeping's height is applied to it as at any start behind the
@@ -2346,6 +2432,7 @@ int main(int argc, char **argv) {
     test_recovery(url);
     test_recovery_adopt(url);
     test_adopt_with_bookkeeping(url);
+    test_adopt_pruned(url);
     test_recovery_file_held(url);
     test_restart_with_commits(url);
     test_soft_replica(url);

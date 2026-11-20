@@ -971,9 +971,18 @@ somewhere else - has the history applied to it as at any start, and with
 
     hpplite: <file> is not adopted (adopt=on): it has its bookkeeping beside it (<file>-hpplite.db, at height N), and the history past that height is applied to the file. For the file to be the state, start it with adopt=on and without that bookkeeping
 
-`adopt=on` reads the history from height 1 and does not start from a
-snapshot: a rollup whose old batches are pruned (`keep=`) is not adopted
-onto yet.
+Where the anchors name a snapshot (`snapshot=`), the history is read from
+the latest one's height, as a new replica reads it (#395): its index
+alone - the root and the chain hash it carries are the ones the chain
+anchored at that height - and none of its pages; then the batches after
+it. So a rollup whose old batches are pruned at the store (`keep=`) is
+adopted onto as any other, and a long history costs the adopt no more
+than a short one. A line says where the reading began:
+
+    hpplite: adopt=on: the history is read from the snapshot at height N (its root and chain hash are the ones the chain anchored there); the snapshot's pages are not read, the file is left
+
+A snapshot that cannot be used (its index gone, or not the anchored one)
+is said, and the history is read from height 1.
 
 **Going back and going on (#392).** The two together are a database taken
 back to a moment and written from there, on its own rollup:
@@ -998,7 +1007,11 @@ database as it was then, with the rows that were left behind; a moment
 after it is the database gone back. Going back a second time, to before
 the first, is the same steps. A replica, a host on an empty volume and
 `hpplite-verify` from batch 1 arrive at the application's file. One
-scenario on the real contracts holds all of it (test_anvil 70).
+scenario on the real contracts holds all of it (test_anvil 70). On a
+history pruned at the store (`keep=`) the steps are the same for a moment
+inside what is kept - `--at` rebuilds from the oldest snapshot kept and
+cannot answer for a moment before it was made - and a second scenario
+holds that (test_anvil 71, #395).
 
 **The soft tier for a replica (#166).** A `role=verify` connection with
 `store=` doesn't wait for the anchor. Past the anchored height, it reads the

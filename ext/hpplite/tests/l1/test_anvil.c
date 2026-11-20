@@ -3831,6 +3831,140 @@ static void test_rewind_and_go_on(void) {
     PASS();
 }
 
+/* 71. Going back on a pruned history (#395): scenario 70 with keep= short enough that the store lets batch 1 go. A
+** platform's tier with a bounded history (a week, a month) rewinds inside what is kept: hpplite-verify --at starts
+** from the oldest snapshot kept, and adopt=on - which read the history from height 1, where there is no batch any
+** more - begins its bookkeeping at the latest snapshot's height, reading its index alone. */
+static void test_rewind_pruned(void) {
+    TEST("going back on a pruned history (#395): snapshot= and keep=3s, three anchors, batch 1 gone at the store; the database as of a moment inside what is kept (--at --keep) put in the app's place, adopt=on - the bookkeeping from the latest snapshot's height, the file adopted; a write, an anchor; hpplite-verify and a replica arrive at the app's file");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char *PKEY = "0x6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f";
+    static const char *SEED = "39203920392039203920392039203920392039203920392039203920392039ac";
+    static const char *APP = DIR "/host16/app.db";
+    static const char *IS = "SELECT count(*) * 100 + coalesce(sum(n), 0) FROM notes";
+    char addr[48], cmd[900], out[2000], contract[80], base[800], params[1000], vparams[500], vout[4096] = "", vout2[4096] = "", why[900] = "", err[2400] = "";
+    long h, a, hRun[2] = {0, 0}, aRun[4] = {0, 0, 0, 0};
+    long long t1, is, repIs = -1;
+    int port, run = 0, vrc, vrc2, nAnchor = 0;
+    pid_t store, side = 0;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!bin || access(bin, X_OK) != 0) FAIL("hpplite-sequencer not beside hpplite-verify (HPPLITE_VERIFY_BIN)");
+    unsetenv("HPPLITE_HOST_NAME");
+    (void)!system("rm -rf " DIR "/host16 " DIR "/store_pins71 " DIR "/pr_owner.db* " DIR "/pr_replica.db* && mkdir -p " DIR "/host16");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", PKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    {
+        FILE *f = fopen(DIR "/pr.seed", "w");
+        if (!f) FAIL("the seed file");
+        fprintf(f, "0x%s\n", SEED);
+        fclose(f);
+    }
+    port = test_free_port();
+    store = start_pin_service_dir(svc, port, DIR "/store_pins71");
+    if (store < 0) FAIL("the store did not come up");
+    {
+        /* the rollup with its store from the first batch, as a platform's is: batch 1 goes with the rest (one that
+        ** began without a store keeps its batch 1 on the chain, and a verifier from batch 1 stops at 2: #399) */
+        sqlite3 *owner;
+        snprintf(cmd, sizeof cmd, "&store=http://127.0.0.1:%d", port);
+        owner = open_db("pr_owner.db", PKEY, cmd);
+        if (owner) snprintf(contract, sizeof contract, "%s", status_text(owner, "contract"));
+        sqlite3_close(owner);
+        if (!owner || !contract[0]) { kill(store, SIGTERM); waitpid(store, NULL, 0); FAIL("create the rollup"); }
+    }
+#define PR_END() do { if (side > 0) stop_sidecar(side, SIGKILL, 5); kill(store, SIGTERM); waitpid(store, NULL, 0); } while (0)
+#define PR_SAID() do { \
+        FILE *f = fopen(side_path(16, run, "err"), "r"); \
+        err[0] = 0; \
+        if (f) { size_t got = fread(err, 1, sizeof err - 1, f); err[got] = 0; fclose(f); } \
+    } while (0)
+#define PR_START(more) do { \
+        snprintf(params, sizeof params, "%s&datadir=" DIR "/host16%s", base, more); \
+        run++; nAnchor = 0; \
+        side = spawn_sidecar(bin, APP, params, side_path(16, run, "out"), side_path(16, run, "err")); \
+        h = wait_synced(side_path(16, run, "out"), side, 60); \
+        if (h < 0) { if (h == -2) side = 0; PR_SAID(); PR_END(); printf("(the sequencer said: %.1500s) ", err); FAILF("run %d of the sequencer did not say it was synced (%ld)", run, h); } \
+        hRun[run - 1] = h; \
+    } while (0)
+#define PR_WRITE(n) do { \
+        if (plain_exec(APP, "INSERT INTO notes(n) VALUES(" #n ")") != SQLITE_OK) { PR_END(); FAIL("the app writes " #n); } \
+        sleep(2); \
+    } while (0)
+#define PR_ANCHOR(i) do { \
+        kill(side, SIGUSR2); \
+        a = anchor_line(side_path(16, run, "err"), "/host16/app.db anchored to height ", ++nAnchor, side, 90); \
+        if (a < 0) { if (a == -2) side = 0; PR_END(); FAILF("run %d: the anchor asked for was not made (%ld)", run, a); } \
+        aRun[i] = a; \
+    } while (0)
+    snprintf(base, sizeof base, "rpc=%s&contract=%s&chainid=31337&privkey=%s&interval=300ms&store=http://127.0.0.1:%d&keeplease=on&anchor=24h&anchorclose=off&snapshot=1ms&keep=3s&instancefile=" DIR "/pr.seed",
+             RPC, contract, PKEY, port);
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", RPC, contract, PKEY, port);
+
+    /* 1 and an anchor (the first snapshot); past keep, 2 and an anchor (the second; below the first is let go);
+    ** 3, the moment to go back to, 4 and an anchor (the third; below the second is let go, made before the moment) */
+    PR_START("");
+    if (plain_exec(APP, "CREATE TABLE notes(id INTEGER PRIMARY KEY, n INTEGER)") != SQLITE_OK) { PR_END(); FAIL("the app creates its table"); }
+    PR_WRITE(1);
+    PR_ANCHOR(0);
+    sleep(4);
+    PR_WRITE(2);
+    PR_ANCHOR(1);
+    PR_WRITE(3); t1 = (long long)time(NULL); sleep(2);
+    PR_WRITE(4);
+    PR_ANCHOR(2);
+    {
+        int rcStop = stop_sidecar(side, SIGTERM, 60);
+        side = 0;
+        if (rcStop != 0) { PR_END(); FAILF("the sequencer did not stop clean (%d)", rcStop); }
+    }
+    vrc = run_verify_with(vparams, "", vout, sizeof vout);
+    if (vrc != 0 || !strstr(vout, "\nverified from the snapshot at ")) { PR_END(); printf("\n%s", vout); FAILF("the history should be pruned by now: hpplite-verify from the oldest snapshot kept (exit %d)", vrc); }
+
+    /* back to t1: 1, 2, 3 - and on: 5 */
+    if (rewind_to(vparams, t1, DIR "/pr_keep", APP, why, sizeof why) != 0) { PR_END(); FAILF("the rewind inside what is kept: %s", why); }
+    is = plain_count(APP, IS);
+    if (is != 306) { PR_END(); FAILF("the database as of t1 should hold 1, 2, 3 (%lld)", is); }
+    PR_START("&adopt=on");
+    PR_SAID();
+    if (!strstr(err, "adopt=on: the history is read from the snapshot at height ") || !strstr(err, "/host16/app.db adopted as the state after height ")) {
+        PR_END(); printf("(the sequencer said: %.1500s) ", err); FAIL("the rewound file should be adopted, its bookkeeping from the latest snapshot's height");
+    }
+    PR_WRITE(5);
+    PR_ANCHOR(3);
+    {
+        int rcStop = stop_sidecar(side, SIGTERM, 60);
+        side = 0;
+        if (rcStop != 0) { PR_END(); FAILF("the sequencer did not stop clean after the adopt (%d)", rcStop); }
+    }
+    is = plain_count(APP, IS);
+    vrc2 = run_verify_with(vparams, "--db " DIR "/host16/app.db", vout2, sizeof vout2);
+    {
+        char uri[900];
+        sqlite3 *r = NULL;
+        snprintf(uri, sizeof uri, "file:" DIR "/pr_replica.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&privkey=%s&role=verify&store=http://127.0.0.1:%d&datadir=" DIR "&interval=0", RPC, contract, PKEY, port);
+        if (sqlite3_open_v2(uri, &r, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK) repIs = scalar(r, IS);
+        sqlite3_close(r);
+    }
+    PR_END();
+#undef PR_END
+#undef PR_SAID
+#undef PR_START
+#undef PR_WRITE
+#undef PR_ANCHOR
+    {
+        const char *q = strstr(err, "adopt=on: the history is read from the snapshot at height ");
+        printf("(the sequencer synced at %ld, anchored to %ld, %ld, %ld; the adopt read from the snapshot at %ld, synced at %ld, anchored to %ld; the app's file %lld; verify: exit %d; a replica %lld) ",
+               hRun[0], aRun[0], aRun[1], aRun[2], q ? atol(q + strlen("adopt=on: the history is read from the snapshot at height ")) : -1, hRun[1], aRun[3], is, vrc2, repIs);
+    }
+    if (is != 411) FAIL("the app's file after the rewind and a write should hold 1, 2, 3, 5");
+    if (vrc2 != 0 || !strstr(vout2, "\nverified") || strstr(vout2, "MISMATCH")) { printf("\n%s", vout2); FAILF("hpplite-verify should say verified against the app's file (exit %d)", vrc2); }
+    if (repIs != 411) FAIL("a replica should arrive at 1, 2, 3, 5");
+    PASS();
+}
+
 /* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
 ** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
 ** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
@@ -4839,6 +4973,7 @@ int main(void) {
     if (wanted(68)) test_store_away_at_start();
     if (wanted(69)) test_anchor_asked();
     if (wanted(70)) test_rewind_and_go_on();
+    if (wanted(71)) test_rewind_pruned();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
