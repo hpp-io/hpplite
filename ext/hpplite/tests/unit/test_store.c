@@ -1971,6 +1971,57 @@ static int restart_other_batch(const char *url) {
     hpplite_l1_disconnect(l1);
     return f0 == 0 && s0 == 0 && strstr(e0, "the store holds batch 4 past the anchor") && strstr(e0, "adopt=on") && rows == 4 && other == 1;
 }
+/* adopt=on beside a file's bookkeeping (#398): a file carried with its sidecar - the directory hpplite-verify --keep
+** leaves moved whole, a copy of a sequencer's file and sidecar from an earlier day - is not adopted (#380 is for a file
+** with no bookkeeping), and the history past the bookkeeping's height is applied to it as at any start behind the
+** chain. The operator asked for the file to be the state and nothing said it was not: one line does */
+static void test_adopt_with_bookkeeping(const char *url) {
+    TEST("adopt=on on a file with its bookkeeping beside it (#398): the history past its height is applied, as the README says, and one line on stderr says the file was not adopted and what to do");
+    unsigned char k[32] = {0};
+    HppliteL1 *l1;
+    HppliteNode *a, *b;
+    char said[900] = "";
+    int rows = -2, saved, fd, lines = 0;
+    const char *q;
+    k[31] = 0x95;
+    l1 = lost_host(url, k, "ab_a", "ab_a.db");
+    if (!l1) FAIL("the first host's three batches");
+    copy_beside("ab_a.db", "ab_b.db");                            /* the file as of height 3, with its bookkeeping */
+    {
+        TestNodeOpts o = { .storeUrl = url, .nodeId = "ab_a", .privkey = k };
+        a = test_open_node(tpath("ab_a.db"), l1, &o);
+        if (!a) { hpplite_l1_disconnect(l1); FAIL("the first host again"); }
+        hpplite_node_exec(a, "INSERT INTO t(v) VALUES('after the copy')", NULL);
+        if (hpplite_node_flush_batch(a) < 4 || hpplite_node_anchor(a) < 4) { printf("(%s) ", status_text(a->db, "last_error")); hpplite_node_destroy(a); FAIL("its fourth batch, and the anchor over the four"); }
+        hpplite_node_stop_timer(a);
+        a->ownsL1 = 0; a->l1 = NULL; hpplite_node_destroy(a);
+        hpplite_l1_mock_advance_time(l1, 400);
+    }
+    fflush(stderr);
+    saved = dup(2);
+    fd = open(tpath("ab_said.txt"), O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (saved < 0 || fd < 0 || dup2(fd, 2) < 0) { hpplite_l1_disconnect(l1); FAIL("stderr to a file"); }
+    close(fd);
+    {
+        TestNodeOpts o = { .storeUrl = url, .nodeId = "ab_a", .privkey = k, .adopt = 1 };
+        b = test_open_node(tpath("ab_b.db"), l1, &o);
+        if (b) { hpplite_node_sync_from_l1(b, 1); hpplite_node_flush_batch(b); hpplite_node_sync_from_l1(b, 1); rows = count_rows(b->db, "t"); }
+    }
+    fflush(stderr);
+    dup2(saved, 2); close(saved);
+    {
+        FILE *f = fopen(tpath("ab_said.txt"), "r");
+        if (f) { size_t got = fread(said, 1, sizeof said - 1, f); said[got] = 0; fclose(f); }
+    }
+    for (q = said; (q = strstr(q, "is not adopted")) != NULL; q += 8) lines++;
+    printf("(rows %d; said: '%.400s') ", rows, said);
+    if (b) { hpplite_node_stop_timer(b); b->ownsL1 = 0; b->l1 = NULL; hpplite_node_destroy(b); }
+    hpplite_l1_disconnect(l1);
+    if (rows != 4) FAIL("the history past the bookkeeping's height should be applied to the file (four rows)");
+    if (!strstr(said, "is not adopted (adopt=on)") || !strstr(said, "ab_b.db-hpplite.db") || !strstr(said, "height 3")) FAIL("one line should say the file was not adopted, name its bookkeeping and the height it is at");
+    if (lines != 1) FAILF("the line should be said once (%d)", lines);
+    PASS();
+}
 static int restart_case(const char *url, unsigned char keyByte, const char *id, const char *file, int when) {
     unsigned char k[32] = {0};
     HppliteL1 *l1;
@@ -2294,6 +2345,7 @@ int main(int argc, char **argv) {
     test_anchor_idle_deadline(url);
     test_recovery(url);
     test_recovery_adopt(url);
+    test_adopt_with_bookkeeping(url);
     test_recovery_file_held(url);
     test_restart_with_commits(url);
     test_soft_replica(url);

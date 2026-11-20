@@ -142,6 +142,7 @@ typedef struct HppliteNode {
     struct HpplitePageMode *pm;     /* page mode (#146): the commits queued and the batches built from them */
     unsigned pageDeflateRatio;      /* raw page bytes per posted byte seen on the last page batch: the next build's budget */
     int pagesSnapshotDecided;       /* the first flush decided whether the file goes whole first */
+    int adoptNotSaid;               /* adopt=on on a file with its bookkeeping: the line that it is not adopted, said once (#398) */
     int adoptDecided, adopting;     /* adopt=on (#380), decided once where the node is behind the chain: the history's batches move the
                                     ** bookkeeping and leave the file */
     int64_t fileCheckAt;            /* the next check of the file against what was last sent, while running (ms) */

@@ -964,9 +964,16 @@ between two pieces of a commit its sequencer never finished is adopted
 onto the same way. What `adopt=on` does not do: it changes nothing where
 the file has its bookkeeping (a second start with it is an ordinary
 start), where the file has no table (it is rebuilt from the history, and
-a line says so), on a new rollup, or on a replica. It reads the history
-from height 1 and does not start from a snapshot: a rollup whose old
-batches are pruned (`keep=`) is not adopted onto yet.
+a line says so), on a new rollup, or on a replica. A file with its
+bookkeeping that is behind the history - carried with its sidecar from
+somewhere else - has the history applied to it as at any start, and with
+`adopt=on` given a line says that it was not adopted (#398):
+
+    hpplite: <file> is not adopted (adopt=on): it has its bookkeeping beside it (<file>-hpplite.db, at height N), and the history past that height is applied to the file. For the file to be the state, start it with adopt=on and without that bookkeeping
+
+`adopt=on` reads the history from height 1 and does not start from a
+snapshot: a rollup whose old batches are pruned (`keep=`) is not adopted
+onto yet.
 
 **Going back and going on (#392).** The two together are a database taken
 back to a moment and written from there, on its own rollup:
@@ -980,7 +987,7 @@ back to a moment and written from there, on its own rollup:
 
 Of what `--keep` leaves in `<dir>`, `rebuilt.db` alone is carried: the
 other files are the verifier's bookkeeping, and a file with bookkeeping
-beside it is not adopted. `rebuilt.db` is in SQLite's rollback mode
+beside it is not adopted (a line says so, #398). `rebuilt.db` is in SQLite's rollback mode
 (`journal_mode` says `delete`); an application that runs in WAL switches
 it as it does a new file, before its sequencer starts or after. The
 history stays one line: the heights left behind are in it, the file as of

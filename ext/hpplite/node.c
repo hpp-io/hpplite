@@ -2037,6 +2037,13 @@ static int node_adopt_pages(HppliteNode *node, const HppliteBatch *batch) {
         ** holds; the batch is applied, as a replica would, and the file as
         ** opened (queued whole in case it was ahead) is dropped: the chain
         ** rebuilds it */
+        if (node->config.adopt && !node->adoptNotSaid && node->ctx->blockHeight > 1 && !node->config.verifyOnly && !node->follower && node->lockFd >= 0) {
+            /* adopt=on was given and the file has its bookkeeping (#398): it is not adopted, and nothing said so */
+            const char *zFile = sqlite3_db_filename(node->db, "main");
+            node->adoptNotSaid = 1;
+            fprintf(stderr, "hpplite: %s is not adopted (adopt=on): it has its bookkeeping beside it (%s-hpplite.db, at height %llu), and the history past that height is applied to the file. For the file to be the state, start it with adopt=on and without that bookkeeping\n",
+                    zFile, zFile, (unsigned long long)(node->ctx->blockHeight - 1));
+        }
         hpplite_pagemode_discard(node->pm);
         hpplite_pagebatch_free(b);
         return node_apply_pages(node, batch);
