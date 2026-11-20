@@ -1095,6 +1095,14 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.10.4** (2026-11-20): a sequencer on a platform's host - rebuilt, restored, on a stock image.
+
+- **The instance a platform gives (#378).** `instancefile=<path>` (`HPPLITE_INSTANCE_FILE`) names a file with the instance's seed, 32 bytes or 64 hex digits. The id is then keccak(seed) wherever the sequencer runs: a host rebuilt on an empty volume with the same key and seed is the instance the chain's lease names, so it claims nothing, waits for nothing, and its writes are at the store within a flush. Without it the rebuilt host waited out the lost one's lease, an hour, its writes in its file and not at the store.
+  - `HPPLITE_HOST_NAME`, where set, still enters the id. A host whose platform wrote the 32 bytes beside the database and set that name keeps its instance when it moves to `instancefile=` with the same seed.
+- **A replaced file ends the sequencer (#379).** A database file replaced or removed under its sequencer (a restore, a directory made again) was said once and nothing more was posted, the process still up. `hpplite-sequencer` on one file now exits 4 after the node's line, for a supervisor to start it on the file there now; with `--dir` that database is closed and opened anew, the others undisturbed. `hpplite_status` has `file_replaced`. The node finds the replacement at its next post, or within a minute (`HPPLITE_FILE_CHECK_SECONDS`).
+- **The static binary finds the distribution's CA bundle (#377).** Compiled on Alpine, it looked for `/etc/ssl/cert.pem`, which a Debian or an Ubuntu does not have, and every HTTPS call failed without `HPPLITE_CA_BUNDLE`. Unset, the distributions' usual files are now tried. A certificate that could not be checked is said, with the host and the remedy: `the certificate of <host> could not be checked: no CA bundle found; set HPPLITE_CA_BUNDLE`.
+- No protocol or format changes; the stores and the relays are unchanged.
+
 **v0.10.3** (2026-11-20): one wallet pays the store and the relay.
 
 - **The funding wallet pays the relay too (#371).** A node paid its store from the funding wallet derived from its key and its relay from the key's own wallet: two balances, and nothing said which was asked. The token now goes on one wallet, the funding wallet (`store_funder`; `relay_payer` in `hpplite_status` names the wallet the relay's payments are asked of).
