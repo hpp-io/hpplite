@@ -547,6 +547,8 @@ void hpplite_l1_mock_inject_batch(HppliteL1 *l1, const uint8_t *data, size_t len
 void hpplite_l1_mock_set_claim_reverts(HppliteL1 *l1, int revert);
 /* The endpoint is unreachable: every call fails until it is set back */
 void hpplite_l1_mock_set_rpc_down(HppliteL1 *l1, int down);
+/* How many times the batch state was asked for: what every sync reads first, so what an idle node's ticks cost */
+int hpplite_l1_mock_da_reads(HppliteL1 *l1);
 /* Make hpplite_l1_wait_for_tx() take this long (a flush that is in flight) */
 void hpplite_l1_mock_set_submit_delay_ms(HppliteL1 *l1, int ms);
 

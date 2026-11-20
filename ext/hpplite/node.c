@@ -1625,6 +1625,7 @@ static int node_repost_lost(HppliteNode *node, uint64_t lastBatch) {
                     "than post past the gap", (unsigned long long)lastBatch,
                     (unsigned long long)(node->ctx->blockHeight - 1), (unsigned long long)h);
             node->state = HPPLITE_STATE_ERROR;
+            node->syncStopped = 0;
             return -1;
         }
         if (!node_ensure_lease(node)) { free(bytes); return 0; }
@@ -3425,6 +3426,7 @@ static int node_file_still_ours(HppliteNode *node) {
         hpplite_error(node->ctx, "the database file %s was replaced or removed under this sequencer: its commits go to the file it opened, "
                       "no longer at that path; nothing more is posted - restart it on the file there now", zFile);
     node->state = HPPLITE_STATE_ERROR;
+    node->syncStopped = 0;
     node->fileReplaced = 1;
     return 0;
 }
@@ -3462,6 +3464,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
         while ((rc = node_adopt_existing(node)) == 1) { }
         if (rc < 0) {
             node->state = HPPLITE_STATE_ERROR;
+            node->syncStopped = 0;
             return 0;
         }
         if (rc == 2) return 0;           /* ours is on L1, waiting for the gate: nothing to post (#90) */
@@ -4096,11 +4099,26 @@ static int node_sync_from_l1(HppliteNode *node, int *pHead) {
 ** cannot be read) and after one that could not read the chain at all, and a program that waits for the file to be the
 ** rollup's state - hpplite-sequencer's "synced" line - asks this, not whether the open returned */
 int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
-    int head = -1, rc;
+    int head = -1, rc, was;
     (void)useTxn;
     if (!node || !node->l1 || !node->ctx) return 0;
+    was = node->state;
     rc = node_sync_from_l1(node, &head);
     if (head >= 0) node->atHead = head;
+    /* a sync that stopped leaves the state at "error" (here, or its caller does), and the sync made later - the store
+    ** answering again, the application's connection closed - took back the error and not the state: "error" for the
+    ** life of the process, the timer's idle rule (#292) and the file check (#327) never met (#386). The stops that
+    ** are not a sync's (the file replaced, a fork met at the flush) forget this, and stay */
+    if (head == 0 && was != HPPLITE_STATE_ERROR && (rc < 0 || node->state == HPPLITE_STATE_ERROR)) {
+        node->syncStopped = 1;
+        node->stateBeforeStop = was;
+    } else if (head == 1 && rc >= 0 && node->syncStopped) {
+        node->syncStopped = 0;
+        if (node->state == HPPLITE_STATE_ERROR) {
+            node->state = (HppliteNodeState)node->stateBeforeStop;
+            hpplite_node_start(node);               /* one that had not started: the lease, as the start would have */
+        }
+    }
     return rc;
 }
 

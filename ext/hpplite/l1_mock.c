@@ -67,6 +67,7 @@ typedef struct MockL1 {
     int txPending;               /* Test hook: wait_for_tx never confirms */
     int claimReverts;            /* Test hook: a claim is mined and reverts (hash returned, no lease) */
     int rpcDown;                 /* Test hook: every call fails (the endpoint is unreachable) */
+    int daReads;                 /* Test hook: how many times the batch state was asked for (what every sync reads first) */
     int submitDelayMs;           /* Test hook: wait_for_tx takes this long (a flush in flight) */
     size_t batchSizeLimit;       /* DA size limit (contract default 128 KB) */
     size_t maxTxBytes;           /* Test hook: the RPC's transaction size limit (0 = none) */
@@ -796,6 +797,11 @@ void hpplite_l1_mock_set_rpc_down(HppliteL1 *l1, int down) {
     if (l1) self->rpcDown = down;
 }
 
+int hpplite_l1_mock_da_reads(HppliteL1 *l1) {
+    if (!l1 || l1->ops != &hppliteL1MockOps) return 0;
+    return self->daReads;
+}
+
 void hpplite_l1_mock_set_claim_reverts(HppliteL1 *l1, int revert) {
     if (!l1 || l1->ops != &hppliteL1MockOps) return;
     if (l1) self->claimReverts = revert;
@@ -1233,6 +1239,7 @@ static int mock_get_da_state(
     uint64_t *total_batches,
     uint8_t latest_batch_hash[32]
 ) {
+    if (l1) self->daReads++;
     if (l1 && self->rpcDown) return -1;   /* the endpoint is down */
     if (!l1) {
         if (last_batch_height) *last_batch_height = 0;

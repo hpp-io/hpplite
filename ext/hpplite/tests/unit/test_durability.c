@@ -887,6 +887,50 @@ static void test_resync_onto_file_read_before(void) {
     PASS();
 }
 
+/* A sync that stopped at the open leaves the node's state at "error", and a sync made later did not take it back:
+** synced 1, no last_error, posting, and the state still "error" for the life of the process - the timer's idle rule
+** (#292) and the file check (#327) are for a running node, so the writer read the chain at every tick (#386) */
+static void test_state_after_sync_made(void) {
+    TEST("a sync that stopped at the open and is made later leaves the node as an open without the stop would (#386: the file held in WAL at the open): state 'sequencing', and idle it asks the chain nothing");
+    HppliteL1 *l1;
+    TestNodeOpts o = { .intervalMs = 200 };
+    HppliteNode *a, *h;
+    sqlite3 *other = NULL;
+    char s0[32], s1[32], e1[300];
+    long long synced = 0;
+    int i, reads;
+    reset_dir();
+    l1 = hpplite_l1_create_mock();
+    a = open_node(DIR "/first.db", l1);
+    if (!a) { hpplite_l1_disconnect(l1); FAIL("open the first host"); }
+    hpplite_node_exec(a, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    hpplite_node_flush_batch(a);
+    a->ownsL1 = 0;
+    hpplite_node_destroy(a);
+    sqlite3_open(DIR "/next.db", &other);
+    sqlite3_exec(other, "CREATE TABLE mine(v); PRAGMA journal_mode=WAL; INSERT INTO mine VALUES(1)", NULL, NULL, NULL);
+    h = test_open_node(DIR "/next.db", l1, &o);
+    if (!h) { sqlite3_close(other); hpplite_l1_disconnect(l1); FAIL("open on the file held in WAL"); }
+    snprintf(s0, sizeof s0, "%s", status_text(h->db, "state"));
+    hpplite_node_start_timer(h);
+    sqlite3_close(other);
+    for (i = 0; i < 100 && !(synced = status_int(h->db, "synced")); i++) usleep(100000);   /* the timer makes the sync */
+    usleep(500000);
+    snprintf(s1, sizeof s1, "%s", status_text(h->db, "state"));
+    snprintf(e1, sizeof e1, "%s", status_text(h->db, "last_error"));
+    reads = hpplite_l1_mock_da_reads(l1);
+    usleep(1500000);                                  /* seven ticks with nothing to post */
+    reads = hpplite_l1_mock_da_reads(l1) - reads;
+    printf("(at the open: state '%s'; the sync made: synced %lld, state '%s', last_error '%s'; idle for 1.5 s: the chain asked %d times) ", s0, synced, s1, e1, reads);
+    h->ownsL1 = 0;
+    hpplite_node_destroy(h);
+    hpplite_l1_disconnect(l1);
+    if (synced != 1 || e1[0]) FAIL("the sync was not made once the file was free");
+    if (strcmp(s1, "sequencing") != 0) FAIL("the state is not 'sequencing' after the sync that stopped was made");
+    if (reads != 0) FAIL("the idle writer read the chain at its ticks");
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_suite_init("durability", PRIVKEY, DIR);
@@ -912,6 +956,7 @@ int main(void) {
     test_file_replaced_under_sequencer();
     test_status_synced();
     test_resync_onto_file_read_before();
+    test_state_after_sync_made();
     remove_dir();
     return test_report();
 }

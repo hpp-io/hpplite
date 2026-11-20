@@ -162,6 +162,8 @@ typedef struct HppliteNode {
     int walkOwed;                   /* ...and could not be: the store did not answer (1: asked again before anything is posted), or it holds batches
                                     ** this file does not have beside commits of its own (2: nothing is posted) (#382) */
     int atHead;                     /* the last sync that read the chain's head reached it: hpplite_status.synced (#381) */
+    int syncStopped;                /* the state is "error" because a sync stopped; a sync that reaches the head takes it back (#386) */
+    int stateBeforeStop;            /* ...to this */
     /* the soft tier (#166): what a verifier applied from the store past the anchored height */
     uint64_t softFirst;             /* the first soft height; 0: nothing soft */
     unsigned char (*softChain)[32]; /* the chain hash after each soft height, from softFirst */
