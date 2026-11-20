@@ -3439,12 +3439,13 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     ** it, as open does. */
     if (node->l1) {
         int rc;
-        if (hpplite_node_pending_count(node) == 0) {
+        if (hpplite_node_pending_count(node) == 0 || node->walkOwed == 1) {
             if (hpplite_node_sync_from_l1(node, 1) < 0) {
                 node->state = HPPLITE_STATE_ERROR;
                 return 0;
             }
         }
+        if (node->walkOwed) return 0;    /* the store's batches past the anchor are not read: nothing of ours goes before them (#382) */
         while ((rc = node_adopt_existing(node)) == 1) { }
         if (rc < 0) {
             node->state = HPPLITE_STATE_ERROR;
@@ -3549,9 +3550,13 @@ static int node_soft_walk(HppliteNode *node) {
     unsigned char da[20], me[20], who[20], inst[32], k[32], before[32], after[32], digest[32];
     uint8_t sig[65];
     uint64_t first = 0, last = 0;
+    int owed = 0;
     if (node->softWalked || !node_ranges(node) || node->follower || !node->ctx) return 0;
+    if (hpplite_l1_get_addresses(node->l1, c, d) != 0 || hpplite_l1_get_my_address(node->l1, me) != 0) {
+        node->walkOwed = 1;                                          /* the chain did not say whose names to read: not "no names" (#382) */
+        return 0;
+    }
     node->softWalked = 1;
-    if (hpplite_l1_get_addresses(node->l1, c, d) != 0 || hpplite_l1_get_my_address(node->l1, me) != 0) return 0;
     zDa = d[0] ? d : c;
     if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return 0;
     uint64_t start = node->ctx->blockHeight;                    /* where the walk starts: read ahead only past it */
@@ -3565,8 +3570,42 @@ static int node_soft_walk(HppliteNode *node) {
         snprintf(name, sizeof name, "%.40s-%llu", zDa + 2, (unsigned long long)h);
         for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
         if (h > start) node_names_ahead(node, h, 0);                 /* past the first name found, the rest together (#195); a fresh rollup asks for one */
+        hpplite_store_take_status(node->store);
         data = hpplite_store_get_named(node->store, name, &n, sig, inst);
-        if (!data) break;                                            /* the first height the store has no name for: the end */
+        if (!data) {
+            /* the first height the store has no name for (its 404; a store that is not a pin store says nothing,
+            ** -1): the end. A store that did not answer, or answered anything else (a 5xx, a 429, a parked bucket's
+            ** 410), has not said so (#382): taken for the end, a successor went on at this height and its first
+            ** batch took the name of the lost host's - every batch past the anchor gone from the history. The walk
+            ** is owed: nothing is posted, to the store or the chain, until it is made */
+            long st = hpplite_store_take_status(node->store);
+            if (st != 404 && st != -1 && h == start) {
+                /* ...unless nobody ever held this rollup's lease: a name is signed by the sequencer holding it, so
+                ** a new rollup has none at any store, and the chain carries its batches while the store is away */
+                static const unsigned char zero[32];
+                HppliteL1State *ls = hpplite_l1_get_state(node->l1);
+                if (ls && memcmp(ls->sequencerInstance, zero, 32) == 0) st = 404;
+                if (ls) hpplite_l1_state_free(ls);
+            }
+            if (st != 404 && st != -1) {
+                owed = 1;
+                if (!strstr(node->ctx->zLastError, "past the anchor are not read"))
+                    hpplite_error(node->ctx, "the store did not give batch %llu (%s): the batches past the anchor are not read; nothing is posted until they are",
+                                  (unsigned long long)h, hpplite_store_error(node->store));
+                node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 5000 ? node->config.batchIntervalMs : 5000);
+            }
+            break;
+        }
+        if (hpplite_node_pending_count(node) > 0 && !node_adopting(node)) {
+            /* the walk made late, the application's commits already in the file: the store's batches are not in it,
+            ** and a batch of this file would take their place in the history. Neither is written over (#382) */
+            hpplite_error(node->ctx, "the store holds batch %llu past the anchor, which this file does not have, and the file has commits of its own: nothing is posted. "
+                          "Restart on an empty file to rebuild it from the history, or with adopt=on to keep this file as the state", (unsigned long long)h);
+            node->state = HPPLITE_STATE_ERROR;
+            owed = 2;
+            free(data);
+            break;
+        }
         chainId = hpplite_l1_chain_id(node->l1);
         if (!chainId) chainId = hpplite_l1_default_chain_id();
         if (hpplite_store_batch_signer(da, chainId, inst, h, data, n, sig, who) != 0 || memcmp(who, me, 20) != 0) {
@@ -3618,6 +3657,8 @@ static int node_soft_walk(HppliteNode *node) {
                 (unsigned long long)first, (unsigned long long)last);
         node->anchorAt = 0;                                          /* the timer anchors them soon */
     }
+    node->walkOwed = owed;
+    if (owed == 1) node->softWalked = 0;                             /* made again, from the height it reached */
     return first ? (int)(last - first + 1) : 0;
 }
 
@@ -4016,13 +4057,15 @@ static int node_sync_from_l1(HppliteNode *node, int *pHead) {
         }
     }
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
-    if (!node->config.verifyOnly && node->ctx->blockHeight == lastBatch + 1
-        && (hpplite_node_pending_count(node) == 0 || (node->pm && node->lockFd >= 0 && node_adopting(node))))
+    if (!node->config.verifyOnly && (node->ctx->blockHeight == lastBatch + 1 || node->walkOwed == 1)
+        && (hpplite_node_pending_count(node) == 0 || node->walkOwed == 1 || (node->pm && node->lockFd >= 0 && node_adopting(node))))
         synced += node_soft_walk(node);             /* what the store holds past the chain (#167), before anything of ours;
                                                     ** an adopted file's commits made meanwhile wait behind it (#380) */
     if (node->ctx->blockHeight >= lastBatch + 1) synced += node_soft_follow(node);   /* a verifier's soft tier (#166) */
-    node_adopt_done(node);                          /* adopt=on: the history is read (#380) */
-    node_pages_decide_snapshot(node);               /* the chain seen: is the file ahead of it? */
+    if (!node->walkOwed) {
+        node_adopt_done(node);                      /* adopt=on: the history is read (#380) */
+        node_pages_decide_snapshot(node);           /* the chain seen: is the file ahead of it? */
+    }
     if (node->pagesWalSuspended && !node->pieceDb) {
         /* the pages applied: back to WAL for this node's own writes, the file as
         ** it is now the base the page mode diffs against (a commit's pieces still
@@ -4031,7 +4074,7 @@ static int node_sync_from_l1(HppliteNode *node, int *pHead) {
         hpplite_pagemode_resume(node->pm);
         node->pagesWalSuspended = 0;
     }
-    *pHead = 1;
+    *pHead = !node->walkOwed;                       /* the store's batches past the chain are the history too (#382) */
     return synced;
 }
 

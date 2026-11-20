@@ -3430,6 +3430,98 @@ static void test_adopt_file(void) {
     PASS();
 }
 
+/* 68. The store away when a lost host's successor starts (#382): the lost host's batches are at the store, none
+** anchored (anchor=24h), and a store that does not answer was taken for a store with no names - the successor said
+** "synced" on an empty file and its first batch took the name of the lost host's first. The sequencer says
+** "not synced: the store did not give batch N ..." and stays up; the store back, it reads them at a tick, says the
+** line, and its own batch goes after them */
+static void test_store_away_at_start(void) {
+    TEST("the store away when a lost host's successor starts (#382): two heights at the store alone; no 'synced' line and 'not synced: the store did not give batch N' while it is away, the sequencer up; the store back, the line comes with the lost host's rows; hpplite-verify agrees with the file");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char *WKEY = "0x6868686868686868686868686868686868686868686868686868686868686868";
+    static const char *SEED = "38203820382038203820382038203820382038203820382038203820382038ab";
+    char addr[48], cmd[600], out[400], contract[80], base[700], params[900], vparams[500], vout[4096] = "", err[1600] = "";
+    long h11, hAway, h12;
+    long long notes = -1;
+    int port, rc12 = -1, vrc = -2, said = 0, up = 0;
+    pid_t store, side;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!bin || access(bin, X_OK) != 0) FAIL("hpplite-sequencer not beside hpplite-verify (HPPLITE_VERIFY_BIN)");
+    unsetenv("HPPLITE_HOST_NAME");
+    (void)!system("rm -rf " DIR "/host11 " DIR "/host12 " DIR "/store_pins68 " DIR "/away_owner.db* && mkdir -p " DIR "/host11 " DIR "/host12");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", WKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    {
+        FILE *f = fopen(DIR "/away.seed", "w");
+        if (!f) FAIL("the seed file");
+        fprintf(f, "0x%s\n", SEED);
+        fclose(f);
+    }
+    {
+        sqlite3 *owner = open_db("away_owner.db", WKEY, NULL);
+        if (!owner) FAIL("create the rollup");
+        snprintf(contract, sizeof contract, "%s", status_text(owner, "contract"));
+        sqlite3_close(owner);
+        if (!contract[0]) FAIL("the rollup's address");
+    }
+    port = test_free_port();
+    store = start_pin_service_dir(svc, port, DIR "/store_pins68");
+    if (store < 0) FAIL("the store did not come up");
+    snprintf(base, sizeof base, "rpc=%s&contract=%s&chainid=31337&privkey=%s&interval=300ms&store=http://127.0.0.1:%d&keeplease=on&anchor=24h&instancefile=" DIR "/away.seed",
+             RPC, contract, WKEY, port);
+
+    /* the lost host: two heights at the store, no anchor, and it is gone */
+    snprintf(params, sizeof params, "%s&datadir=" DIR "/host11&anchorclose=off", base);
+    side = spawn_sidecar(bin, DIR "/host11/app.db", params, side_path(11, 1, "out"), side_path(11, 1, "err"));
+    h11 = wait_synced(side_path(11, 1, "out"), side, 60);
+    if (h11 < 0) { if (h11 == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); kill(store, SIGTERM); waitpid(store, NULL, 0); FAILF("the lost host's sequencer did not say it was synced (%ld)", h11); }
+    if (plain_exec(DIR "/host11/app.db", "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('at the store alone')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); kill(store, SIGTERM); waitpid(store, NULL, 0); FAIL("the lost host's app writes"); }
+    sleep(2);
+    if (plain_exec(DIR "/host11/app.db", "INSERT INTO notes(body) VALUES('and this one')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); kill(store, SIGTERM); waitpid(store, NULL, 0); FAIL("the lost host's app writes again"); }
+    sleep(3);
+    stop_sidecar(side, SIGKILL, 5);
+    kill(store, SIGTERM); waitpid(store, NULL, 0);               /* the store is away */
+
+    /* the successor, on an empty volume: not synced, and it says why */
+    snprintf(params, sizeof params, "%s&datadir=" DIR "/host12", base);
+    side = spawn_sidecar(bin, DIR "/host12/app.db", params, side_path(12, 1, "out"), side_path(12, 1, "err"));
+    hAway = wait_synced(side_path(12, 1, "out"), side, 8);
+    up = hAway != -2;
+    {
+        FILE *f = fopen(side_path(12, 1, "err"), "r");
+        if (f) { size_t got = fread(err, 1, sizeof err - 1, f); err[got] = 0; fclose(f); }
+        said = strstr(err, "/host12/app.db not synced: the store did not give batch ") != NULL && strstr(err, "nothing is posted until they are") != NULL;
+    }
+    if (hAway != -1 || !said) {
+        if (up) stop_sidecar(side, SIGKILL, 5);
+        printf("(the successor said: %.900s) ", err);
+        FAILF("with the store away the successor should hold its 'synced' line (%ld: -1 held, -2 exited, else the height it said), say why (%d) and stay up", hAway, said);
+    }
+
+    /* the store back: the names are read at a tick, the line comes, the lost host's rows are in the file */
+    store = start_pin_service_dir(svc, port, DIR "/store_pins68");
+    if (store < 0) { stop_sidecar(side, SIGKILL, 5); FAIL("the store did not come up again"); }
+    h12 = wait_synced(side_path(12, 1, "out"), side, 90);
+    if (h12 >= 0) {
+        notes = plain_count(DIR "/host12/app.db", "SELECT count(*) FROM notes");
+        if (plain_exec(DIR "/host12/app.db", "INSERT INTO notes(body) VALUES('the successor')") != SQLITE_OK) notes = -2;
+        sleep(3);
+        rc12 = stop_sidecar(side, SIGTERM, 60);                  /* its stop anchors */
+    } else { if (h12 == -1) kill(side, SIGKILL); waitpid(side, NULL, WNOHANG); }
+    if (h12 >= 0 && rc12 == 0) {
+        snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", RPC, contract, WKEY, port);
+        vrc = run_verify_with(vparams, "--db " DIR "/host12/app.db", vout, sizeof vout);
+    }
+    kill(store, SIGTERM); waitpid(store, NULL, 0);
+    printf("(the lost host synced at %ld; the successor held its line, then synced at %ld with %lld of the lost host's rows, stop %d, verify %d) ", h11, h12, notes, rc12, vrc);
+    if (h12 < 3 || notes != 2 || rc12 != 0) FAIL("the store back, the successor should read the lost host's heights, say the line and stop clean");
+    if (vrc != 0 || !strstr(vout, "\nverified") || strstr(vout, "MISMATCH")) { printf("\n%s", vout); FAIL("hpplite-verify should say verified against the successor's file"); }
+    PASS();
+}
+
 /* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
 ** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
 ** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
@@ -4435,6 +4527,7 @@ int main(void) {
     if (wanted(65)) test_one_wallet();
     if (wanted(66)) test_instance_given();
     if (wanted(67)) test_adopt_file();
+    if (wanted(68)) test_store_away_at_start();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

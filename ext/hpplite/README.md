@@ -213,7 +213,7 @@ What the node may spend is the deployment's, like its key: it is set in the envi
 | `HPPLITE_FUNDER` | `funder=` as an environment variable (#272): the external funding wallet |
 | `HPPLITE_LOW_BALANCE` | Warn when the money left lasts fewer hours than this at the last day's rate (default 72; 0 turns it off; #173). USDC.e is the funding wallet's balance against the charges; ETH is the wallet's balance against how fast it fell. The warning prints one line on stderr when it starts and when it clears, and shows in `spend_warning` |
 | `HPPLITE_RELAY_CAP` | The most to pay the relay per call, in its asset's atomic units. With `relay=on` the default is 1000000 (1 USDC.e: a relayed call on HPP costs cents, #251); with a relay URL, 0 (default) pays nothing |
-| `HPPLITE_STORE_FALLBACK` | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
+| `HPPLITE_STORE_FALLBACK` | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store. Nor at a start where the store's names past the anchor could not be read (#382, Recovery): nothing is posted until they are |
 | `HPPLITE_STORE_PARALLEL` | how many batch reads a replica, a verifier or a recovering sequencer keeps in flight to the store, 8 by default, up to 32; `1` reads one at a time. A far store costs a round trip a read: an anchored range is read eight batches at once (#195) |
 | `HPPLITE_CA_BUNDLE` | The certificate file (PEM) both HTTPS clients trust - the chain RPC's and the store's (#269). Unset, libcurl's own default applies (the system bundle on a stock build); where the file libcurl was compiled to look for is not there - the static binary, compiled on Alpine, in a Debian or an Ubuntu image - the first of the distributions' usual files that is: `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, `/etc/ssl/ca-bundle.pem` (#377). Set it for an image that keeps its own bundle elsewhere, or has none and a bundle copied in. A certificate that could not be checked is said with the host and what it was checked against, in the node's error and `last_error`: `the certificate of <host> could not be checked: no CA bundle found; set HPPLITE_CA_BUNDLE` |
 | `HPPLITE_HOST_NAME` | The host name in the sequencer's instance id (keccak of the seed beside the file and the host name), where a platform keeps one across machines; default the machine's, or none where the seed is given (`instancefile=`) |
@@ -695,8 +695,9 @@ followed by a rebuild), `snapshot_height` (#221: the latest snapshot the
 anchors name, NULL for none), and `file_replaced` (1 once the database file
 was replaced or removed under this sequencer, #320: it posts nothing more,
 and `hpplite-sequencer` stops on it, #379), and `synced` (#381: 1 when the
-last sync that read the chain's head reached it; 0 after an open whose sync
-stopped or could not read the chain, until a later one is made - the open
+last sync that read the chain's head reached it, and the store's names past
+the anchor were read (#382); 0 after an open whose sync
+stopped or could not read the chain or the store, until a later one is made - the open
 returns either way, and `hpplite-sequencer` holds its "synced" line on it). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
@@ -893,8 +894,22 @@ the same file or a fresh one on another machine, replays the chain, then
 reads the names past the anchored height, takes each batch whose signature
 recovers to its own wallet and that applies on its history, and anchors them
 with its own. It stops at the first height without a name, or at one signed
-by another wallet. What is lost is what never reached the store: at most one
-flush interval. A successor that is another instance - a fresh file has a
+by another wallet. A height without a name is the store's 404: a store that
+does not answer, or answers anything else (a 5xx, a 429, a parked bucket's
+410), has not said there is none (#382), and the successor then posts
+nothing, to the store or to the chain (`HPPLITE_STORE_FALLBACK` does not
+apply: a batch posted there would take the height of one waiting at the
+store). `last_error` says "the store did not give batch N (...): the batches
+past the anchor are not read; nothing is posted until they are", `synced`
+is 0, the application goes on writing to its file, and the names are asked
+for again at each flush until the store answers; a rollup whose lease nobody
+ever held has none and is not held back. Where the application committed
+meanwhile and the store, answering again, holds batches the file does not
+have, neither is written over: the node posts nothing and says "the store
+holds batch N past the anchor, which this file does not have, and the file
+has commits of its own" - restart it on an empty file to rebuild from the
+history, or with `adopt=on` to keep the file as the state after it. What is
+lost is what never reached the store: at most one flush interval. A successor that is another instance - a fresh file has a
 seed of its own - waits out the dead one's lease (an hour since VERSION 9)
 before it can post: what its app writes during the wait is in its file and
 not at the store, and a second loss inside that hour takes it. A platform

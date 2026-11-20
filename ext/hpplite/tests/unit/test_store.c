@@ -1726,6 +1726,113 @@ static void test_recovery_adopt(const char *url) {
     PASS();
 }
 
+/* 10c. Recovery with the store down at the successor's open (#382): the batches at the store, none anchored, are not
+** there to read, and a store that does not answer was taken for a store with no names - the successor went on at the
+** anchored height and its first batch took the name of the lost host's first. The walk is owed: the successor is not
+** synced, posts nothing (not to the chain as a fallback either), and recovers them once the store answers. Where the
+** application committed to its file meanwhile, neither is written over: nothing is posted, and it says so */
+static HppliteL1 *lost_host(const char *url, const unsigned char *key, const char *id, const char *file) {
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = id, .privkey = key };
+    HppliteNode *w = test_open_node(tpath(file), l1, &o);
+    int i;
+    if (!w) { hpplite_l1_disconnect(l1); return NULL; }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3; i++) {
+        char sql[80];
+        snprintf(sql, sizeof sql, "INSERT INTO t(v) VALUES('the lost host %d')", i);
+        hpplite_node_exec(w, sql, NULL);
+        if (hpplite_node_flush_batch(w) < 1) { hpplite_node_destroy(w); return NULL; }
+    }
+    hpplite_node_stop_timer(w);                                   /* the machine is gone: no close, no anchor */
+    w->ownsL1 = 0; w->l1 = NULL;
+    hpplite_node_destroy(w);
+    hpplite_l1_mock_advance_time(l1, 400);
+    return l1;
+}
+static int replica_rows(HppliteL1 *l1, const char *url, const unsigned char *key, const char *id, const char *file, const char *table) {
+    TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = id, .privkey = key };
+    HppliteNode *r = test_open_node(tpath(file), l1, &ro);
+    int rows = r ? count_rows(r->db, table) : -2;
+    if (r) { r->l1 = NULL; hpplite_node_destroy(r); }
+    return rows;
+}
+static void test_recovery_store_down(const char *dir) {
+    TEST("recovery with the store down at the successor's open (#382): three batches at the store, none anchored; the successor is not synced and posts nothing; the store back, it recovers them, then posts its own; with a commit of the app's made meanwhile nothing is posted and the lost host's batches stay");
+    int port = test_free_port();
+    char url[64], storeDir[600];
+    pid_t pid;
+    static const unsigned char k1[32] = { [31] = 0x7b }, k2[32] = { [31] = 0x7c };
+    HppliteL1 *l1, *l2;
+    TestNodeOpts o;
+    HppliteNode *w2, *w3;
+    int rows1, rows2, rowsU, rows3, rowsA, s0, s1, s3;
+    long long h0, h1, h3;
+    uint64_t f0, f1, f2, f3, f4, f5, last = 0, total = 0;
+    unsigned char latest[32];
+    char e0[400], e3[400];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/rd_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) FAIL("the test's store did not start");
+    l1 = lost_host(url, k1, "rd_a", "rd_a.db");
+    l2 = lost_host(url, k2, "rd_c", "rd_c.db");
+    if (!l1 || !l2) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the lost hosts' batches"); }
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);                    /* the store does not answer */
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "rd_b"; o.privkey = k1;          /* the chain can carry a batch the store does not take: not these */
+    w2 = test_open_node(tpath("rd_b.db"), l1, &o);
+    o.nodeId = "rd_d"; o.privkey = k2;
+    w3 = test_open_node(tpath("rd_d.db"), l2, &o);
+    if (!w2 || !w3) FAIL("open the successors");
+    h0 = status_int(w2->db, "height"); s0 = (int)status_int(w2->db, "synced");
+    snprintf(e0, sizeof e0, "%s", status_text(w2->db, "last_error"));
+    f0 = hpplite_node_flush_batch(w2);
+    hpplite_node_exec(w3, "CREATE TABLE u(v)", NULL);             /* the second successor's app writes while the store is away */
+    f3 = hpplite_node_flush_batch(w3);
+    hpplite_l1_get_da_state(l2, &last, &total, latest);
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) FAIL("the test's store did not start again");
+    /* the first successor: nothing of its own meanwhile; the batches are recovered, then its own goes after them */
+    f1 = hpplite_node_flush_batch(w2);
+    h1 = status_int(w2->db, "height"); s1 = (int)status_int(w2->db, "synced"); rows1 = count_rows(w2->db, "t");
+    hpplite_node_exec(w2, "CREATE TABLE u(v)", NULL);
+    f2 = hpplite_node_flush_batch(w2);
+    hpplite_node_anchor(w2);
+    rows2 = replica_rows(l1, url, k1, "rd_r", "rd_r.db", "t");
+    rowsU = replica_rows(l1, url, k1, "rd_r2", "rd_r2.db", "u");
+    printf("(store down: height %lld, synced %d, '%s', flush %llu; store back: flush %llu, height %lld, synced %d, rows %d, its own at %llu; a replica: rows %d, u %d) ",
+           h0, s0, e0, (unsigned long long)f0, (unsigned long long)f1, h1, s1, rows1, (unsigned long long)f2, rows2, rowsU);
+    /* the second: its file has a commit of its own and not the store's batches */
+    f4 = hpplite_node_flush_batch(w3);
+    h3 = status_int(w3->db, "height"); s3 = (int)status_int(w3->db, "synced");
+    snprintf(e3, sizeof e3, "%s", status_text(w3->db, "last_error"));
+    rows3 = replica_rows(l2, url, k2, "rd_r3", "rd_r3.db", "t");
+    /* ...and what it says to do works: the same file with adopt=on goes whole after the lost host's three */
+    w3->ownsL1 = 0; hpplite_node_destroy(w3);
+    o.adopt = 1;
+    w3 = test_open_node(tpath("rd_d.db"), l2, &o);
+    f5 = w3 ? hpplite_node_flush_batch(w3) : 0;
+    if (w3) hpplite_node_anchor(w3);
+    rowsA = replica_rows(l2, url, k2, "rd_r4", "rd_r4.db", "u");
+    printf("(with a commit meanwhile: flush %llu with the store down, the chain's batches %llu; store back: flush %llu, height %lld, synced %d, '%s'; a replica: the lost host's rows %d; with adopt=on the file at %llu, a replica's u %d) ",
+           (unsigned long long)f3, (unsigned long long)total, (unsigned long long)f4, h3, s3, e3, rows3, (unsigned long long)f5, rowsA);
+    w2->ownsL1 = 0; hpplite_node_destroy(w2);
+    if (w3) { w3->ownsL1 = 0; hpplite_node_destroy(w3); }
+    hpplite_l1_disconnect(l1);
+    hpplite_l1_disconnect(l2);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (s0 != 0 || !strstr(e0, "past the anchor are not read")) FAIL("the successor says it is synced with the store's batches not read");
+    if (f0 != 0 || h1 != 4 || rows1 != 3 || s1 != 1) FAIL("the store back, the lost host's three batches are not recovered");
+    if (f2 != 4) FAIL("the successor's own batch does not go after the recovered ones");
+    if (rows2 != 3 || rowsU != 0) FAIL("a replica does not arrive at the lost host's rows and the successor's table");
+    if (f3 != 0 || total != 0) FAIL("a batch was posted while the store's batches were not read");
+    if (f4 != 0 || h3 != 1 || s3 != 0 || !strstr(e3, "commits of its own")) FAIL("with a commit of its own the successor posted, or did not say why it does not");
+    if (rows3 != 3) FAIL("the lost host's batches at the store were written over");
+    if (f5 != 4 || rowsA != 0) FAIL("the file is not adopted after the lost host's batches, as the line says it can be");
+    PASS();
+}
+
 /* 11. The soft tier (#166): a verifier with the store follows the sequencer's batches as they reach the
 ** store, before any anchor, and they turn hard when the anchor names what it applied. */
 static void test_soft_replica(const char *url) {
@@ -1964,6 +2071,7 @@ int main(int argc, char **argv) {
     test_snapshot_chunks(url);
     test_keep(url);
     test_store_down_at_open(dir);
+    test_recovery_store_down(dir);
     test_reads_ahead(dir);
     test_restart_store_down(dir);
     test_snapshot_name_refused(dir);
