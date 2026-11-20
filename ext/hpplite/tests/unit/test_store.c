@@ -1895,6 +1895,155 @@ static void test_recovery_file_held(const char *url) {
     PASS();
 }
 
+/* 10e. The sequencer dies after its batch reached the store and before its bookkeeping has it; the application, whose
+** connection never closes, commits meanwhile; the sequencer starts again (#388). With commits pending the store's
+** names were not read, and the batch was made again - from the last posted image, with the application's commits - and
+** put under the same name: the sequencer's file and a new replica agree, and a replica that had read the first one
+** under that name is on bytes the history no longer has. The sidecar knows the batch (the in-flight mark, written
+** before the post): it is taken as posted, as one found on the chain is, and what the file holds past it follows */
+/* A sequencer on the file commits a row and dies with its batch at the store, before its bookkeeping has it */
+static int dies_after_post(HppliteL1 *l1, const char *url, const unsigned char *k, const char *id, const char *file, const char *sql) {
+    pid_t pid;
+    int st = 0;
+    fflush(stdout);
+    pid = fork();
+    if (pid == 0) {
+        TestNodeOpts oc = { .storeUrl = url, .nodeId = id, .privkey = k };
+        HppliteNode *c = test_open_node(tpath(file), l1, &oc);
+        if (!c) _exit(2);
+        hpplite_node_exec(c, sql, NULL);
+        setenv("HPPLITE_TEST_CRASH_AT", "after_submit", 1);
+        hpplite_node_flush_batch(c);
+        _exit(3);
+    }
+    waitpid(pid, &st, 0);
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 137) return 1;
+    printf("(the child on %s: %d) ", file, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return 0;
+}
+/* The file and what is beside it - the WAL, the seed, the sidecar - under another name */
+static void copy_beside(const char *from, const char *to) {
+    static const char *sfx[] = { "", "-wal", "-hpplite", "-hpplite.db", "-hpplite.db-wal" };
+    size_t i, n;
+    for (i = 0; i < sizeof sfx / sizeof sfx[0]; i++) {
+        char a[700], b[700], buf[8192];
+        FILE *in, *out;
+        snprintf(a, sizeof a, "%s%s", tpath(from), sfx[i]);
+        snprintf(b, sizeof b, "%s%s", tpath(to), sfx[i]);
+        if (!(in = fopen(a, "rb"))) continue;
+        out = fopen(b, "wb");
+        while (out && (n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+        if (out) fclose(out);
+        fclose(in);
+    }
+}
+/* ...and where the name is another batch by then - a second host with the first's bookkeeping posted its own - it
+** is not taken and not written over (#382's line): the file has the commit it left in flight, the history another */
+static int restart_other_batch(const char *url) {
+    unsigned char k[32] = {0};
+    HppliteL1 *l1;
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "rs_d", .privkey = k }, ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "rs_d_r", .privkey = k };
+    HppliteNode *a, *r;
+    int s0, rows = -2, other = -2;
+    uint64_t f0;
+    char e0[500];
+    k[31] = 0x94;
+    l1 = lost_host(url, k, "rs_d", "rs_d.db");
+    if (!l1) return 0;
+    copy_beside("rs_d.db", "rs_d2.db");
+    if (!dies_after_post(l1, url, k, "rs_d", "rs_d.db", "INSERT INTO t(v) VALUES('in flight')")
+        || !dies_after_post(l1, url, k, "rs_d", "rs_d2.db", "INSERT INTO t(v) VALUES('the other host')")) { hpplite_l1_disconnect(l1); return 0; }
+    hpplite_l1_mock_advance_time(l1, 400);
+    a = test_open_node(tpath("rs_d.db"), l1, &o);
+    if (!a) { hpplite_l1_disconnect(l1); return 0; }
+    f0 = hpplite_node_flush_batch(a);
+    s0 = (int)status_int(a->db, "synced");
+    snprintf(e0, sizeof e0, "%s", status_text(a->db, "last_error"));
+    hpplite_node_stop_timer(a);
+    a->ownsL1 = 0; a->l1 = NULL; hpplite_node_destroy(a);
+    r = test_open_node(tpath("rs_d_r.db"), l1, &ro);
+    if (r) {
+        rows = count_rows(r->db, "t");
+        other = (int)scalar(r->db, "SELECT count(*) FROM t WHERE v = 'the other host'");
+        r->l1 = NULL; hpplite_node_destroy(r);
+    }
+    printf("(another batch under the name: flush %llu, synced %d, '%s'; a replica: rows %d, the other host's %d) ", (unsigned long long)f0, s0, e0, rows, other);
+    hpplite_l1_disconnect(l1);
+    return f0 == 0 && s0 == 0 && strstr(e0, "the store holds batch 4 past the anchor") && strstr(e0, "adopt=on") && rows == 4 && other == 1;
+}
+static int restart_case(const char *url, unsigned char keyByte, const char *id, const char *file, int when) {
+    unsigned char k[32] = {0};
+    HppliteL1 *l1;
+    TestNodeOpts o = { .storeUrl = url, .nodeId = id, .privkey = k, .noSync = when == 1 };
+    int want = when == 2 ? 5 : 6;
+    HppliteNode *a;
+    sqlite3 *app = NULL;
+    int pend, s0, s1, rows, rowsR, rowsV0, rowsV1, sameV = 0;
+    char eV[400] = "";
+    long long h0, h1;
+    uint64_t f0, f1, f2;
+    char e0[400], e1[400], rfile[80], rid[40], vfile[80], vid[40];
+    k[31] = keyByte;
+    l1 = lost_host(url, k, id, file);
+    if (!l1) return 0;
+    if (!dies_after_post(l1, url, k, id, file, "INSERT INTO t(v) VALUES('in flight')")) { hpplite_l1_disconnect(l1); return 0; }
+    hpplite_l1_mock_advance_time(l1, 400);
+    /* a replica that keeps its file reads the store meanwhile: the batch the sequencer's bookkeeping does not have */
+    snprintf(vfile, sizeof vfile, "%s_v.db", id); snprintf(vid, sizeof vid, "%s_v", id);
+    rowsV0 = replica_rows(l1, url, k, vid, vfile, "t");
+    sqlite3_open(tpath(file), &app);
+    sqlite3_exec(app, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    if (when == 0) sqlite3_exec(app, "INSERT INTO t(v) VALUES('the application, the sequencer down')", NULL, NULL, NULL);
+    a = test_open_node(tpath(file), l1, &o);
+    if (!a) { sqlite3_close(app); hpplite_l1_disconnect(l1); return 0; }
+    if (when == 1) sqlite3_exec(app, "INSERT INTO t(v) VALUES('the application, the sequencer opening')", NULL, NULL, NULL);
+    pend = hpplite_node_pending_count(a);
+    h0 = status_int(a->db, "height"); s0 = (int)status_int(a->db, "synced");
+    snprintf(e0, sizeof e0, "%s", status_text(a->db, "last_error"));
+    f0 = hpplite_node_flush_batch(a);
+    f1 = hpplite_node_flush_batch(a);
+    sqlite3_exec(app, "INSERT INTO t(v) VALUES('the application, later')", NULL, NULL, NULL);
+    f2 = hpplite_node_flush_batch(a);
+    h1 = status_int(a->db, "height"); s1 = (int)status_int(a->db, "synced"); rows = count_rows(a->db, "t");
+    snprintf(e1, sizeof e1, "%s", status_text(a->db, "last_error"));
+    hpplite_node_anchor(a);
+    snprintf(rfile, sizeof rfile, "%s_r.db", id); snprintf(rid, sizeof rid, "%s_r", id);
+    rowsR = replica_rows(l1, url, k, rid, rfile, "t");
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = vid, .privkey = k };
+        HppliteNode *r = test_open_node(tpath(vfile), l1, &ro);
+        rowsV1 = r ? count_rows(r->db, "t") : -2;
+        if (r) {
+            sameV = same_root(a, r);
+            snprintf(eV, sizeof eV, "%s", status_text(r->db, "last_error"));
+            r->l1 = NULL; hpplite_node_destroy(r);
+        }
+    }
+    printf("(%s: at the open pending %d, height %lld, synced %d, '%s'; flushes %llu %llu %llu; height %lld, synced %d, '%s', rows %d; a new replica: rows %d; the replica that read the store meanwhile: rows %d, then %d, the sequencer's root %d, '%s') ",
+           when == 2 ? "no commit until it is up" : when == 1 ? "a commit as it opens" : "a commit while down", pend, h0, s0, e0, (unsigned long long)f0, (unsigned long long)f1, (unsigned long long)f2, h1, s1, e1, rows, rowsR, rowsV0, rowsV1, sameV, eV);
+    sqlite3_close(app);
+    a->ownsL1 = 0; hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    return rows == want && rowsR == want && s1 == 1 && !e1[0] && rowsV0 == 4 && rowsV1 == want && sameV && !eV[0];
+}
+static void test_restart_with_commits(const char *url) {
+    TEST("a sequencer that died with its batch at the store and not in its bookkeeping, the application committing meanwhile (#388): started again, the batch at the store is taken as posted and the application's commits follow it; a replica that had read it goes on; another batch under that name is neither taken nor written over");
+#ifndef HPPLITE_TEST_HOOKS
+    (void)url; (void)restart_case; (void)restart_other_batch;
+    printf("SKIP (no test hooks) "); PASS(); return;
+#else
+    int a = restart_case(url, 0x91, "rs_a", "rs_a.db", 0);
+    int b = restart_case(url, 0x92, "rs_b", "rs_b.db", 1);
+    int c = restart_case(url, 0x93, "rs_c", "rs_c.db", 2);
+    int d = restart_other_batch(url);
+    if (!a) FAIL("a commit made while the sequencer was down: the batch at the store was made again under its name");
+    if (!b) FAIL("a commit made as the sequencer opens, before its sync: the batch at the store was made again under its name");
+    if (!c) FAIL("no commit while the sequencer was down: the replica that read the batch at the store is not on the sequencer's history");
+    if (!d) FAIL("another batch under the name of the one left in flight: it should be neither taken nor written over");
+    PASS();
+#endif
+}
+
 /* 11. The soft tier (#166): a verifier with the store follows the sequencer's batches as they reach the
 ** store, before any anchor, and they turn hard when the anchor names what it applied. */
 static void test_soft_replica(const char *url) {
@@ -2146,6 +2295,7 @@ int main(int argc, char **argv) {
     test_recovery(url);
     test_recovery_adopt(url);
     test_recovery_file_held(url);
+    test_restart_with_commits(url);
     test_soft_replica(url);
     test_soft_past_ring(url);
     test_soft_disagreement(url);

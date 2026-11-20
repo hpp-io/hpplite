@@ -914,7 +914,11 @@ the store gave whose pages cannot be written yet - the application's
 connection holds the file in WAL - is owed the same way (#387): "batch N at
 the store is not applied (the file is held by another connection): the
 batches past the anchor are not read; nothing is posted until they are",
-tried again at each flush and recovered once the file is free. What is
+tried again at each flush and recovered once the file is free. A sequencer
+that died with its batch at the store and not yet in its bookkeeping finds
+it there when it starts again (#388) - the sidecar knows the batch it left
+in flight - and takes it as posted; what the application committed
+meanwhile follows as the next height. What is
 lost is what never reached the store: at most one flush interval. A successor that is another instance - a fresh file has a
 seed of its own - waits out the dead one's lease (an hour since VERSION 9)
 before it can post: what its app writes during the wait is in its file and

@@ -33,6 +33,7 @@ static void node_ck_close(HppliteNode *node);
 static void node_pins_close(HppliteNode *node);
 static void node_wal_maintenance(void *pArg);
 static int node_ranges(HppliteNode *node);
+static int node_inflight_here(HppliteNode *node);
 static int node_anchor(HppliteNode *node);
 static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch);
 static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
@@ -3258,6 +3259,7 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
         char *txHash;
         /* the sidecar knows the batch before the chain does: a process that dies
         ** between the submit and the finalize finds it its own on reopen */
+        node->inflightMine = 1;                 /* this process's post: what became of it is the flush's to find out, not the walk's (#388) */
         if (hppliteMarkInflightPages(ctx, height, root) != SQLITE_OK) { hpplite_pagemode_failed(node->pm); sqlite3_free(bytes); free(packed); free(sealed); free(framed); *pMore = 0; return 0; }
         if (node->store) {
             /* the bytes to the store, the commitment to the chain (#11), as the row flush does */
@@ -3454,7 +3456,7 @@ static uint64_t node_flush_unlocked(HppliteNode *node) {
     ** it, as open does. */
     if (node->l1) {
         int rc;
-        if (hpplite_node_pending_count(node) == 0 || node->walkOwed == 1) {
+        if (hpplite_node_pending_count(node) == 0 || node->walkOwed == 1 || (node_inflight_here(node) && !node->softWalked)) {
             if (hpplite_node_sync_from_l1(node, 1) < 0) {
                 node->state = HPPLITE_STATE_ERROR;
                 return 0;
@@ -3560,6 +3562,28 @@ void hpplite_node_spend_check(HppliteNode *node) {
 ** content reference, the chain hash before and after), so the next anchor
 ** names it. Once per node: a restart on the same file starts past them.
 */
+/* The sidecar's in-flight mark, left by a process before this one, is at this node's height: a batch posted and not
+** finalized - the process died between the two (#388). The chain's side of it is node_adopt_existing's; a store under
+** ranges may hold it under its name, which the walk reads - past the anchored height too, and with commits pending:
+** the application's, made while the sequencer was down, go after it. Made again from the file it took the name with
+** other bytes, and a replica that had read the first was on a batch the history no longer had */
+static int node_inflight_here(HppliteNode *node) {
+    return node->pm && node->lockFd >= 0 && !node->inflightMine && node_ranges(node)
+           && node->ctx->inflightHeight && node->ctx->inflightHeight == node->ctx->blockHeight;
+}
+/* ...and the bytes the store gave under that name are that batch: the root the mark recorded */
+static int node_inflight_at_store(HppliteNode *node, uint64_t h, const uint8_t *data, size_t n) {
+    HppliteBatch *batch;
+    HpplitePageBatch *b;
+    int same;
+    if (!node_inflight_here(node) || h != node->ctx->inflightHeight || !(batch = node_decode_batch(node, h, data, n))) return 0;
+    b = hpplite_pagebatch_decode(batch->pPagesRaw, batch->nPagesRaw);
+    same = b && memcmp(node->ctx->inflightRoot, b->root, 32) == 0;
+    if (b) hpplite_pagebatch_free(b);
+    hpplite_batch_free(batch);
+    return same;
+}
+
 static int node_soft_walk(HppliteNode *node) {
     char c[43], d[43], name[80], *p, cid[64];
     const char *zDa;
@@ -3612,9 +3636,11 @@ static int node_soft_walk(HppliteNode *node) {
             }
             break;
         }
-        if (hpplite_node_pending_count(node) > 0 && !node_adopting(node)) {
+        if ((hpplite_node_pending_count(node) > 0 || node_inflight_here(node)) && !node_adopting(node) && !node_inflight_at_store(node, h, data, n)) {
             /* the walk made late, the application's commits already in the file: the store's batches are not in it,
-            ** and a batch of this file would take their place in the history. Neither is written over (#382) */
+            ** and a batch of this file would take their place in the history. Neither is written over (#382). The
+            ** batch this node left in flight is in the file, whatever came after it: taken as posted below (#388);
+            ** another batch under its name is not, and the in-flight commit is one of the file's own */
             hpplite_error(node->ctx, "the store holds batch %llu past the anchor, which this file does not have, and the file has commits of its own: nothing is posted. "
                           "Restart on an empty file to rebuild it from the history, or with adopt=on to keep this file as the state", (unsigned long long)h);
             node->state = HPPLITE_STATE_ERROR;
@@ -4090,10 +4116,11 @@ static int node_sync_from_l1(HppliteNode *node, int *pHead) {
         }
     }
     if (synced) hpplite_error_clear(node->ctx);   /* up to date with L1 (#32) */
-    if (!node->config.verifyOnly && (node->ctx->blockHeight == lastBatch + 1 || node->walkOwed == 1)
-        && (hpplite_node_pending_count(node) == 0 || node->walkOwed == 1 || (node->pm && node->lockFd >= 0 && node_adopting(node))))
+    if (!node->config.verifyOnly && (node->ctx->blockHeight == lastBatch + 1 || node->walkOwed == 1 || node_inflight_here(node))
+        && (hpplite_node_pending_count(node) == 0 || node->walkOwed == 1 || node_inflight_here(node) || (node->pm && node->lockFd >= 0 && node_adopting(node))))
         synced += node_soft_walk(node);             /* what the store holds past the chain (#167), before anything of ours;
-                                                    ** an adopted file's commits made meanwhile wait behind it (#380) */
+                                                    ** an adopted file's commits made meanwhile wait behind it (#380), and
+                                                    ** the application's behind a batch of this node's the store may have (#388) */
     if (node->ctx->blockHeight >= lastBatch + 1) synced += node_soft_follow(node);   /* a verifier's soft tier (#166) */
     if (!node->walkOwed) {
         node_adopt_done(node);                      /* adopt=on: the history is read (#380) */
