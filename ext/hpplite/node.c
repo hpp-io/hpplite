@@ -3353,6 +3353,7 @@ static int node_file_still_ours(HppliteNode *node) {
         hpplite_error(node->ctx, "the database file %s was replaced or removed under this sequencer: its commits go to the file it opened, "
                       "no longer at that path; nothing more is posted - restart it on the file there now", zFile);
     node->state = HPPLITE_STATE_ERROR;
+    node->fileReplaced = 1;
     return 0;
 }
 

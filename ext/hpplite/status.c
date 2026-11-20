@@ -90,6 +90,7 @@ typedef struct StatusCursor {
 #define STATUS_COL_SPEND_WARNING  38  /* what runs out and when at the recent rate (HPPLITE_LOW_BALANCE); NULL when nothing does */
 #define STATUS_COL_STORE_BUCKET   41  /* ...the bucket's state at the store: covered, parked, deleted; NULL before one is known */
 #define STATUS_COL_RELAY_PAYER    43  /* the wallet the relay's payments are asked of (#371): the funding wallet, or the node key's own once it paid instead */
+#define STATUS_COL_FILE_REPLACED  44  /* 1 once the database file was replaced or removed under this sequencer (#320): it posts nothing more, and hpplite-sequencer stops on it (#379) */
 #define STATUS_COL_SNAPSHOT       42  /* the latest snapshot's height: the one this sequencer's anchors name, or a replica started from (#221, #222); NULL: none */
 
 static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *argv,
@@ -108,7 +109,7 @@ static int statusConnect(sqlite3 *db, void *pAux, int argc, const char *const *a
         " store TEXT, store_state TEXT, store_spent INTEGER, store_calls INTEGER, store_price INTEGER, store_balance INTEGER,"
         " readers INTEGER, anchored INTEGER, last_anchor_tx TEXT, last_checkpoint_root TEXT,"
         " relay TEXT, relay_spent INTEGER, last_tx_path TEXT, store_funder TEXT, store_covered_until INTEGER, spent_window INTEGER, spend_warning TEXT, soft_height INTEGER, soft_disagreements INTEGER,"
-        " store_bucket TEXT, snapshot_height INTEGER, relay_payer TEXT)");
+        " store_bucket TEXT, snapshot_height INTEGER, relay_payer TEXT, file_replaced INTEGER)");
     if (rc != SQLITE_OK) return rc;
     p = sqlite3_malloc(sizeof(StatusVtab));
     if (!p) return SQLITE_NOMEM;
@@ -380,6 +381,9 @@ static int statusColumn(sqlite3_vtab_cursor *pCur, sqlite3_context *ctx, int col
             }
             break;
         }
+        case STATUS_COL_FILE_REPLACED:
+            sqlite3_result_int(ctx, node->fileReplaced);
+            break;
         case STATUS_COL_RELAY_PAYER: {
             unsigned char a[20];
             char hex[43];

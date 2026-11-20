@@ -321,7 +321,13 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   pending, sequencer, lease, state, last error); commits pending for
   `HPPLITE_STUCK_SECONDS` (30) with nothing posted are said once, with the
   node's last error (#368). In `--dir` mode SIGUSR1 prints a status line
-  per database on stdout.
+  per database on stdout. A database file replaced or removed under the
+  sequencer (another file at its path: a restore, a directory made again)
+  ends the process with exit 4, after the node's line (#379): the node
+  posts nothing more from then on (#320), and a supervisor that restarts
+  on failure (`Restart=on-failure`) starts it on the file there now. The
+  node finds it at its next post, or when it compares the file with what
+  it last sent: once a minute (`HPPLITE_FILE_CHECK_SECONDS`).
 - **Many databases on one host** (a platform with many apps' databases):
   `hpplite-sequencer --dir <directory>` holds every database named by a
   `<name>.conf` there - `db=<path>`, `params=<HPPLITE_PARAMS with
@@ -331,7 +337,9 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   opens, a removed one closes (posting what is pending), a changed one is
   reopened, the others are not disturbed. One line per database on stdout:
   `<name>: synced height N`, `<name>: closed`, `<name>: error: ...`. One
-  failing does not stop the rest; SIGTERM closes all within
+  failing does not stop the rest; one whose file was replaced or removed
+  under it says its error, is closed and is opened again on the file there
+  now (#379); SIGTERM closes all within
   `HPPLITE_STOP_SECONDS` (30). One trust domain only: the process follows
   each `db=` (links included) with the keys its files give it, so over
   several tenants' volumes in one mount namespace a tenant's link could make
@@ -674,8 +682,10 @@ and what runs out and when at the recent rate, NULL when nothing does), and
 `soft_height` and `soft_disagreements` (#166: a verifier with a store, the
 height its soft batches reach, with `height` staying the anchored one; and
 how many times the chain committed another batch than the store served, each
-followed by a rebuild), and `snapshot_height` (#221: the latest snapshot the
-anchors name, NULL for none). `state` says what this node is doing about posting: `sequencing`,
+followed by a rebuild), `snapshot_height` (#221: the latest snapshot the
+anchors name, NULL for none), and `file_replaced` (1 once the database file
+was replaced or removed under this sequencer, #320: it posts nothing more,
+and `hpplite-sequencer` stops on it, #379). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:

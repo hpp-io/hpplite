@@ -175,6 +175,7 @@ typedef struct HppliteNode {
     uint64_t anchoredHeight;        /* the chain's last height as last read: above it, the store alone holds the batches */
     uint64_t rootsKeptAt;           /* a verifier: the anchored height its kept roots were last named for (#362) */
     int fileKnown;                  /* the database file's identity as first flushed, to see it replaced under us (#320) */
+    int fileReplaced;               /* ...and it was: nothing more is posted; hpplite_status.file_replaced, for the process to stop on (#379) */
     uint64_t aheadFrom, aheadNext;  /* the range's batches read ahead from the store: [aheadFrom, aheadNext) (#195) */
     uint64_t namesFrom, namesNext;  /* ...and the store's names: [namesFrom, namesNext) */
     unsigned long long fileDev, fileIno;

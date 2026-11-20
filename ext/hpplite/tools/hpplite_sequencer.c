@@ -20,7 +20,9 @@
 ** before the application opens the file - pages cannot be applied while
 ** another connection holds the file in WAL mode. Everything else goes to stderr.
 ** SIGUSR1 prints one line of the node's status there; commits pending for HPPLITE_STUCK_SECONDS (30) with nothing
-** posted are said once, with the node's last error (#368).
+** posted are said once, with the node's last error (#368). A database file replaced or removed under the sequencer
+** (#320: the node says so and posts nothing more) ends the process, exit 4 (#379): to a supervisor it is a failure,
+** and its restart is on the file there now.
 **
 ** Many databases in one process:
 **
@@ -36,7 +38,9 @@
 ** one that failed to open is tried again; the others are not disturbed. One
 ** line per database on stdout, prefixed with its name: "<name>: synced height
 ** N", "<name>: closed", "<name>: error: ...", and the sequencer role as it
-** changes. One database failing does not stop the rest. SIGTERM or SIGINT
+** changes. One database failing does not stop the rest. A database whose file
+** was replaced or removed under it (#320) says "<name>: error: ...", is closed
+** and opened again on the file there now (#379). SIGTERM or SIGINT
 ** closes them all, each posting what is pending, within
 ** HPPLITE_STOP_SECONDS (default 30); a database not closed by then is named
 ** and keeps its pending pages in its file for the next start (exit 1).
@@ -77,6 +81,7 @@
 #include <unistd.h>
 
 static volatile sig_atomic_t stop, reread, asked;
+#define EXIT_REPLACED 4             /* the database file was replaced or removed under the sequencer (#379) */
 static void on_signal(int sig) { (void)sig; stop = 1; }
 static volatile sig_atomic_t askedGen;     /* --dir: each database's thread answers each SIGUSR1 once */
 static void on_usr1(int sig) { (void)sig; asked = 1; askedGen++; }
@@ -143,7 +148,7 @@ static void *db_thread(void *arg) {
     Db *d = (Db *)arg;
     sqlite3 *db = hpplite_open(d->uri);
     char err[512] = "", seen[512] = "", state[32];
-    int role = -1, gen = askedGen;
+    int role = -1, gen = askedGen, replaced = 0;
     wipe_free(d->uri);
     d->uri = NULL;
     if (!db) {
@@ -169,10 +174,17 @@ static void *db_thread(void *arg) {
                 status_int(db, "pending"), status_int(db, "sequencer"), status_int(db, "lease"), state, err[0] ? err : "-");
         }
         snprintf(seen, sizeof seen, "%s", strcmp(state, "error") == 0 ? err : "");
+        if (status_int(db, "file_replaced") == 1) { replaced = 1; break; }   /* said above, as the node's error (#379) */
         for (int i = 0; i < 10 && !d->quit; i++) usleep(100000);
     }
     sqlite3_close(db);              /* what is pending is posted */
     say(d->name, "closed");
+    if (replaced && !d->quit) {
+        /* opened again on the file there now: the directory is read again, as at SIGHUP, and an entry that
+        ** failed is one it opens anew - its key is read from its file, this thread kept none */
+        d->failed = 1;
+        reread = 1;
+    }
     d->done = 1;
     return NULL;
 }
@@ -466,6 +478,13 @@ int main(int argc, char **argv) {
             stuckSaid = 1;
         }
         fflush(stderr);
+        if (status_int(db, "file_replaced") == 1) {
+            /* the node said why and posts nothing more (#320); a process that stayed up was a healthy one to its
+            ** supervisor (#379, somaro#352) */
+            fprintf(stderr, "hpplite-sequencer: %s was replaced or removed under this sequencer: stopping (exit %d) for a restart on the file there now\n", argv[1], EXIT_REPLACED);
+            sqlite3_close(db);
+            return EXIT_REPLACED;
+        }
         sleep(1);
     }
     fprintf(stderr, "hpplite-sequencer: stopping; posting what is pending\n");
