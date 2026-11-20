@@ -1861,7 +1861,7 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
     sqlite3_file *pf = NULL;
     unsigned char *page = NULL, root[32];
     unsigned i, counter = 0;
-    int rc;
+    int rc, fresh = node->ctx->blockHeight == 1;
     if (!b) { hpplite_error(node->ctx, "batch %llu: page batch that does not decode", (unsigned long long)batch->height); return SQLITE_CORRUPT; }
     if (!node->pm) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu is a page batch and this node is not in page mode (capture=pages)", (unsigned long long)batch->height); return SQLITE_MISMATCH; }
     if (batch->height > 1 && batch->height == node->ctx->blockHeight && b->piece <= 1 && !node->ctx->openTxnId) {
@@ -1916,6 +1916,11 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
     }
     page = sqlite3_malloc64((sqlite3_uint64)b->pageSize);
     if (rc == SQLITE_OK && (!pf || !pf->pMethods || !page)) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK) {
+        /* this file's change counter, before anything is written: the one written at the end is past it (#384) */
+        unsigned char c[4];
+        if (pf->pMethods->xRead(pf, c, 4, 24) == SQLITE_OK) counter = ((unsigned)c[0] << 24) | ((unsigned)c[1] << 16) | ((unsigned)c[2] << 8) | c[3];
+    }
     for (i = 0; rc == SQLITE_OK && i < b->nPages; i++) {
         unsigned rPgno = 0, rFlags = 0, k;
         const unsigned char *rBody = NULL;
@@ -1928,15 +1933,18 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
             if (rc != SQLITE_OK) break;
             for (k = 0; k < b->pageSize; k++) page[k] ^= rBody[k];
         } else memcpy(page, rBody, b->pageSize);
-        if (rPgno == 1) { counter = ((unsigned)page[24] << 24) | ((unsigned)page[25] << 16) | ((unsigned)page[26] << 8) | page[27]; page[18] = page[19] = 1; }
+        if (rPgno == 1) page[18] = page[19] = 1;
         rc = pf->pMethods->xWrite(pf, page, (int)b->pageSize, off);
         if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, rPgno, page);
     }
     if (rc == SQLITE_OK) {
-        /* page 1 as the file has it: the counters moved, rollback-journal mode */
+        /* page 1 as the file has it, rollback-journal mode, its change counter moved past the one this file had
+        ** - not past the batch's (#384): a connection that read the file before, this node's own among them, would
+        ** take its cached pages for current where the two counters met, and the node's switch back to WAL, which
+        ** writes page 1, put the old page 1 over the one applied (a restored file under the history's pages) */
         rc = pf->pMethods->xRead(pf, page, (int)b->pageSize, 0);
         if (rc == SQLITE_OK) {
-            counter = (((unsigned)page[24] << 24) | ((unsigned)page[25] << 16) | ((unsigned)page[26] << 8) | page[27]) + 1;
+            counter++;
             page[24] = (unsigned char)(counter >> 24); page[25] = (unsigned char)(counter >> 16); page[26] = (unsigned char)(counter >> 8); page[27] = (unsigned char)counter;
             memcpy(page + 92, page + 24, 4);
             page[18] = page[19] = 1;
@@ -1957,6 +1965,11 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
         node->pieceDb = NULL; node->piecePf = NULL;
     }
     sqlite3_free(page);
+    /* the first of the history onto this file: whatever this node's connection read of the file before was another
+    ** file's (a restored copy the application held at the open), and a schema cookie equal in both - two files with
+    ** one CREATE each - would keep that schema on the connection (#384). Once the lock has gone: between the pieces
+    ** of a commit it is held, and the connection would wait on it */
+    if (fresh && !node->pieceDb) hppliteInternalExec(node->ctx, node->db, "PRAGMA writable_schema=RESET");
     if (rc != SQLITE_OK) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu: its pages could not be written (rc=%d)", (unsigned long long)batch->height, rc); return rc; }
     hpplite_pagemode_root(node->pm, root);
     /* a piece with more after it carries the whole commit's root: checked at the last piece (#152) */

@@ -814,6 +814,79 @@ static void test_status_synced(void) {
     PASS();
 }
 
+/* The history applied onto a file the node had already read as another: a restored file held in WAL by the
+** application at the open, the sync made once its connection closed. The restored file here is made with n commits
+** before its switch to WAL, n = 1..6, so that its page-1 counters meet the history's whatever they are today. */
+static int resync_case(int n, char *why, size_t nWhy) {
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts ov = { .verifyOnly = 1 };
+    HppliteNode *a, *h, *v;
+    sqlite3 *other = NULL, *plain = NULL;
+    char live[200], path[200], rep[200];
+    long long t, mine, tn, mn, tv = -2, mis = -1, synced, height;
+    uint64_t f;
+    int i, rcx;
+    why[0] = 0;
+    snprintf(live, sizeof live, DIR "/lost%d.db", n);
+    snprintf(path, sizeof path, DIR "/restored%d.db", n);
+    snprintf(rep, sizeof rep, DIR "/replica%d.db", n);
+    a = open_node(live, l1);
+    if (!a) { snprintf(why, nWhy, "open the first host"); hpplite_l1_disconnect(l1); return 1; }
+    hpplite_node_exec(a, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    hpplite_node_flush_batch(a);
+    hpplite_node_exec(a, "INSERT INTO t VALUES(2)", NULL);
+    hpplite_node_flush_batch(a);
+    a->ownsL1 = 0;
+    hpplite_node_destroy(a);
+    sqlite3_open(path, &other);
+    sqlite3_exec(other, "CREATE TABLE mine(v)", NULL, NULL, NULL);
+    for (i = 1; i < n; i++) sqlite3_exec(other, "INSERT INTO mine VALUES(1)", NULL, NULL, NULL);
+    sqlite3_exec(other, "PRAGMA journal_mode=WAL; INSERT INTO mine VALUES(2)", NULL, NULL, NULL);
+    h = open_node(path, l1);
+    if (!h) { sqlite3_close(other); snprintf(why, nWhy, "open on the restored file"); hpplite_l1_disconnect(l1); return 1; }
+    sqlite3_close(other);
+    hpplite_node_flush_batch(h);
+    synced = status_int(h->db, "synced"); height = status_int(h->db, "height");
+    sqlite3_open_v2(path, &plain, SQLITE_OPEN_READONLY, NULL);
+    t = count_rows(plain, "t"); mine = count_rows(plain, "mine");
+    sqlite3_close(plain);
+    tn = count_rows(h->db, "t"); mn = count_rows(h->db, "mine");
+    rcx = hpplite_node_exec(h, "INSERT INTO t VALUES(3)", NULL);
+    f = hpplite_node_flush_batch(h);
+    v = test_open_node(rep, l1, &ov);
+    if (v) {
+        hpplite_node_sync_from_l1(v, 1);
+        tv = count_rows(v->db, "t"); mis = (long long)v->ctx->nRootMismatches;
+        v->ownsL1 = 0;
+        hpplite_node_destroy(v);
+    }
+    h->ownsL1 = 0;
+    hpplite_node_destroy(h);
+    hpplite_l1_disconnect(l1);
+    if (synced != 1 || height != 3) snprintf(why, nWhy, "the sync was not made (synced %lld, height %lld)", synced, height);
+    else if (t != 2 || mine != -1) snprintf(why, nWhy, "the file is not the history's: another connection reads t %lld, mine %lld", t, mine);
+    else if (tn != 2 || mn != -1) snprintf(why, nWhy, "the node's connection is on the schema of the file it read before: t %lld, mine %lld", tn, mn);
+    else if (rcx != SQLITE_OK || f != 3) snprintf(why, nWhy, "a commit after the sync: exec rc %d, flush %llu", rcx, (unsigned long long)f);
+    else if (tv != 3 || mis != 0) snprintf(why, nWhy, "a replica from height 1: t %lld, root mismatches %lld", tv, mis);
+    return why[0] != 0;
+}
+static void test_resync_onto_file_read_before(void) {
+    TEST("the history applied onto a file the node had read as another (#384: a restored file held in WAL at the open, the sync made later): the file is the history's, the node's connection reads it, its next commit reaches a replica");
+    char why[300], first[340];
+    int n, bad = 0;
+    reset_dir();
+    first[0] = 0;
+    for (n = 1; n <= 6; n++) {
+        if (resync_case(n, why, sizeof why)) {
+            printf("\n   restored file with %d commits before WAL: %s", n, why);
+            if (!bad) snprintf(first, sizeof first, "%d commits before WAL: %s", n, why);
+            bad++;
+        }
+    }
+    if (bad) { printf("\n   "); FAILF("%d of 6 restored files (%s)", bad, first); }
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_suite_init("durability", PRIVKEY, DIR);
@@ -838,6 +911,7 @@ int main(void) {
     test_adopted_batch_kept_for_reorg();
     test_file_replaced_under_sequencer();
     test_status_synced();
+    test_resync_onto_file_read_before();
     remove_dir();
     return test_report();
 }
