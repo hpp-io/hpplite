@@ -14,6 +14,7 @@
 #include "crypto.h"
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -646,6 +647,44 @@ static void test_instance_given(void) {
     if (posted == 0 || pending != 0) { printf("(flush %llu, pending %lld) ", (unsigned long long)posted, (long long)pending); FAIL("the rebuilt host's write should be posted at once"); }
     if (memcmp(third, wantNamed, 32) != 0) FAIL("with HPPLITE_HOST_NAME the instance should be keccak(seed, that name)");
     if (memcmp(other, want, 32) == 0 || leaseOther != 0) FAIL("a host without the seed is another instance and does not hold the lease");
+    /* a host that came to its seed before instancefile=: its platform wrote the 32 bytes beside the database
+    ** and set HPPLITE_HOST_NAME (what v0.10.3 offered). Given the same seed as instancefile=, it is the
+    ** instance it was; the file then says the seed was given, and a start without the parameter is it still */
+    {
+        unsigned char was[32], given[32], after[32];
+        struct stat st0, st1;
+        FILE *f;
+        HppliteNode *n;
+        (void)!system("mkdir -p " DIR "/host5");
+        f = fopen(DIR "/host5/app.db-hpplite", "wb");
+        if (!f) FAIL("the platform's seed beside the database");
+        fwrite(SEED, 1, 32, f); fclose(f);
+        setenv("HPPLITE_HOST_NAME", "platform", 1);
+        l1 = hpplite_l1_create_mock_dir(L1DIR);
+        o.instanceSeed = NULL;
+        n = test_open_node(DIR "/host5/app.db", l1, &o);
+        if (!n) FAIL("open on the platform's seed");
+        memcpy(was, n->instanceId, 32);
+        hpplite_node_destroy(n);
+        if (stat(DIR "/host5/app.db-hpplite", &st0) != 0) FAIL("the seed beside the database should stay");
+        o.instanceSeed = SEED;
+        n = test_open_node(DIR "/host5/app.db", l1, &o);
+        if (!n) FAIL("open with the seed given");
+        memcpy(given, n->instanceId, 32);
+        hpplite_node_destroy(n);
+        if (stat(DIR "/host5/app.db-hpplite", &st1) != 0) FAIL("the seed beside the database should stay");
+        o.instanceSeed = NULL;
+        n = test_open_node(DIR "/host5/app.db", l1, &o);
+        if (!n) FAIL("open without the parameter again");
+        memcpy(after, n->instanceId, 32);
+        hpplite_node_destroy(n);
+        hpplite_l1_disconnect(l1);
+        unsetenv("HPPLITE_HOST_NAME");
+        if (memcmp(was, wantNamed, 32) != 0) FAIL("on a seed its platform wrote beside the database, the instance is keccak(seed, HPPLITE_HOST_NAME)");
+        if (memcmp(given, was, 32) != 0) FAIL("given the same seed as instancefile=, the host should be the instance it was");
+        if (st0.st_size != 32 || st1.st_size != 33) { printf("(%lld -> %lld bytes) ", (long long)st0.st_size, (long long)st1.st_size); FAIL("the file beside the database should then say the seed was given"); }
+        if (memcmp(after, was, 32) != 0) FAIL("a later start without the parameter should be that instance still");
+    }
     /* the file's forms: 32 bytes as they are, or 64 hex digits; anything else is said and not taken */
     {
         HppliteConfig *cfg = hpplite_config_create();
