@@ -461,6 +461,92 @@ static void test_from_soft_gone(void) {
     PASS();
 }
 
+/* #393: a duration that does not parse was dropped without a word and the default stayed - anchor=1d anchored every
+** 30 minutes. It refuses the open now, naming the setting and its value, from the URI, the SQLite URI and the
+** environment; and d is a unit of all four */
+static void test_durations_refused(void) {
+    TEST("a duration that does not parse refuses the open; anchor=1d is a day (#393)");
+#define U "hpplite://x?hpplite=1&rpc=http://127.0.0.1:9&chainid=31337&"
+    struct { const char *uri; int interval, anchor, snapshot; long long keep; } ok[] = {
+        {U "anchor=1d", 5000, 86400000, 0, 0},
+        {U "interval=500ms&anchor=24h&snapshot=7d&keep=30d", 500, 86400000, 7 * 86400000, 30 * 86400},
+        {U "interval=0&anchor=0&snapshot=0&keep=all", 0, 0, 0, 0},
+        {U "interval=90&anchor=5M&snapshot=1H&keep=7", 90000, 300000, 3600000, 7 * 86400},
+    };
+    static const char *bad[][2] = {
+        {U "anchor=soon", "anchor=soon"}, {U "anchor=1.5h", "anchor=1.5h"}, {U "anchor=24h30m", "anchor=24h30m"},
+        {U "anchor=-5m", "anchor=-5m"}, {U "interval=0.5s", "interval=0.5s"}, {U "interval=5sec", "interval=5sec"},
+        {U "snapshot=daily", "snapshot=daily"}, {U "snapshot=30d", "snapshot=30d"},   /* past what the node's timers hold: said, not wrapped */
+        {U "keep=1w", "keep=1w"}, {U "keep=0", "keep=0"}, {U "keep=7days", "keep=7days"},
+    };
+    static const char *env[][3] = {
+        {"HPPLITE_ANCHOR", "1w", "HPPLITE_ANCHOR=1w"}, {"HPPLITE_BATCH_INTERVAL", "fast", "HPPLITE_BATCH_INTERVAL=fast"},
+        {"HPPLITE_SNAPSHOT", "1.5d", "HPPLITE_SNAPSHOT=1.5d"}, {"HPPLITE_KEEP", "forever", "HPPLITE_KEEP=forever"},
+    };
+    size_t i;
+    int failed = 0;
+    for (i = 0; i < sizeof ok / sizeof ok[0]; i++) {
+        HppliteConfig *c = hpplite_config_load(ok[i].uri);
+        const char *why = hpplite_config_error();
+        if (!c || why || c->batchIntervalMs != ok[i].interval || c->anchorIntervalMs != ok[i].anchor
+            || c->snapshotIntervalMs != ok[i].snapshot || (long long)c->keepSeconds != ok[i].keep) {
+            printf("  %s: interval %d, anchor %d, snapshot %d, keep %lld, '%s'\n", ok[i].uri + sizeof(U) - 1, c ? c->batchIntervalMs : -1,
+                   c ? c->anchorIntervalMs : -1, c ? c->snapshotIntervalMs : -1, c ? (long long)c->keepSeconds : -1, why ? why : "");
+            failed++;
+        }
+        if (c) hpplite_config_free(c);
+    }
+    for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        HppliteConfig *c = hpplite_config_load(bad[i][0]);
+        const char *why = hpplite_config_error();
+        if (!why || !strstr(why, bad[i][1]) || !strstr(why, strcmp(bad[i][1], "snapshot=30d") ? "not a duration" : "24 days")) {
+            printf("  %s: %s\n", bad[i][1], why ? why : "taken");
+            failed++;
+        }
+        if (c) hpplite_config_free(c);
+    }
+    for (i = 0; i < sizeof env / sizeof env[0]; i++) {
+        HppliteConfig *c;
+        const char *why;
+        setenv(env[i][0], env[i][1], 1);
+        c = hpplite_config_load(U "interval=1s");
+        why = hpplite_config_error();
+        if (!why || !strstr(why, env[i][2]) || !strstr(why, "not a duration")) { printf("  %s: %s\n", env[i][2], why ? why : "taken"); failed++; }
+        if (c) hpplite_config_free(c);
+        unsetenv(env[i][0]);
+    }
+    {   /* the environment's day, and an empty value is no setting */
+        HppliteConfig *c;
+        setenv("HPPLITE_ANCHOR", "1d", 1); setenv("HPPLITE_SNAPSHOT", "", 1);
+        c = hpplite_config_load(U "interval=1s");
+        if (!c || hpplite_config_error() || c->anchorIntervalMs != 86400000 || c->snapshotIntervalMs != 0) {
+            printf("  HPPLITE_ANCHOR=1d, HPPLITE_SNAPSHOT=: anchor %d, '%s'\n", c ? c->anchorIntervalMs : -1, hpplite_config_error() ? hpplite_config_error() : "");
+            failed++;
+        }
+        if (c) hpplite_config_free(c);
+        unsetenv("HPPLITE_ANCHOR"); unsetenv("HPPLITE_SNAPSHOT");
+    }
+    {   /* a file: URI, as an application opens it */
+        static const char *f[][2] = { {"file:dur_refused.db?anchor=1.5h", "anchor=1.5h"}, {"file:dur_refused.db?keep=1w", "keep=1w"},
+                                      {"file:dur_refused.db?interval=5sec", "interval=5sec"}, {"file:dur_refused.db?snapshot=daily", "snapshot=daily"} };
+        for (i = 0; i < sizeof f / sizeof f[0]; i++) {
+            sqlite3 *db = NULL;
+            int rc = sqlite3_open_v2(f[i][0], &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+            HppliteConfig *c = rc == SQLITE_OK ? hpplite_config_create() : NULL;
+            const char *why;
+            if (c) hpplite_config_load_sqlite_uri(c, sqlite3_db_filename(db, "main"));
+            why = hpplite_config_error();
+            if (!why || !strstr(why, f[i][1]) || !strstr(why, "not a duration")) { printf("  %s: %s\n", f[i][0], why ? why : "taken"); failed++; }
+            if (c) hpplite_config_free(c);
+            sqlite3_close(db);
+        }
+        unlink("dur_refused.db");
+    }
+#undef U
+    if (failed) { printf("  %d of the settings\n", failed); FAIL("a duration that does not parse must refuse the open, and d be a day"); }
+    PASS();
+}
+
 int main(void) {
     printf("test_da_uri: DA URI Scheme Tests\n");
     printf("================================\n\n");
@@ -480,6 +566,7 @@ int main(void) {
     test_fleet_gone();
     test_money_knobs_env_only();
     test_from_soft_gone();
+    test_durations_refused();
 
     printf("\n================================\n");
     printf("%d/%d tests passed\n", tests_passed, tests_run);

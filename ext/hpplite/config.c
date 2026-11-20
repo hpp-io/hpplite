@@ -68,31 +68,21 @@ static int parse_off(const char *v) {
     return v && (strcasecmp(v, "off") == 0 || strcmp(v, "0") == 0 || strcasecmp(v, "false") == 0 || strcasecmp(v, "no") == 0);
 }
 
+/* A whole number with ms, s, m, h or d (no unit: seconds), "0" for none - in ms; -1 not one, -2 past what an int of
+** ms holds (24 days). Nothing else is read as one (#393): "1.5h" was an hour, "24h30m" a day, "0.5s" no timer */
 static int parse_duration_ms(const char *str) {
-    if (!str) return -1;
-
-    int value = atoi(str);
-    if (value == 0 && (str[0] == '0')) return 0;   /* "0", "0s", "0ms": no timer */
-    if (value <= 0) return -1;
-
-    /* Find unit suffix */
-    const char *p = str;
-    while (*p && (isdigit(*p) || *p == '.')) p++;
-
-    if (*p == 's' || *p == 'S') {
-        return value * 1000;
-    } else if (*p == 'm' && (*(p+1) == 's' || *(p+1) == 'S')) {
-        return value;
-    } else if (*p == 'm' || *p == 'M') {
-        return value * 60 * 1000;
-    } else if (*p == 'h' || *p == 'H') {
-        return value * 60 * 60 * 1000;
-    } else if (*p == '\0') {
-        /* No unit = seconds */
-        return value * 1000;
-    }
-
-    return -1;
+    char *end = NULL;
+    long long v, mul;
+    if (!str || !isdigit((unsigned char)str[0])) return -1;
+    v = strtoll(str, &end, 10);
+    if (strcasecmp(end, "ms") == 0) mul = 1;
+    else if (!*end || strcasecmp(end, "s") == 0) mul = 1000;
+    else if (strcasecmp(end, "m") == 0) mul = 60 * 1000;
+    else if (strcasecmp(end, "h") == 0) mul = 60 * 60 * 1000;
+    else if (strcasecmp(end, "d") == 0) mul = 24 * 60 * 60 * 1000;
+    else return -1;
+    if (v > 0x7fffffff / mul) return -2;
+    return (int)(v * mul);
 }
 
 /* keep= (#223): "all" (0: every batch kept), or N with s, m, h or d (no unit: days) - in seconds; -1 malformed */
@@ -101,18 +91,38 @@ static int64_t parse_keep_seconds(const char *str) {
     long long v;
     if (!str) return -1;
     if (strcmp(str, "all") == 0) return 0;
+    if (!isdigit((unsigned char)str[0])) return -1;
     v = strtoll(str, &end, 10);
-    if (v <= 0 || end == str) return -1;
-    if (*end == 's' || *end == 'S') return v;
-    if (*end == 'm' || *end == 'M') return v * 60;
-    if (*end == 'h' || *end == 'H') return v * 3600;
-    if (*end == 'd' || *end == 'D' || *end == 0) return v * 86400;
+    if (v <= 0 || v > INT64_MAX / 86400) return -1;
+    if (strcasecmp(end, "s") == 0) return v;
+    if (strcasecmp(end, "m") == 0) return v * 60;
+    if (strcasecmp(end, "h") == 0) return v * 3600;
+    if (strcasecmp(end, "d") == 0 || *end == 0) return v * 86400;
     return -1;
 }
 
 
 static char gConfigError[160];
 const char *hpplite_config_error(void) { return gConfigError[0] ? gConfigError : NULL; }
+
+/* A duration that does not parse refuses the open, naming the setting (#393): dropped without a word it left the
+** default - anchor=1d anchored every 30 minutes, keep=1w kept everything. An empty value is no setting. 1: taken */
+static int take_duration(const char *name, const char *val, int *pMs) {
+    int ms;
+    if (!val || !val[0]) return 0;
+    ms = parse_duration_ms(val);
+    if (ms >= 0) { *pMs = ms; return 1; }
+    if (ms == -2) snprintf(gConfigError, sizeof(gConfigError), "%s=%.40s is longer than a timer here runs (24 days)", name, val);
+    else snprintf(gConfigError, sizeof(gConfigError), "%s=%.40s is not a duration: a whole number with ms, s, m, h or d (no unit: seconds), 0 for none", name, val);
+    return 0;
+}
+static void take_keep(const char *name, const char *val, int64_t *pSeconds) {
+    int64_t k;
+    if (!val || !val[0]) return;
+    k = parse_keep_seconds(val);
+    if (k >= 0) *pSeconds = k;
+    else snprintf(gConfigError, sizeof(gConfigError), "%s=%.40s is not a duration: all, or a whole number with s, m, h or d (no unit: days)", name, val);
+}
 
 /* capture= and determinism= are gone (v0.8, #253): HPPLite captures pages, which replicate any SQL. A setting from
 ** before refuses the open rather than being read as a default in its place (#80) */
@@ -268,17 +278,11 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
 
     /* Batch interval */
     val = getenv(HPPLITE_ENV_BATCH_INTERVAL);
-    if (val) {
-        int ms = parse_duration_ms(val);
-        if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
-    }
+    if (take_duration(HPPLITE_ENV_BATCH_INTERVAL, val, &cfg->batchIntervalMs)) cfg->intervalGiven = 1;
     val = getenv("HPPLITE_ANCHOR");
-    if (val) {
-        int ms = parse_duration_ms(val);
-        if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
-    }
+    if (take_duration("HPPLITE_ANCHOR", val, &cfg->anchorIntervalMs)) cfg->anchorGiven = 1;
     val = getenv("HPPLITE_KEEP");
-    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; } }
+    take_keep("HPPLITE_KEEP", val, &cfg->keepSeconds);
     val = getenv("HPPLITE_KEEP_LEASE");
     if (val) cfg->keepLease = parse_on(val);
     val = getenv("HPPLITE_ADOPT");
@@ -288,10 +292,7 @@ int hpplite_config_load_env(HppliteConfig *cfg) {
     val = getenv(HPPLITE_ENV_FROM);
     if (val) refuse_from();
     val = getenv("HPPLITE_SNAPSHOT");
-    if (val) {
-        int ms = parse_duration_ms(val);
-        if (ms >= 0) { cfg->snapshotIntervalMs = ms; }
-    }
+    take_duration("HPPLITE_SNAPSHOT", val, &cfg->snapshotIntervalMs);
 
     /* Encryption */
     val = getenv(HPPLITE_ENV_ENCRYPT);
@@ -535,21 +536,12 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
 
 
     /* Batch interval */
-    if (get_uri_param(uri, "interval", buf, sizeof(buf))) {
-        int ms = parse_duration_ms(buf);
-        if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
-    }
-    if (get_uri_param(uri, "anchor", buf, sizeof(buf))) {
-        int ms = parse_duration_ms(buf);
-        if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
-    }
+    if (get_uri_param(uri, "interval", buf, sizeof(buf)) && take_duration("interval", buf, &cfg->batchIntervalMs)) cfg->intervalGiven = 1;
+    if (get_uri_param(uri, "anchor", buf, sizeof(buf)) && take_duration("anchor", buf, &cfg->anchorIntervalMs)) cfg->anchorGiven = 1;
     if (get_uri_param(uri, "keeplease", buf, sizeof(buf))) cfg->keepLease = parse_on(buf);
     if (get_uri_param(uri, "adopt", buf, sizeof(buf))) cfg->adopt = parse_on(buf);
     if (get_uri_param(uri, "anchorclose", buf, sizeof(buf))) cfg->anchorClose = !parse_off(buf);
-    if (get_uri_param(uri, HPPLITE_URI_SNAPSHOT, buf, sizeof(buf))) {
-        int ms = parse_duration_ms(buf);
-        if (ms >= 0) { cfg->snapshotIntervalMs = ms; }
-    }
+    if (get_uri_param(uri, HPPLITE_URI_SNAPSHOT, buf, sizeof(buf))) take_duration(HPPLITE_URI_SNAPSHOT, buf, &cfg->snapshotIntervalMs);
 
     /* Encryption */
     if (get_uri_param(uri, HPPLITE_URI_COMPRESS, buf, sizeof(buf))) {
@@ -579,7 +571,7 @@ int hpplite_config_load_uri(HppliteConfig *cfg, const char *uri) {
         snprintf(gConfigError, sizeof(gConfigError), "relaydeposit= is gone (v0.8, #251): the relay is paid per call by x402 exact; drop it (HPPLITE_RELAY_CAP bounds a call)");
     if (get_uri_param(uri, HPPLITE_URI_SOFT, buf, sizeof(buf))) refuse_soft();
     if (get_uri_param(uri, HPPLITE_URI_SYNC_TO, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncTo = (uint64_t)atoll(buf);
-    if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) { int64_t k = parse_keep_seconds(buf); if (k >= 0) { cfg->keepSeconds = k; } }
+    if (get_uri_param(uri, HPPLITE_URI_KEEP, buf, sizeof(buf))) take_keep(HPPLITE_URI_KEEP, buf, &cfg->keepSeconds);
     if (get_uri_param(uri, HPPLITE_URI_FROM, buf, sizeof(buf))) refuse_from();
     if (get_uri_param(uri, "fleet", buf, sizeof(buf))) refuse_fleet();
     if (get_uri_param(uri, HPPLITE_URI_SYNC_AT, buf, sizeof(buf)) && atoll(buf) > 0) cfg->syncAtMs = (uint64_t)atoll(buf);
@@ -722,15 +714,9 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
 
     /* Batch interval */
     val = sqlite3_uri_parameter(filename, "interval");
-    if (val) {
-        int ms = parse_duration_ms(val);
-        if (ms >= 0) { cfg->batchIntervalMs = ms; cfg->intervalGiven = 1; }
-    }
+    if (take_duration("interval", val, &cfg->batchIntervalMs)) cfg->intervalGiven = 1;
     val = sqlite3_uri_parameter(filename, "anchor");
-    if (val) {
-        int ms = parse_duration_ms(val);
-        if (ms >= 0) { cfg->anchorIntervalMs = ms; cfg->anchorGiven = 1; }
-    }
+    if (take_duration("anchor", val, &cfg->anchorIntervalMs)) cfg->anchorGiven = 1;
     val = sqlite3_uri_parameter(filename, "keeplease");
     if (val) cfg->keepLease = parse_on(val);
     val = sqlite3_uri_parameter(filename, "adopt");
@@ -738,10 +724,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, "anchorclose");
     if (val) cfg->anchorClose = !parse_off(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SNAPSHOT);
-    if (val) {
-        int ms = parse_duration_ms(val);
-        if (ms >= 0) { cfg->snapshotIntervalMs = ms; }
-    }
+    take_duration(HPPLITE_URI_SNAPSHOT, val, &cfg->snapshotIntervalMs);
 
     /* Encryption */
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_ENCRYPT);
@@ -769,7 +752,7 @@ int hpplite_config_load_sqlite_uri(HppliteConfig *cfg, const char *filename) {
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_SYNC_TO);
     if (val && atoll(val) > 0) cfg->syncTo = (uint64_t)atoll(val);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_KEEP);
-    if (val) { int64_t k = parse_keep_seconds(val); if (k >= 0) { cfg->keepSeconds = k; } }
+    take_keep(HPPLITE_URI_KEEP, val, &cfg->keepSeconds);
     val = sqlite3_uri_parameter(filename, HPPLITE_URI_FROM);
     if (val) refuse_from();
     if (sqlite3_uri_parameter(filename, "fleet")) refuse_fleet();
