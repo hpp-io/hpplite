@@ -2442,8 +2442,9 @@ static void test_snapshots_on_chain(void) {
     sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
     static const int ends[] = { 3, 5, 6 };
     int b = 0;
+    long long tAfter5 = 0;
     for (int k = 0; k < 3; k++) {
-        if (k) sleep(4);                           /* keep=3s, by whole seconds */
+        if (k) { sleep(2); if (k == 2) tAfter5 = (long long)time(NULL); sleep(2); }   /* keep=3s, by whole seconds; a moment after the snapshot at 5 and before batch 6 */
         while (b < ends[k]) {
             sqlite3_exec(w, "INSERT INTO n(v) VALUES(hex(randomblob(500)))", NULL, NULL, NULL);
             if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("a batch through the store"); }
@@ -2472,6 +2473,18 @@ static void test_snapshots_on_chain(void) {
     out[0] = 0;
     rc = run_verify_with(params, "--to 2", out, sizeof out);
     if (rc == 0 || !strstr(out, "cannot be rebuilt")) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAILF("--to 2, below the snapshot kept: exit %d\n%s", rc, out); }
+    {
+        /* a moment the snapshot itself answers (#400): no batch is replayed after it, and the line has no batch's
+        ** time to give - it said 'written 1970-01-01T00:00:00Z' */
+        char at[60];
+        snprintf(at, sizeof at, "--at %lld", tAfter5);
+        out[0] = 0;
+        rc = run_verify_with(params, at, out, sizeof out);
+        if (rc != 0 || !strstr(out, "verified from the snapshot at 5") || strstr(out, "1970") || !strstr(out, "through batch 5, the snapshot's: no batch after it was written by then")) {
+            kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+            FAILF("--at a moment after the snapshot at 5 and before batch 6: the line should name batch 5 as the snapshot's, with no time of a batch; exit %d\n%s", rc, out);
+        }
+    }
     {
         /* from= is gone (#255; was #239's override): given, the tool cannot open and says so */
         char fromGenesis[600];

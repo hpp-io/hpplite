@@ -296,7 +296,11 @@ int main(int argc, char **argv) {
         char want[40], wrote[40];
         fmt_time(atMs, want, sizeof want);
         if (rebuilt == 0) printf("\nthe database as of %s: no batch written by then", want);
-        else {
+        else if (node->lastAppliedMs == 0) {
+            /* a start from a snapshot with no batch replayed after it (#400): the snapshot's own batch is not read,
+            ** so there is no writer's time to give */
+            printf("\nthe database as of %s: through batch %llu, the snapshot's: no batch after it was written by then", want, (unsigned long long)rebuilt);
+        } else {
             fmt_time(node->lastAppliedMs, wrote, sizeof wrote);
             printf("\nthe database as of %s: through batch %llu, written %s%s", want, (unsigned long long)rebuilt, wrote,
                    node->lastAppliedMs > atMs ? " (it completes a transaction in flight at that time)" : "");
