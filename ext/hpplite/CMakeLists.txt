@@ -109,7 +109,7 @@ set(HPPLITE_SOURCES
 # L1 backends: every build has both; the endpoint picks one at run time (#35).
 # HPPLITE_USE_REAL_L1 now only decides whether the tests and examples that
 # need a chain (anvil, HPP Sepolia) are built, and keeps the test hooks out.
-list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c spend.c compress.c)
+list(APPEND HPPLITE_SOURCES l1.c l1_eth.c l1_mock.c l1_dir.c store.c spend.c compress.c tls.c)
 if(HPPLITE_USE_REAL_L1)
     message(STATUS "L1 backends: eth + mock; chain tests and examples on")
 else()
@@ -402,9 +402,11 @@ if(HPPLITE_BUILD_TESTS)
         # the chain client refuses contracts before VERSION 8 (#252), against a JSON-RPC stand-in
         add_test(NAME test_l1_threads COMMAND test_l1_threads)
         add_test(NAME test_l1_version COMMAND test_l1_version ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/rpc_stub.py)
-        # HPPLITE_CA_BUNDLE names the certificate file both curl clients trust (#269)
+        # HPPLITE_CA_BUNDLE names the certificate file both curl clients trust (#269); a certificate that could
+        # not be checked is said, with the host and the bundle (#377)
         add_test(NAME test_ca_bundle COMMAND test_ca_bundle ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/tls_stub.py)
-        # the static musl build of the tools runs in Alpine and Debian images (#269); skipped without docker
+        # the static musl build of the tools runs in Alpine and Debian images (#269), and finds a Debian's CA
+        # bundle with no HPPLITE_CA_BUNDLE (#377); skipped without docker
         add_test(NAME test_static_build COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/static_build.sh ${CMAKE_CURRENT_SOURCE_DIR}/tools/linux/static/build.sh)
         # ...of the SQLite this build was configured with, not the repo's build/ whatever the build uses (#287)
         set_tests_properties(test_static_build PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT "HPPLITE_SQLITE_SRC=${SQLITE_BUILD_DIR}")

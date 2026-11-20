@@ -214,7 +214,7 @@ What the node may spend is the deployment's, like its key: it is set in the envi
 | `HPPLITE_RELAY_CAP` | The most to pay the relay per call, in its asset's atomic units. With `relay=on` the default is 1000000 (1 USDC.e: a relayed call on HPP costs cents, #251); with a relay URL, 0 (default) pays nothing |
 | `HPPLITE_STORE_FALLBACK` | `on` (default): a store that does not answer lets the chain carry the bytes meanwhile, said once on stderr; `off`: the batch waits with the store's reason. Not past batches waiting for their anchor (#164): those wait for the store |
 | `HPPLITE_STORE_PARALLEL` | how many batch reads a replica, a verifier or a recovering sequencer keeps in flight to the store, 8 by default, up to 32; `1` reads one at a time. A far store costs a round trip a read: an anchored range is read eight batches at once (#195) |
-| `HPPLITE_CA_BUNDLE` | The certificate file (PEM) both HTTPS clients trust - the chain RPC's and the store's (#269). Unset, libcurl's own default applies (the system bundle on a stock build). For the static binary, which has no system bundle unless the image has one where it was compiled to look, and for an image that keeps its own: `HPPLITE_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt`, or a bundle copied in |
+| `HPPLITE_CA_BUNDLE` | The certificate file (PEM) both HTTPS clients trust - the chain RPC's and the store's (#269). Unset, libcurl's own default applies (the system bundle on a stock build); where the file libcurl was compiled to look for is not there - the static binary, compiled on Alpine, in a Debian or an Ubuntu image - the first of the distributions' usual files that is: `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, `/etc/ssl/ca-bundle.pem` (#377). Set it for an image that keeps its own bundle elsewhere, or has none and a bundle copied in. A certificate that could not be checked is said with the host and what it was checked against, in the node's error and `last_error`: `the certificate of <host> could not be checked: no CA bundle found; set HPPLITE_CA_BUNDLE` |
 | `HPPLITE_HOST_NAME` | The host name in the sequencer's instance id (keccak of the seed beside the file and the host name), where a platform keeps one across machines; default the machine's, or none where the seed is given (`instancefile=`) |
 | `HPPLITE_INSTANCE_FILE` | `instancefile=` from the environment (#378): the file with the instance's seed, given by a platform whose hosts are rebuilt on empty volumes |
 
@@ -457,9 +457,10 @@ ext/hpplite/tools/linux_test.sh stress   # + the 100 MB stress test
 # A static hpplite-sequencer and hpplite-verify for any Linux image (#269): built on Alpine (musl) in a
 # container, every library linked in (libcurl with OpenSSL, libsecp256k1 from source, zlib), no dynamic
 # dependency, so one binary is copied into Alpine and Debian images alike (a platform's sidecar). The
-# option behind it is -DHPPLITE_STATIC_TOOLS=ON; the image needs no libraries, only a CA bundle for HTTPS
-# (HPPLITE_CA_BUNDLE, or the distribution's at its usual path). ctest test_static_build runs the result in
-# both images; skipped without docker.
+# option behind it is -DHPPLITE_STATIC_TOOLS=ON; the image needs no libraries, only a CA bundle for HTTPS:
+# the distribution's at its usual path is found (#377), HPPLITE_CA_BUNDLE names another. ctest
+# test_static_build runs the result in both images, and against an HTTPS endpoint in a Debian one with the
+# distribution's bundle and with none; skipped without docker.
 ext/hpplite/tools/linux/static/build.sh [out-dir] [linux/amd64|linux/arm64]   # binaries in out-dir (default ext/hpplite/build_static)
 
 # ORM smoke tests on anvil: SQLAlchemy + Alembic, Django (migrate, ORM), Drizzle, Knex;

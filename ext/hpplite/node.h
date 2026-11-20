@@ -232,7 +232,7 @@ typedef struct HppliteNode {
     int wantsL1;                    /* Config named an L1 (contract/factory): local-only flush is not OK */
     char lastBatchTx[80];           /* Transaction hash of the last confirmed batch (status table) */
     int warnedNoL1;                 /* "L1 requested but not connected" said once */
-    char l1Why[300];                /* why the factory gave no rollup: the RPC's refusal of the create, a create not mined (#370) */
+    char l1Why[300];                /* why no connection came: the RPC's refusal of the create, a create not mined (#370), a certificate not checked (#377) */
     int64_t l1RetryAt;              /* a connection that did not come at open is tried again at a flush, not before this (ms) (#229) */
     int warnedNoChain;              /* "no chain configured, the log is kept" said once (#38) */
     int checkpointGiven;            /* The configuration named an interval (else the contract's is used, #44) */

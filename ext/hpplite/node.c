@@ -62,6 +62,7 @@ static int node_check_rollup(HppliteNode *node);
 #include "eth/keccak256.h"
 #include "eth/eth_client.h"
 #include "spend.h"
+#include "tls.h"
 
 /*
 ** Helper: duplicate a string using sqlite3_malloc
@@ -790,7 +791,7 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
     return 0;
 }
 
-static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
+static void node_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
     if (node->follower) return;
     if (!config->rpcUrl) return;
     if (config->hasContract || config->hasFactory) {
@@ -928,6 +929,17 @@ static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *con
             node_ensure_lease(node);          /* an audit never takes it (#5) */
         }
     }
+}
+
+/* ...and where no connection came of it because a certificate could not be checked - the RPC's, or the store's a
+** named database's rollup is looked up in - that is the reason: said once, and kept for the 'not connected' line
+** of the flushes after (#377). A static binary on a host with no CA bundle said only 'not connected' */
+static void node_auto_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) {
+    const char *zTls;
+    hpplite_tls_why_clear();
+    node_connect_l1(node, config);
+    zTls = hpplite_tls_why();
+    if (!node->l1 && node->wantsL1 && zTls && !strstr(node->l1Why, zTls)) node_no_rollup(node, "%s", zTls);
 }
 
 /*
@@ -1664,9 +1676,11 @@ static int node_ensure_lease(HppliteNode *node) {
 
     if (now < node->leaseRecheckAt) return node->hasLease;
 
+    hpplite_tls_why_clear();
     st = hpplite_l1_get_state(node->l1);
     if (!st) {
-        hpplite_error(node->ctx, "cannot read the sequencer lease from L1; not posting");
+        const char *zTls = hpplite_tls_why();         /* the RPC's certificate could not be checked (#377) */
+        hpplite_error(node->ctx, "cannot read the sequencer lease from L1%s%s; not posting", zTls ? ": " : "", zTls ? zTls : "");
         node->leaseRecheckAt = now + 5000;
         return 0;
     }

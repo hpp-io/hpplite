@@ -18,6 +18,7 @@
 #include "eth_client.h"
 #include "sha256.h"
 #include "spend.h"
+#include "tls.h"
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,7 +185,7 @@ static void storePrefetch(HppliteStore *s, char **paths, int n) {
         memset(&out[k], 0, sizeof out[k]);
         snprintf(url, sizeof url, "%s%s", s->base, paths[i]);
         curl_easy_setopt(h[k], CURLOPT_URL, url);
-        if (getenv("HPPLITE_CA_BUNDLE")) curl_easy_setopt(h[k], CURLOPT_CAINFO, getenv("HPPLITE_CA_BUNDLE"));
+        hpplite_tls_trust(h[k]);
         curl_easy_setopt(h[k], CURLOPT_TIMEOUT, 60L);
         curl_easy_setopt(h[k], CURLOPT_WRITEFUNCTION, bufWrite);
         curl_easy_setopt(h[k], CURLOPT_WRITEDATA, &out[k]);
@@ -250,7 +251,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
     if (!c) return 0;
     snprintf(url, sizeof url, "%s%s", s->base, path);
     curl_easy_setopt(c, CURLOPT_URL, url);
-    if (getenv("HPPLITE_CA_BUNDLE")) curl_easy_setopt(c, CURLOPT_CAINFO, getenv("HPPLITE_CA_BUNDLE"));   /* the certificates to trust (#269) */
+    hpplite_tls_trust(c);                               /* the certificates to trust (#269, #377) */
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, bufWrite);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, out);
@@ -278,8 +279,10 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
         }
     }
     if (hdrs) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
-    if (curl_easy_perform(c) != CURLE_OK) {
-        snprintf(s->error, sizeof s->error, "store unreachable: %s", url);
+    CURLcode rc = curl_easy_perform(c);
+    if (rc != CURLE_OK) {
+        /* a certificate that could not be checked says so, and the remedy (#377) */
+        if (!hpplite_tls_failed(rc, url, s->error, sizeof s->error)) snprintf(s->error, sizeof s->error, "store unreachable: %s", url);
     } else {
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
     }

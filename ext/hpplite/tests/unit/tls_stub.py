@@ -3,7 +3,9 @@
 RPC (eth/eth_client.c) and the store (store.c) - reach when HPPLITE_CA_BUNDLE must name the certificate that
 signed this server. Test infrastructure; nothing is sent anywhere.
 
-    tls_stub.py --port 8545 --cert cert.pem --key key.pem
+    tls_stub.py --port 8545 --cert cert.pem --key key.pem [--log asked.txt]
+
+--log: a line per request that came through the handshake (#377): the RPC method, or GET and the path.
 """
 import argparse
 import json
@@ -16,7 +18,19 @@ import rpc_stub
 
 
 class Handler(rpc_stub.Handler):
+    log = None
+
+    def asked(self, what):
+        if self.log:
+            with open(self.log, "a") as f:
+                f.write(what + "\n")
+
+    def answer(self, r):
+        self.asked(str(r.get("method")))
+        return super().answer(r)
+
     def do_GET(self):
+        self.asked("GET " + self.path)
         if self.path != "/status":
             self.send_response(404)
             self.end_headers()
@@ -34,7 +48,9 @@ def main():
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--cert", required=True)
     ap.add_argument("--key", required=True)
+    ap.add_argument("--log")
     a = ap.parse_args()
+    Handler.log = a.log
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(a.cert, a.key)
     srv = rpc_stub.Server(("127.0.0.1", a.port), Handler)

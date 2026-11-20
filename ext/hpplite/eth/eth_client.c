@@ -6,6 +6,7 @@
 #include "cJSON.h"
 #include "keccak256.h"
 #include "rlp.h"
+#include "tls.h"
 #include <curl/curl.h>
 #include <secp256k1.h>
 #include <secp256k1_recovery.h>
@@ -128,6 +129,7 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
     struct ResponseBuffer response = {0};
     struct curl_slist *headers = NULL;
 
+    hpplite_tls_why_clear();                /* what hpplite_tls_why() says after a call is that call's (#377) */
     /* After a timeout, the operations that follow (a lease read is several
     ** calls, a flush and a close several more) fail at once instead of each
     ** waiting out its own timeout: a frozen endpoint costs one timeout, not
@@ -153,7 +155,7 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
     headers = curl_slist_append(headers, "Content-Type: application/json");
     
     curl_easy_setopt(client->curl, CURLOPT_URL, client->rpc_url);
-    if (getenv("HPPLITE_CA_BUNDLE")) curl_easy_setopt(client->curl, CURLOPT_CAINFO, getenv("HPPLITE_CA_BUNDLE"));   /* the certificates to trust: a static binary has no system bundle (#269) */
+    hpplite_tls_trust(client->curl);        /* the certificates to trust: HPPLITE_CA_BUNDLE, or the distribution's where the static binary's own are not there (#269, #377) */
     curl_easy_setopt(client->curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(client->curl, CURLOPT_POSTFIELDS, request_str);
     curl_easy_setopt(client->curl, CURLOPT_WRITEFUNCTION, write_callback);
@@ -175,8 +177,8 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
         httpStatus = 0;
         if (res == CURLE_OK) curl_easy_getinfo(client->curl, CURLINFO_RESPONSE_CODE, &httpStatus);
         if (res == CURLE_OK && httpStatus != 429 && httpStatus < 500) break;
-        /* an endpoint that does not answer will not answer 2 s later either */
-        if (res == CURLE_OPERATION_TIMEDOUT) break;
+        /* an endpoint that does not answer will not answer 2 s later either, nor will a certificate check out then */
+        if (res == CURLE_OPERATION_TIMEDOUT || res == CURLE_PEER_FAILED_VERIFICATION || res == CURLE_SSL_CACERT_BADFILE) break;
         usleep((useconds_t)(250000u << attempt));            /* 0.25, 0.5, 1, 2 s */
     }
     curl_slist_free_all(headers);
@@ -185,8 +187,9 @@ static cJSON *rpc_call_locked(EthClient *client, const char *method, cJSON *para
     if (res == CURLE_OPERATION_TIMEDOUT) client->downUntil = mono_s() + 10;      /* monotonic: a wall clock stepped back must not lengthen it */
     else client->downUntil = 0;
     if (res != CURLE_OK) {
-        snprintf(client->error, sizeof(client->error), "curl error: %s", 
-                 curl_easy_strerror(res));
+        if (!hpplite_tls_failed(res, client->rpc_url, client->error, sizeof(client->error)))
+            snprintf(client->error, sizeof(client->error), "curl error: %s", curl_easy_strerror(res));
+        if (getenv("HPPLITE_ETH_DEBUG")) fprintf(stderr, "eth: %s -> %s (curl %d)\n", method, client->error, (int)res);
         free(response.data);
         return NULL;
     }
