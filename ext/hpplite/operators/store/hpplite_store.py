@@ -526,7 +526,7 @@ class Ledger:
                 if (owed >= self.args.pull_threshold or now - a.get("lastPull", 0) >= self.args.pull_interval
                         or (pull is not None and owed > pull)):
                     self.pull(a, now)
-            self.sweep(now)
+        self.sweep(now)
 
     def delete_bucket(self, b):
         da = b["da"]
@@ -547,11 +547,20 @@ class Ledger:
             self.disk.delete("c/%s" % cid)
 
     def sweep(self, now):
-        """bytes in no bucket (an interrupted put, #200), once they are old enough not to be a put in flight"""
+        """bytes in no bucket (an interrupted put, #200), once they are old enough not to be a put in flight. Not
+        under the tick's lock (#409): it reads a file for every object the store holds, and every put waited for it.
+        The lock is taken for bytes found without a reference, which are looked at again under it: a put writes the
+        bytes first and the reference after, and may find old bytes already there"""
         for f in self.disk.list("c"):
             if f.endswith(".refs") or ".tmp" in f:
                 continue
-            if self.disk.read("c/%s.refs" % f) is None:
+            if self.args.sweep_delay:
+                time.sleep(self.args.sweep_delay)
+            if self.disk.read("c/%s.refs" % f) is not None:
+                continue
+            with self.lock:
+                if self.disk.read("c/%s.refs" % f) is not None:
+                    continue
                 try:
                     if now - os.path.getmtime(self.disk.path("c/%s" % f)) >= self.args.sweep_age:
                         self.disk.delete("c/%s" % f)
@@ -1273,6 +1282,7 @@ def main():
     ap.add_argument("--park-seconds", type=int, default=MONTH, help="a parked bucket is deleted after this long")
     ap.add_argument("--tick-interval", type=float, default=3600, help="seconds between ticks: accrue, pull, park, delete, sweep")
     ap.add_argument("--sweep-age", type=int, default=3600, help="bytes in no bucket older than this are swept")
+    ap.add_argument("--sweep-delay", type=float, default=0, help="a test hook: the sweep waits this long at every object (#409)")
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--fail-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th content put or batch name answers 503

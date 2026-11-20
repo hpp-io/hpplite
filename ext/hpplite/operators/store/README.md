@@ -42,7 +42,8 @@ hpplite_store.py ... --extra-asset "0xCHIP,House Chip,1,6,1000000,exact" \
   cannot pay or the funder released it, restorable by paying; deleted
   `--park-seconds` later.
 - **Pruning** only at a prune point the sequencer signs; bytes in no bucket
-  (an interrupted put) are swept after `--sweep-age`.
+  (an interrupted put) are swept after `--sweep-age`. The sweep reads a file for
+  every object held, once a tick, and holds no put up meanwhile (#409).
 - **The bucket statement**, signed by `--signer-key`: the heights held and
   covered-until. A node commits it with each anchor.
 

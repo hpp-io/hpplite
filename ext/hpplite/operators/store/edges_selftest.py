@@ -367,6 +367,49 @@ def main():
             after = pg.get("next")
         check(code == 200 and b5.get("objects") == 26 and left == kept,
               "a prune lets go of them by height: %s objects left of %d, the 26 at or past the prune's height (%s)" % (b5.get("objects"), want_objects + 15, code))
+
+        # --- a put does not wait for the tick's sweep (#409) ---
+        # The sweep reads a file for every object the store holds; under the tick's lock every put waited for it. A
+        # store that ticks every 0.3 s and whose sweep is made slow (0.3 s an object, a test hook, so 3.6 s for the 12
+        # objects put first): bytes no bucket holds, two hours old, are in its directory; then five more puts, half a
+        # second apart, each timed.
+        p6, url6 = start_store(work, "swept", "--price-per-write", "0", "--price-per-mib-month", "0", "--tick-interval", "0.3", "--sweep-delay", "0.3")
+        procs.append(p6)
+        dom6 = eth.domain_separator("HPPLiteStore", "2", CHAIN_ID, http_("GET", url6 + "/status")[1]["domain"]["verifyingContract"])
+        seq6, fund6 = secrets.token_bytes(32), secrets.token_bytes(32)
+        da6 = eth.address(secrets.token_bytes(32)).lower()
+        code, _ = http_("POST", url6 + "/bucket/" + da6, bind_body(dom6, da6, seq6, fund6, int(time.time())))
+        check(code == 200, "bound")
+        orphan = os.path.join(work, "swept", "c", "a-put-that-never-ended")
+        with open(orphan, "wb") as f:
+            f.write(b"bytes no bucket holds")
+        os.utime(orphan, (time.time() - 7200, time.time() - 7200))
+
+        def put6(i):
+            data = b"swept past %d" % i
+            sig = eth.sign(seq6, eth.typed_digest(dom6, CONTENT_TYPE, da6, i + 1, eth.keccak256(data)))
+            t = time.monotonic()
+            code, _ = http_("POST", "%s/put?bucket=%s&height=%d" % (url6, da6, i + 1), data, {"X-HPPLite-Signature": "0x" + sig.hex()})
+            return code, time.monotonic() - t
+
+        check(all(put6(i)[0] == 200 for i in range(12)), "12 objects put")
+        t6, done = [], True
+        for i in range(12, 17):
+            time.sleep(0.5)
+            code, t = put6(i)
+            t6.append(t)
+            done = done and code == 200
+        check(done, "five more put while the store sweeps")
+        print("          (a put beside a sweep of 3.6 s and more: the slowest of five %.2f s, their sum %.2f s)" % (max(t6), sum(t6)))
+        check(max(t6) < 1.0, "a put does not wait for the sweep: the slowest of five took %.2f s" % max(t6))
+        for _ in range(100):
+            if not os.path.exists(orphan):
+                break
+            time.sleep(0.1)
+        check(not os.path.exists(orphan), "the sweep still takes bytes no bucket holds")
+        b6 = http_("GET", url6 + "/bucket/" + da6)[1]
+        held6 = sum(1 for i in range(17) if os.path.exists(os.path.join(work, "swept", "c", cid_of(b"swept past %d" % i))))
+        check(b6.get("objects") == 17 and held6 == 17, "and leaves the 17 that a bucket holds (%s in the bucket, %d files)" % (b6.get("objects"), held6))
     finally:
         for p in procs:
             p.terminate()
