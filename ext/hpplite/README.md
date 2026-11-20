@@ -968,6 +968,31 @@ a line says so), on a new rollup, or on a replica. It reads the history
 from height 1 and does not start from a snapshot: a rollup whose old
 batches are pruned (`keep=`) is not adopted onto yet.
 
+**Going back and going on (#392).** The two together are a database taken
+back to a moment and written from there, on its own rollup:
+
+    kill -USR2 <the sequencer's pid>              # with a long anchor=: the heights up to now are anchored (#396)
+    hpplite-verify '<uri>' --at <time> --keep <dir>
+    # stop the application and its sequencer
+    rm -f app.db app.db-wal app.db-shm app.db-hpplite.db*
+    cp <dir>/rebuilt.db app.db
+    hpplite-sequencer app.db '<params>&adopt=on'  # this one start; the next is an ordinary one
+
+Of what `--keep` leaves in `<dir>`, `rebuilt.db` alone is carried: the
+other files are the verifier's bookkeeping, and a file with bookkeeping
+beside it is not adopted. `rebuilt.db` is in SQLite's rollback mode
+(`journal_mode` says `delete`); an application that runs in WAL switches
+it as it does a new file, before its sequencer starts or after. The
+history stays one line: the heights left behind are in it, the file as of
+`<time>` goes whole as the next height - with no write after it too, a
+height of its own - and what is written since follows. `--at` asked later
+answers by the time of each height: a moment before the going back is the
+database as it was then, with the rows that were left behind; a moment
+after it is the database gone back. Going back a second time, to before
+the first, is the same steps. A replica, a host on an empty volume and
+`hpplite-verify` from batch 1 arrive at the application's file. One
+scenario on the real contracts holds all of it (test_anvil 70).
+
 **The soft tier for a replica (#166).** A `role=verify` connection with
 `store=` doesn't wait for the anchor. Past the anchored height, it reads the
 batches the store holds under the rollup's names, as they arrive. It takes

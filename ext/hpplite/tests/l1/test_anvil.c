@@ -3641,6 +3641,196 @@ static void test_anchor_asked(void) {
     PASS();
 }
 
+/* 70. Going back and going on (#392, somaro's "rewind"): the two halves that had their own tests, together. A
+** platform's app with its sequencer beside it (a store, anchor=24h, snapshot= and keep=) writes a history; the
+** platform asks for an anchor (SIGUSR2, #396), rebuilds the database as of a moment (hpplite-verify --at --keep),
+** puts that file - the database alone, no bookkeeping - in the app's place and starts the sequencer with adopt=on
+** (#380). Nobody writes, the sequencer stops and starts again as ever: the file is still the rewound one, and the
+** app writes on. Then a second time, to a moment before the first, the app up before its sequencer with its
+** connection kept in WAL. The history is one line: the heights left behind stay in it, so a later --at answers what
+** the database was at each moment - before the rewind, after it with nothing written, after the write that followed.
+** After all of it a replica, a host on an empty volume and hpplite-verify from batch 1 arrive at the app's file. */
+static int rewind_to(const char *vparams, long long at, const char *keep, const char *file, char *why, size_t nWhy) {
+    char cmd[1200], extra[300], out[4096] = "";
+    int rc;
+    snprintf(cmd, sizeof cmd, "rm -rf %s", keep);
+    (void)!system(cmd);
+    snprintf(extra, sizeof extra, "--at %lld --keep %s", at, keep);
+    rc = run_verify_with(vparams, extra, out, sizeof out);
+    if (rc != 0 || !strstr(out, "\nverified")) { snprintf(why, nWhy, "hpplite-verify --at %lld: exit %d: %.600s", at, rc, out); return -1; }
+    /* the file to carry is the database alone: the app's file, its WAL and the sequencer's bookkeeping go */
+    snprintf(cmd, sizeof cmd, "rm -f %s %s-wal %s-shm %s-hpplite.db %s-hpplite.db-wal %s-hpplite.db-shm %s-journal && cp %s/rebuilt.db %s", file, file, file, file, file, file, file, keep, file);
+    if (system(cmd) != 0) { snprintf(why, nWhy, "put the rebuilt file in the app's place"); return -1; }
+    return 0;
+}
+static void test_rewind_and_go_on(void) {
+    TEST("going back and going on (#392): a history at a store with snapshots; an anchor asked for, the database as of a moment (--at --keep) put in the app's place, adopt=on, an ordinary start after it, more writes; a second rewind to before the first, the app's connection kept in WAL; --at answers each moment since by its time; a replica, an empty host and hpplite-verify from batch 1 arrive at the app's file");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char *RKEY = "0x6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e";
+    static const char *SEED = "39203920392039203920392039203920392039203920392039203920392039ab";
+    static const char *APP = DIR "/host14/app.db";
+    char addr[48], cmd[900], out[2000], contract[80], base[800], params[1000], vparams[500], vout[4096] = "", why[900] = "", mode[32] = "", ls[400] = "", err[1600];
+    static const char *IS = "SELECT count(*) * 100 + coalesce(sum(n), 0) FROM notes";   /* 1 and 2: 203 */
+    long h, a, hRun[5] = {0, 0, 0, 0, 0}, aRun[5] = {0, 0, 0, 0, 0};
+    sqlite3 *app = NULL;
+    long long t0, t1, t2, tAb, tIdle, sum, rows, is, isAb = -1, isIdle = -1, is2 = -1, rows15 = -1, sum15 = -1, repRows = -1, repSum = -1;
+    int port, run = 0, rcv = -2, vrc = -2, rc15 = -1;
+    pid_t store, side = 0;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!bin || access(bin, X_OK) != 0) FAIL("hpplite-sequencer not beside hpplite-verify (HPPLITE_VERIFY_BIN)");
+    unsetenv("HPPLITE_HOST_NAME");
+    (void)!system("rm -rf " DIR "/host14 " DIR "/host15 " DIR "/store_pins70 " DIR "/rw_owner.db* " DIR "/rw_replica.db* && mkdir -p " DIR "/host14 " DIR "/host15");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", RKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    {
+        FILE *f = fopen(DIR "/rw.seed", "w");
+        if (!f) FAIL("the seed file");
+        fprintf(f, "0x%s\n", SEED);
+        fclose(f);
+    }
+    {
+        sqlite3 *owner = open_db("rw_owner.db", RKEY, NULL);
+        if (!owner) FAIL("create the rollup");
+        snprintf(contract, sizeof contract, "%s", status_text(owner, "contract"));
+        sqlite3_close(owner);
+        if (!contract[0]) FAIL("the rollup's address");
+    }
+    port = test_free_port();
+    store = start_pin_service_dir(svc, port, DIR "/store_pins70");
+    if (store < 0) FAIL("the store did not come up");
+#define RW_END() do { if (app) sqlite3_close(app); if (side > 0) stop_sidecar(side, SIGKILL, 5); kill(store, SIGTERM); waitpid(store, NULL, 0); } while (0)
+/* the sequencer beside the app, started (with `more`) and waited for; the app's write; an anchor asked for and waited for */
+#define RW_START(more) do { \
+        snprintf(params, sizeof params, "%s&datadir=" DIR "/host14%s", base, more); \
+        run++; \
+        side = spawn_sidecar(bin, APP, params, side_path(14, run, "out"), side_path(14, run, "err")); \
+        h = wait_synced(side_path(14, run, "out"), side, 90); \
+        if (h < 0) { if (h == -2) side = 0; RW_END(); FAILF("run %d of the sequencer did not say it was synced (%ld)", run, h); } \
+        hRun[run - 1] = h; \
+    } while (0)
+#define RW_WRITE(n) do { \
+        if (plain_exec(APP, "INSERT INTO notes(n) VALUES(" #n ")") != SQLITE_OK) { RW_END(); FAIL("the app writes " #n); } \
+        sleep(2); \
+    } while (0)
+#define RW_ANCHOR(nth) do { \
+        kill(side, SIGUSR2); \
+        a = anchor_line(side_path(14, run, "err"), "/host14/app.db anchored to height ", nth, side, 90); \
+        if (a < 0) { if (a == -2) side = 0; RW_END(); FAILF("run %d: the anchor asked for was not made (%ld)", run, a); } \
+        aRun[run - 1] = a; \
+    } while (0)
+#define RW_ADOPTED() do { \
+        FILE *f = fopen(side_path(14, run, "err"), "r"); \
+        err[0] = 0; \
+        if (f) { size_t got = fread(err, 1, sizeof err - 1, f); err[got] = 0; fclose(f); } \
+        if (!strstr(err, "/host14/app.db adopted as the state after height ")) { RW_END(); printf("(the sequencer said: %.900s) ", err); FAILF("run %d: the rewound file should be adopted as the state", run); } \
+    } while (0)
+#define RW_STOP() do { \
+        int rcStop = stop_sidecar(side, SIGTERM, 60); \
+        side = 0; \
+        if (rcStop != 0) { RW_END(); FAILF("run %d of the sequencer did not stop clean (%d)", run, rcStop); } \
+    } while (0)
+    snprintf(base, sizeof base, "rpc=%s&contract=%s&chainid=31337&privkey=%s&interval=300ms&store=http://127.0.0.1:%d&keeplease=on&anchor=24h&anchorclose=off&snapshot=1ms&keep=30d&instancefile=" DIR "/rw.seed",
+             RPC, contract, RKEY, port);
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", RPC, contract, RKEY, port);
+
+    /* the history: 1, (t0) 2, (t1) 3, (tAb) - each moment a whole second away from the writes beside it */
+    RW_START("");
+    if (plain_exec(APP, "CREATE TABLE notes(id INTEGER PRIMARY KEY, n INTEGER)") != SQLITE_OK) { RW_END(); FAIL("the app creates its table"); }
+    RW_WRITE(1); t0 = (long long)time(NULL); sleep(2);
+    RW_WRITE(2); t1 = (long long)time(NULL); sleep(2);
+    RW_WRITE(3); tAb = (long long)time(NULL); sleep(2);
+    RW_ANCHOR(1);
+    RW_STOP();
+
+    /* the first rewind, to t1: 1, 2 - and on: 4 */
+    if (rewind_to(vparams, t1, DIR "/rw_keep1", APP, why, sizeof why) != 0) { RW_END(); FAILF("the first rewind: %s", why); }
+    {
+        sqlite3 *f = NULL;
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_open_v2(APP, &f, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK && sqlite3_prepare_v2(f, "PRAGMA journal_mode", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
+            snprintf(mode, sizeof mode, "%s", (const char *)sqlite3_column_text(st, 0));
+        sqlite3_finalize(st);
+        sqlite3_close(f);
+        run_cmd("ls " DIR "/rw_keep1 | tr '\\n' ' '", ls, sizeof ls);
+    }
+    rows = plain_count(APP, "SELECT count(*) FROM notes"); sum = plain_count(APP, "SELECT sum(n) FROM notes");
+    if (rows != 2 || sum != 3) { RW_END(); FAILF("the database as of t1 should hold 1 and 2 (rows %lld, sum %lld)", rows, sum); }
+    if (strcmp(mode, "delete") != 0 || !strstr(ls, "rebuilt.db ")) { RW_END(); FAILF("--keep should leave rebuilt.db, in rollback mode (the README says so): '%s', '%s'", ls, mode); }
+    RW_START("&adopt=on");
+    RW_ADOPTED();
+    /* nobody writes: the rewound state is a height of its own, and the next start is an ordinary one */
+    sleep(2); tIdle = (long long)time(NULL); sleep(2);
+    RW_STOP();
+    RW_START("");
+    is = plain_count(APP, IS);
+    if (is != 203) { RW_END(); FAILF("an ordinary start after the adopt should leave the rewound file as it was: 1 and 2 (%lld)", is); }
+    RW_WRITE(4); t2 = (long long)time(NULL); sleep(2);
+    RW_ANCHOR(1);
+    /* moments asked for now: before the rewind the history left behind (1, 2, 3); after it and before any write, the rewound state (1, 2) */
+    isAb = rows_at(vparams, tAb, DIR "/rw_keep_ab", IS, &rcv);
+    if (rcv != 0 || isAb != 306) { RW_END(); FAILF("--at a moment before the first rewind, asked after it, should be the history left behind: 1, 2, 3 (exit %d, %lld)", rcv, isAb); }
+    isIdle = rows_at(vparams, tIdle, DIR "/rw_keep_idle", IS, &rcv);
+    if (rcv != 0 || isIdle != 203) { RW_END(); FAILF("--at a moment after the first rewind and before any write should be the rewound state: 1, 2 (exit %d, %lld)", rcv, isIdle); }
+    RW_STOP();
+
+    /* the second rewind, to t0 - before the first: 1 - and on: 5. The other order of a platform's start: the app is
+    ** up before its sequencer, has switched the file to WAL and keeps its connection */
+    if (rewind_to(vparams, t0, DIR "/rw_keep2", APP, why, sizeof why) != 0) { RW_END(); FAILF("the second rewind: %s", why); }
+    rows = plain_count(APP, "SELECT count(*) FROM notes"); sum = plain_count(APP, "SELECT sum(n) FROM notes");
+    if (rows != 1 || sum != 1) { RW_END(); FAILF("the database as of t0 should hold 1 (rows %lld, sum %lld)", rows, sum); }
+    if (sqlite3_open_v2(APP, &app, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK || sqlite3_busy_timeout(app, 10000) != SQLITE_OK
+        || sqlite3_exec(app, "PRAGMA journal_mode=WAL", NULL, NULL, NULL) != SQLITE_OK) { RW_END(); FAIL("the app opens the rewound file in WAL"); }
+    RW_START("&adopt=on");
+    RW_ADOPTED();
+    if (sqlite3_exec(app, "INSERT INTO notes(n) VALUES(5)", NULL, NULL, NULL) != SQLITE_OK) { RW_END(); FAIL("the app writes 5 on its kept connection"); }
+    sleep(2);
+    RW_ANCHOR(1);
+    /* the first rewind's line, asked for now: 1, 2, 4 */
+    is2 = rows_at(vparams, t2, DIR "/rw_keep_t2", IS, &rcv);
+    if (rcv != 0 || is2 != 307) { RW_END(); FAILF("--at a moment after the first rewind, asked after the second, should be 1, 2, 4 (exit %d, %lld)", rcv, is2); }
+    RW_STOP();
+    sqlite3_close(app); app = NULL;
+    rows = plain_count(APP, "SELECT count(*) FROM notes"); sum = plain_count(APP, "SELECT sum(n) FROM notes");
+
+    /* after all of it: hpplite-verify from batch 1 against the app's file; a replica; a host on an empty volume */
+    vrc = run_verify_with(vparams, "--db " DIR "/host14/app.db", vout, sizeof vout);
+    {
+        char uri[900];
+        sqlite3 *r = NULL;
+        snprintf(uri, sizeof uri, "file:" DIR "/rw_replica.db?hpplite=on&rpc=%s&contract=%s&chainid=31337&privkey=%s&role=verify&store=http://127.0.0.1:%d&datadir=" DIR "&interval=0", RPC, contract, RKEY, port);
+        if (sqlite3_open_v2(uri, &r, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL) == SQLITE_OK) { repRows = scalar(r, "SELECT count(*) FROM notes"); repSum = scalar(r, "SELECT sum(n) FROM notes"); }
+        sqlite3_close(r);
+    }
+    snprintf(params, sizeof params, "%s&datadir=" DIR "/host15", base);
+    side = spawn_sidecar(bin, DIR "/host15/app.db", params, side_path(15, 1, "out"), side_path(15, 1, "err"));
+    h = wait_synced(side_path(15, 1, "out"), side, 90);
+    if (h >= 0) {
+        rows15 = plain_count(DIR "/host15/app.db", "SELECT count(*) FROM notes");
+        sum15 = plain_count(DIR "/host15/app.db", "SELECT sum(n) FROM notes");
+        if (plain_exec(DIR "/host15/app.db", "INSERT INTO notes(n) VALUES(6)") != SQLITE_OK) rows15 = -2;
+        sleep(2);
+        rc15 = stop_sidecar(side, SIGTERM, 60);
+    } else if (h == -1) stop_sidecar(side, SIGKILL, 5);
+    side = 0;
+    RW_END();
+#undef RW_END
+#undef RW_START
+#undef RW_WRITE
+#undef RW_ANCHOR
+#undef RW_STOP
+#undef RW_ADOPTED
+    printf("(--keep left: %s, rebuilt.db in journal mode %s; the sequencer synced at %ld, anchored to %ld; rewound to t1: synced at %ld, started again at %ld, anchored to %ld; rewound to t0: synced at %ld, anchored to %ld; the app's file: rows %lld, sum %lld; verify from batch 1: exit %d; a replica: rows %lld, sum %lld; an empty host: synced %ld, rows %lld, sum %lld, stop %d) ",
+           ls, mode, hRun[0], aRun[0], hRun[1], hRun[2], aRun[2], hRun[3], aRun[3], rows, sum, vrc, repRows, repSum, h, rows15, sum15, rc15);
+    if (rows != 2 || sum != 6) FAIL("the app's file after the second rewind and a write should hold 1 and 5");
+    if (vrc != 0 || !strstr(vout, "\nverified") || strstr(vout, "MISMATCH") || strstr(vout, "from the snapshot")) { printf("\n%s", vout); FAILF("hpplite-verify from batch 1 should say verified against the app's file (exit %d)", vrc); }
+    if (repRows != 2 || repSum != 6) FAIL("a replica should arrive at 1 and 5");
+    if (h < 0 || rows15 != 2 || sum15 != 6 || rc15 != 0) FAIL("a host on an empty volume should rebuild 1 and 5, write on and stop clean");
+    PASS();
+}
+
 /* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
 ** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
 ** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
@@ -4648,6 +4838,7 @@ int main(void) {
     if (wanted(67)) test_adopt_file();
     if (wanted(68)) test_store_away_at_start();
     if (wanted(69)) test_anchor_asked();
+    if (wanted(70)) test_rewind_and_go_on();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
