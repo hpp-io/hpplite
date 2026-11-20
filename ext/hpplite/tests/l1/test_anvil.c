@@ -3978,6 +3978,94 @@ static void test_rewind_pruned(void) {
     PASS();
 }
 
+/* 72. A stop and the snapshots (#391): a rollup at a store with a snapshot at each anchor and nothing pruned
+** (keep=all). hpplite-verify with a stop read from batch 1 however far back the stop was; it begins at the newest
+** snapshot at or before the stop - found by the anchors' manifests, its root the one the chain anchored at its
+** height - and says so. --to between two snapshots, --at a moment the snapshot itself answers, a stop below the
+** first snapshot (from batch 1), and no stop (from batch 1: every step since genesis, the stronger check). */
+static long long stop_rows(const char *vparams, const char *stop, const char *dir, char *out, size_t nOut, int *pRc) {
+    char extra[300], path[300], cmd[300];
+    sqlite3 *kept = NULL;
+    long long rows = -1;
+    snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
+    (void)!system(cmd);
+    snprintf(extra, sizeof extra, "%s --keep %s", stop, dir);
+    out[0] = 0;
+    *pRc = run_verify_with(vparams, extra, out, nOut);
+    snprintf(path, sizeof path, "%s/rebuilt.db", dir);
+    if (access(path, R_OK) == 0 && sqlite3_open_v2(path, &kept, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) rows = scalar(kept, "SELECT count(*) FROM n");
+    sqlite3_close(kept);
+    return rows;
+}
+static void test_stop_nearest_snapshot(void) {
+    TEST("a stop begins at the newest snapshot at or before it (#391): snapshots at 3, 5 and 7, nothing pruned; hpplite-verify --to 6 from the one at 5, --to 5 and --at a moment after it and before batch 6 the one at 5 itself, --to 4 from the one at 3, --to 2 and no stop from batch 1");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char *NKEY = "0x7070707070707070707070707070707070707070707070707070707070707070";
+    static const int ends[] = { 3, 5, 7 };
+    char addr[48], cmd[600], extra[300], vparams[500], contract[80] = "", at[60], out[6][8192];
+    long long tAfter5 = 0, rows[6];
+    int port, b = 0, rc[6], k;
+    pid_t pid;
+    sqlite3 *w;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    (void)!system("rm -rf " DIR "/store_pins72 " DIR "/ns_writer.db* " DIR "/ns_keep*");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", NKEY);
+    if (run_cmd(cmd, out[0], sizeof out[0]) != 0 || strncmp(out[0], "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out[0]);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    port = test_free_port();
+    pid = start_pin_service_dir(svc, port, DIR "/store_pins72");
+    if (pid < 0) FAIL("the store did not come up");
+#define NS_END() do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } while (0)
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&anchor=0&snapshot=1ms", port);
+    w = open_db("ns_writer.db", NKEY, extra);
+    if (!w) { NS_END(); FAIL("open writer"); }
+    sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    for (k = 0; k < 3; k++) {
+        /* a snapshot's age is counted in whole seconds: each anchor is to make one; and a moment after the
+        ** snapshot at 5 and before batch 6 */
+        if (k) { sleep(2); if (k == 2) tAfter5 = (long long)time(NULL); sleep(2); }
+        while (b < ends[k]) {
+            sqlite3_exec(w, "INSERT INTO n(v) VALUES(hex(randomblob(500)))", NULL, NULL, NULL);
+            if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); NS_END(); FAIL("a batch through the store"); }
+            b++;
+        }
+        if (scalar(w, "SELECT hpplite_anchor()") != ends[k] || scalar(w, "SELECT snapshot_height FROM hpplite_status") != ends[k]) {
+            printf("(anchor %d: %s) ", ends[k], status_text(w, "last_error")); sqlite3_close(w); NS_END(); FAIL("an anchor with a snapshot at its height");
+        }
+    }
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    sqlite3_close(w);
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", RPC, contract, NKEY, port);
+    snprintf(at, sizeof at, "--at %lld", tAfter5);
+    rows[0] = stop_rows(vparams, "--to 6", DIR "/ns_keep0", out[0], sizeof out[0], &rc[0]);
+    rows[1] = stop_rows(vparams, at, DIR "/ns_keep1", out[1], sizeof out[1], &rc[1]);
+    rows[2] = stop_rows(vparams, "--to 4", DIR "/ns_keep2", out[2], sizeof out[2], &rc[2]);
+    rows[3] = stop_rows(vparams, "--to 2", DIR "/ns_keep3", out[3], sizeof out[3], &rc[3]);
+    rows[4] = stop_rows(vparams, "", DIR "/ns_keep4", out[4], sizeof out[4], &rc[4]);
+    rows[5] = stop_rows(vparams, "--to 5", DIR "/ns_keep5", out[5], sizeof out[5], &rc[5]);
+    NS_END();
+#undef NS_END
+    printf("(rows: --to 6: %lld, --to 5: %lld, --at after the snapshot at 5: %lld, --to 4: %lld, --to 2: %lld, no stop: %lld) ", rows[0], rows[5], rows[1], rows[2], rows[3], rows[4]);
+    if (rc[0] != 0 || rows[0] != 6 || !strstr(out[0], "verified from the snapshot at 5, the newest at or before the stop") || !strstr(out[0], "1 batches were replayed after it")
+        || !strstr(out[0], "the database as of batch 6: state root"))
+        FAILF("--to 6 should begin at the snapshot at 5, replay batch 6 and say so; exit %d, rows %lld\n%s", rc[0], rows[0], out[0]);
+    if (rc[5] != 0 || rows[5] != 5 || !strstr(out[5], "verified from the snapshot at 5, the newest at or before the stop") || !strstr(out[5], "0 batches were replayed after it")
+        || !strstr(out[5], "the database as of batch 5: state root"))
+        FAILF("--to 5 is the snapshot at 5 itself, its root the one anchored there; exit %d, rows %lld\n%s", rc[5], rows[5], out[5]);
+    if (rc[1] != 0 || rows[1] != 5 || !strstr(out[1], "verified from the snapshot at 5, the newest at or before the stop") || !strstr(out[1], "through batch 5, the snapshot's"))
+        FAILF("--at a moment after the snapshot at 5 and before batch 6 should be that snapshot; exit %d, rows %lld\n%s", rc[1], rows[1], out[1]);
+    if (rc[2] != 0 || rows[2] != 4 || !strstr(out[2], "verified from the snapshot at 3, the newest at or before the stop"))
+        FAILF("--to 4 should begin at the snapshot at 3; exit %d, rows %lld\n%s", rc[2], rows[2], out[2]);
+    if (rc[3] != 0 || rows[3] != 2 || strstr(out[3], "from the snapshot"))
+        FAILF("--to 2, below the first snapshot, is read from batch 1; exit %d, rows %lld\n%s", rc[3], rows[3], out[3]);
+    if (rc[4] != 0 || rows[4] != 7 || strstr(out[4], "from the snapshot") || !strstr(out[4], "chain hash over 7 batches: matches"))
+        FAILF("without a stop every batch from batch 1 is read; exit %d, rows %lld\n%s", rc[4], rows[4], out[4]);
+    PASS();
+}
+
 /* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
 ** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
 ** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
@@ -4987,6 +5075,7 @@ int main(void) {
     if (wanted(69)) test_anchor_asked();
     if (wanted(70)) test_rewind_and_go_on();
     if (wanted(71)) test_rewind_pruned();
+    if (wanted(72)) test_stop_nearest_snapshot();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

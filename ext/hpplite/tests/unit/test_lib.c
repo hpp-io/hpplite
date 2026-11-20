@@ -157,6 +157,8 @@ HppliteNode *test_open_node(const char *dbPath, HppliteL1 *l1, const TestNodeOpt
     if (o->funder) { memcpy(config.funder, o->funder, 20); config.hasFunder = 1; }
     config.snapshotIntervalMs = o->snapshotMs;
     config.fromSnapshot = o->fromSnapshot;
+    config.syncTo = o->syncTo;
+    config.syncAtMs = o->syncAtMs;
     config.keepSeconds = o->keepSeconds;
     config.storeCap = o->storeCap;
     config.storeFallback = !o->storeFallbackOff;

@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #include <fcntl.h>
 #include <math.h>
 
@@ -1971,6 +1972,65 @@ static int restart_other_batch(const char *url) {
     hpplite_l1_disconnect(l1);
     return f0 == 0 && s0 == 0 && strstr(e0, "the store holds batch 4 past the anchor") && strstr(e0, "adopt=on") && rows == 4 && other == 1;
 }
+/* A stop and the snapshots (#391): a verifier with a stop (hpplite-verify --to/--at) read from batch 1 - or, pruned,
+** from the oldest snapshot kept - however far back the stop: a rebuild to a point one day back replayed the whole
+** history. With a stop it begins at the newest snapshot at or before it: its root is the one the chain anchored at
+** its height, as for the oldest. Found by the anchors' manifests, each naming the latest snapshot of its time. */
+static int stop_case(const char *url, HppliteL1 *l1, const unsigned char *key, const char *id, uint64_t to, uint64_t atMs, int *pRows, long long *pSnap) {
+    TestNodeOpts vo = { .storeUrl = url, .verifyOnly = 1, .nodeId = id, .privkey = key, .syncTo = to, .syncAtMs = atMs };
+    char file[64];
+    HppliteNode *v;
+    long long height;
+    snprintf(file, sizeof file, "%s.db", id);
+    v = test_open_node(tpath(file), l1, &vo);
+    if (!v) { *pRows = -2; *pSnap = -2; return -1; }
+    *pRows = count_rows(v->db, "t");
+    *pSnap = status_int(v->db, "snapshot_height");
+    height = status_int(v->db, "height");
+    v->l1 = NULL;
+    hpplite_node_destroy(v);
+    return (int)height;
+}
+static void test_stop_nearest_snapshot(const char *url) {
+    TEST("a stop begins at the newest snapshot at or before it (#391): snapshots at 3, 5, 7 and 8; a verifier to 6 from the one at 5, to 5 from the one at 5, to 4 from the one at 3, to 2 from batch 1, to a time between the anchors at 5 and 7 from the one at 5; without a stop from batch 1");
+    static const unsigned char kseq[32] = { [31] = 0x7d };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "ns_w", .privkey = kseq, .snapshotMs = 1 };
+    HppliteNode *w = test_open_node(tpath("ns_w.db"), l1, &o);
+    struct timeval tv;
+    uint64_t tMid;
+    int i, rows[6], h[6], bad = 0;
+    long long snap[6];
+    static const int wantRows[6] = { 6, 5, 4, 2, 5, 8 }, wantSnap[6] = { 5, 5, 3, 0, 5, 0 };
+    if (!w) FAIL("open");
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('one of the first three')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 3) { hpplite_node_destroy(w); FAIL("the anchor 1-3"); }
+    sleep(2);                                     /* a snapshot's age is counted in whole seconds: each anchor here is to make one */
+    for (i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('four and five')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 5) { hpplite_node_destroy(w); FAIL("the anchor 4-5"); }
+    sleep(2); gettimeofday(&tv, NULL); tMid = (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000; sleep(2);
+    for (i = 0; i < 2; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('six and seven')", NULL); hpplite_node_flush_batch(w); }
+    if (hpplite_node_anchor(w) != 7) { hpplite_node_destroy(w); FAIL("the anchor 6-7"); }
+    sleep(2);
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('eight')", NULL); hpplite_node_flush_batch(w);
+    if (hpplite_node_anchor(w) != 8) { hpplite_node_destroy(w); FAIL("the anchor 8"); }
+    h[0] = stop_case(url, l1, kseq, "ns_to6", 6, 0, &rows[0], &snap[0]);
+    h[1] = stop_case(url, l1, kseq, "ns_to5", 5, 0, &rows[1], &snap[1]);
+    h[2] = stop_case(url, l1, kseq, "ns_to4", 4, 0, &rows[2], &snap[2]);
+    h[3] = stop_case(url, l1, kseq, "ns_to2", 2, 0, &rows[3], &snap[3]);
+    h[4] = stop_case(url, l1, kseq, "ns_at", 0, tMid, &rows[4], &snap[4]);
+    h[5] = stop_case(url, l1, kseq, "ns_all", 0, 0, &rows[5], &snap[5]);
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    printf("(rows/from the snapshot at: to 6: %d/%lld, to 5: %d/%lld, to 4: %d/%lld, to 2: %d/%lld, at a time between 5 and 7: %d/%lld, no stop: %d/%lld) ",
+           rows[0], snap[0], rows[1], snap[1], rows[2], snap[2], rows[3], snap[3], rows[4], snap[4], rows[5], snap[5]);
+    for (i = 0; i < 6; i++) if (rows[i] != wantRows[i] || snap[i] != wantSnap[i] || h[i] != wantRows[i] + 1) bad = 1;
+    if (bad) FAIL("each stop should begin at the newest snapshot at or before it and end at the stop: 6/5, 5/5, 4/3, 2/0, 5/5; no stop 8/0");
+    PASS();
+}
+
 /* adopt=on onto a history pruned at the store (#395): the adopt read the history from height 1, and a rollup that
 ** prunes (keep=) has no batch 1 - a platform's tier with a bounded history could not go back in place, nor restore
 ** its copy onto a new host. The adopt writes none of the history to the file; it needs where the history ends. It
@@ -2433,6 +2493,7 @@ int main(int argc, char **argv) {
     test_recovery_adopt(url);
     test_adopt_with_bookkeeping(url);
     test_adopt_pruned(url);
+    test_stop_nearest_snapshot(url);
     test_recovery_file_held(url);
     test_restart_with_commits(url);
     test_soft_replica(url);

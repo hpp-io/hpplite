@@ -779,6 +779,20 @@ height stays, its own posted root matched; checkpoints past it are not compared.
 every batch its writer wrote by then, by the time each batch carries; a transaction in
 flight at that moment is completed, never left halfway; with `--keep`, the database as of
 that time stays.
+With a stop the rebuild begins at the newest snapshot at or before it (#391),
+on a rollup with `snapshot=`, pruned or not: what is asked for is the state at
+a point, and a rebuild to yesterday does not replay the history before
+yesterday's snapshot. The snapshot is found by the anchors' manifests - each
+names the latest snapshot of its time, so the anchors are halved, at most
+twenty reads of the chain and the store for half a million batches - and
+checked like any other: its root and chain hash are the ones the chain
+anchored at its height. The tool says `verified from the snapshot at <h>,
+the newest at or before the stop`, and its claim is the one below (#232),
+from that snapshot. A stop before the first snapshot is read from batch 1.
+A moment the snapshot itself answers - after it was made, before the next
+batch - says `through batch <h>, the snapshot's` (#400). For every step
+since genesis checked, run it without a stop: that reads every batch from
+batch 1, the stop's height among them.
 A history pruned at the store (`keep=`, #223) has no batch 1 to read: the
 rebuild then starts from the oldest snapshot the last anchor still names
 (#224) - its root checked against the one the chain anchored
@@ -794,7 +808,8 @@ check, every step since genesis - is only possible on a rollup without
 defaults follow from this, and neither is a setting (#255): a replica
 starts from the latest snapshot (it wants the state, fast); a verifier
 starts from batch 1 and falls back to the oldest snapshot kept only when
-batch 1 is pruned, saying so on stderr.
+batch 1 is pruned, saying so on stderr; a verifier with a stop wants the
+state at a point, and starts from the newest snapshot at or before it.
 A verifier never posts, never claims the lease and never creates a rollup;
 `role=verify` is also usable from any connection that only wants to audit.
 It needs the wallet key or a viewing key the writer granted (batches are encrypted; see Keys).
@@ -1009,9 +1024,9 @@ the first, is the same steps. A replica, a host on an empty volume and
 `hpplite-verify` from batch 1 arrive at the application's file. One
 scenario on the real contracts holds all of it (test_anvil 70). On a
 history pruned at the store (`keep=`) the steps are the same for a moment
-inside what is kept - `--at` rebuilds from the oldest snapshot kept and
-cannot answer for a moment before it was made - and a second scenario
-holds that (test_anvil 71, #395).
+inside what is kept - `--at` rebuilds from the newest snapshot at or
+before the moment (#391) and cannot answer for a moment before the oldest
+kept was made - and a second scenario holds that (test_anvil 71, #395).
 
 **The soft tier for a replica (#166).** A `role=verify` connection with
 `store=` doesn't wait for the anchor. Past the anchored height, it reads the

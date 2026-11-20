@@ -2747,7 +2747,52 @@ static const char *node_snapshot_open_file(HppliteNode *node, uint64_t h, const 
     return why;
 }
 
-static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, int earliest, int adopting) {
+/* The newest snapshot at or before a verifier's stop (#391). A manifest names the latest snapshot of its anchor's
+** time (and the oldest kept); the ones between are named by the manifests of the anchors of their time, and both a
+** snapshot's height and the time it was made only grow from one anchor to the next. So the anchors are halved: the
+** manifest of the range a height is inside names a snapshot at or before the stop - it or a later one is the answer -
+** or one past it, or none (pruned below the oldest kept, or from before snapshot= was set: none below it either).
+** A manifest the store does not give is taken as none: what is found is at or before the stop whatever was missed,
+** and it is checked against the chain like any other. 0 and the snapshot, -1 none */
+static int node_snapshot_before_stop(HppliteNode *node, uint64_t lastBatch, uint64_t *pHeight, char zIndex[64], int64_t *pAt, unsigned char sha[32]) {
+    uint64_t lo = 1, hi = node->syncTo && node->syncTo < lastBatch ? node->syncTo : lastBatch;
+    int found = -1;
+    while (lo <= hi) {
+        uint64_t mid = lo + (hi - lo) / 2, h = 0, from, to;
+        int64_t at = 0;
+        char ix[64], cid[64];
+        unsigned char ixSha[32];
+        HppliteRange r;
+        uint8_t *text;
+        size_t n = 0;
+        cJSON *m = NULL;
+        memset(&r, 0, sizeof r);
+        if (hpplite_l1_get_range(node->l1, mid, &r) != 0 || r.fromHeight == 0 || r.fromHeight > mid || r.toHeight < mid) {
+            hpplite_l1_range_clear(&r);
+            lo = mid + 1;                                   /* a batch on the chain itself: no anchor here names a snapshot */
+            continue;
+        }
+        from = r.fromHeight; to = r.toHeight;
+        hpplite_store_cid_from_sha256(r.manifestDigest, cid);
+        text = node_store_get_checked(node, cid, r.manifestDigest, &n);
+        if (text) m = cJSON_ParseWithLength((const char *)text, n);
+        free(text);
+        hpplite_l1_range_clear(&r);
+        if (m && node_manifest_snapshot(m, &h, ix, &at, ixSha) == 0 && h >= 2) {
+            if ((node->syncTo && h > node->syncTo) || (node->syncAtMs && (uint64_t)at * 1000 > node->syncAtMs)) hi = from - 1;
+            else {
+                *pHeight = h; *pAt = at; snprintf(zIndex, 64, "%s", ix); memcpy(sha, ixSha, 32);
+                found = 0;
+                lo = to + 1;
+            }
+        } else lo = to + 1;
+        cJSON_Delete(m);
+    }
+    return found;
+}
+
+/* `which`: 0 the latest snapshot, 1 the oldest still kept, 2 the newest at or before the stop */
+static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, int which, int adopting) {
     HppliteCtx *ctx = node->ctx;
     cJSON *m, *ix = NULL, *chunks = NULL, *c;
     uint64_t h = 0;
@@ -2765,9 +2810,13 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
     HppliteBatch *batch = NULL;
     const char *why = NULL;
     node->snapshotPastStop = 0;
+    if (which == 2) {
+        if (node_snapshot_before_stop(node, lastBatch, &h, zIndex, &at, ixSha) != 0) return 0;
+        goto chosen;
+    }
     m = node_range_manifest(node, lastBatch);
     if (!m || node_manifest_snapshot(m, &h, zIndex, &at, ixSha) != 0 || h < 2) { cJSON_Delete(m); return 0; }
-    if (earliest) {
+    if (which == 1) {
         /* the oldest snapshot still kept (keep=, #223; #224, "earliest" #257) - the most history verified */
         uint64_t eh = 0; int64_t eat = 0; char eIndex[64]; unsigned char eSha[32];
         if (node_manifest_snapshot_key(m, "earliest", &eh, eIndex, &eat, eSha) == 0 && eh >= 2 && eh < h) {
@@ -2777,6 +2826,7 @@ static int node_start_from_snapshot_at(HppliteNode *node, uint64_t lastBatch, in
     cJSON_Delete(m);
     if (node->syncTo && h > node->syncTo) { node->snapshotPastStop = h; return 0; }                         /* a stop before it (#206): from batch 1 */
     if (node->syncAtMs && (uint64_t)at * 1000 > node->syncAtMs) { node->snapshotPastStop = h; return 0; }  /* ...or a time before it was made (#205) */
+chosen:
     memset(&r, 0, sizeof r);
     ix = node_snapshot_index(node, zIndex, ixSha);
     if (!ix) why = "its index is not at the store, or not the one the anchor named";
@@ -4063,6 +4113,15 @@ static int node_sync_from_l1(HppliteNode *node, int *pHead) {
         ** over (#380): its bookkeeping begins at that snapshot's height, whatever its application has committed
         ** meanwhile, and the batches after it are read as from batch 1 (#395) */
         int started = node->adopting ? node_start_from_snapshot_at(node, lastBatch, 0, 1) : node_start_from_snapshot(node, lastBatch, 0);
+        if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
+        if (started > 0) synced++;
+    }
+    if ((node->syncTo || node->syncAtMs) && node->config.verifyOnly && node->pm && node->store && node->ctx->blockHeight == 1 && lastBatch >= 2
+        && hpplite_l1_has_ranges(node->l1) && hpplite_pagemode_captured(node->pm) == 0 && hpplite_pagemode_pending(node->pm) == 0) {
+        /* a verifier with a stop (#391): what is asked for is the state at a point, and the rebuild begins at the newest
+        ** snapshot at or before it - its root the one the chain anchored at its height - not at batch 1 with the whole
+        ** history before the point to replay. None at or before the stop: from batch 1, as without one */
+        int started = node_start_from_snapshot_at(node, lastBatch, 2, 0);
         if (started < 0) { node->state = HPPLITE_STATE_ERROR; return -1; }
         if (started > 0) synced++;
     }

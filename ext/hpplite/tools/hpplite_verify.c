@@ -25,6 +25,10 @@
 ** its root checked against the one the chain anchored at its height, and
 ** says "verified from the snapshot at h". --to/--at before it cannot be met.
 **
+** With a stop (--to/--at) the rebuild begins at the newest snapshot at or
+** before the stop (#391), pruned or not, and says so: the state at a point
+** is what is asked for. Without a stop every batch from batch 1 is read.
+**
 ** --at <time> (unix seconds, or YYYY-MM-DDTHH:MM:SSZ): point-in-time recovery
 ** (#205) - every batch its writer wrote by then, by the time each batch
 ** carries; a transaction in flight at that moment is completed, never left
@@ -287,8 +291,14 @@ int main(int argc, char **argv) {
     }
     printf("rollup %s: %llu batches on chain, %llu replayed", contract, (unsigned long long)onChain, (unsigned long long)rebuilt);
     if (stopAt) printf(" (--to %llu)", (unsigned long long)stopAt);
-    if (fromSnap > 0 && rebuilt >= target) {
-        /* a verifier starts from a snapshot only when batch 1 could not be read (#239, #255): the prune is the node's finding */
+    if (fromSnap > 0 && rebuilt >= target && (stopAt || atMs) && !node->triedOldestSnapshot) {
+        /* a stop (#391): the state at a point is what is asked for, and the rebuild began at the newest snapshot at or
+        ** before it; the batches before it were not read, pruned or not. #232's claim, from that snapshot */
+        printf("\nverified from the snapshot at %lld, the newest at or before the stop: the batches before it were not read (without a stop every batch from batch 1 is); "
+               "its root is the one the chain anchored there, and %llu batches were replayed after it",
+               (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
+    } else if (fromSnap > 0 && rebuilt >= target) {
+        /* without a stop a verifier starts from a snapshot only when batch 1 could not be read (#239, #255): the prune is the node's finding */
         printf("\nverified from the snapshot at %lld: the batches below it are pruned at the store (keep=); its root is the one the chain anchored there, and %llu batches were replayed after it",
                (long long)fromSnap, (unsigned long long)(rebuilt - (uint64_t)fromSnap));
     }
