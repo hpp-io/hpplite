@@ -749,6 +749,68 @@ static void test_reads_ahead(const char *dir) {
     PASS();
 }
 
+/* 6e3. A sync that stops midway (#403): a sequencer on a file behind the chain applies the history's pages in
+** rollback-journal mode and switches back to WAL when the sync ends; one that stops at a read that failed returns
+** before the switch. The WAL upkeep ran at the next tick all the same: its pin is a read transaction, in that mode a
+** SHARED lock on the file, the next pin taken before the last is let go - and every later try read its batch and
+** could not write it ("its pages could not be written (rc=5)") until the process was started again. A new host with
+** a timer, 40 anchored batches, the store failing one read in the middle: the host arrives by its own tries */
+static void test_sync_stopped_midway(const char *dir) {
+    TEST("a new host's sync stops at a read that failed, midway through the history (#403): its timer's next tries go on and arrive; no restart");
+    int port = test_free_port();
+    char url[64], storeDir[600], e0[200] = "", e1[200] = "";
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x37 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = NULL;
+    TestNodeOpts o;
+    int i, rows = -1;
+    long long h0 = 0, h1 = 0;
+    uint64_t own = 0;
+    double t0;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/midway_pins", test_dir());
+    setenv("HPPLITE_STORE_FAIL_GET", "12", 1);                    /* the 12th object read: a manifest and ten batches before it */
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    unsetenv("HPPLITE_STORE_FAIL_GET");
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
+#define MIDWAY_DONE() do { unsetenv("HPPLITE_STORE_PARALLEL"); if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); } while (0)
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "midway_a"; o.privkey = kseq;
+    if (!(w = test_open_node(tpath("midway_a.db"), l1, &o))) { MIDWAY_DONE(); FAIL("open the writer"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 40; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('the history')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { MIDWAY_DONE(); FAIL("a flush"); }
+        if (i % 20 == 19 && hpplite_node_anchor(w) != (uint64_t)i + 1) { MIDWAY_DONE(); FAIL("an anchor"); }
+    }
+    hpplite_node_stop_timer(w);                                   /* the machine is gone, the file with it */
+    w->ownsL1 = 0; w->l1 = NULL;
+    hpplite_node_destroy(w); w = NULL;
+    hpplite_l1_mock_advance_time(l1, 400);
+    setenv("HPPLITE_STORE_PARALLEL", "1", 1);                     /* one read at a time: the one that fails is the one asked for, not one read ahead */
+    o.nodeId = "midway_b"; o.intervalMs = 100;
+    if (!(w = test_open_node(tpath("midway_b.db"), l1, &o))) { MIDWAY_DONE(); FAIL("open the new host"); }
+    h0 = status_int(w->db, "height");
+    snprintf(e0, sizeof e0, "%s", status_text(w->db, "last_error"));
+    hpplite_node_start_timer(w);                                  /* as hpplite_open does: the tries from here are its ticks */
+    for (t0 = now_s(); now_s() - t0 < 12 && (h1 = status_int(w->db, "height")) != 41; ) usleep(200 * 1000);
+    snprintf(e1, sizeof e1, "%s", status_text(w->db, "last_error"));
+    if (h1 == 41) {
+        rows = count_rows(w->db, "t");
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('the new host')", NULL);
+        own = hpplite_node_flush_batch(w);
+    }
+    printf("(after the open: height %lld, '%.110s'; %.1f s of its timer later: height %lld, rows %d, '%.110s'; its own batch at %llu) ",
+           h0, e0, now_s() - t0, h1, rows, e1, (unsigned long long)own);
+    MIDWAY_DONE();
+#undef MIDWAY_DONE
+    if (h0 < 2 || h0 >= 41) FAIL("the test's premise: the open's sync stops inside the history");
+    if (h1 != 41 || rows != 40) FAIL("the new host should arrive at the chain's height by its own tries");
+    if (own != 41) FAIL("its own batch does not go after the history");
+    PASS();
+}
+
 /* 6f. A store that was down at open (#244): the first put after it answers must go through - the client's
 ** "keeps buckets" flag comes from /status, and the node told it the rollup's address only once it knew that */
 static void test_store_down_at_open(const char *dir) {
@@ -2558,6 +2620,7 @@ int main(int argc, char **argv) {
     test_store_down_at_open(dir);
     test_recovery_store_down(dir);
     test_reads_ahead(dir);
+    test_sync_stopped_midway(dir);
     test_restart_store_down(dir);
     test_snapshot_name_refused(dir);
     test_manifest_short_hex(url);

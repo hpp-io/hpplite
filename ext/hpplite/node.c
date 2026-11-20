@@ -4317,11 +4317,15 @@ static void node_pins_close(HppliteNode *node) {
 /* the WAL's upkeep for a page-mode sequencer: the new pin, the poll (frames
 ** another connection or process committed, #153), the old pin let go, the
 ** checkpoint when due. From the timer each tick, and from a commit hook at
-** 1000 frames when no timer runs */
+** 1000 frames when no timer runs. None while the file is out of WAL for a
+** sync's pages (#403): there is no WAL to keep, and a pin there is a read
+** lock on the file - a sync that stopped midway leaves the file so until
+** its next try ends, and with a pin held no try could write its batch */
 static void node_wal_maintenance(void *pArg) {
     HppliteNode *node = pArg;
     sqlite3 *fresh;
     if (!node || !node->pm || node->config.verifyOnly || !node->ctx || !node->ctx->zWalKey || !node->walMaintMutex) return;
+    if (node->pagesWalSuspended) return;
     if (pthread_mutex_trylock((pthread_mutex_t *)node->walMaintMutex) != 0) return;   /* one at a time; the other's poll covers this */
     fresh = node_pin_open(node, !node->pinActive);
     if (fresh) sqlite3_exec(fresh, "BEGIN; SELECT count(*) FROM sqlite_schema", NULL, NULL, NULL);   /* its snapshot: the WAL as it is now */
