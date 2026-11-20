@@ -326,7 +326,15 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   "this file is not the rollup's state yet". The rest goes to
   stderr. SIGUSR1 prints one line of the node's status there (height,
   pending, sequencer, lease, state, last error) - one sent while the open
-  has not returned is answered when it has (#383); commits pending for
+  has not returned is answered when it has (#383). SIGUSR2 asks for an
+  anchor now (#396): what is pending is flushed to the store and the
+  batches there are anchored in one commitment, whatever `anchor=` says,
+  with one line - `anchored to height N`, `nothing to anchor past height N`
+  (no transaction is sent), or `not anchored: ` and why; the timer counts
+  on from there. A platform whose sequencer runs beside the application
+  asks so before a rebuild to a moment (`hpplite-verify --at` reaches the
+  last anchor). In `--dir` mode every database answers, on stdout. Commits
+  pending for
   `HPPLITE_STUCK_SECONDS` (30) with nothing posted are said once, with the
   node's last error (#368). In `--dir` mode SIGUSR1 prints a status line
   per database on stdout. A database file replaced or removed under the

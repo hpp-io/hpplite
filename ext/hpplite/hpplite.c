@@ -807,6 +807,10 @@ uint64_t hpplite_anchor(sqlite3 *db) {
     return hpplite_node_anchor(node);
 }
 
+int hpplite_anchor_now(sqlite3 *db, uint64_t *pHeight) {
+    return hpplite_node_anchor_rc(hppliteFindNode(db), pHeight);
+}
+
 static void hpplite_anchor_func(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     (void)argc; (void)argv;
     sqlite3_result_int64(ctx, (sqlite3_int64)hpplite_anchor(sqlite3_context_db_handle(ctx)));

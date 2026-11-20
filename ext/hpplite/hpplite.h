@@ -401,6 +401,10 @@ uint64_t hpplite_check_flush(sqlite3 *db);
 /* Anchor on the chain every batch the store holds since the last anchor (#164): the
 ** last height anchored, 0 when there was nothing to anchor or the chain did not take it */
 uint64_t hpplite_anchor(sqlite3 *db);
+/* The same, saying which (#396): 1 anchored, 0 nothing past the last anchor, -1 the store or the chain did not take
+** it (hpplite_status.last_error says), -2 this connection does not anchor (no store, a verifier, a chain without
+** ranges, not an HPPLite connection); *pHeight the anchored height after */
+int hpplite_anchor_now(sqlite3 *db, uint64_t *pHeight);
 
 /*
 ** Get current state root.

@@ -3061,6 +3061,11 @@ static void test_dir_sequencer(void) {
     long req0 = proxy_stat(modeFile, "requests");
     sleep(30);
     long idle = proxy_stat(modeFile, "requests") - req0;
+    if (!why) {                                              /* SIGUSR2 (#396): every database answers once; none has a store to anchor from here */
+        kill(pid, SIGUSR2);
+        if (!dir_wait(out, ": not anchored: this node keeps no batches at a store", n, 30)) why = "SIGUSR2: every database should answer the anchor asked for, once (#396)";
+        else { sleep(2); if (dir_lines(out, ": not anchored: ") != n) why = "SIGUSR2: one answer per database (#396)"; }
+    }
     int stopRc = stop_sidecar(pid, SIGTERM, 90);
     printf("\n    %d databases (+1 added, 1 removed): rollups created in %.1f s, all synced %.1f s after the start; the process: %ld threads (%.1f per db), %ld open files (%.1f per db); idle RPC %ld requests in 30 s (%.1f per db per minute); SIGTERM exit %d ",
            n, tCreate, tSynced, thr, (double)thr / n, fds, (double)fds / n, idle, idle * 2.0 / n, stopRc);
@@ -3519,6 +3524,120 @@ static void test_store_away_at_start(void) {
     printf("(the lost host synced at %ld; the successor held its line, then synced at %ld with %lld of the lost host's rows, stop %d, verify %d) ", h11, h12, notes, rc12, vrc);
     if (h12 < 3 || notes != 2 || rc12 != 0) FAIL("the store back, the successor should read the lost host's heights, say the line and stop clean");
     if (vrc != 0 || !strstr(vout, "\nverified") || strstr(vout, "MISMATCH")) { printf("\n%s", vout); FAIL("hpplite-verify should say verified against the successor's file"); }
+    PASS();
+}
+
+/* 69. An anchor asked of hpplite-sequencer from outside (#396): the sequencer is a process of its own beside the
+** application, anchor=24h, and nothing outside it could ask for an anchor - SIGUSR2's default ended the process. It
+** flushes what is pending and anchors what the store holds now: "anchored to height N" on stderr, the process up, a
+** rebuild to a time (hpplite-verify --at, which reaches the last anchor) has the rows; asked again with nothing new
+** it says so and sends no transaction; a commit made just before the next one is in it */
+static int g_askStatus;             /* how the sequencer ended, where anchor_line saw it end */
+static long anchor_line(const char *path, const char *what, int nth, pid_t pid, double secs) {
+    double t0 = now_s();
+    do {
+        FILE *f = fopen(path, "r");
+        char line[900];
+        int seen = 0;
+        if (f) {
+            while (fgets(line, sizeof line, f)) {
+                char *q = strstr(line, what);
+                if (q && ++seen == nth) { fclose(f); return atol(q + strlen(what)); }
+            }
+            fclose(f);
+        }
+        if (waitpid(pid, &g_askStatus, WNOHANG) != 0) return -2;
+        usleep(100000);
+    } while (now_s() - t0 < secs);
+    return -1;
+}
+static long long rows_at(const char *vparams, long long at, const char *dir, const char *sql, int *pRc) {
+    char extra[300], path[300], out[4096] = "", cmd[300];
+    sqlite3 *kept = NULL;
+    long long rows = -1;
+    snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
+    (void)!system(cmd);
+    snprintf(extra, sizeof extra, "--at %lld --keep %s", at, dir);
+    *pRc = run_verify_with(vparams, extra, out, sizeof out);
+    snprintf(path, sizeof path, "%s/rebuilt.db", dir);
+    if (access(path, R_OK) == 0 && sqlite3_open_v2(path, &kept, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) rows = scalar(kept, sql);
+    sqlite3_close(kept);
+    return rows;
+}
+static void test_anchor_asked(void) {
+    TEST("SIGUSR2 to hpplite-sequencer anchors now (#396): anchor=24h, the heights at the store alone; the signal - 'anchored to height N' on stderr, the process up, hpplite-verify --at has the rows; again with nothing new: said, no transaction; a commit just before the next is in it");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE"), *bin = sidecar_bin();
+    static const char *WKEY = "0x6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d";
+    char addr[48], cmd[600], out[400], contract[80], params[900], vparams[500];
+    long h, a1, none, a2;
+    long long before, after1, after2, n1, n2, n3, at;
+    int port, rcB = -2, rc1 = -2, rc2 = -2, stop;
+    pid_t store, side;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!bin || access(bin, X_OK) != 0) FAIL("hpplite-sequencer not beside hpplite-verify (HPPLITE_VERIFY_BIN)");
+    (void)!system("rm -rf " DIR "/host13 " DIR "/store_pins69 " DIR "/ask_owner.db* && mkdir -p " DIR "/host13");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", WKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    {
+        sqlite3 *owner = open_db("ask_owner.db", WKEY, NULL);
+        if (!owner) FAIL("create the rollup");
+        snprintf(contract, sizeof contract, "%s", status_text(owner, "contract"));
+        sqlite3_close(owner);
+        if (!contract[0]) FAIL("the rollup's address");
+    }
+    port = test_free_port();
+    store = start_pin_service_dir(svc, port, DIR "/store_pins69");
+    if (store < 0) FAIL("the store did not come up");
+#define ASK_END() do { kill(store, SIGTERM); waitpid(store, NULL, 0); } while (0)
+    snprintf(params, sizeof params, "rpc=%s&contract=%s&chainid=31337&privkey=%s&interval=300ms&store=http://127.0.0.1:%d&keeplease=on&anchor=24h&anchorclose=off&datadir=" DIR "/host13",
+             RPC, contract, WKEY, port);
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", RPC, contract, WKEY, port);
+    side = spawn_sidecar(bin, DIR "/host13/app.db", params, side_path(13, 1, "out"), side_path(13, 1, "err"));
+    h = wait_synced(side_path(13, 1, "out"), side, 60);
+    if (h < 0) { if (h == -1) kill(side, SIGKILL); waitpid(side, NULL, 0); ASK_END(); FAILF("the sequencer did not say it was synced (%ld)", h); }
+    if (plain_exec(DIR "/host13/app.db", "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES('at the store alone')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); ASK_END(); FAIL("the app writes"); }
+    sleep(2);
+    if (plain_exec(DIR "/host13/app.db", "INSERT INTO notes(body) VALUES('and this one')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); ASK_END(); FAIL("the app writes again"); }
+    sleep(3);
+    at = (long long)time(NULL);
+    before = rows_at(vparams, at, DIR "/ask_keep0", "SELECT count(*) FROM notes", &rcB);        /* nothing anchored: the rebuild to a time has no row */
+    n1 = nonce_of(addr);
+
+    kill(side, SIGUSR2);
+    a1 = anchor_line(side_path(13, 1, "err"), "/host13/app.db anchored to height ", 1, side, 90);
+    if (a1 < 0) {
+        int st = g_askStatus, rc;
+        if (a1 == -1) { kill(side, SIGKILL); waitpid(side, &st, 0); }
+        rc = WIFEXITED(st) ? WEXITSTATUS(st) : (WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1);
+        ASK_END();
+        printf("(before the signal --at: exit %d, rows %lld) ", rcB, before);
+        if (a1 == -2) FAILF("SIGUSR2 ended the sequencer (exit %d): nothing outside it can ask for an anchor", rc);
+        FAIL("SIGUSR2: no 'anchored to height N' line on stderr");
+    }
+    n2 = nonce_of(addr);
+    after1 = rows_at(vparams, at, DIR "/ask_keep1", "SELECT count(*) FROM notes", &rc1);
+
+    kill(side, SIGUSR2);                                          /* nothing new: said, and no transaction */
+    none = anchor_line(side_path(13, 1, "err"), "/host13/app.db nothing to anchor past height ", 1, side, 60);
+    n3 = nonce_of(addr);
+
+    if (plain_exec(DIR "/host13/app.db", "INSERT INTO notes(body) VALUES('just before the signal')") != SQLITE_OK) { stop_sidecar(side, SIGKILL, 5); ASK_END(); FAIL("the app writes a third time"); }
+    kill(side, SIGUSR2);
+    a2 = anchor_line(side_path(13, 1, "err"), "/host13/app.db anchored to height ", 2, side, 90);
+    after2 = a2 > 0 ? rows_at(vparams, (long long)time(NULL) + 1, DIR "/ask_keep2", "SELECT count(*) FROM notes", &rc2) : -3;
+    stop = a2 == -2 ? -2 : stop_sidecar(side, SIGTERM, 60);
+    ASK_END();
+#undef ASK_END
+    printf("(synced at %ld; --at before the signal: exit %d, rows %lld; anchored to %ld in %lld transaction(s), --at: exit %d, rows %lld; nothing new: past %ld, %lld transaction(s); a commit and the signal: anchored to %ld, --at: exit %d, rows %lld; stop %d) ",
+           h, rcB, before, a1, n2 - n1, rc1, after1, none, n3 - n2, a2, rc2, after2, stop);
+    if (before == 2) FAIL("the test's premise: with anchor=24h nothing is anchored before the signal");
+    if (a1 < 2 || n2 != n1 + 1 || rc1 != 0 || after1 != 2) FAIL("the signal should anchor the store's heights in one transaction, and a rebuild to the time have both rows");
+    if (none != a1 || n3 != n2) FAIL("asked again with nothing new, it should say 'nothing to anchor past height N' and send nothing");
+    if (a2 <= a1 || rc2 != 0 || after2 != 3) FAIL("a commit made just before the signal should be flushed and in the anchor");
+    if (stop != 0) FAIL("the sequencer should stop clean");
     PASS();
 }
 
@@ -4528,6 +4647,7 @@ int main(void) {
     if (wanted(66)) test_instance_given();
     if (wanted(67)) test_adopt_file();
     if (wanted(68)) test_store_away_at_start();
+    if (wanted(69)) test_anchor_asked();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

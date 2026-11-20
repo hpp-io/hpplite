@@ -401,6 +401,10 @@ int hpplite_node_should_checkpoint(HppliteNode *node);
 
 /* Anchor every batch the store holds since the last anchor (#164): the last height anchored, 0 when nothing was or the chain refused */
 uint64_t hpplite_node_anchor(HppliteNode *node);
+/* the same, saying which: 1 anchored, 0 nothing past the last anchor, -1 the store or the chain did not take it (the
+** node's error says), -2 a node that does not anchor (no store, a verifier, a chain without ranges); *pHeight the
+** anchored height after (#396) */
+int hpplite_node_anchor_rc(HppliteNode *node, uint64_t *pHeight);
 
 /*
 ** Create and submit checkpoint to L1.

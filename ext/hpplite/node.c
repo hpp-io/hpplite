@@ -3042,19 +3042,24 @@ static int node_anchor(HppliteNode *node) {
     return rc;
 }
 
-uint64_t hpplite_node_anchor(HppliteNode *node) {
+int hpplite_node_anchor_rc(HppliteNode *node, uint64_t *pHeight) {
     pthread_mutex_t *mutex;
     int rc;
-    uint64_t h = 0;
-    if (!node) return 0;
+    if (pHeight) *pHeight = 0;
+    if (!node) return -2;
     mutex = (pthread_mutex_t *)node->flushMutex;
     if (mutex) pthread_mutex_lock(mutex);
     if (node->state == HPPLITE_STATE_INIT) hpplite_node_start(node);
-    rc = node_anchor(node);
-    if (rc == 1) h = node->anchoredHeight;
+    rc = node_ranges(node) ? node_anchor(node) : -2;
+    if (pHeight) *pHeight = node->anchoredHeight;
     if (node->config.anchorIntervalMs > 0) node->anchorAt = node_current_time_ms() + node->config.anchorIntervalMs;
     if (mutex) pthread_mutex_unlock(mutex);
-    return h;
+    return rc;
+}
+
+uint64_t hpplite_node_anchor(HppliteNode *node) {
+    uint64_t h = 0;
+    return hpplite_node_anchor_rc(node, &h) == 1 ? h : 0;
 }
 
 /* a replica: the bytes of a height inside an anchored range, by the manifest the chain's digest names */

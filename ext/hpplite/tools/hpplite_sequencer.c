@@ -22,7 +22,9 @@
 ** stopped, or could not read the chain, the line is held: "hpplite-sequencer:
 ** <file> not synced: <the node's error>" goes to stderr, the process stays up,
 ** and the line comes when the node is synced. Everything else goes to stderr.
-** SIGUSR1 prints one line of the node's status there; commits pending for HPPLITE_STUCK_SECONDS (30) with nothing
+** SIGUSR1 prints one line of the node's status there; SIGUSR2 flushes what is pending and anchors what the store
+** holds now, with one line: "anchored to height N", "nothing to anchor past height N", or "not anchored: " and why
+** (#396; --dir: every database, on stdout); commits pending for HPPLITE_STUCK_SECONDS (30) with nothing
 ** posted are said once, with the node's last error (#368). A database file replaced or removed under the sequencer
 ** (#320: the node says so and posts nothing more) ends the process, exit 4 (#379): to a supervisor it is a failure,
 ** and its restart is on the file there now.
@@ -89,6 +91,8 @@ static void on_signal(int sig) { (void)sig; stop = 1; }
 static volatile sig_atomic_t askedGen;     /* --dir: each database's thread answers each SIGUSR1 once */
 static void on_usr1(int sig) { (void)sig; asked = 1; askedGen++; }
 static void on_hup(int sig) { (void)sig; reread = 1; }
+static volatile sig_atomic_t anchorAsked, anchorGen;   /* SIGUSR2 (#396): anchor now; --dir: each database's thread once */
+static void on_usr2(int sig) { (void)sig; anchorAsked = 1; anchorGen++; }
 
 static int status_int(sqlite3 *db, const char *col) {
     char sql[96];
@@ -117,6 +121,28 @@ static char *not_synced_why(sqlite3 *db, char *out, size_t n) {
     char state[32];
     status_text(db, "last_error", out, n);
     if (!out[0]) snprintf(out, n, "the chain was not read yet (state %s)", status_text(db, "state", state, sizeof state));
+    return out;
+}
+
+/* SIGUSR2 (#396): the commits pending are flushed to the store and the batches there are anchored now, whatever
+** anchor= says - asked from outside, by a supervisor that wants the chain's height at the present (before a rebuild
+** to a moment: hpplite-verify --at reaches the last anchor). The line it reads: "anchored to height N", "nothing to
+** anchor past height N", or "not anchored: " and why. The timer counts on from here */
+static char *anchor_now(sqlite3 *db, char *out, size_t n) {
+    char why[400];
+    uint64_t h = 0;
+    int rc;
+    if (status_int(db, "sequencer") != 1) { snprintf(out, n, "not anchored: another process sequences it"); return out; }
+    if (status_int(db, "synced") != 1) { snprintf(out, n, "not anchored: not synced: %s", not_synced_why(db, why, sizeof why)); return out; }
+    hpplite_flush(db);
+    rc = hpplite_anchor_now(db, &h);
+    if (rc == 1) {
+        int pending = status_int(db, "pending");
+        if (pending > 0) snprintf(out, n, "anchored to height %llu; %d commit(s) pending are not in it: %s", (unsigned long long)h, pending, status_text(db, "last_error", why, sizeof why));
+        else snprintf(out, n, "anchored to height %llu", (unsigned long long)h);
+    } else if (rc == 0) snprintf(out, n, "nothing to anchor past height %llu", (unsigned long long)h);
+    else if (rc == -2) snprintf(out, n, "not anchored: this node keeps no batches at a store to anchor (store=, on a chain that takes ranges)");
+    else snprintf(out, n, "not anchored: %s", status_text(db, "last_error", why, sizeof why)[0] ? why : "the node gave no reason");
     return out;
 }
 
@@ -159,7 +185,7 @@ static void *db_thread(void *arg) {
     Db *d = (Db *)arg;
     sqlite3 *db = hpplite_open(d->uri);
     char err[512] = "", seen[512] = "", state[32];
-    int role = -1, gen = askedGen, replaced = 0, synced;
+    int role = -1, gen = askedGen, agen = anchorGen, replaced = 0, synced;
     wipe_free(d->uri);
     d->uri = NULL;
     if (!db) {
@@ -193,6 +219,13 @@ static void *db_thread(void *arg) {
             gen = askedGen;
             say(d->name, "status: height %d pending %d sequencer %d lease %d state %s last_error %s", status_int(db, "height"),
                 status_int(db, "pending"), status_int(db, "sequencer"), status_int(db, "lease"), state, err[0] ? err : "-");
+        }
+        if (agen != anchorGen) {
+            char line[700];
+            agen = anchorGen;
+            say(d->name, "%s", anchor_now(db, line, sizeof line));
+            status_text(db, "state", state, sizeof state);       /* an anchor the chain did not take is said here, once */
+            status_text(db, "last_error", err, sizeof err);
         }
         snprintf(seen, sizeof seen, "%s", strcmp(state, "error") == 0 ? err : "");
         if (status_int(db, "file_replaced") == 1) { replaced = 1; break; }   /* said above, as the node's error (#379) */
@@ -312,6 +345,8 @@ static int dir_main(const char *dir) {
     sigaction(SIGHUP, &sa, NULL);
     sa.sa_handler = on_usr1;
     sigaction(SIGUSR1, &sa, NULL);                       /* a status line per database (#368) */
+    sa.sa_handler = on_usr2;
+    sigaction(SIGUSR2, &sa, NULL);                       /* an anchor now, per database (#396) */
     dir_scan(dir);
     while (!stop) {
         if (reread) { reread = 0; dir_scan(dir); }
@@ -462,6 +497,7 @@ int main(int argc, char **argv) {
     ** meanwhile ended the process by the signal's default (#383). It is kept and answered once the open returned.
     ** SIGTERM and SIGINT stay at their default until then: a supervisor's stop ends a sequencer still opening */
     signal(SIGUSR1, on_usr1);
+    signal(SIGUSR2, on_usr2);                            /* an anchor now (#396): kept likewise, made once the open returned */
     sqlite3 *db = uri ? hpplite_open(uri) : NULL;
     sqlite3_free(uri);
     if (!db) {
@@ -506,6 +542,12 @@ int main(int argc, char **argv) {
             asked = 0;
             fprintf(stderr, "hpplite-sequencer: %s status: height %d pending %d sequencer %d lease %d state %s last_error %s\n",
                     argv[1], height, pending, seq, status_int(db, "lease"), state, err[0] ? err : "-");
+        }
+        if (anchorAsked) {
+            char line[700];
+            anchorAsked = 0;
+            fprintf(stderr, "hpplite-sequencer: %s %s\n", argv[1], anchor_now(db, line, sizeof line));
+            height = status_int(db, "height"); pending = status_int(db, "pending");
         }
         if (pending > 0 && height == lastHeight) stuckFor++;
         else { stuckFor = 0; stuckSaid = 0; lastHeight = height; }

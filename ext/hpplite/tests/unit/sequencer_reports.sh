@@ -1,7 +1,7 @@
 #!/bin/sh
 # hpplite-sequencer <file> says what a supervisor needs when nothing posts (#368, somaro#352): SIGUSR1 prints one line
 # of the node's status on stderr, and commits pending for 30 s with nothing posted are said once, with the node's
-# last error or that it gave none. Here the store does not answer (a port nothing listens on): every batch stays pending.
+# last error or that it gave none; SIGUSR2 asks for an anchor and is answered (#396). Here the store does not answer (a port nothing listens on): every batch stays pending.
 #   tests/unit/sequencer_reports.sh <path/to/hpplite-sequencer>
 set -u
 bin=$1
@@ -27,6 +27,12 @@ grep -q "hpplite-sequencer: $d/app.db status: height [0-9]* pending [1-9][0-9]* 
 sleep 4
 grep -q "hpplite-sequencer: $d/app.db pending [1-9][0-9]* for [0-9]* s, nothing posted: " "$d/err" || fail "commits stuck past HPPLITE_STUCK_SECONDS were not said"
 [ "$(grep -c 'nothing posted: ' "$d/err")" = 1 ] || fail "the stuck note should be said once, not at every check"
+# SIGUSR2 asks for an anchor (#396); its default ended the process. This chain takes no ranges: it says so and stays up
+kill -USR2 "$pid"
+i=0
+while [ $i -lt 100 ] && ! grep -q "hpplite-sequencer: $d/app.db not anchored: this node keeps no batches at a store" "$d/err" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+kill -0 "$pid" 2>/dev/null || { wait "$pid"; rc=$?; pid=; fail "SIGUSR2 ended the process (exit $rc)"; }
+grep -q "hpplite-sequencer: $d/app.db not anchored: this node keeps no batches at a store" "$d/err" || fail "SIGUSR2 was not answered with why nothing is anchored"
 kill -TERM "$pid"; wait "$pid"; pid=
 
 # SIGUSR1 while the open has not returned (#383): the handler was installed after it, and the signal's default ended
@@ -55,9 +61,15 @@ sleep 2
 kill -USR1 "$pid"
 sleep 1
 kill -0 "$pid" 2>/dev/null || { wait "$pid"; rc=$?; pid=; fail "SIGUSR1 before the open returned ended the process (exit $rc)"; }
+kill -USR2 "$pid"                 # the anchor asked for during the open is kept likewise (#396)
+sleep 1
+kill -0 "$pid" 2>/dev/null || { wait "$pid"; rc=$?; pid=; fail "SIGUSR2 before the open returned ended the process (exit $rc)"; }
 kill "$mute" 2>/dev/null; wait "$mute" 2>/dev/null       # the store gone: the open returns
 i=0
 while [ $i -lt 300 ] && ! grep -q "hpplite-sequencer: $d/slow/app.db status: height " "$d/err" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 grep -q "hpplite-sequencer: $d/slow/app.db status: height " "$d/err" || fail "the SIGUSR1 sent during the open was not answered once it returned"
+i=0
+while [ $i -lt 300 ] && ! grep -q "hpplite-sequencer: $d/slow/app.db not anchored: " "$d/err" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+grep -q "hpplite-sequencer: $d/slow/app.db not anchored: " "$d/err" || fail "the SIGUSR2 sent during the open was not answered once it returned"
 kill -TERM "$pid"; wait "$pid"; pid=
 echo "sequencer_reports: ok"
