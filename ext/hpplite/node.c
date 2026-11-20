@@ -1539,7 +1539,7 @@ static uint8_t *node_fetch_bytes(HppliteNode *node, HppliteL1 *l1, uint64_t heig
     } else {
         data = hpplite_store_get(node->store, zRef, pLen);
         if (!data) {
-            hpplite_error(node->ctx, "batch %llu: the store has no %s: %s", (unsigned long long)height, zRef, hpplite_store_error(node->store));
+            hpplite_error(node->ctx, "batch %llu: the store did not give %s: %s", (unsigned long long)height, zRef, hpplite_store_error(node->store));
         } else {
             hpplite_keccak256(data, *pLen, got);
             if (memcmp(got, hash, 32) != 0) {
@@ -3163,7 +3163,7 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
         uint64_t h = r.fromHeight;
         hpplite_store_cid_from_sha256(r.manifestDigest, cid);
         text = hpplite_store_get(node->store, cid, &n);
-        if (!text) { hpplite_error(node->ctx, "range %llu-%llu: the store has no manifest %s: %s", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, cid, hpplite_store_error(node->store)); hpplite_l1_range_clear(&r); return NULL; }
+        if (!text) { hpplite_error(node->ctx, "range %llu-%llu: the store did not give the manifest %s: %s", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, cid, hpplite_store_error(node->store)); hpplite_l1_range_clear(&r); return NULL; }
         hpplite_store_sha256(text, n, digest);
         if (memcmp(digest, r.manifestDigest, 32) != 0) { hpplite_error(node->ctx, "range %llu-%llu: the store's manifest is not the one the chain anchored", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight); free(text); hpplite_l1_range_clear(&r); return NULL; }
         m = cJSON_ParseWithLength((const char *)text, n);
@@ -3223,7 +3223,7 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
     }
     data = hpplite_store_get(node->store, zRef, pLen);
     if (!data) {
-        hpplite_error(node->ctx, "batch %llu: the store has no %s: %s", (unsigned long long)height, zRef, hpplite_store_error(node->store));
+        hpplite_error(node->ctx, "batch %llu: the store did not give %s: %s", (unsigned long long)height, zRef, hpplite_store_error(node->store));
     } else {
         hpplite_keccak256(data, *pLen, got);
         if (memcmp(got, want, 32) != 0) {
@@ -4531,6 +4531,7 @@ void hpplite_node_start_timer(HppliteNode *node) {
         node->timerWakeMutex = m;
     }
 
+    hpplite_store_no_wait(node->store, 0);
     node->timerRunning = 1;
     pthread_create(thread, NULL, node_timer_thread_func, node);
     node->timerThread = thread;
@@ -4547,7 +4548,8 @@ void hpplite_node_start_timer(HppliteNode *node) {
 void hpplite_node_stop_timer(HppliteNode *node) {
     if (!node || !node->timerRunning) return;
 
-    /* Signal thread to stop, and wake it */
+    /* Signal thread to stop, and wake it; a read of its that waits a store's Retry-After out ends (#402) */
+    hpplite_store_no_wait(node->store, 1);
     pthread_mutex_lock((pthread_mutex_t *)node->timerWakeMutex);
     node->timerRunning = 0;
     if (node->ctx && node->db && !node->pm) hppliteInternalExec(node->ctx, node->db, "PRAGMA wal_autocheckpoint=1000");   /* SQLite's own again */

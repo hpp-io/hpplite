@@ -52,6 +52,8 @@ MONTH = 30 * 24 * 3600
 GET_DELAY = float(os.environ.get("HPPLITE_STORE_GET_DELAY") or 0)   # a test hook: seconds added to every batch read (#195)
 FAIL_GET = int(os.environ.get("HPPLITE_STORE_FAIL_GET") or 0)       # a test hook: the k-th read of an object answers 503, once (#403)
 GETS = {"lock": threading.Lock(), "count": 0}
+READ_LIMIT = os.environ.get("HPPLITE_STORE_READ_LIMIT") or ""       # a test hook: "N/S", N batch reads in a window of S seconds, the rest 429 (#402)
+READ_WINDOW = {"lock": threading.Lock(), "start": 0.0, "count": 0}
 FOREVER = 2 ** 53 - 1           # coveredUntil when nothing is charged: exact in a double, an int64 and every JSON (#216)
 
 BIND_TYPE = "Bind(address da,address funder,uint256 issuedAt)"
@@ -744,6 +746,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = url.path
         if GET_DELAY and (path.startswith("/get/") or path.startswith("/name/")):
             time.sleep(GET_DELAY)                       # a test hook: a far store's round trip on every read (#195)
+        if READ_LIMIT and (path.startswith("/get/") or path.startswith("/name/")):
+            # a test hook: an operator's read limit an address, as the canonical stores have (600 a minute)
+            limit, window = (float(x) for x in READ_LIMIT.split("/"))
+            with READ_WINDOW["lock"]:
+                now = time.monotonic()
+                if now - READ_WINDOW["start"] >= window:
+                    READ_WINDOW["start"], READ_WINDOW["count"] = now, 0
+                READ_WINDOW["count"] += 1
+                over, left = READ_WINDOW["count"] > limit, READ_WINDOW["start"] + window - now
+            if over:
+                return self.reply(429, {"error": "too many requests from this address: try again in a minute"}, {"Retry-After": str(max(1, int(left + 0.999)))})
         if FAIL_GET and path.startswith("/get/"):
             with GETS["lock"]:
                 GETS["count"] += 1

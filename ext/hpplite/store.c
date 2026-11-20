@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <math.h>
+#include <unistd.h>
 
 
 struct HppliteStore {
@@ -65,6 +66,8 @@ struct HppliteStore {
     int hasFund;                    /* the funding key: derived from the node's key */
     int external;                   /* funder= (#272): fundAddr is another's wallet; no key, no binding, no permit from here */
     int retryAfter;                 /* the last answer's Retry-After on a 429 or 503, seconds (somaro#48); 0: none */
+    volatile int noWait;            /* a read answered 429 is not waited for: the node is closing (#402) */
+    int saidLimited;                /* the store's read limit, said once */
     uint64_t (*xChainTime)(void *); /* the chain's time for a payment's validity window (somaro: a host clock stepped back); 0: not read */
     void *pChainTimeArg;
     int clockSaid;                  /* the host's clock off the chain's (or the chain's unread), said once */
@@ -98,7 +101,7 @@ struct HppliteStore {
 };
 
 /* a response's bytes, kept; or handed to xSink as they come (#364: a snapshot's chunk is never held whole) */
-typedef struct Buf { char *p; size_t n; int (*xSink)(void *, const uint8_t *, size_t); void *pSinkArg; } Buf;
+typedef struct Buf { char *p; size_t n; int (*xSink)(void *, const uint8_t *, size_t); void *pSinkArg; CURL *curl; } Buf;
 
 static void deriveFund(HppliteStore *s, const uint8_t privkey[32]);
 static int ensureBucket(HppliteStore *s);
@@ -125,7 +128,14 @@ static size_t bufWrite(void *data, size_t size, size_t nmemb, void *arg) {
     Buf *b = (Buf *)arg;
     size_t n = size * nmemb;
     char *q;
-    if (b->xSink) { if (b->xSink(b->pSinkArg, (const uint8_t *)data, n) != 0) return 0; b->n += n; return n; }
+    if (b->xSink) {
+        long status = 200;
+        if (b->curl) curl_easy_getinfo(b->curl, CURLINFO_RESPONSE_CODE, &status);
+        if (status != 200) return n;            /* an error's body is not the object's bytes: the read may be asked again (#402) */
+        if (b->xSink(b->pSinkArg, (const uint8_t *)data, n) != 0) return 0;
+        b->n += n;
+        return n;
+    }
     q = realloc(b->p, b->n + n + 1);
     if (!q) return 0;
     memcpy(q + b->n, data, n);
@@ -249,6 +259,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
     char url[1200];
     long status = 0;
     if (!c) return 0;
+    if (out) out->curl = c;
     snprintf(url, sizeof url, "%s%s", s->base, path);
     curl_easy_setopt(c, CURLOPT_URL, url);
     hpplite_tls_trust(c);                               /* the certificates to trust (#269, #377) */
@@ -1760,6 +1771,33 @@ int hpplite_store_put_named(HppliteStore *s, const char *zName, const unsigned c
     return rc;
 }
 
+/* A read of a batch, a name or a snapshot's chunk at a store that limits the reads of one address (#402; the
+** canonical stores: 600 a minute, then 429 with Retry-After): the answer is waited out and the read asked again, so
+** a history longer than the limit is read at the store's rate and not stopped at it. STORE_READ_WAITS such answers
+** in a row for one read are the read's failure, as any other answer is; a wait is at most STORE_READ_WAIT_MAX
+** seconds and ends when the node is closing (hpplite_store_no_wait). A 429 without Retry-After is not waited for */
+#define STORE_READ_WAITS 5
+#define STORE_READ_WAIT_MAX 120
+static long storeRead(HppliteStore *s, const char *path, Buf *out) {
+    int waits = 0;
+    for (;;) {
+        long status = storeRequest(s, "GET", path, NULL, 0, NULL, out, NULL, NULL);
+        int ms;
+        if (status != 429 || s->retryAfter <= 0 || waits >= STORE_READ_WAITS || s->noWait) return status;
+        if (!s->saidLimited) {
+            s->saidLimited = 1;
+            fprintf(stderr, "hpplite: the store %s limits the reads of one address (429, Retry-After %d s): a read past the limit waits and is asked again; the history is read at the store's rate\n", s->url, s->retryAfter);
+        }
+        waits++;
+        ms = (s->retryAfter < STORE_READ_WAIT_MAX ? s->retryAfter : STORE_READ_WAIT_MAX) * 1000;
+        if (!out->xSink) { free(out->p); out->p = NULL; }
+        out->n = 0;
+        for (; ms > 0 && !s->noWait; ms -= 100) usleep(100 * 1000);
+        if (s->noWait) return status;
+    }
+}
+void hpplite_store_no_wait(HppliteStore *s, int on) { if (s) s->noWait = on; }
+
 uint8_t *hpplite_store_get_named(HppliteStore *s, const char *zName, size_t *pLen, uint8_t sig[65], unsigned char instance[32]) {
     Buf out = {0};
     long status;
@@ -1769,7 +1807,7 @@ uint8_t *hpplite_store_get_named(HppliteStore *s, const char *zName, size_t *pLe
     {
         char path[120];
         snprintf(path, sizeof path, "/name/%s", zName);
-        status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+        status = storeRead(s, path, &out);
     }
     if (status != 200 || !out.p || out.n < 98) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to the name %s", status, zName);
@@ -1792,7 +1830,7 @@ uint8_t *hpplite_store_get(HppliteStore *s, const char *zRef, size_t *pLen) {
     if (!s || !zRef || !zRef[0] || strlen(zRef) > 500 || strchr(zRef, '/')) return NULL;
     s->error[0] = 0;
     snprintf(path, sizeof path, "/get/%s", zRef);
-    status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+    status = storeRead(s, path, &out);
     if (status != 200) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to get %s", status, zRef);
         free(out.p);
@@ -1813,7 +1851,7 @@ int hpplite_store_get_to(HppliteStore *s, const char *zRef, int (*xSink)(void *,
     s->error[0] = 0;
     out.xSink = xSink; out.pSinkArg = pArg;
     snprintf(path, sizeof path, "/get/%s", zRef);
-    status = storeRequest(s, "GET", path, NULL, 0, NULL, &out, NULL, NULL);
+    status = storeRead(s, path, &out);
     if (status != 200) {
         if (!s->error[0]) snprintf(s->error, sizeof s->error, "store answered %ld to get %s", status, zRef);
         return -1;

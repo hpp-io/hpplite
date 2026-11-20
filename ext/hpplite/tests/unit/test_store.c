@@ -811,6 +811,101 @@ static void test_sync_stopped_midway(const char *dir) {
     PASS();
 }
 
+/* 6e4. A store's read limit (#402): the canonical stores answer 600 reads a minute an address and 429 with
+** Retry-After past them. A history longer than the limit, read eight at a time, passes it inside the first seconds:
+** the read was answered 429 and the rebuild stopped there, "sync stopped", for hpplite-verify exit 1 - a history of
+** more than some hundreds of batches could not be rebuilt in one run. A store that gives 20 batch reads in two
+** seconds, 60 anchored batches and 30 past the anchor: a verifier waits the store's Retry-After and arrives, and so
+** does a lost host's successor in its open. A node that is closed while it waits does not wait the store's time out */
+static void test_read_limit(const char *dir) {
+    TEST("a store's read limit (#402): 60 anchored batches at a store that gives 20 reads in two seconds - a verifier waits out the 429s and arrives, a new host too with 30 more by name; a close ends a wait");
+    int port = test_free_port(), port2;
+    char url[64], url2[64], storeDir[600], e0[300] = "", st0[40] = "";
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x36 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = NULL, *r = NULL;
+    TestNodeOpts o;
+    int i, rows = -1, same = 0;
+    long long h0 = 0, hw = 0, un = 0, h3 = 0;
+    double t0, took, tookW, tookStop;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/limit_pins", test_dir());
+    setenv("HPPLITE_STORE_READ_LIMIT", "20/2", 1);
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    unsetenv("HPPLITE_STORE_READ_LIMIT");
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
+#define LIMIT_DONE() do { if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } hpplite_l1_disconnect(l1); if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } } while (0)
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "limit_w"; o.privkey = kseq;
+    if (!(w = test_open_node(tpath("limit_w.db"), l1, &o))) { LIMIT_DONE(); FAIL("open the writer"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 60; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('past the limit')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { LIMIT_DONE(); FAIL("a flush"); }
+        if (i % 20 == 19 && hpplite_node_anchor(w) != (uint64_t)i + 1) { LIMIT_DONE(); FAIL("an anchor"); }
+    }
+    usleep(2100 * 1000);                                          /* a window of its own for the verifier */
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "limit_r", .privkey = kseq };
+        t0 = now_s();
+        r = test_open_node(tpath("limit_r.db"), l1, &ro);
+        took = now_s() - t0;
+    }
+    if (r) {
+        h0 = status_int(r->db, "height"); rows = count_rows(r->db, "t"); same = same_root(w, r);
+        snprintf(e0, sizeof e0, "%s", status_text(r->db, "last_error"));
+        snprintf(st0, sizeof st0, "%s", status_text(r->db, "state"));
+        r->l1 = NULL; hpplite_node_destroy(r); r = NULL;
+    }
+    /* the lost host: 30 more batches at the store, none anchored; its successor reads the history and them by name */
+    for (i = 0; i < 30; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('the lost host')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { LIMIT_DONE(); FAIL("a flush of the lost host"); }
+    }
+    hpplite_node_stop_timer(w);
+    w->ownsL1 = 0; w->l1 = NULL;
+    hpplite_node_destroy(w); w = NULL;
+    hpplite_l1_mock_advance_time(l1, 400);
+    usleep(2100 * 1000);
+    o.nodeId = "limit_w2";
+    t0 = now_s();
+    if (!(w = test_open_node(tpath("limit_w2.db"), l1, &o))) { LIMIT_DONE(); FAIL("open the successor"); }
+    tookW = now_s() - t0;
+    hw = status_int(w->db, "height"); un = scalar(w->ctx->bkDb, "SELECT count(*) FROM _hpplite_unanchored");
+    hpplite_node_stop_timer(w);
+    w->ownsL1 = 0; w->l1 = NULL;
+    hpplite_node_destroy(w); w = NULL;                            /* gone too, nothing anchored */
+    hpplite_l1_mock_advance_time(l1, 400);
+    /* a close while a read waits: the same directory behind a store that gives 5 reads in 30 seconds, a new host whose
+    ** timer reads the history - stopped a second and a half in, it does not wait the store's half minute out */
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    port2 = test_free_port();
+    snprintf(url2, sizeof url2, "http://127.0.0.1:%d", port2);
+    setenv("HPPLITE_STORE_READ_LIMIT", "5/30", 1);
+    pid = start_store_at(dir, port2, storeDir, 0, 0);
+    unsetenv("HPPLITE_STORE_READ_LIMIT");
+    if (pid < 0) { LIMIT_DONE(); FAIL("the test's second store did not start"); }
+    o.storeUrl = url2; o.nodeId = "limit_w3"; o.noSync = 1; o.intervalMs = 100;
+    if (!(w = test_open_node(tpath("limit_w3.db"), l1, &o))) { LIMIT_DONE(); FAIL("open the host that is closed"); }
+    hpplite_node_start_timer(w);
+    usleep(1500 * 1000);
+    t0 = now_s();
+    hpplite_node_stop_timer(w);
+    tookStop = now_s() - t0;
+    h3 = w->ctx->blockHeight;
+    printf("(the verifier: height %lld, rows %d, state %s, '%.150s', %.1f s; the successor's open: height %lld, %lld kept for the anchor, %.1f s; the host closed while it waits: at height %lld, its timer stopped in %.1f s) ",
+           h0, rows, st0, e0, took, hw, un, tookW, h3, tookStop);
+    LIMIT_DONE();
+#undef LIMIT_DONE
+    if (h0 != 61 || rows != 60 || !same) FAIL("the verifier should wait out the store's 429s and hold the 60 batches, the writer's root");
+    if (took < 2.0) FAIL("the test's premise: 60 batches and their manifests are more than one window's reads");
+    if (hw != 91 || un != 30) FAIL("the successor's open should read the history and the lost host's 30 batches across the limit");
+    if (h3 < 2 || h3 >= 91) FAIL("the test's premise: the host is closed while a read of its history waits");
+    if (tookStop > 5.0) FAIL("a node that is closed should not wait the store's Retry-After out");
+    PASS();
+}
+
 /* 6f. A store that was down at open (#244): the first put after it answers must go through - the client's
 ** "keeps buckets" flag comes from /status, and the node told it the rollup's address only once it knew that */
 static void test_store_down_at_open(const char *dir) {
@@ -2621,6 +2716,7 @@ int main(int argc, char **argv) {
     test_recovery_store_down(dir);
     test_reads_ahead(dir);
     test_sync_stopped_midway(dir);
+    test_read_limit(dir);
     test_restart_store_down(dir);
     test_snapshot_name_refused(dir);
     test_manifest_short_hex(url);

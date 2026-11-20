@@ -153,6 +153,9 @@ int hpplite_store_sign_batch(HppliteStore *store, const unsigned char da[20], ui
                              uint64_t height, const uint8_t *data, size_t len, uint8_t sig[65]);
 int hpplite_store_put_named(HppliteStore *store, const char *zName, const unsigned char instance[32], const uint8_t *data, size_t len, const uint8_t sig[65]);
 int hpplite_store_retry_after(HppliteStore *store);
+/* a read (get, get_named, get_to) answered 429 with Retry-After waits that long and is asked again, up to five times
+** in a row (#402); on: no such wait, and one in progress ends - a node that is closing */
+void hpplite_store_no_wait(HppliteStore *store, int on);
 /* the chain's time for a payment's validity window (validAfter, validBefore): what the chain checks it against; a
 ** function returning 0 (not read) falls back to the host's clock, said once */
 void hpplite_store_set_chain_time(HppliteStore *store, uint64_t (*xChainTime)(void *), void *pArg);
