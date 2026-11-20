@@ -1154,6 +1154,15 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.10.5** (2026-11-20): a restored file, and a start that says what it knows.
+
+- **A restored file as the state (#380).** `adopt=on` (`HPPLITE_ADOPT`), given for one start: a sequencer's file with no bookkeeping beside it and at least one table, on a rollup whose history is not this file's (a platform's newest copy restored onto a new host), is taken as the state. The history is read and kept, none of it written to the file; the file goes whole as the next height, and the node says "adopted as the state after height N". Without it such a file is overwritten by the history, as before. See [A restored file](#a-restored-file-380).
+- **"synced" only when the node is (#381).** `hpplite-sequencer` printed "synced height N" when the open had returned, also after a sync that stopped or could not read the chain. `hpplite_status.synced` says it; the tool holds the line until it is 1, says "not synced: <the node's error>" on stderr meanwhile and stays up. A supervisor's timeout on the line means the file is not the rollup's state yet.
+- **A store that did not answer is not a store with no batches (#382).** A successor that started while the store was away went on at the anchored height, and the lost host's batches at the store - a day of them with `anchor=24h` - were written over or left out of the history. Only the store's 404 ends the read of the names now; otherwise the node is not synced, posts nothing to the store or the chain, and asks again at each flush. With commits of the application's made meanwhile it posts nothing and says so; `adopt=on` or an empty file is the way on.
+  - A sequencer that restarts with the store away, all of its batches anchored, also waits for the store before it posts (`HPPLITE_STORE_FALLBACK` does not apply to that start): its file cannot tell the two cases apart. A rollup whose lease nobody ever held is not held back.
+- **SIGUSR1 during the open (#383).** Sent to `hpplite-sequencer <file>` before the open had returned it ended the process; it is kept and answered once the open has returned.
+- No protocol or format changes; the stores and the relays are unchanged.
+
 **v0.10.4** (2026-11-20): a sequencer on a platform's host - rebuilt, restored, on a stock image.
 
 - **The instance a platform gives (#378).** `instancefile=<path>` (`HPPLITE_INSTANCE_FILE`) names a file with the instance's seed, 32 bytes or 64 hex digits. The id is then keccak(seed) wherever the sequencer runs: a host rebuilt on an empty volume with the same key and seed is the instance the chain's lease names, so it claims nothing, waits for nothing, and its writes are at the store within a flush. Without it the rebuilt host waited out the lost one's lease, an hour, its writes in its file and not at the store.
