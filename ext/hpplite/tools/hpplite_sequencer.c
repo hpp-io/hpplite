@@ -458,6 +458,10 @@ int main(int argc, char **argv) {
     const char *params = getenv("HPPLITE_PARAMS");
     char *uri = sqlite3_mprintf("file:%s?hpplite=on%s%s", argv[1],
                                 params && params[0] ? "&" : "", params ? params : "");
+    /* before the open, which can take long (a history to read, a store or a chain slow to answer): a SIGUSR1 sent
+    ** meanwhile ended the process by the signal's default (#383). It is kept and answered once the open returned.
+    ** SIGTERM and SIGINT stay at their default until then: a supervisor's stop ends a sequencer still opening */
+    signal(SIGUSR1, on_usr1);
     sqlite3 *db = uri ? hpplite_open(uri) : NULL;
     sqlite3_free(uri);
     if (!db) {
@@ -477,7 +481,6 @@ int main(int argc, char **argv) {
     }
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
-    signal(SIGUSR1, on_usr1);
     int role = -1;
     /* what a supervisor cannot see otherwise (#368): SIGUSR1 prints the node's status; commits pending for
     ** HPPLITE_STUCK_SECONDS (default 30) with no height posted are said once, with the node's last error */

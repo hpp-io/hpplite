@@ -325,7 +325,8 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   synced (`hpplite_status.synced`) - a supervisor's timeout on the line is
   "this file is not the rollup's state yet". The rest goes to
   stderr. SIGUSR1 prints one line of the node's status there (height,
-  pending, sequencer, lease, state, last error); commits pending for
+  pending, sequencer, lease, state, last error) - one sent while the open
+  has not returned is answered when it has (#383); commits pending for
   `HPPLITE_STUCK_SECONDS` (30) with nothing posted are said once, with the
   node's last error (#368). In `--dir` mode SIGUSR1 prints a status line
   per database on stdout. A database file replaced or removed under the
