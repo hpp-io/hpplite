@@ -68,6 +68,10 @@ struct HppliteStore {
     int retryAfter;                 /* the last answer's Retry-After on a 429 or 503, seconds (somaro#48); 0: none */
     volatile int noWait;            /* a read answered 429 is not waited for: the node is closing (#402) */
     int saidLimited;                /* the store's read limit, said once */
+    long nRequests, nConnects;      /* the requests sent, and the connections opened for them (#405) */
+    CURL *curl;                     /* the client's handle and, in it, the connection of its last request (#405) */
+    CURLM *multi;                   /* ...and the connections of its reads ahead */
+    volatile int curlBusy, multiBusy;   /* one request at a time on each: a request that finds it taken makes its own */
     uint64_t (*xChainTime)(void *); /* the chain's time for a payment's validity window (somaro: a host clock stepped back); 0: not read */
     void *pChainTimeArg;
     int clockSaid;                  /* the host's clock off the chain's (or the chain's unread), said once */
@@ -168,6 +172,18 @@ static void aheadClear(HppliteStore *s) {
     s->nAhead = 0;
 }
 
+/* one request done on this handle: counted, with the connections curl opened for it (0: one it had was used) */
+static void storeCount(HppliteStore *s, CURL *c) {
+    long n = 0;
+    s->nRequests++;
+    if (curl_easy_getinfo(c, CURLINFO_NUM_CONNECTS, &n) == CURLE_OK) s->nConnects += n;
+}
+
+void hpplite_store_traffic(HppliteStore *s, long *pnRequests, long *pnConnects) {
+    if (pnRequests) *pnRequests = s ? s->nRequests : 0;
+    if (pnConnects) *pnConnects = s ? s->nConnects : 0;
+}
+
 /* how many reads a prefetch keeps in flight: HPPLITE_STORE_PARALLEL (1: none ahead), default 8 */
 int hpplite_store_parallel(void) {
     const char *z = getenv("HPPLITE_STORE_PARALLEL");
@@ -179,14 +195,19 @@ int hpplite_store_parallel(void) {
 ** trip paid once for the lot, not once a batch. Paths already held are skipped; the rest of the cache is dropped
 ** when it would not fit (reads move on). Answers are checked where they are taken, as any read's */
 static void storePrefetch(HppliteStore *s, char **paths, int n) {
-    CURLM *m;
+    CURLM *m = NULL;
     CURL *h[HPPLITE_STORE_AHEAD_MAX];
     Buf out[HPPLITE_STORE_AHEAD_MAX];
-    int k = 0, running = 0;
+    int k = 0, running = 0, kept = 0;
     if (!s || n <= 1) return;
     if (n > HPPLITE_STORE_AHEAD_MAX) n = HPPLITE_STORE_AHEAD_MAX;
     if (s->nAhead + n > HPPLITE_STORE_AHEAD_MAX) aheadClear(s);
-    if (!(m = curl_multi_init())) return;
+    /* the client's multi handle: the connections of the last reads ahead are in it, and these go out on them (#405) */
+    if (!__sync_lock_test_and_set(&s->multiBusy, 1)) {
+        if (!s->multi) s->multi = curl_multi_init();
+        if (s->multi) { m = s->multi; kept = 1; } else __sync_lock_release(&s->multiBusy);
+    }
+    if (!kept && !(m = curl_multi_init())) return;
     for (int i = 0; i < n; i++) {
         int held = 0;
         char url[1200];
@@ -213,6 +234,7 @@ static void storePrefetch(HppliteStore *s, char **paths, int n) {
         char *path = NULL;
         curl_easy_getinfo(h[i], CURLINFO_RESPONSE_CODE, &status);
         curl_easy_getinfo(h[i], CURLINFO_PRIVATE, &path);
+        storeCount(s, h[i]);
         if (status == 200 && path && s->nAhead < HPPLITE_STORE_AHEAD_MAX) {
             if (!out[i].p) { out[i].p = malloc(1); if (out[i].p) out[i].p[0] = 0; }
             s->aAhead[s->nAhead].path = sqlite3_mprintf("%s", path);
@@ -225,7 +247,7 @@ static void storePrefetch(HppliteStore *s, char **paths, int n) {
         curl_multi_remove_handle(m, h[i]);
         curl_easy_cleanup(h[i]);
     }
-    curl_multi_cleanup(m);
+    if (kept) __sync_lock_release(&s->multiBusy); else curl_multi_cleanup(m);
 }
 
 void hpplite_store_prefetch_refs(HppliteStore *s, const char *const *zRefs, int n) {
@@ -253,12 +275,20 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
         s->retryAfter = 0;
         return 200;
     }
-    CURL *c = curl_easy_init();
+    CURL *c = NULL;
     struct curl_slist *hdrs = NULL;
     Buf headers = {0};
     char url[1200];
     long status = 0;
-    if (!c) return 0;
+    int kept = 0;
+    /* The client's own handle (#405): a request made a handle and with it a connection - a TCP and a TLS handshake
+    ** for every put and every read, and a rebuild from a near store opened them faster than the machine gives its
+    ** local ports back. The handle is kept for the client's life and reset for each request: its connection stays */
+    if (!__sync_lock_test_and_set(&s->curlBusy, 1)) {
+        if (!s->curl) s->curl = curl_easy_init();
+        if (s->curl) { c = s->curl; curl_easy_reset(c); kept = 1; } else __sync_lock_release(&s->curlBusy);
+    }
+    if (!c && !(c = curl_easy_init())) return 0;
     if (out) out->curl = c;
     snprintf(url, sizeof url, "%s%s", s->base, path);
     curl_easy_setopt(c, CURLOPT_URL, url);
@@ -297,6 +327,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
     } else {
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
     }
+    storeCount(s, c);
     s->lastStatus = status;
     s->retryAfter = 0;
     /* the x402 headers, case-insensitively */
@@ -324,7 +355,7 @@ static long storeRequest(HppliteStore *s, const char *method, const char *path, 
         free(headers.p);
     }
     curl_slist_free_all(hdrs);
-    curl_easy_cleanup(c);
+    if (kept) __sync_lock_release(&s->curlBusy); else curl_easy_cleanup(c);
     return status;
 }
 
@@ -1056,6 +1087,8 @@ long hpplite_store_take_status(HppliteStore *s) {
 void hpplite_store_close(HppliteStore *s) {
     if (!s) return;
     aheadClear(s);
+    if (s->curl) curl_easy_cleanup(s->curl);
+    if (s->multi) curl_multi_cleanup(s->multi);
     if (s->crypto) hpplite_crypto_free(s->crypto);
     memset(&s->kp, 0, sizeof s->kp);
     free(s->url);

@@ -642,6 +642,12 @@ class Service:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     service = None  # type: Service
+    # a connection is kept for the client's next request (#405: a node keeps its connections); every answer carries
+    # its Content-Length. One left idle two minutes is closed, and an answer goes out when it is written, not when
+    # the client has acknowledged its headers
+    protocol_version = "HTTP/1.1"
+    timeout = 120
+    disable_nagle_algorithm = True
 
     def log_message(self, fmt, *args):
         if self.service.args.verbose:
@@ -856,7 +862,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path, query = url.path, urllib.parse.parse_qs(url.query)
         n = int(self.headers.get("Content-Length") or 0)
         if n > self.service.args.max_bytes + 4096:
-            return self.reply(413, {"error": "too large", "max": self.service.args.max_bytes})
+            # its body is not read: nothing more is read from this connection
+            return self.reply(413, {"error": "too large", "max": self.service.args.max_bytes}, {"Connection": "close"})
         body = self.rfile.read(n) if n else b""
         try:
             if path.startswith("/name/"):

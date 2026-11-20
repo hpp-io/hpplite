@@ -124,6 +124,14 @@ wait, five such answers in a row before the read fails, #402): a store
 that limits reads should always give the header. JSON bodies with `error`; for `402` also
 `bucket_unbound`, `bucket_parked` or `account_uncovered`.
 
+Connections: a node keeps the connections it has to a store - one for its
+writes and its single reads, up to `HPPLITE_STORE_PARALLEL` (8) more for
+the batches it reads ahead - and sends its next request on them (#405). A
+store should keep a connection open after an answer (HTTP/1.1 with a
+`Content-Length`, or HTTP/2): one that closes it after every answer costs
+a sequencer a handshake a batch and a rebuild a handshake a read. A store
+may close an idle connection when it likes; the node opens another.
+
 ### Binding
 
 - The first binding creates the bucket. A newer one changes the funder: the

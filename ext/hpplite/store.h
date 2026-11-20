@@ -25,6 +25,9 @@ typedef struct HppliteStore HppliteStore;
 ** each 200 answer for the read that asks for it next; up to hpplite_store_parallel() (HPPLITE_STORE_PARALLEL, default 8) */
 #define HPPLITE_STORE_AHEAD_MAX 32
 int hpplite_store_parallel(void);
+/* the requests this client sent and the connections it opened for them (#405): a client keeps its connections, so
+** the second number stays small however many batches are put or read */
+void hpplite_store_traffic(HppliteStore *store, long *pnRequests, long *pnConnects);
 void hpplite_store_prefetch_refs(HppliteStore *s, const char *const *zRefs, int n);
 void hpplite_store_prefetch_names(HppliteStore *s, const char *const *zNames, int n);
 

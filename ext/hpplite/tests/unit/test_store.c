@@ -817,6 +817,48 @@ static void test_sync_stopped_midway(const char *dir) {
 ** more than some hundreds of batches could not be rebuilt in one run. A store that gives 20 batch reads in two
 ** seconds, 60 anchored batches and 30 past the anchor: a verifier waits the store's Retry-After and arrives, and so
 ** does a lost host's successor in its open. A node that is closed while it waits does not wait the store's time out */
+static void test_connections_kept(const char *dir) {
+    TEST("6e5. a node keeps its connections to the store: 40 batches put and 40 read open a few, not one a request (#405)");
+    int port = test_free_port();
+    char url[64], storeDir[600];
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x38 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = NULL, *r = NULL;
+    TestNodeOpts o;
+    long wReq = 0, wConn = 0, rReq = 0, rConn = 0;
+    int i;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/kept_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
+#define KEPT_DONE() do { if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); } while (0)
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "kept_w"; o.privkey = kseq;
+    if (!(w = test_open_node(tpath("kept_w.db"), l1, &o))) { KEPT_DONE(); FAIL("open the writer"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 0; i < 40; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('one connection')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { KEPT_DONE(); FAIL("a flush"); }
+        if (i % 20 == 19 && hpplite_node_anchor(w) != (uint64_t)i + 1) { KEPT_DONE(); FAIL("an anchor"); }
+    }
+    hpplite_store_traffic(w->store, &wReq, &wConn);
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "kept_r", .privkey = kseq };
+        r = test_open_node(tpath("kept_r.db"), l1, &ro);
+    }
+    if (!r) { KEPT_DONE(); FAIL("open the verifier"); }
+    hpplite_store_traffic(r->store, &rReq, &rConn);
+    printf("(the writer: %ld requests on %ld connections; the verifier: %ld requests on %ld connections) ", wReq, wConn, rReq, rConn);
+    if (status_int(r->db, "height") != 41 || count_rows(r->db, "t") != 40 || !same_root(w, r)) { KEPT_DONE(); FAIL("the verifier holds the 40 batches, the writer's root"); }
+    if (wReq < 40 || rReq < 40) { KEPT_DONE(); FAIL("the test's premise: a request or more a batch"); }
+    if (wConn > 4) { KEPT_DONE(); FAIL("the writer should put its batches on the connection it has"); }
+    if (rConn > 12) { KEPT_DONE(); FAIL("the verifier should read its batches on the connections it has: the eight of its reads ahead and its own"); }
+    KEPT_DONE();
+#undef KEPT_DONE
+    PASS();
+}
+
 static void test_read_limit(const char *dir) {
     TEST("a store's read limit (#402): 60 anchored batches at a store that gives 20 reads in two seconds - a verifier waits out the 429s and arrives, a new host too with 30 more by name; a close ends a wait");
     int port = test_free_port(), port2;
@@ -2717,6 +2759,7 @@ int main(int argc, char **argv) {
     test_reads_ahead(dir);
     test_sync_stopped_midway(dir);
     test_read_limit(dir);
+    test_connections_kept(dir);
     test_restart_store_down(dir);
     test_snapshot_name_refused(dir);
     test_manifest_short_hex(url);
