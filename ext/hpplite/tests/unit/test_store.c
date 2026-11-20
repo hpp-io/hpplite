@@ -1833,6 +1833,68 @@ static void test_recovery_store_down(const char *dir) {
     PASS();
 }
 
+/* 10d. Recovery onto a file the application holds (#387): the store gives the batch past this file's height and its
+** pages cannot be written while another connection has the file in WAL. Taken for the end of the names, the node said
+** "synced" and its next batch took the name. It is owed, as a store that did not answer is: not synced, nothing posted,
+** asked again, recovered once the file is free */
+static void test_recovery_file_held(const char *url) {
+    TEST("recovery onto a file the application holds (#387): a host with its bookkeeping at height 4, two batches past it at the store; held in WAL it is not synced and posts nothing; the file free, it recovers them, then posts its own");
+    static const unsigned char k[32] = { [31] = 0x7d };
+    HppliteL1 *l1 = lost_host(url, k, "rh_a", "rh_a.db");
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "rh_b", .privkey = k }, oa = { .storeUrl = url, .nodeId = "rh_a", .privkey = k };
+    HppliteNode *b, *a;
+    sqlite3 *app = NULL;
+    long long hb, h0, h1;
+    int s0, s1, rows1, rowsR, i;
+    uint64_t f0, f1, f2;
+    char e0[400], e1[400];
+    if (!l1) FAIL("the first host's batches");
+    /* the second host: the first's three batches recovered, a clean stop; its file and bookkeeping are at height 4 */
+    b = test_open_node(tpath("rh_b.db"), l1, &o);
+    if (!b) { hpplite_l1_disconnect(l1); FAIL("open the second host"); }
+    hb = status_int(b->db, "height");
+    b->ownsL1 = 0; hpplite_node_destroy(b);
+    hpplite_l1_mock_advance_time(l1, 400);
+    /* the first host again: two more batches to the store, and gone */
+    a = test_open_node(tpath("rh_a.db"), l1, &oa);
+    if (!a) { hpplite_l1_disconnect(l1); FAIL("open the first host again"); }
+    for (i = 0; i < 2; i++) {
+        hpplite_node_exec(a, "INSERT INTO t(v) VALUES('the lost host, later')", NULL);
+        if (hpplite_node_flush_batch(a) < 1) { printf("(%s) ", status_text(a->db, "last_error")); hpplite_node_destroy(a); FAIL("the first host's later batches"); }
+    }
+    hpplite_node_stop_timer(a);
+    a->ownsL1 = 0; a->l1 = NULL;
+    hpplite_node_destroy(a);
+    hpplite_l1_mock_advance_time(l1, 400);
+    /* the second host's application is up before its sequencer */
+    sqlite3_open(tpath("rh_b.db"), &app);
+    sqlite3_exec(app, "PRAGMA journal_mode=WAL; SELECT count(*) FROM t", NULL, NULL, NULL);
+    b = test_open_node(tpath("rh_b.db"), l1, &o);
+    if (!b) { sqlite3_close(app); hpplite_l1_disconnect(l1); FAIL("open the second host on the held file"); }
+    h0 = status_int(b->db, "height"); s0 = (int)status_int(b->db, "synced");
+    snprintf(e0, sizeof e0, "%s", status_text(b->db, "last_error"));
+    f0 = hpplite_node_flush_batch(b);
+    sqlite3_close(app);
+    f1 = hpplite_node_flush_batch(b);
+    h1 = status_int(b->db, "height"); s1 = (int)status_int(b->db, "synced"); rows1 = count_rows(b->db, "t");
+    snprintf(e1, sizeof e1, "%s", status_text(b->db, "last_error"));
+    hpplite_node_exec(b, "INSERT INTO t(v) VALUES('the second host')", NULL);
+    f2 = hpplite_node_flush_batch(b);
+    hpplite_node_anchor(b);
+    rowsR = replica_rows(l1, url, k, "rh_r", "rh_r.db", "t");
+    printf("(the second host at %lld; held: height %lld, synced %d, '%s', flush %llu; free: flush %llu, height %lld, synced %d, '%s', rows %d, its own at %llu; a replica: rows %d) ",
+           hb, h0, s0, e0, (unsigned long long)f0, (unsigned long long)f1, h1, s1, e1, rows1, (unsigned long long)f2, rowsR);
+    b->ownsL1 = 0; hpplite_node_destroy(b);
+    hpplite_l1_disconnect(l1);
+    if (hb != 4) FAIL("the second host did not recover the first three batches");
+    if (s0 != 0 || !strstr(e0, "past the anchor are not read")) FAIL("the host says it is synced with the store's batch not applied");
+    if (f0 != 0 || h1 != 6 || s1 != 1 || rows1 != 5) FAIL("the file free, the two batches are not recovered");
+    if (e1[0]) FAIL("recovered, the node still says why it was not");
+    if (f2 != 6) FAIL("the host's own batch does not go after the recovered ones");
+    if (rowsR != 6) FAIL("a replica does not arrive at the lost host's rows and the second host's");
+    PASS();
+}
+
 /* 11. The soft tier (#166): a verifier with the store follows the sequencer's batches as they reach the
 ** store, before any anchor, and they turn hard when the anchor names what it applied. */
 static void test_soft_replica(const char *url) {
@@ -2083,6 +2145,7 @@ int main(int argc, char **argv) {
     test_anchor_idle_deadline(url);
     test_recovery(url);
     test_recovery_adopt(url);
+    test_recovery_file_held(url);
     test_soft_replica(url);
     test_soft_past_ring(url);
     test_soft_disagreement(url);

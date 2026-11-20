@@ -3581,7 +3581,7 @@ static int node_soft_walk(HppliteNode *node) {
         size_t n = 0;
         uint8_t *data;
         HppliteBatch *batch;
-        int rc, saved;
+        int rc, saved, held;
         sqlite3_stmt *q = NULL;
         snprintf(name, sizeof name, "%.40s-%llu", zDa + 2, (unsigned long long)h);
         for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
@@ -3635,7 +3635,23 @@ static int node_soft_walk(HppliteNode *node) {
         if (!batch) { hpplite_error(node->ctx, "batch %llu at the store could not be read; recovery stops before it", (unsigned long long)h); free(data); break; }
         batch->pPosted = data; batch->nPosted = n; batch->bOwnsPosted = 1;
         memcpy(before, node->ctx->chainHash, 32);
+        held = strstr(node->ctx->zLastError, "the file is held by another connection") != NULL;
+        if (held) { node->ctx->quiet = 1; node->ctx->zQuietError[0] = 0; }   /* said already: tried again without saying it at every flush */
         rc = (node->pm && !node->config.verifyOnly && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
+        node->ctx->quiet = 0;
+        if (rc == SQLITE_BUSY) {
+            /* the store gave the batch and its pages cannot be written yet: the application holds the file. Not the
+            ** end of the names either (#387): taken for it, the node said "synced" and its next batch took this name.
+            ** Owed, as a store that did not answer is */
+            owed = 1;
+            if (!held)
+                hpplite_error(node->ctx, "batch %llu at the store is not applied (the file is held by another connection): the batches past the anchor are not read; nothing is posted until they are",
+                              (unsigned long long)h);
+            node->retryAt = node_current_time_ms() + (node->config.batchIntervalMs > 5000 ? node->config.batchIntervalMs : 5000);
+            hpplite_batch_free(batch);
+            break;
+        }
+        if (held && rc != SQLITE_OK && node->ctx->zQuietError[0]) hpplite_error(node->ctx, "%s", node->ctx->zQuietError);
         if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
             hpplite_error(node->ctx, "batch %llu at the store does not apply on this history (rc=%d); recovery stops before it", (unsigned long long)h, rc);
             hpplite_batch_free(batch);
@@ -3673,6 +3689,7 @@ static int node_soft_walk(HppliteNode *node) {
                 (unsigned long long)first, (unsigned long long)last);
         node->anchorAt = 0;                                          /* the timer anchors them soon */
     }
+    if (node->walkOwed == 1 && !owed && strstr(node->ctx->zLastError, "past the anchor are not read")) hpplite_error_clear(node->ctx);   /* made now: its line is taken back */
     node->walkOwed = owed;
     if (owed == 1) node->softWalked = 0;                             /* made again, from the height it reached */
     return first ? (int)(last - first + 1) : 0;

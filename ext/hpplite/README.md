@@ -909,7 +909,12 @@ meanwhile and the store, answering again, holds batches the file does not
 have, neither is written over: the node posts nothing and says "the store
 holds batch N past the anchor, which this file does not have, and the file
 has commits of its own" - restart it on an empty file to rebuild from the
-history, or with `adopt=on` to keep the file as the state after it. What is
+history, or with `adopt=on` to keep the file as the state after it. A batch
+the store gave whose pages cannot be written yet - the application's
+connection holds the file in WAL - is owed the same way (#387): "batch N at
+the store is not applied (the file is held by another connection): the
+batches past the anchor are not read; nothing is posted until they are",
+tried again at each flush and recovered once the file is free. What is
 lost is what never reached the store: at most one flush interval. A successor that is another instance - a fresh file has a
 seed of its own - waits out the dead one's lease (an hour since VERSION 9)
 before it can post: what its app writes during the wait is in its file and
