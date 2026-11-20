@@ -15,10 +15,13 @@
 ** what is left, and an application connection takes over if any is open.
 **
 ** The first line on stdout, "hpplite-sequencer: <file> synced height N", comes
-** when the open has returned (#264): the chain and the store applied to the
-** file, the lease taken. A supervisor restoring an empty volume waits for it
+** when the node is synced (#264, #381): the chain's head read and the file there
+** (hpplite_status.synced). A supervisor restoring an empty volume waits for it
 ** before the application opens the file - pages cannot be applied while
-** another connection holds the file in WAL mode. Everything else goes to stderr.
+** another connection holds the file in WAL mode. After an open whose sync
+** stopped, or could not read the chain, the line is held: "hpplite-sequencer:
+** <file> not synced: <the node's error>" goes to stderr, the process stays up,
+** and the line comes when the node is synced. Everything else goes to stderr.
 ** SIGUSR1 prints one line of the node's status there; commits pending for HPPLITE_STUCK_SECONDS (30) with nothing
 ** posted are said once, with the node's last error (#368). A database file replaced or removed under the sequencer
 ** (#320: the node says so and posts nothing more) ends the process, exit 4 (#379): to a supervisor it is a failure,
@@ -37,8 +40,8 @@
 ** closed (what is pending posted), a changed one is closed and opened again,
 ** one that failed to open is tried again; the others are not disturbed. One
 ** line per database on stdout, prefixed with its name: "<name>: synced height
-** N", "<name>: closed", "<name>: error: ...", and the sequencer role as it
-** changes. One database failing does not stop the rest. A database whose file
+** N" ("<name>: not synced: ..." until it is, #381), "<name>: closed", "<name>:
+** error: ...", and the sequencer role as it changes. One database failing does not stop the rest. A database whose file
 ** was replaced or removed under it (#320) says "<name>: error: ...", is closed
 ** and opened again on the file there now (#379). SIGTERM or SIGINT
 ** closes them all, each posting what is pending, within
@@ -109,6 +112,14 @@ static char *status_text(sqlite3 *db, const char *col, char *out, size_t n) {
     return out;
 }
 
+/* why the node is not synced (#381): its last error, or what its state says */
+static char *not_synced_why(sqlite3 *db, char *out, size_t n) {
+    char state[32];
+    status_text(db, "last_error", out, n);
+    if (!out[0]) snprintf(out, n, "the chain was not read yet (state %s)", status_text(db, "state", state, sizeof state));
+    return out;
+}
+
 /* ---- --dir: one connection per <name>.conf, each in its own thread ---- */
 
 typedef struct Db Db;
@@ -148,7 +159,7 @@ static void *db_thread(void *arg) {
     Db *d = (Db *)arg;
     sqlite3 *db = hpplite_open(d->uri);
     char err[512] = "", seen[512] = "", state[32];
-    int role = -1, gen = askedGen, replaced = 0;
+    int role = -1, gen = askedGen, replaced = 0, synced;
     wipe_free(d->uri);
     d->uri = NULL;
     if (!db) {
@@ -158,9 +169,19 @@ static void *db_thread(void *arg) {
         d->done = 1;
         return NULL;
     }
-    say(d->name, "synced height %d", status_int(db, "height"));
+    /* the line says the file is the rollup's state: held after a sync that stopped or could not read the chain (#381) */
+    synced = status_int(db, "synced") == 1;
+    if (synced) say(d->name, "synced height %d", status_int(db, "height"));
+    else {
+        say(d->name, "not synced: %s", not_synced_why(db, err, sizeof err));
+        if (strcmp(status_text(db, "state", state, sizeof state), "error") == 0) status_text(db, "last_error", seen, sizeof seen);   /* said */
+    }
     while (!d->quit) {
         int seq = status_int(db, "sequencer");
+        if (!synced && status_int(db, "synced") == 1) {
+            synced = 1;
+            say(d->name, "synced height %d", status_int(db, "height"));
+        }
         if (seq != role) {
             role = seq;
             say(d->name, "%s", seq == 1 ? "sequencing" : "waiting: another process sequences it");
@@ -443,8 +464,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "hpplite-sequencer: cannot open %s with HPPLite (HPPLITE_PARAMS?)\n", argv[1]);
         return 1;
     }
-    printf("hpplite-sequencer: %s synced height %d\n", argv[1], status_int(db, "height"));
-    fflush(stdout);                                /* the line is the signal: out before anything else happens */
+    /* the line is the signal: out before anything else happens - and only when the node is synced (#381): after a
+    ** sync that stopped, or could not read the chain, the open returns all the same, and the line then said the file
+    ** was the rollup's state when it was not. Held, with the reason on stderr, until the node is synced */
+    int synced = status_int(db, "synced") == 1;
+    if (synced) {
+        printf("hpplite-sequencer: %s synced height %d\n", argv[1], status_int(db, "height"));
+        fflush(stdout);
+    } else {
+        char why[512];
+        fprintf(stderr, "hpplite-sequencer: %s not synced: %s\n", argv[1], not_synced_why(db, why, sizeof why));
+    }
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
     signal(SIGUSR1, on_usr1);
@@ -457,6 +487,11 @@ int main(int argc, char **argv) {
     while (!stop) {
         int seq = status_int(db, "sequencer"), height = status_int(db, "height"), pending = status_int(db, "pending");
         char state[32], err[512];
+        if (!synced && status_int(db, "synced") == 1) {
+            synced = 1;
+            printf("hpplite-sequencer: %s synced height %d\n", argv[1], height);
+            fflush(stdout);
+        }
         if (seq != role) {
             role = seq;
             fprintf(stderr, "hpplite-sequencer: %s %s\n", argv[1],

@@ -315,10 +315,15 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   never waits for the chain (WordPress, 8 PHP workers, 16 concurrent
   clients: ~4% over plain SQLite; `tests/real_apps/wordpress`). Its first
   line on stdout, `hpplite-sequencer: <file> synced height N`, comes when
-  the open has returned - the chain and the store applied to the file, the
-  lease taken (#264): a supervisor that starts an app on an empty volume
-  waits for it before the app opens the file, since pages cannot be applied
-  while another connection holds the file in WAL mode. The rest goes to
+  the node is synced - the chain's head read and the file there (#264): a
+  supervisor that starts an app on an empty volume waits for it before the
+  app opens the file, since pages cannot be applied while another connection
+  holds the file in WAL mode. After an open whose sync stopped (those pages,
+  a batch that cannot be read) or could not read the chain, the line is
+  held (#381): `hpplite-sequencer: <file> not synced: <the node's error>`
+  goes to stderr, the process stays up, and the line comes when the node is
+  synced (`hpplite_status.synced`) - a supervisor's timeout on the line is
+  "this file is not the rollup's state yet". The rest goes to
   stderr. SIGUSR1 prints one line of the node's status there (height,
   pending, sequencer, lease, state, last error); commits pending for
   `HPPLITE_STUCK_SECONDS` (30) with nothing posted are said once, with the
@@ -338,7 +343,8 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   rollup, in one process. SIGHUP reads the directory again: a new file
   opens, a removed one closes (posting what is pending), a changed one is
   reopened, the others are not disturbed. One line per database on stdout:
-  `<name>: synced height N`, `<name>: closed`, `<name>: error: ...`. One
+  `<name>: synced height N` (`<name>: not synced: ...` until it is, #381),
+  `<name>: closed`, `<name>: error: ...`. One
   failing does not stop the rest; one whose file was replaced or removed
   under it says its error, is closed and is opened again on the file there
   now (#379); SIGTERM closes all within
@@ -688,7 +694,10 @@ how many times the chain committed another batch than the store served, each
 followed by a rebuild), `snapshot_height` (#221: the latest snapshot the
 anchors name, NULL for none), and `file_replaced` (1 once the database file
 was replaced or removed under this sequencer, #320: it posts nothing more,
-and `hpplite-sequencer` stops on it, #379). `state` says what this node is doing about posting: `sequencing`,
+and `hpplite-sequencer` stops on it, #379), and `synced` (#381: 1 when the
+last sync that read the chain's head reached it; 0 after an open whose sync
+stopped or could not read the chain, until a later one is made - the open
+returns either way, and `hpplite-sequencer` holds its "synced" line on it). `state` says what this node is doing about posting: `sequencing`,
 `retrying` (the last post failed, backing off), `waiting` (another instance
 holds the lease), `follower` (another connection on this file posts),
 `verify` (`role=verify`: an audit, never posts), `unposted` (no chain configured: the log waits for one), `local` (`l1=local`:

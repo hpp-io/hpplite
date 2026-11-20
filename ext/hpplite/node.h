@@ -159,6 +159,7 @@ typedef struct HppliteNode {
     int warnedFunder;               /* funder= (#272): the wait on the external funder is said once per episode */
     int warnedNames;                /* said once that the store takes no names (#165) */
     int softWalked;                 /* the store's names past the chain were read once (#167) */
+    int atHead;                     /* the last sync that read the chain's head reached it: hpplite_status.synced (#381) */
     /* the soft tier (#166): what a verifier applied from the store past the anchored height */
     uint64_t softFirst;             /* the first soft height; 0: nothing soft */
     unsigned char (*softChain)[32]; /* the chain hash after each soft height, from softFirst */

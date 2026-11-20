@@ -3892,14 +3892,16 @@ static int node_soft_follow(HppliteNode *node) {
     return applied;
 }
 
-int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
+/* *pHead: 1 the chain's head was read and the file is there, 0 the sync stopped before it, left as it is where the
+** head could not be read (nothing learned) */
+static int node_sync_from_l1(HppliteNode *node, int *pHead) {
     uint64_t lastBatch = 0, totalBatches = 0;
     unsigned char latestHash[32];
     int synced = 0;
 
-    if (!node || !node->l1 || !node->ctx) return 0;
-    if (node_check_rollup(node) < 0) return -1;
+    if (node_check_rollup(node) < 0) { *pHead = 0; return -1; }
     if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
+    *pHead = 0;
     node->anchoredHeight = lastBatch;
     if (node->config.verifyOnly && lastBatch != node->rootsKeptAt) {
         /* the heights a verifier checks against the chain - the anchored one and the last checkpoint - keep their roots
@@ -3918,12 +3920,13 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
                           (unsigned long long)lastBatch);
             node->softDisagreements++;
             if (node_soft_rebuild(node) != 0) return -1;
+            *pHead = 1;
             return 1;
         }
         {
             int settled = node_soft_settle(node, lastBatch);
             if (settled < 0) return -1;
-            if (settled > 0) return 1;                  /* rebuilt: the copy is up to date */
+            if (settled > 0) { *pHead = 1; return 1; }  /* rebuilt: the copy is up to date */
         }
     }
 
@@ -3995,7 +3998,6 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         hpplite_batch_free(batch);
         synced++;
     }
-    (void)useTxn;
     /* Caught up: what we rebuilt must be what the contract committed to.
     ** The DA contract keeps a rolling hash over every batch (#33); ours
     ** advanced with every batch finalized, replayed or skipped. A file from
@@ -4029,7 +4031,21 @@ int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
         hpplite_pagemode_resume(node->pm);
         node->pagesWalSuspended = 0;
     }
+    *pHead = 1;
     return synced;
+}
+
+/* The chain's batches past this node's height, then the store's (below). What it leaves in node->atHead is
+** hpplite_status.synced (#381): the open returns after a sync that stopped (pages that cannot be applied, a batch that
+** cannot be read) and after one that could not read the chain at all, and a program that waits for the file to be the
+** rollup's state - hpplite-sequencer's "synced" line - asks this, not whether the open returned */
+int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn) {
+    int head = -1, rc;
+    (void)useTxn;
+    if (!node || !node->l1 || !node->ctx) return 0;
+    rc = node_sync_from_l1(node, &head);
+    if (head >= 0) node->atHead = head;
+    return rc;
 }
 
 
@@ -4215,7 +4231,7 @@ static void *node_timer_thread_func(void *arg) {
         ** reads the lease and adopts or refuses. It still looks every HPPLITE_IDLE_SYNC_MS; a waiting writer, a
         ** follower and a verifier keep looking at every tick, and hpplite_flush() always does */
         if ((elapsed >= intervalMs || sizeTrigger) && !sizeTrigger && node->state == HPPLITE_STATE_RUNNING && node->hasLease
-            && !node->leaseHeldElsewhere && !node->config.verifyOnly && now < node->idleSyncAt && hpplite_node_pending_count(node) == 0) {
+            && !node->leaseHeldElsewhere && !node->config.verifyOnly && now < node->idleSyncAt && node->atHead && hpplite_node_pending_count(node) == 0) {
             node->lastFlushTime = now;
         } else if (elapsed >= intervalMs || sizeTrigger) {
             pthread_mutex_t *mutex = (pthread_mutex_t *)node->flushMutex;

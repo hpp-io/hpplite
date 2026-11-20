@@ -768,6 +768,52 @@ static void test_file_replaced_under_sequencer(void) {
     PASS();
 }
 
+/* hpplite_status.synced (#381): the node read the chain's head and its file is there. Not so after an open whose
+** sync could not read the chain, nor after one that stopped - the open returns either way */
+static void test_status_synced(void) {
+    TEST("hpplite_status.synced (#381): 1 on a new rollup; 0 after an open that could not read the chain, 1 after the flush that does; 0 after a sync that stopped (the file held in WAL by another connection), 1 once it is made");
+    reset_dir();
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *a = open_node(DIR "/live.db", l1), *r, *h;
+    sqlite3 *other = NULL;
+    long long s0, s1, s2, s3, s4, h1, h3;
+    if (!a) FAIL("open a");
+    s0 = status_int(a->db, "synced");
+    hpplite_node_exec(a, "CREATE TABLE t(x); INSERT INTO t VALUES(1)", NULL);
+    if (hpplite_node_flush_batch(a) != 1) FAIL("a batch 1");
+    hpplite_node_exec(a, "INSERT INTO t VALUES(2)", NULL);
+    if (hpplite_node_flush_batch(a) != 2) FAIL("a batch 2");
+    /* the chain does not answer at the open of a host rebuilt on an empty volume */
+    hpplite_l1_mock_set_rpc_down(l1, 1);
+    r = open_node(DIR "/rebuilt.db", l1);
+    if (!r) { hpplite_l1_mock_set_rpc_down(l1, 0); FAIL("open with the chain down"); }
+    s1 = status_int(r->db, "synced"); h1 = status_int(r->db, "height");
+    hpplite_l1_mock_set_rpc_down(l1, 0);
+    hpplite_node_flush_batch(r);
+    s2 = status_int(r->db, "synced");
+    printf("(new rollup %lld; chain down: synced %lld at height %lld; chain back: synced %lld at height %lld) ", s0, s1, h1, s2, (long long)status_int(r->db, "height"));
+    if (s0 != 1) FAIL("a new rollup's node is synced: there is nothing to read");
+    if (s1 != 0) FAIL("synced after an open that could not read the chain");
+    if (s2 != 1 || count_rows(r->db, "t") != 2) FAIL("not synced after the flush that read the chain");
+    hpplite_node_destroy(r);
+    /* the sync stops: another connection holds the file in WAL */
+    if (sqlite3_open(DIR "/held.db", &other) != SQLITE_OK) FAIL("the other connection");
+    sqlite3_exec(other, "PRAGMA journal_mode=WAL; CREATE TABLE mine(v); INSERT INTO mine VALUES(zeroblob(20000))", NULL, NULL, NULL);
+    h = open_node(DIR "/held.db", l1);
+    if (!h) { sqlite3_close(other); FAIL("open on the held file"); }
+    s3 = status_int(h->db, "synced");
+    sqlite3_close(other);
+    hpplite_node_flush_batch(h);
+    s4 = status_int(h->db, "synced"); h3 = status_int(h->db, "height");
+    printf("(held in WAL: synced %lld; the connection closed: synced %lld at height %lld) ", s3, s4, h3);
+    if (s3 != 0) FAIL("synced after a sync that stopped");
+    if (s4 != 1 || h3 != 3) FAIL("not synced after the sync that was made");
+    hpplite_node_destroy(h);
+    hpplite_node_destroy(a);
+    hpplite_l1_disconnect(l1);
+    PASS();
+}
+
 int main(void) {
     printf("=== HPPLite Durability Tests ===\n");
     test_suite_init("durability", PRIVKEY, DIR);
@@ -791,6 +837,7 @@ int main(void) {
     test_full_disk_mid_series();
     test_adopted_batch_kept_for_reorg();
     test_file_replaced_under_sequencer();
+    test_status_synced();
     remove_dir();
     return test_report();
 }
