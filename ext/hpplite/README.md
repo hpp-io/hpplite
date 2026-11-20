@@ -1159,6 +1159,13 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.10.6** (2026-11-20): what a sync made late leaves behind.
+
+- **The history applied onto a file the node had read before (#384).** A sequencer opened on a restored copy the application held in WAL applies the history once the connection has closed (#381). Where the two files' header counters met, the file was left with the restored schema over the history's pages, the node saying "synced"; and the node's own connection could keep the restored file's schema. The file is the history's now, to every connection. `adopt=on` starts were not affected: they write nothing of the history to the file.
+- **"error" for the life of the process (#386).** A sync that stopped and was made later left `hpplite_status.state` at "error" beside `synced` 1, and the writer asked the chain at every tick (the idle rule, #292, is for a running node). The state is taken back when the sync reaches the head.
+- **A batch at the store the node cannot apply yet (#387).** With the application holding the file, a batch the store gave past the node's height was taken for the end of the history: "synced", and the node's next batch took its name. It is owed, as a store that did not answer is (#382): "batch N at the store is not applied (the file is held by another connection): the batches past the anchor are not read; nothing is posted until they are", `synced` 0, tried again at each flush.
+- No protocol or format changes; the stores and the relays are unchanged.
+
 **v0.10.5** (2026-11-20): a restored file, and a start that says what it knows.
 
 - **A restored file as the state (#380).** `adopt=on` (`HPPLITE_ADOPT`), given for one start: a sequencer's file with no bookkeeping beside it and at least one table, on a rollup whose history is not this file's (a platform's newest copy restored onto a new host), is taken as the state. The history is read and kept, none of it written to the file; the file goes whole as the next height, and the node says "adopted as the state after height N". Without it such a file is overwritten by the history, as before. See [A restored file](#a-restored-file-380).
