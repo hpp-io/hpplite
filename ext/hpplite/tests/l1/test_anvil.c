@@ -4219,6 +4219,78 @@ static void test_rebuild_chain_calls(void) {
     PASS();
 }
 
+/* 75. The index's walk (#411): the chain client learns where each height's commitment is by walking the events
+** backward from lastBlock(), each naming the block of the one before. It asked for one block a request - a request
+** a commitment, down to genesis, at every open and in every handle (HPP Sepolia, a rollup of 718 commitments:
+** minutes before the first batch was read). It asks for a span of blocks a request and follows the names inside
+** the answer; an RPC that refuses a span is asked for less, and one whose answer for a span leaves out a block a
+** commitment names is asked for that block alone and for shorter spans from then on. */
+static void test_index_walk_spans(void) {
+    TEST("the index's walk asks for a span of blocks, not a block a commitment (#411): 30 batches each anchored, hpplite-verify --to 1 through the counting proxy; then an RPC that refuses more than 8 blocks a request, and one that cuts a span's answer to its first 3 logs: the whole history verified at each");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char *NKEY = "0x7373737373737373737373737373737373737373737373737373737373737373";
+    static const char *modeFile = DIR "/proxy75.mode";
+    char addr[48], cmd[600], extra[300], vparams[500], contract[80] = "", out[3][8192], proxyRpc[64];
+    long logs[3], refused, cut;
+    int port, pport, b, rc[3];
+    pid_t pid;
+    sqlite3 *w;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    (void)!system("rm -rf " DIR "/store_pins75 " DIR "/iw_writer.db* " DIR "/proxy75.mode*");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", NKEY);
+    if (run_cmd(cmd, out[0], sizeof out[0]) != 0 || strncmp(out[0], "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out[0]);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    port = test_free_port();
+    pid = start_pin_service_dir(svc, port, DIR "/store_pins75");
+    if (pid < 0) FAIL("the store did not come up");
+#define IW_END() do { kill_proxy(); kill(pid, SIGTERM); waitpid(pid, NULL, 0); } while (0)
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&anchor=0", port);
+    w = open_db("iw_writer.db", NKEY, extra);
+    if (!w) { IW_END(); FAIL("open writer"); }
+    sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    for (b = 1; b <= 30; b++) {
+        sqlite3_exec(w, "INSERT INTO n(v) VALUES(hex(randomblob(200)))", NULL, NULL, NULL);
+        if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); IW_END(); FAIL("a batch through the store"); }
+        if (scalar(w, "SELECT hpplite_anchor()") != b) { printf("(anchor %d: %s) ", b, status_text(w, "last_error")); sqlite3_close(w); IW_END(); FAIL("an anchor"); }
+    }
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    sqlite3_close(w);
+    pport = test_free_port();
+    snprintf(proxyRpc, sizeof proxyRpc, "http://127.0.0.1:%d", pport);
+    set_proxy_mode(modeFile, "");
+    if (start_proxy(pport, modeFile) != 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); printf("SKIP (python3 or tests/l1/rpc_proxy.py not available) "); PASS(); return; }
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", proxyRpc, contract, NKEY, port);
+    logs[0] = proxy_count(modeFile, "eth_getLogs");
+    out[0][0] = 0;
+    rc[0] = run_verify_with(vparams, "--to 1", out[0], sizeof out[0]);
+    logs[0] = proxy_count(modeFile, "eth_getLogs") - logs[0];
+    set_proxy_mode(modeFile, "logs_span=8\n");
+    logs[1] = proxy_count(modeFile, "eth_getLogs");
+    out[1][0] = 0;
+    rc[1] = run_verify_with(vparams, "", out[1], sizeof out[1]);
+    logs[1] = proxy_count(modeFile, "eth_getLogs") - logs[1];
+    refused = proxy_count(modeFile, "refused");
+    set_proxy_mode(modeFile, "logs_cut=3\n");
+    logs[2] = proxy_count(modeFile, "eth_getLogs");
+    out[2][0] = 0;
+    rc[2] = run_verify_with(vparams, "", out[2], sizeof out[2]);
+    logs[2] = proxy_count(modeFile, "eth_getLogs") - logs[2];
+    cut = proxy_count(modeFile, "cut");
+    IW_END();
+#undef IW_END
+    printf("(30 commitments: --to 1 asked eth_getLogs %ld times; at an RPC refusing more than 8 blocks a request the whole history %ld times, %ld of them refused; at one cutting a span's answer to 3 logs %ld times, %ld answers cut) ", logs[0], logs[1], refused, logs[2], cut);
+    if (rc[0] != 0 || !strstr(out[0], "the database as of batch 1: state root")) FAILF("--to 1 through the proxy should verify; exit %d\n%s", rc[0], out[0]);
+    if (logs[0] > 6) FAILF("an open on a rollup of 30 commitments should not ask eth_getLogs once a commitment: %ld times", logs[0]);
+    if (rc[1] != 0 || !strstr(out[1], "chain hash over 30 batches: matches")) FAILF("at an RPC that refuses a span the walk asks for less and the history verifies; exit %d\n%s", rc[1], out[1]);
+    if (refused < 1) FAIL("the proxy refused no request: the span was not asked for");
+    if (rc[2] != 0 || !strstr(out[2], "chain hash over 30 batches: matches")) FAILF("at an RPC that cuts a span's answer short the named blocks are asked for alone and the history verifies; exit %d\n%s", rc[2], out[2]);
+    if (cut < 1) FAIL("the proxy cut no answer short");
+    PASS();
+}
+
 /* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
 ** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
 ** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
@@ -5231,6 +5303,7 @@ int main(void) {
     if (wanted(72)) test_stop_nearest_snapshot();
     if (wanted(73)) test_stop_past_anchor();
     if (wanted(74)) test_rebuild_chain_calls();
+    if (wanted(75)) test_index_walk_spans();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

@@ -15,6 +15,13 @@ each line is key=value, missing keys are 0:
     error=0.4        this fraction gets HTTP 503 with an empty body, and is
                      not forwarded (a gateway that refused it)
     hold_ms=4000     how long a timed-out response is held
+    logs_span=8      an eth_getLogs over more blocks than this is answered
+                     with a JSON-RPC error and not forwarded (#411: an RPC
+                     that limits the blocks of one request); counted as
+                     "refused"
+    logs_cut=3       an eth_getLogs over more than one block is answered
+                     with its first logs_cut logs and no error (#411: an RPC
+                     that cuts a long answer short); counted as "cut"
     seed=1           the random stream (one per proxy start)
 
 When the mode changes, the first requests take each fault kind the mode
@@ -126,13 +133,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 roll = {"error": 0.0, "drop": mode.get("error", 0),
                         "timeout": mode.get("error", 0) + mode.get("drop", 0)}[kind]
         try:
-            method = json.loads(body).get("method")
+            req = json.loads(body)
+            method = req.get("method")
         except (ValueError, AttributeError):
-            method = None
+            req, method = None, None
         if isinstance(method, str) and method.replace("_", "").isalnum():
             count("requests", method)
         else:
             count("requests")
+        blocks = 0
+        if method == "eth_getLogs":
+            try:
+                f = req["params"][0]
+                blocks = int(f["toBlock"], 16) - int(f["fromBlock"], 16) + 1
+            except (KeyError, IndexError, TypeError, ValueError):
+                blocks = 0
+        if mode.get("logs_span", 0) > 0:
+            if blocks > mode["logs_span"]:
+                count("refused")
+                self.reply(200, json.dumps({"jsonrpc": "2.0", "id": req.get("id"),
+                                            "error": {"code": -32602, "message": "block range too large"}}).encode())
+                return
         if roll < mode.get("error", 0):
             count("errored")
             self.reply(503, b"")
@@ -147,6 +168,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(502, b"")
             return
         count("forwarded")
+        if blocks > 1 and mode.get("logs_cut", 0) > 0:
+            try:
+                answer = json.loads(data)
+                if len(answer["result"]) > mode["logs_cut"]:
+                    answer["result"] = answer["result"][:int(mode["logs_cut"])]
+                    data = json.dumps(answer).encode()
+                    count("cut")
+            except (ValueError, KeyError, TypeError):
+                pass
         if roll < mode.get("drop", 0):
             count("dropped")
             self.close_connection = True       # the answer never arrives

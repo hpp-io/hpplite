@@ -54,6 +54,7 @@ typedef struct EthL1 {
     uint64_t nIndexAlloc;
     uint64_t indexedHeight;
     uint64_t lastIndexedBlock; /* the block the last walk started from: the next walk stops there */
+    uint64_t indexSpanMax;     /* the walk asks eth_getLogs for no more blocks than this (#411: more was refused, or left a commitment out); 0: no such limit met */
     HppliteRange lastRange;    /* the range last read from its log (#410): a rebuild asks for it once a batch; fromHeight 0: none */
 
     /* relay= (#126): the signed forms of the node's writes go through it,
@@ -1332,12 +1333,23 @@ static uint64_t abi_word_u64(const uint8_t *data, size_t len, int i) {
 /*
 ** DA v3 (#164): the contract keeps no block per height; every event names
 ** the block of the commitment before it. The index walks the events
-** backward from lastBlock() to the block the previous walk started from,
-** one eth_getLogs per block, and records per height its block and, when the
-** height is inside an anchored range, the range's first height.
+** backward from lastBlock() to the block the previous walk started from
+** and records per height its block and, when the height is inside an
+** anchored range, the range's first height.
+**
+** The walk asks for a span of blocks a request and follows the names inside
+** the answer (#411: a block a request was a request a commitment, down to
+** genesis at every open). The span doubles while its answers are small; an
+** RPC that refuses one is asked for a quarter, down to the one block. The
+** names stay the check: a block a commitment names and the span's answer
+** does not hold is asked for alone, and an RPC that had left it out is asked
+** for a quarter of the span from then on.
 */
+#define INDEX_SPAN 2000u            /* blocks in a walk's first request */
+#define INDEX_SPAN_LOGS 256         /* an answer of fewer logs: the next span is twice as long */
 static int eth_index_update(HppliteL1 *l1) {
-    uint64_t last = 0, total = 0, block, top, stop;
+    uint64_t last = 0, total = 0, block, top, stop, span;
+    int alone = 0;                    /* the next request is for the one block a name gave and a span's answer did not hold */
     uint8_t calldata[4], latest[32];
     uint8_t *result;
     size_t result_len = 0;
@@ -1363,33 +1375,54 @@ static int eth_index_update(HppliteL1 *l1) {
     top = block = abi_decode_uint64(result);
     free(result);
     stop = self->lastIndexedBlock;
+    span = self->indexSpanMax && self->indexSpanMax < INDEX_SPAN ? self->indexSpanMax : INDEX_SPAN;
     while (block > stop) {
         EthLog *logs = NULL;
-        int n = 0, i;
-        uint64_t prev = block;
-        if (eth_client_get_block_logs(self->eth, self->da_contract, block, &logs, &n) != 0) return -1;
-        for (i = 0; i < n; i++) {
-            EthLog *e = &logs[i];
-            uint64_t p = block, h, from, to;
-            if (e->nTopics < 2) continue;
-            if (memcmp(e->topics[0], TOPIC3_BATCH_SUBMITTED, 32) == 0 || memcmp(e->topics[0], TOPIC3_BATCH_COMMITTED, 32) == 0) {
-                h = abi_decode_uint64(e->topics[1]);
-                if (h >= 1 && h <= last) { self->aBlock[h] = block; self->aRangeFrom[h] = 0; }
-                p = abi_word_u64(e->data, e->nData, memcmp(e->topics[0], TOPIC3_BATCH_SUBMITTED, 32) == 0 ? 1 : 2);
-            } else if (memcmp(e->topics[0], TOPIC3_RANGE_COMMITTED, 32) == 0 && e->nTopics >= 3) {
-                from = abi_decode_uint64(e->topics[1]);
-                to = abi_decode_uint64(e->topics[2]);
-                if (to > last) to = last;
-                for (h = from; h >= 1 && h <= to; h++) { self->aBlock[h] = block; self->aRangeFrom[h] = from; }
-                p = abi_word_u64(e->data, e->nData, 4);
-            } else {
-                continue;
+        int n = 0, i, ended = 0, missed = 0;
+        uint64_t lo = alone ? block : block - stop > span ? block - span + 1 : stop + 1;
+        uint64_t cur = block;
+        if (eth_client_get_logs(self->eth, self->da_contract, lo, block, &logs, &n) != 0) {
+            if (lo == block) return -1;
+            span = span / 4 ? span / 4 : 1;          /* refused, or failed: less is asked for - that costs requests, not the walk */
+            self->indexSpanMax = span;
+            continue;
+        }
+        i = n - 1;
+        for (;;) {
+            uint64_t prev = cur;
+            int here = 0;
+            while (i >= 0 && logs[i].block > cur) i--;       /* between two named blocks: not a commitment of the chain of names */
+            for (; i >= 0 && logs[i].block == cur; i--) {
+                EthLog *e = &logs[i];
+                uint64_t p = cur, h, from, to;
+                here++;
+                if (e->nTopics < 2) continue;
+                if (memcmp(e->topics[0], TOPIC3_BATCH_SUBMITTED, 32) == 0 || memcmp(e->topics[0], TOPIC3_BATCH_COMMITTED, 32) == 0) {
+                    h = abi_decode_uint64(e->topics[1]);
+                    if (h >= 1 && h <= last) { self->aBlock[h] = cur; self->aRangeFrom[h] = 0; }
+                    p = abi_word_u64(e->data, e->nData, memcmp(e->topics[0], TOPIC3_BATCH_SUBMITTED, 32) == 0 ? 1 : 2);
+                } else if (memcmp(e->topics[0], TOPIC3_RANGE_COMMITTED, 32) == 0 && e->nTopics >= 3) {
+                    from = abi_decode_uint64(e->topics[1]);
+                    to = abi_decode_uint64(e->topics[2]);
+                    if (to > last) to = last;
+                    for (h = from; h >= 1 && h <= to; h++) { self->aBlock[h] = cur; self->aRangeFrom[h] = from; }
+                    p = abi_word_u64(e->data, e->nData, 4);
+                } else {
+                    continue;
+                }
+                if (p < prev) prev = p;
             }
-            if (p < prev) prev = p;
+            if (here == 0 && lo < block) { missed = 1; break; }   /* a named block the span's answer does not hold */
+            if (here == 0 || prev >= cur) { ended = 1; break; }   /* nothing of ours here, or no earlier commitment named: the walk ends */
+            cur = prev;
+            if (cur < lo) break;
         }
         eth_logs_free(logs, n);
-        if (n == 0 || prev >= block) break;      /* nothing of ours here, or no earlier commitment named: the walk ends */
-        block = prev;
+        if (ended) break;
+        if (alone) self->indexSpanMax = span = span / 4 ? span / 4 : 1;    /* it was there: this RPC's answer for a span had left it out */
+        alone = missed;
+        block = cur;
+        if (!missed && n < INDEX_SPAN_LOGS && span < ((uint64_t)1 << 40) && (!self->indexSpanMax || span * 2 <= self->indexSpanMax)) span *= 2;
     }
     self->lastIndexedBlock = top;
     self->indexedHeight = last;

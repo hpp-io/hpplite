@@ -100,17 +100,21 @@ uint8_t *eth_client_get_log(EthClient *client, const uint8_t address[20], uint64
                             const uint8_t topic0[32], const uint8_t topic1[32],
                             size_t *data_len, uint8_t topic2[32]);
 
-/* Every log of `address` in `block`, in log order (#164: DA v3 names the
-** previous commitment's block in every event, so a reader walks the
-** commitments backward from the contract's lastBlock()). 0 with a malloc'd
-** array (eth_logs_free), -1 when the call failed. */
+/* Every log of `address` in the blocks fromBlock..toBlock, as the RPC gives
+** them (by block, then in log order), each with its block (#164: DA v3 names
+** the previous commitment's block in every event, so a reader walks the
+** commitments backward from the contract's lastBlock(); #411: a span of
+** blocks a request). 0 with a malloc'd array (eth_logs_free), -1 when the
+** call failed - an RPC that limits the blocks of one request among the
+** reasons. */
 typedef struct EthLog {
     int nTopics;
     uint8_t topics[4][32];
     uint8_t *data;          /* ABI-encoded, malloc'd, terminated */
     size_t nData;
+    uint64_t block;         /* the block it is in */
 } EthLog;
-int eth_client_get_block_logs(EthClient *client, const uint8_t address[20], uint64_t block, EthLog **pLogs, int *pnLogs);
+int eth_client_get_logs(EthClient *client, const uint8_t address[20], uint64_t fromBlock, uint64_t toBlock, EthLog **pLogs, int *pnLogs);
 void eth_logs_free(EthLog *logs, int n);
 
 /* === Utility === */
