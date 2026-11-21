@@ -54,6 +54,7 @@ typedef struct EthL1 {
     uint64_t nIndexAlloc;
     uint64_t indexedHeight;
     uint64_t lastIndexedBlock; /* the block the last walk started from: the next walk stops there */
+    HppliteRange lastRange;    /* the range last read from its log (#410): a rebuild asks for it once a batch; fromHeight 0: none */
 
     /* relay= (#126): the signed forms of the node's writes go through it,
     ** paid over x402; the plain call only when it fails and the wallet
@@ -235,6 +236,7 @@ static void eth_disconnect(HppliteL1 *l1) {
     if (!l1) return;
     free(self->aBlock);
     free(self->aRangeFrom);
+    hpplite_l1_range_clear(&self->lastRange);
     if (self->cached_state) hpplite_l1_state_free(self->cached_state);
     if (self->cached_system_config) hpplite_l1_system_config_free(self->cached_system_config);
     if (self->rpcUrl) free(self->rpcUrl);
@@ -1394,6 +1396,13 @@ static int eth_index_update(HppliteL1 *l1) {
     return 0;
 }
 
+/* The index as far as `height` (#410): what is anchored stays where it is, so a height the index covers asks the
+** chain nothing - a rebuild looked each of its batches up three times, and each lookup began with getDAState() */
+static int eth_index_cover(HppliteL1 *l1, uint64_t height) {
+    if (height >= 1 && height <= self->indexedHeight) return 0;
+    return eth_index_update(l1);
+}
+
 static int eth_has_ranges(HppliteL1 *l1) {
     return l1 && ensure_da_contract(l1) && self->version >= 9;
 }
@@ -1460,9 +1469,18 @@ static int eth_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
     size_t raw_len = 0, rcptLen = 0;
     uint64_t from;
     if (!l1 || !out || !ensure_da_contract(l1) || self->version < 9) return -1;
-    if (eth_index_update(l1) != 0 || height == 0 || height > self->indexedHeight) return -1;
+    if (eth_index_cover(l1, height) != 0 || height == 0 || height > self->indexedHeight) return -1;
     from = self->aRangeFrom[height];
     if (from == 0) return -1;
+    if (self->lastRange.fromHeight == from) {             /* the range of the batch before (#410): its log is not read again */
+        *out = self->lastRange;
+        out->receipt = NULL; out->nReceipt = 0;
+        if (self->lastRange.receipt && self->lastRange.nReceipt) {
+            out->receipt = sqlite3_malloc((int)self->lastRange.nReceipt);
+            if (out->receipt) { memcpy(out->receipt, self->lastRange.receipt, self->lastRange.nReceipt); out->nReceipt = self->lastRange.nReceipt; }
+        }
+        return 0;
+    }
     abi_encode_uint64(from, topic1);
     raw = eth_client_get_log(self->eth, self->da_contract, self->aBlock[height], TOPIC3_RANGE_COMMITTED, topic1, &raw_len, topic2);
     if (!raw || raw_len < 5 * 32) { free(raw); return -1; }
@@ -1477,6 +1495,14 @@ static int eth_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
     if (rcpt && rcptLen) {
         out->receipt = sqlite3_malloc((int)rcptLen);
         if (out->receipt) { memcpy(out->receipt, rcpt, rcptLen); out->nReceipt = rcptLen; }
+    }
+    hpplite_l1_range_clear(&self->lastRange);
+    self->lastRange = *out;
+    self->lastRange.receipt = NULL; self->lastRange.nReceipt = 0;
+    if (out->receipt) {
+        self->lastRange.receipt = sqlite3_malloc((int)rcptLen);
+        if (self->lastRange.receipt) { memcpy(self->lastRange.receipt, out->receipt, rcptLen); self->lastRange.nReceipt = rcptLen; }
+        else self->lastRange.fromHeight = 0;              /* not kept whole: not kept */
     }
     free(rcpt);
     return 0;
@@ -1497,7 +1523,7 @@ static uint8_t *eth_height_log(HppliteL1 *l1, uint64_t height, const uint8_t top
 
     if (self->version >= 9) {
         /* DA v3: no blockOf(); the index, walked from the events (#164) */
-        if (eth_index_update(l1) != 0 || height == 0 || height > self->indexedHeight || self->aBlock[height] == 0) return NULL;
+        if (eth_index_cover(l1, height) != 0 || height == 0 || height > self->indexedHeight || self->aBlock[height] == 0) return NULL;
         if (self->aRangeFrom[height]) return NULL;        /* inside a range: no log of its own (eth_get_range) */
         block = self->aBlock[height];
         if (topic0 == TOPIC_BATCH_SUBMITTED) topic0 = TOPIC3_BATCH_SUBMITTED;

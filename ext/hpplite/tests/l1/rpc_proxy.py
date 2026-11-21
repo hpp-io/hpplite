@@ -23,12 +23,14 @@ A phase of a few requests then always shows its kind (#127: on CI the 503
 phase saw no 503 and the test failed on its own coverage check).
 
 What happened is counted in <mode_file>.stats (requests, forwarded,
-delayed, dropped, timed_out, errored), rewritten after every request, so
-the test can tell the faults were exercised. Only the standard library.
+delayed, dropped, timed_out, errored, and one count for each JSON-RPC method
+asked: eth_call, eth_getLogs, ...), rewritten after every request, so
+the test can tell the faults were exercised and what a client asked (#410). Only the standard library.
 The proxy exits on its own when its parent is gone.
 """
 import http.client
 import http.server
+import json
 import os
 import random
 import socketserver
@@ -64,9 +66,10 @@ def read_mode():
     return mode
 
 
-def count(key):
+def count(*keys):
     with stats_lock:
-        stats[key] += 1
+        for key in keys:
+            stats[key] = stats.get(key, 0) + 1
         tmp = mode_file + ".stats.tmp"
         with open(tmp, "w") as f:
             for k, v in stats.items():
@@ -122,7 +125,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 kind = forced.pop(0)
                 roll = {"error": 0.0, "drop": mode.get("error", 0),
                         "timeout": mode.get("error", 0) + mode.get("drop", 0)}[kind]
-        count("requests")
+        try:
+            method = json.loads(body).get("method")
+        except (ValueError, AttributeError):
+            method = None
+        if isinstance(method, str) and method.replace("_", "").isalnum():
+            count("requests", method)
+        else:
+            count("requests")
         if roll < mode.get("error", 0):
             count("errored")
             self.reply(503, b"")

@@ -4160,6 +4160,65 @@ static void test_stop_past_anchor(void) {
     PASS();
 }
 
+/* 74. What a rebuild asks the chain (#410): a batch inside an anchored range is at the store, and its place on the
+** chain does not change once anchored. A rebuild asked the chain four times for every such batch - getDAState()
+** before each of three lookups, and the range's log again for each batch of the range - so on a real chain the RPC
+** set a rebuild's rate (0.8 s a batch on HPP Sepolia) and not the store. hpplite-verify through the counting proxy:
+** it asks the chain less than once a batch. */
+static long proxy_count(const char *modeFile, const char *key) {
+    long v = proxy_stat(modeFile, key);
+    return v < 0 ? 0 : v;
+}
+static void test_rebuild_chain_calls(void) {
+    TEST("a rebuild asks the chain less than once a batch (#410): 60 batches at a store in three anchored ranges of 20, hpplite-verify from batch 1 through the counting proxy");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char *NKEY = "0x7272727272727272727272727272727272727272727272727272727272727272";
+    static const char *modeFile = DIR "/proxy74.mode";
+    char addr[48], cmd[600], extra[300], vparams[500], contract[80] = "", out[8192], proxyRpc[64];
+    long calls, logs, all;
+    int port, pport, b, rc;
+    pid_t pid;
+    sqlite3 *w;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    (void)!system("rm -rf " DIR "/store_pins74 " DIR "/rc_writer.db* " DIR "/proxy74.mode*");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", NKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    port = test_free_port();
+    pid = start_pin_service_dir(svc, port, DIR "/store_pins74");
+    if (pid < 0) FAIL("the store did not come up");
+#define RC_END() do { kill_proxy(); kill(pid, SIGTERM); waitpid(pid, NULL, 0); } while (0)
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&anchor=0", port);
+    w = open_db("rc_writer.db", NKEY, extra);
+    if (!w) { RC_END(); FAIL("open writer"); }
+    sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    for (b = 1; b <= 60; b++) {
+        sqlite3_exec(w, "INSERT INTO n(v) VALUES(hex(randomblob(200)))", NULL, NULL, NULL);
+        if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); RC_END(); FAIL("a batch through the store"); }
+        if (b % 20 == 0 && scalar(w, "SELECT hpplite_anchor()") != b) { printf("(anchor %d: %s) ", b, status_text(w, "last_error")); sqlite3_close(w); RC_END(); FAIL("an anchor"); }
+    }
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    sqlite3_close(w);
+    pport = test_free_port();
+    snprintf(proxyRpc, sizeof proxyRpc, "http://127.0.0.1:%d", pport);
+    set_proxy_mode(modeFile, "");
+    if (start_proxy(pport, modeFile) != 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); printf("SKIP (python3 or tests/l1/rpc_proxy.py not available) "); PASS(); return; }
+    calls = proxy_count(modeFile, "eth_call"); logs = proxy_count(modeFile, "eth_getLogs"); all = proxy_count(modeFile, "requests");
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", proxyRpc, contract, NKEY, port);
+    out[0] = 0;
+    rc = run_verify_with(vparams, "", out, sizeof out);
+    calls = proxy_count(modeFile, "eth_call") - calls; logs = proxy_count(modeFile, "eth_getLogs") - logs; all = proxy_count(modeFile, "requests") - all;
+    RC_END();
+#undef RC_END
+    printf("(60 batches in 3 ranges: %ld requests of the chain, %ld of them eth_call and %ld eth_getLogs) ", all, calls, logs);
+    if (rc != 0 || !strstr(out, "chain hash over 60 batches: matches") || !strstr(out, "verified")) FAILF("the rebuild through the proxy should verify; exit %d\n%s", rc, out);
+    if (calls + logs >= 60) FAILF("a rebuild of 60 anchored batches should ask the chain less than once a batch: %ld eth_call and %ld eth_getLogs", calls, logs);
+    PASS();
+}
+
 /* 54. A host clock behind the chain's (somaro: a VM clock stepped back; a host never synced): a payment's validity
 ** window is the chain's time, what the chain checks it against - not this host's, which would have every payment
 ** refused with nothing pointing at the clock. The chain is moved 10 minutes ahead here, and no HPPLITE_STORE_VALID_FOR
@@ -5171,6 +5230,7 @@ int main(void) {
     if (wanted(71)) test_rewind_pruned();
     if (wanted(72)) test_stop_nearest_snapshot();
     if (wanted(73)) test_stop_past_anchor();
+    if (wanted(74)) test_rebuild_chain_calls();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();
