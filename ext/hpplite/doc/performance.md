@@ -398,3 +398,47 @@ Reproduce: `cmake -S . -B build_bench -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS
 `cmake --build build_bench -t rebuild_bench`, then
 `build_bench/rebuild_bench --batches 518400 --marks 120960,518400 --dir /tmp/rebuild` (about three and a half hours);
 the pruned run: `--batches 172800 --marks 172800 --keep-days 7` (about 70 minutes).
+
+## A day in one range (2026-11-21, #394)
+
+`anchor=24h` with a batch every 5 s puts 17,280 batches in one range: one manifest, one commitment. `tests/bench/range_bench.c`
+writes that range through a node into the reference store on the mock chain (a 5 MB database, two rows rewritten a
+batch), anchors it, reads it back, loses the host a day later and prunes. Apple M-series, nothing else running; the
+day is written in seven minutes, so what depends on a real day's clock (the lease's renewals) is not shown.
+
+| | Wall | The node's CPU | Node memory |
+|---|---|---|---|
+| The day's 17,280 batches written, none anchored | 402 s (43 a second: the store's rate) | | peak 35 MB; the bookkeeping file 3.5 MB |
+| The anchor of the range | 5.95 s | 0.06 s | +10 MB |
+| A verifier from batch 1 through the range | 15.94 s (1,087 batches a second) | 7.12 s | +6 MB |
+| A lost host's successor reading the next day's 17,280 batches by name | 359.75 s (48 a second) | 16.05 s | +0 MB |
+| Its anchor of that range, with a snapshot | 12.67 s | 0.26 s | +4 MB |
+| The anchor that prunes behind that snapshot | 15.18 s | 0.00 s | +0 MB |
+| A verifier after the prune, from the snapshot | 0.07 s | 0.06 s | +0 MB |
+
+- **The manifest:** 2,685,057 bytes for 17,280 batches, about 155 bytes a batch, one object. A store's limit of 16 MiB an object is reached near 108,000 batches a range (computed): six days at a batch every 5 s.
+- **The anchor's time is the store's:** the node's part is 0.06 s; the rest is the reference store hashing the manifest in pure Python. While an anchor runs, the node's flush waits behind it (read from the code, not measured): batches written meanwhile are posted after it.
+- **Reading the range:** a verifier reads eight batches at once over the connections it keeps (#405). Against a store that limits reads the limit is the rate, not this: 600 requests a minute an address at the canonical stores is about 10 batches a second, 29 minutes for this range (computed from their configuration; #402 makes the node wait the limit out, #404 asks for several batches a request).
+- **The lost host:** the 48 names a second are the reference store's, which recovers a signer at every read of a name (#406); the node's own work for the 17,280 batches is 16 s.
+- **The prune:** the store's files went from 103,815 to 25, its names from 34,600 to 4.
+- **What this bench led to:** #406 (the reference store's rate for names), and #407 (a snapshot's chunk refused by a store's write limit ends the snapshot).
+
+Reproduce: `cmake -S . -B build_bench -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-DHPPLITE_MOCK_MAX_BATCHES=600000`,
+`cmake --build build_bench -t range_bench`, then `build_bench/range_bench --dir /tmp/range`.
+
+## What a snapshot costs at a canonical store (2026-11-21, computed)
+
+Computed from the mainnet store's configuration (a new write $0.00001, a MiB held a month $0.00003: about $0.031 a GiB
+a month), not measured; the sizes are the upper bound, a database that does not deflate.
+
+A snapshot is a put for every 8 MiB of the deflated database and one for its index, and its bytes are held until an
+anchor with `keep=` prunes behind a newer one.
+
+| Database | Puts a snapshot | Its write fees | Held a month, each | `snapshot=24h`, `keep=30d` (about 30 held) | `snapshot=6h`, `keep=30d` (about 120 held) |
+|---|---|---|---|---|---|
+| 10 MB | 3 | $0.00003 | $0.0003 | $0.009 a month | $0.036 a month |
+| 1 GB | 129 | $0.0013 | $0.031 | $0.92 a month, 30 GiB | $3.70 a month, 120 GiB |
+
+- **The bytes are the cost,** the writes are not; an account's quota (1 GiB unless the operator set another) is reached long before the money matters.
+- **Time:** the anchor that made a snapshot of the 5 MB database above took 12.67 s against the reference store, 0.26 s of it the node's. The flush waits behind an anchor (read from the code).
+- **Past about 60 chunks (480 MiB deflated)** a snapshot put inside a minute would meet the canonical stores' limit of 60 writes a minute a bucket: the chunk that is refused ends the snapshot, and the next anchor begins another from its first chunk (shown against the reference store's 429 hook; against a canonical store computed, not measured). #407.
