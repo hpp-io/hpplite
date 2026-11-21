@@ -1254,6 +1254,22 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.11.0** (2026-11-21): going back to a moment.
+
+- **A stop reaches past the last anchor (#390).** `hpplite-verify --to` and `--at` read the store's batches past the anchor up to the stop, each signed by the rollup's sequencer and applied on the anchored history; one line says which part of what was rebuilt rests on the chain. `--to` a height past the anchor was refused before, and `--at` a moment after it answered with the anchor's batch.
+- **A stop begins at the newest snapshot at or before it (#391),** on a pruned history or not: a rebuild to a point costs what lies between the point and the snapshot before it, at most a day's batches with `snapshot=24h`. Without a stop every batch is read as before. `--at` a moment the snapshot itself answers says so (#400). Measured on a 7-day and a 30-day history in [doc/performance.md](doc/performance.md): 11 to 13 s to the worst stop on either, 80 s and 409 s from batch 1, against a store on the same machine.
+- **An anchor when asked (#396).** SIGUSR2 to `hpplite-sequencer` flushes and anchors now and says what came of it; `hpplite_anchor_now` is the call under it.
+- **`adopt=on` (#380) for a platform's going back:** onto a history pruned at the store, read from the latest snapshot's index (#395); a file carried with its bookkeeping is not adopted, and one line says so (#398); going back and going on twice over, in one scenario on the real contracts (#392).
+- **A duration that does not parse refuses the open, and `d` is a unit (#393).** `anchor=1d` anchored every 30 minutes and `keep=1w` kept everything, without a word. A duration is a whole number with ms, s, m, h or d; anything else is refused, naming the setting and its value. A configuration with such a value started before and does not now.
+- **A store that limits reads (#402).** A read answered 429 with Retry-After is waited out and asked again; a rebuild longer than the limit ended in state error before. At the canonical stores' 600 requests a minute an address that is about 10 batches a second (computed from their configuration). The messages for a read that failed say "the store did not give ..." where they said "the store has no ...".
+- **A sync that stopped midway goes on at the next try (#403).** A new host whose first sync met one failed read stayed at that height until the process was started again ("its pages could not be written (rc=5)").
+- **A node keeps its connections to the store (#405):** one for its requests and eight for its reads ahead, where every request made its own.
+- **A batch at the store and not in the bookkeeping (#388).** A sequencer killed between the store's answer and its own record takes the batch as posted when it starts again; it wrote other bytes under the name before.
+- **The reference store** (`operators/store/hpplite_store.py`; the canonical stores are not this code): what a bucket holds is in `index.db`, a row an object, taken over from the bucket's record at the first start - a store from before must not be run on the directory afterwards (#401); it answers HTTP/1.1 and keeps the connection (#405); its hourly sweep holds no put up (#409).
+- **A day in one range, measured (#394):** `anchor=24h` at a batch every 5 s, 17,280 batches in one manifest of 2.7 MB - the anchor, a verifier, a lost host's successor, the prune - and what a snapshot costs at a canonical store, in [doc/performance.md](doc/performance.md).
+- Open, not in this version: a read of several batches a request (#404), a snapshot's chunk refused by a store's write limit (#407), `adopt=on` beside batches of another timeline at the store (#408).
+- No protocol or format changes; the canonical stores and the relays are unchanged.
+
 **v0.10.6** (2026-11-20): what a sync made late leaves behind.
 
 - **The history applied onto a file the node had read before (#384).** A sequencer opened on a restored copy the application held in WAL applies the history once the connection has closed (#381). Where the two files' header counters met, the file was left with the restored schema over the history's pages, the node saying "synced"; and the node's own connection could keep the restored file's schema. The file is the history's now, to every connection. `adopt=on` starts were not affected: they write nothing of the history to the file.
