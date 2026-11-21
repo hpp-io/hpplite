@@ -15,7 +15,11 @@
 #include <time.h>
 
 #define MAX_CHECKPOINTS 1000
+#ifdef HPPLITE_MOCK_MAX_BATCHES            /* a bench of a long history (tests/bench/rebuild_bench.c, #391) builds with more */
+#define MAX_BATCHES HPPLITE_MOCK_MAX_BATCHES
+#else
 #define MAX_BATCHES 10000
+#endif
 #define DEFAULT_LEASE_DURATION 300  /* 5 minutes */
 
 /*

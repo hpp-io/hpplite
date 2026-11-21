@@ -365,3 +365,36 @@ Costs:
 - **Throughput:** oltp_bench write_only is within 1-2% (7,690 vs 7,600 tps). Opening a 64 MB database and posting it whole went from 34 s to 10 s in test_memory, because a pieced commit's pages now enter the root once instead of at every piece.
 
 Reproduce: `ctest -R test_memory`; `build_mock/snapshot_bench --mb 200 --store operators/store`.
+
+## A rebuild's time on a long history (2026-11-21, #391)
+
+How long a rebuild to a point takes: `tests/bench/rebuild_bench.c` writes a small, busy database (5 MB, two rows
+rewritten a batch) through a node into the reference store on the mock chain, an anchor every 360 batches and a
+snapshot every 17,280 - a batch every 5 s with `anchor=30m&snapshot=24h`, nothing pruned - and at 7 and at 30 days of
+batches rebuilds it with a verifier on an empty file. Apple M-series, the store on the same machine, nothing else
+running. With a stop a rebuild begins at the newest snapshot at or before it (#391); without one at batch 1.
+
+| Rebuild | 7 days (120,960 batches) | 30 days (518,400 batches) |
+|---|---|---|
+| No stop: from batch 1, every batch checked | 79.87 s (38.50 s CPU; 121,298 requests) | 409.47 s (167.10 s CPU; 519,842 requests) |
+| To a stop a day's batches less one past a snapshot (the worst) | 11.53 s (5.50 s CPU) | 13.06 s (5.49 s CPU) |
+| To a stop half a day past a snapshot | 5.69 s (2.75 s CPU) | 6.67 s (2.78 s CPU) |
+| To a stop at a snapshot's height | 0.08 s | 0.09 s |
+
+Every rebuild ended in state `verify` with no root mismatch, on nine connections (one, and eight for the reads ahead, #405).
+
+A second run with the history pruned: ten days of batches with a `keep=` of seven days (172,800 batches, `--keep-days 7`).
+Without a stop the rebuild begins at the oldest snapshot the store still keeps, at batch 51,840, and replays the
+120,960 batches after it: 94.35 s (38.23 s CPU; 121,302 requests). To the three stops as above: 14.08 s, 6.68 s and
+0.08 s. The store held 1.5 GB in 363,594 files, what seven days make, at ten.
+
+- **A stop costs what lies between it and the snapshot before it,** not the history's length: at most a day's batches with `snapshot=24h`, 11 to 13 s here whether the history is 7 or 30 days. `snapshot=6h` would make it a quarter (computed).
+- **From batch 1, or from the oldest snapshot kept, the time follows the history read:** about 1,300 to 1,500 batches a second (the same 120,960 batches took 79.87 s in one run and 94.35 s in the other), four tenths to a half of it the rebuilding process's CPU, the rest its wait for the store's answers.
+- **This is a store on the same machine.** A store that limits reads sets the rate instead: at the canonical stores' 600 requests a minute an address, about 10 batches a second - a day's batches in about 29 minutes, 30 days from batch 1 in about 14 hours (computed from their configuration, not measured; the node waits the limit out since #402, and #404 asks for several batches a request). A stop near a snapshot is what stays fast there: the stop at a snapshot's height is 12 to 14 requests.
+- **Writing it:** 42 batches a second throughout (7 days in 2,847 s, 30 in 12,387 s), the reference store's rate; the store held 1.5 GB in 363,585 files at 7 days and 6.2 GB in 1,558,205 at 30.
+- **What its runs found:** the reference store rewrote a bucket's whole record at every put (#401); the store client made a connection a request (#405); the reference store's hourly sweep held every put up (#409). And what a rebuild meets at a store that limits reads: #402, and with its test #403. The 30-day run completed on the fourth try, after these.
+
+Reproduce: `cmake -S . -B build_bench -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-DHPPLITE_MOCK_MAX_BATCHES=600000`,
+`cmake --build build_bench -t rebuild_bench`, then
+`build_bench/rebuild_bench --batches 518400 --marks 120960,518400 --dir /tmp/rebuild` (about three and a half hours);
+the pruned run: `--batches 172800 --marks 172800 --keep-days 7` (about 70 minutes).
