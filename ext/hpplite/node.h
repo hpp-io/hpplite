@@ -107,6 +107,8 @@ typedef struct HppliteNodeConfig {
 /*
 ** Main node structure (simplified - sequencer only)
 */
+#define NODE_AHEAD_RANGES 32            /* ranges whose manifests are known ahead of the reading (#413) */
+
 typedef struct HppliteNode {
     /* Configuration */
     HppliteNodeConfig config;
@@ -188,8 +190,16 @@ typedef struct HppliteNode {
     uint64_t rootsKeptAt;           /* a verifier: the anchored height its kept roots were last named for (#362) */
     int fileKnown;                  /* the database file's identity as first flushed, to see it replaced under us (#320) */
     int fileReplaced;               /* ...and it was: nothing more is posted; hpplite_status.file_replaced, for the process to stop on (#379) */
-    uint64_t aheadFrom, aheadNext;  /* the range's batches read ahead from the store: [aheadFrom, aheadNext) (#195) */
-    uint64_t namesFrom, namesNext;  /* ...and the store's names: [namesFrom, namesNext) */
+    /* a replica's reads ahead from the store (#195, #413): the height it read last from a range and whose rollup,
+    ** how many heights from there are asked ahead (it grows while the reads come in order), the ranges after the one
+    ** it is reading (their manifests are asked ahead too, and name the batches to ask for), and a height the chain
+    ** had no range at: the reads ahead do not ask about it again before the reading comes to it */
+    uint64_t aheadLast, aheadNone;
+    int aheadWin;
+    char aheadOf[43];
+    struct { uint64_t from, to; unsigned char digest[32]; int bad; struct cJSON *m; } aAheadRange[NODE_AHEAD_RANGES];
+    int nAheadRange;
+    uint64_t namesFrom, namesNext;  /* ...and the store's names asked ahead: [namesFrom, namesNext) */
     unsigned long long fileDev, fileIno;
     uint64_t syncTo;                /* a verifier's stop (hpplite-verify --to, #206): no batch past it is applied; 0: none */
     uint64_t syncAtMs;              /* ...by time (--at, #205): no batch written after it begins (a transaction in flight completes) */

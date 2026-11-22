@@ -19,7 +19,8 @@
 #include <unistd.h>
 #include <time.h>
 
-#define RANGE_KEEP 32              /* ranges kept from their logs (#412) */
+#define RANGE_KEEP 96              /* ranges kept from their logs (#412) */
+#define RANGE_ASK 32               /* ...and how many of them one request is meant to bring */
 
 typedef struct EthL1 {
     HppliteL1 base;               /* the function table first: l1.c dispatches through it */
@@ -58,7 +59,9 @@ typedef struct EthL1 {
     uint64_t lastIndexedBlock; /* the block the last walk started from: the next walk stops there */
     uint64_t indexSpanMax;     /* the walk asks eth_getLogs for no more blocks than this (#411: more was refused, or left a commitment out); 0: no such limit met */
     /* The ranges read last from their logs (#410: a rebuild asks for a range once a batch), the one asked for and those
-    ** after it whose logs the same request gave (#412): a rebuild of short ranges asked the chain once a range */
+    ** after it whose logs the same request gave (#412): a rebuild of short ranges asked the chain once a range. More
+    ** are kept than a request brings, and the lowest gives way first (#413): a rebuild asks about the ranges ahead of
+    ** the one it is reading, and the one it is reading must not go when their logs come */
     HppliteRange aRange[RANGE_KEEP];
     int nRange;
     uint64_t rangeSpan;        /* the blocks a request for ranges' logs asks for; 0: INDEX_SPAN, 1: a range a request (a span was refused down to that) */
@@ -242,6 +245,19 @@ static HppliteL1 *eth_connect_config(const HppliteNetworkConfig *config) {
 static void eth_ranges_clear(HppliteL1 *l1) {
     for (int i = 0; i < self->nRange; i++) hpplite_l1_range_clear(&self->aRange[i]);
     self->nRange = 0;
+}
+
+/* a range read from its log, kept (its receipt with it): where there is no room the lowest kept gives way */
+static void eth_range_keep(HppliteL1 *l1, HppliteRange *r) {
+    int i, low = 0;
+    for (i = 0; i < self->nRange; i++)
+        if (self->aRange[i].fromHeight == r->fromHeight) { hpplite_l1_range_clear(r); return; }
+    if (self->nRange == RANGE_KEEP) {
+        for (i = 1; i < RANGE_KEEP; i++) if (self->aRange[i].fromHeight < self->aRange[low].fromHeight) low = i;
+        hpplite_l1_range_clear(&self->aRange[low]);
+        self->aRange[low] = self->aRange[--self->nRange];
+    }
+    self->aRange[self->nRange++] = *r;
 }
 
 static void eth_disconnect(HppliteL1 *l1) {
@@ -1550,6 +1566,7 @@ static int eth_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
     uint8_t topic1[32], topic2[32], *raw;
     size_t raw_len = 0;
     uint64_t from, block, span;
+    HppliteRange one;
     int i, ok;
     if (!l1 || !out || !ensure_da_contract(l1) || self->version < 9) return -1;
     if (eth_index_cover(l1, height) != 0 || height == 0 || height > self->indexedHeight) return -1;
@@ -1567,33 +1584,33 @@ static int eth_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
         if (eth_client_get_logs(self->eth, self->da_contract, block, block + span - 1, &logs, &n) != 0) {
             self->rangeSpan = span / 4 ? span / 4 : 1;
         } else {
-            eth_ranges_clear(l1);
             for (i = 0; i < n; i++) {
                 EthLog *e = &logs[i];
+                HppliteRange k;
                 uint64_t f, t;
                 if (e->nTopics < 3 || memcmp(e->topics[0], TOPIC3_RANGE_COMMITTED, 32) != 0) continue;
                 f = abi_decode_uint64(e->topics[1]);
                 t = abi_decode_uint64(e->topics[2]);
                 if (f < from || f > self->indexedHeight || self->aRangeFrom[f] != f || self->aBlock[f] != e->block) continue;
                 seen++;
-                if (self->nRange < RANGE_KEEP && eth_range_of_log(e->data, e->nData, f, t, &self->aRange[self->nRange])) self->nRange++;
+                if (seen <= RANGE_ASK && eth_range_of_log(e->data, e->nData, f, t, &k)) eth_range_keep(l1, &k);
             }
             eth_logs_free(logs, n);
-            /* the span follows what it gave: more ranges than are kept, half of it the next time; few, twice */
-            if (seen > RANGE_KEEP) self->rangeSpan = span / 2;
-            else if (seen < RANGE_KEEP / 2 && span < ((uint64_t)1 << 40)) self->rangeSpan = span * 2;
+            /* the span follows what it gave: more ranges than a request is meant to bring, half of it the next time; few, twice */
+            if (seen > RANGE_ASK) self->rangeSpan = span / 2;
+            else if (seen < RANGE_ASK / 2 && span < ((uint64_t)1 << 40)) self->rangeSpan = span * 2;
             for (i = 0; i < self->nRange; i++)
                 if (self->aRange[i].fromHeight == from) return eth_range_copy(&self->aRange[i], out) ? 0 : -1;
         }
     }
     abi_encode_uint64(from, topic1);
     raw = eth_client_get_log(self->eth, self->da_contract, block, TOPIC3_RANGE_COMMITTED, topic1, &raw_len, topic2);
-    eth_ranges_clear(l1);
-    ok = eth_range_of_log(raw, raw_len, from, raw ? abi_decode_uint64(topic2) : 0, &self->aRange[0]);
+    ok = eth_range_of_log(raw, raw_len, from, raw ? abi_decode_uint64(topic2) : 0, &one);
     free(raw);
     if (!ok) return -1;
-    self->nRange = 1;
-    return eth_range_copy(&self->aRange[0], out) ? 0 : -1;
+    ok = eth_range_copy(&one, out);
+    eth_range_keep(l1, &one);
+    return ok ? 0 : -1;
 }
 
 /*

@@ -749,6 +749,72 @@ static void test_reads_ahead(const char *dir) {
     PASS();
 }
 
+/* 6e2b. Reads ahead across the ranges (#413): the reads ahead were groups inside one range, each waited for whole,
+** and a history of short ranges - a batch or two an anchor, what a quiet database writes - was read a round trip
+** after another: a range's manifest, its batches, the next range's manifest. 40 batches anchored two at a time and
+** a store that delays every read by 0.15 s and counts the reads it has in flight: the verifier keeps a window of
+** reads in flight across the ranges (eight by default), where a range at a time never had more than a range's two */
+static int store_reads_most(int port) {
+    char cmd[200], buf[4096] = "";
+    const char *p;
+    FILE *f;
+    size_t n;
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 http://127.0.0.1:%d/status 2>/dev/null", port);
+    if (!(f = popen(cmd, "r"))) return -1;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    buf[n] = 0;
+    pclose(f);
+    p = strstr(buf, "\"readsInFlightMost\":");
+    return p ? atoi(p + 20) : -1;
+}
+
+static void test_reads_ahead_across_ranges(const char *dir) {
+    TEST("a replica's reads run ahead across the ranges: 40 batches anchored two at a time, a store slow to answer has a window of them in flight, not a range's two (#413)");
+    int port = test_free_port();
+    char url[64], storeDir[600];
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x39 };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = NULL, *r = NULL;
+    TestNodeOpts o;
+    int i, most;
+    double t0, took;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/across_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
+#define ACROSS_DONE() do { if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } hpplite_l1_disconnect(l1); if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } } while (0)
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "across_w"; o.privkey = kseq;
+    if (!(w = test_open_node(tpath("across_w.db"), l1, &o))) { ACROSS_DONE(); FAIL("open the writer"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 1; i <= 40; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('read ahead across ranges')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { ACROSS_DONE(); FAIL("a flush"); }
+        if (i % 2 == 0 && hpplite_node_anchor(w) != (uint64_t)i) { ACROSS_DONE(); FAIL("an anchor of two batches"); }
+    }
+    /* the same bytes at a store that is far: every read 0.15 s */
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    setenv("HPPLITE_STORE_GET_DELAY", "0.15", 1);
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    unsetenv("HPPLITE_STORE_GET_DELAY");
+    if (pid < 0) { ACROSS_DONE(); FAIL("the test's store did not start again"); }
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "across_r", .privkey = kseq };
+        t0 = now_s();
+        r = test_open_node(tpath("across_r.db"), l1, &ro);
+        took = now_s() - t0;
+    }
+    if (!r) { ACROSS_DONE(); FAIL("open the verifier"); }
+    most = store_reads_most(port);
+    printf("(40 batches in 20 ranges in %.2f s, %d reads in flight at most; a range at a time is 40 round trips, 6 s) ", took, most);
+    if (status_int(r->db, "height") != 41 || count_rows(r->db, "t") != 40 || !same_root(w, r)) { ACROSS_DONE(); FAIL("the verifier holds the 40 batches, the writer's root"); }
+    if (most < 6) { ACROSS_DONE(); FAIL("the reads did not run ahead across the ranges: the store never had six in flight"); }
+    ACROSS_DONE();
+#undef ACROSS_DONE
+    PASS();
+}
+
 /* 6e3. A sync that stops midway (#403): a sequencer on a file behind the chain applies the history's pages in
 ** rollback-journal mode and switches back to WAL when the sync ends; one that stops at a read that failed returns
 ** before the switch. The WAL upkeep ran at the next tick all the same: its pin is a read transaction, in that mode a
@@ -2757,6 +2823,7 @@ int main(int argc, char **argv) {
     test_store_down_at_open(dir);
     test_recovery_store_down(dir);
     test_reads_ahead(dir);
+    test_reads_ahead_across_ranges(dir);
     test_sync_stopped_midway(dir);
     test_read_limit(dir);
     test_connections_kept(dir);

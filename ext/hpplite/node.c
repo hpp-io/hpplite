@@ -38,6 +38,7 @@ static int node_anchor(HppliteNode *node);
 static uint64_t node_unanchored_above(HppliteNode *node, uint64_t lastBatch);
 static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen);
 static void node_names_ahead(HppliteNode *node, uint64_t h, uint64_t last);
+static void node_ahead_ranges_clear(HppliteNode *node, uint64_t upTo);
 static int node_check_rollup(HppliteNode *node);
 static char *node_snapshot_name(HppliteNode *node, HppliteL1 *l1);
 static uint8_t *node_store_get_checked(HppliteNode *node, const char *zRef, const unsigned char want[32], size_t *pLen);
@@ -1149,6 +1150,7 @@ void hpplite_node_destroy(HppliteNode *node) {
         pthread_mutex_unlock((pthread_mutex_t *)node->flushMutex);
     }
     if (node->manifest) { cJSON_Delete(node->manifest); node->manifest = NULL; }
+    node_ahead_ranges_clear(node, UINT64_MAX);
     free(node->softChain);
     free(node->aEarlier);
     free(node->zAnchorRef);
@@ -3134,6 +3136,92 @@ uint64_t hpplite_node_anchor(HppliteNode *node) {
     return hpplite_node_anchor_rc(node, &h) == 1 ? h : 0;
 }
 
+/* the ranges known ahead that begin at or before upTo: forgotten */
+static void node_ahead_ranges_clear(HppliteNode *node, uint64_t upTo) {
+    int k = 0;
+    for (int i = 0; i < node->nAheadRange; i++) {
+        if (node->aAheadRange[i].from <= upTo) { if (node->aAheadRange[i].m) cJSON_Delete(node->aAheadRange[i].m); }
+        else node->aAheadRange[k++] = node->aAheadRange[i];
+    }
+    node->nAheadRange = k;
+}
+
+/* The store's reads for the heights after `height`, asked ahead (#195, #413). The batches of a range were read in
+** groups that began again at each range: a history of short ranges - a batch or a few an anchor, what a quiet
+** database writes - was read one round trip after another, a manifest, then its batches, then the next range's.
+** Now a window of heights runs ahead of the reading and across the ranges: the batches left in this range, then
+** for each range after it its manifest, and once that has come (and is the bytes the chain's digest names) its
+** batches. Every call names the whole window; the store client starts what is not held or in flight, as many as
+** HPPLITE_STORE_PARALLEL lets be in flight. Nothing read ahead is relied on here: a manifest is checked whole and
+** a batch against it where the reading comes to them, as before.
+** The window is one height at a read out of order and twice as many at each read in order, up to
+** HPPLITE_STORE_PARALLEL: the lookup by name reads batch 1 of each of the wallet's rollups and nothing after it.
+** `b` is the manifest's entry for `height` */
+static void node_range_ahead(HppliteNode *node, HppliteL1 *l1, const HppliteRange *r, const char *of, uint64_t height, const cJSON *b) {
+    const char *refs[2 * HPPLITE_STORE_AHEAD_MAX];
+    char cids[NODE_AHEAD_RANGES][64];
+    int n = 0, nc = 0, win = 1, par = hpplite_store_parallel();
+    uint64_t end, next, k;
+    const cJSON *e;
+    if (node->aheadLast && height == node->aheadLast + 1 && strcmp(of, node->aheadOf) == 0) {
+        win = node->aheadWin * 2 > par ? par : node->aheadWin * 2;
+        node_ahead_ranges_clear(node, r->toHeight);
+    } else {
+        node_ahead_ranges_clear(node, UINT64_MAX);
+        node->aheadNone = 0;
+        snprintf(node->aheadOf, sizeof node->aheadOf, "%s", of);
+    }
+    node->aheadLast = height;
+    node->aheadWin = win;
+    if (node->aheadNone && r->toHeight >= node->aheadNone) node->aheadNone = 0;     /* the chain has grown past it */
+    if (win <= 1) return;
+    end = height + (uint64_t)win - 1;
+    for (k = height; b && k <= r->toHeight && k <= end; k++, b = b->next) {
+        e = cJSON_GetObjectItemCaseSensitive(b, "ref");
+        if (cJSON_IsString(e)) refs[n++] = e->valuestring;
+    }
+    for (next = r->toHeight + 1; next <= end && (!node->aheadNone || next < node->aheadNone); ) {
+        int i;
+        for (i = 0; i < node->nAheadRange && node->aAheadRange[i].from != next; i++);
+        if (i == node->nAheadRange) {
+            HppliteRange r2;
+            if (i == NODE_AHEAD_RANGES) break;
+            memset(&r2, 0, sizeof r2);
+            if (hpplite_l1_get_range(l1, next, &r2) != 0) { node->aheadNone = next; break; }
+            memset(&node->aAheadRange[i], 0, sizeof node->aAheadRange[i]);
+            node->aAheadRange[i].from = r2.fromHeight;
+            node->aAheadRange[i].to = r2.toHeight;
+            memcpy(node->aAheadRange[i].digest, r2.manifestDigest, 32);
+            hpplite_l1_range_clear(&r2);
+            if (node->aAheadRange[i].from != next || node->aAheadRange[i].to < next) break;     /* not a range that begins here: left to the reading */
+            node->nAheadRange++;
+        }
+        if (!node->aAheadRange[i].m && !node->aAheadRange[i].bad && nc < NODE_AHEAD_RANGES) {
+            size_t len = 0;
+            uint8_t *text, digest[32];
+            hpplite_store_cid_from_sha256(node->aAheadRange[i].digest, cids[nc]);
+            if ((text = hpplite_store_ahead_copy(node->store, cids[nc], &len))) {
+                hpplite_store_sha256(text, len, digest);
+                if (memcmp(digest, node->aAheadRange[i].digest, 32) == 0) node->aAheadRange[i].m = cJSON_ParseWithLength((const char *)text, len);
+                if (!node->aAheadRange[i].m) node->aAheadRange[i].bad = 1;      /* not the chain's manifest: the reading says so when it comes to it */
+                free(text);
+            } else if (n < 2 * HPPLITE_STORE_AHEAD_MAX) {
+                refs[n++] = cids[nc++];
+            }
+        }
+        if (node->aAheadRange[i].m) {
+            e = cJSON_GetObjectItemCaseSensitive(node->aAheadRange[i].m, "batches");
+            b = cJSON_IsArray(e) ? e->child : NULL;
+            for (k = next; b && k <= node->aAheadRange[i].to && k <= end && n < 2 * HPPLITE_STORE_AHEAD_MAX; k++, b = b->next) {
+                e = cJSON_GetObjectItemCaseSensitive(b, "ref");
+                if (cJSON_IsString(e)) refs[n++] = e->valuestring;
+            }
+        }
+        next = node->aAheadRange[i].to + 1;
+    }
+    hpplite_store_ahead_refs(node->store, refs, n);
+}
+
 /* a replica: the bytes of a height inside an anchored range, by the manifest the chain's digest names */
 static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen) {
     HppliteRange r;
@@ -3208,19 +3296,7 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
     zRef = cJSON_IsString(e) ? e->valuestring : NULL;
     e = b ? cJSON_GetObjectItemCaseSensitive(b, "hash") : NULL;
     if (!zRef || !json_hex32(e, want)) { hpplite_l1_range_clear(&r); return NULL; }
-    if (height >= node->aheadNext || height < node->aheadFrom) {
-        /* the next batches of the range, read together (#195): a far store's round trip once for them all */
-        const char *refs[HPPLITE_STORE_AHEAD_MAX];
-        int n = 0, want_n = hpplite_store_parallel();
-        for (uint64_t k = height; k <= r.toHeight && n < want_n; k++) {
-            const cJSON *bk = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(node->manifest, "batches"), (int)(k - r.fromHeight));
-            const cJSON *rk = bk ? cJSON_GetObjectItemCaseSensitive(bk, "ref") : NULL;
-            if (cJSON_IsString(rk)) refs[n++] = rk->valuestring;
-        }
-        hpplite_store_prefetch_refs(node->store, refs, n);
-        node->aheadFrom = height;
-        node->aheadNext = height + (uint64_t)(n > 0 ? n : 1);
-    }
+    node_range_ahead(node, l1, &r, of, height, b);
     data = hpplite_store_get(node->store, zRef, pLen);
     if (!data) {
         hpplite_error(node->ctx, "batch %llu: the store did not give %s: %s", (unsigned long long)height, zRef, hpplite_store_error(node->store));
@@ -3843,21 +3919,24 @@ static int node_store_name(HppliteNode *node, uint64_t h, char name[80], unsigne
     return 0;
 }
 
-/* The store's names from h on, read together (#195): from h to the window's end once h passes the last window, or
-** falls before it. A name past the last one the store holds is a 404 and is not kept */
+/* The store's names from h on, asked ahead (#195, #413): a window of HPPLITE_STORE_PARALLEL names runs ahead of the
+** reading, and each call asks for the names it has not asked for yet - a name is asked ahead once, since a name
+** past the last one the store holds is a 404, which is not kept. A read out of the window begins it again at h */
 static void node_names_ahead(HppliteNode *node, uint64_t h, uint64_t last) {
     char names[HPPLITE_STORE_AHEAD_MAX][80];
     const char *z[HPPLITE_STORE_AHEAD_MAX];
     unsigned char da[20];
     int n = 0, want = hpplite_store_parallel();
-    if (want <= 1 || (h < node->namesNext && h >= node->namesFrom)) return;
-    for (uint64_t k = h; n < want && (!last || k <= last); k++) {
+    uint64_t k;
+    if (want <= 1) return;
+    if (h < node->namesFrom || h > node->namesNext) node->namesNext = h;
+    node->namesFrom = h;
+    for (k = node->namesNext; k < h + (uint64_t)want && (!last || k <= last); k++) {
         if (node_store_name(node, k, names[n], da) != 0) break;
         z[n] = names[n]; n++;
     }
-    hpplite_store_prefetch_names(node->store, z, n);
-    node->namesFrom = h;
-    node->namesNext = h + (uint64_t)(n > 0 ? n : 1);
+    hpplite_store_ahead_names(node->store, z, n);
+    node->namesNext = k > node->namesNext ? k : node->namesNext;
 }
 
 /* The chain hash the range commitment ending at `height` names (0 when none ends there; height 0: zero) */

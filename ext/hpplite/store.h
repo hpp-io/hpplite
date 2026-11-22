@@ -21,15 +21,20 @@ extern "C" {
 
 typedef struct HppliteStore HppliteStore;
 
-/* Reads fetched ahead (#195): GET these batches' refs (/get/<ref>) or names (/name/<name>) several at once and keep
-** each 200 answer for the read that asks for it next; up to hpplite_store_parallel() (HPPLITE_STORE_PARALLEL, default 8) */
+/* Reads asked ahead (#195, #413): these batches' refs (/get/<ref>) or names (/name/<name>) are asked for without
+** waiting for their answers, up to hpplite_store_parallel() in flight (HPPLITE_STORE_PARALLEL, default 8; 1: none
+** ahead), and each 200 answer is kept for the read that asks for it next. A read of one still in flight waits for
+** that one alone. What is held, in flight, or does not fit in flight is passed over: the caller names its whole
+** window every time. hpplite_store_ahead_copy: a copy of an answer held (malloc'd; NULL when it is not), left there
+** for its read */
 #define HPPLITE_STORE_AHEAD_MAX 32
 int hpplite_store_parallel(void);
+uint8_t *hpplite_store_ahead_copy(HppliteStore *s, const char *zRef, size_t *pLen);
 /* the requests this client sent and the connections it opened for them (#405): a client keeps its connections, so
 ** the second number stays small however many batches are put or read */
 void hpplite_store_traffic(HppliteStore *store, long *pnRequests, long *pnConnects);
-void hpplite_store_prefetch_refs(HppliteStore *s, const char *const *zRefs, int n);
-void hpplite_store_prefetch_names(HppliteStore *s, const char *const *zNames, int n);
+void hpplite_store_ahead_refs(HppliteStore *s, const char *const *zRefs, int n);
+void hpplite_store_ahead_names(HppliteStore *s, const char *const *zNames, int n);
 
 /* Open a store by URL; NULL when the scheme is unknown. The key (may be
 ** NULL) pays for calls the provider charges for; cap is the most to pay per

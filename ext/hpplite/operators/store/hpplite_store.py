@@ -50,6 +50,7 @@ PROTOCOL = "hpplite-store/2"
 MIB = 1024 * 1024
 MONTH = 30 * 24 * 3600
 GET_DELAY = float(os.environ.get("HPPLITE_STORE_GET_DELAY") or 0)   # a test hook: seconds added to every batch read (#195)
+READS = {"lock": threading.Lock(), "now": 0, "most": 0}             # ...the delayed reads in flight, and the most there were at once (#413)
 FAIL_GET = int(os.environ.get("HPPLITE_STORE_FAIL_GET") or 0)       # a test hook: the k-th read of an object answers 503, once (#403)
 GETS = {"lock": threading.Lock(), "count": 0}
 READ_LIMIT = os.environ.get("HPPLITE_STORE_READ_LIMIT") or ""       # a test hook: "N/S", N batch reads in a window of S seconds, the rest 429 (#402)
@@ -760,7 +761,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         path = url.path
         if GET_DELAY and (path.startswith("/get/") or path.startswith("/name/")):
+            with READS["lock"]:
+                READS["now"] += 1
+                READS["most"] = max(READS["most"], READS["now"])
             time.sleep(GET_DELAY)                       # a test hook: a far store's round trip on every read (#195)
+            with READS["lock"]:
+                READS["now"] -= 1
         if READ_LIMIT and (path.startswith("/get/") or path.startswith("/name/")):
             # a test hook: an operator's read limit an address, as the canonical stores have (600 a minute)
             limit, window = (float(x) for x in READ_LIMIT.split("/"))
@@ -779,7 +785,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if failed:
                 return self.reply(503, {"error": "test hook: this read is refused (HPPLITE_STORE_FAIL_GET)"})
         if path == "/status":
-            return self.reply(200, self.service.status())
+            status = self.service.status()
+            if GET_DELAY:
+                status["test"] = {"readsInFlightMost": READS["most"]}      # the test hook's count, for the test to read
+            return self.reply(200, status)
         m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})/objects$", path)
         if m:
             return self.get_objects(m.group(1).lower(), urllib.parse.parse_qs(url.query))
