@@ -1279,6 +1279,12 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.12.1** (2026-11-22): a snapshot at a store that limits writes.
+
+- **An anchor's put answered 429 waits and is made again (#407).** A snapshot's chunk a store's rate limit refused ended the snapshot, and the next anchor began another from its first chunk: past about 60 chunks (480 MiB deflated) the canonical stores' 60 writes a minute a bucket would refuse one at every try, and no snapshot was ever made (computed; shown against the reference store). A snapshot's chunks, its name, its index and the anchor's manifest now wait the answer's `Retry-After` out and are put again, as a read does since v0.11.0: five such answers in a row at most, two minutes a wait, none while the node is closing. The flushes wait behind the anchor meanwhile: a 1 GiB snapshot is about two minutes of waits at the canonical stores (computed). The funder's daily cap is not waited for, and a batch's put waits for the next flush as before.
+- A snapshot that is not made says how many of its chunks stay at the store.
+- No protocol or format changes; no message a platform may match is changed. A v0.11 binary opened on a sidecar that v0.12 has opened reads its rows by name and passes over the two new columns (read from the code, not tried).
+
 **v0.12.0** (2026-11-22): what there is to go back to.
 
 - **`hpplite-verify --list` (#397).** The rollup's batches listed, nothing rebuilt: a JSON line a batch on stdout - its height, the time its head carries (the one `--at` goes by), its bytes at the store, whether a range on the chain covers it. Of the anchored history it reads one object a range, the manifest, checked against the chain as a rebuild checks it, and no batch; past the last anchor, the store's names one by one, each signed by the rollup's sequencer. The connection is `role=list`, a verifier that applies nothing (`hpplite_node_list`).
