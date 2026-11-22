@@ -1254,6 +1254,13 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.11.2** (2026-11-22): a rebuild's reads run ahead.
+
+- **The reads run ahead across the ranges (#413).** The reads ahead were groups inside one anchored range, each waited for whole: a group waited for its slowest, nothing was in flight while the node applied what it read, and a history of short ranges - a batch or a few an anchor - was read a round trip after another. A window of reads now stays in flight ahead of the batch being applied, across the ranges, each range's manifest among them, and a read waits for its own answer only. Nothing read ahead is relied on: every manifest and batch is checked where the reading comes to it, as before.
+- **A range's log is asked for with those after it (#412).** The chain client asked `eth_getLogs` once a range; it asks for a span of blocks and keeps the ranges the answer holds. A history of 30 ranges of one batch asked 31 times, and asks twice.
+- **What it comes to,** measured on HPP Sepolia from a Mac in Korea, the same rollup (15,353 batches by now, ranges of 20): from batch 1 in 387 s with `HPPLITE_STORE_PARALLEL=32`, 39.7 batches a second, where v0.11.1 took 854 s for 14,401, 16.9 a second; its first 2,000 batches with the default eight in flight in 139 s, where v0.11.1 took 212.66 s. With 32 in flight a rebuild makes about 2,500 store reads a minute there (computed from what it read), under the canonical stores' 6,000; past a limit the node waits the `429` out, as before. [doc/performance.md](doc/performance.md) has it.
+- `HPPLITE_STORE_PARALLEL=1` asks for nothing ahead, as before. No protocol or format changes; no message a platform may match is changed.
+
 **v0.11.1** (2026-11-21): a rebuild on a real chain.
 
 - **A rebuild asks the chain about once a range (#410).** A batch inside an anchored range was looked up on the chain three times on its way, each lookup asking whether the chain had grown, and its range's log was read again for every batch: four RPC calls a batch. A height the index covers now asks the chain nothing, and a range's log is read once.
