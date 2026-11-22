@@ -70,7 +70,7 @@ int main(void) {
 
     /* Test 3: Config loading */
     tests++;
-    TEST("Config loading from URI; role= takes verify only (#248)");
+    TEST("Config loading from URI; role= takes verify or list, nothing else (#248, #397)");
     {
         const char *uri = "file:/tmp/test_simple_open.db?hpplite=on&chainid=12345&datadir=/tmp/hpplite_test_simple";
         sqlite3 *db = hpplite_open(uri);
@@ -82,10 +82,10 @@ int main(void) {
         if (cfg->chainId != 12345) FAIL("chainId not 12345");
         hpplite_close(db);
 
-        /* role=sequencer and role=observer were parsed and read nowhere; now anything but verify refuses the open */
+        /* role=sequencer and role=observer were parsed and read nowhere; now anything but verify and list refuses the open */
         db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&role=observer&chainid=12345&datadir=/tmp/hpplite_test_simple");
         if (db) { hpplite_close(db); FAIL("role=observer should refuse the open"); }
-        if (!hpplite_config_error() || !strstr(hpplite_config_error(), "role= takes verify only")) FAIL("the refusal should say role= takes verify only");
+        if (!hpplite_config_error() || !strstr(hpplite_config_error(), "role= takes verify (an audit connection) or list")) FAIL("the refusal should say role= takes verify or list");
         db = hpplite_open("file:/tmp/test_simple_open.db?hpplite=on&role=verify&chainid=12345&datadir=/tmp/hpplite_test_simple");
         if (!db) FAIL("role=verify should open");
         { sqlite3_stmt *st = NULL; int isVerify = 0;

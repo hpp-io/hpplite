@@ -163,10 +163,12 @@ static void refuse_fleet(void) {
     snprintf(gConfigError, sizeof(gConfigError), "fleet= is gone (#352, decision 0003): fleet mode was removed; its history is on the branch fleet-experiment");
 }
 
-/* role=verify, nothing else (#248): sequencer and observer were parsed and read nowhere - a sequencer needs no role= */
+/* role=verify or role=list (#397), nothing else (#248): sequencer and observer were parsed and read nowhere - a
+** sequencer needs no role= */
 static void parse_role(HppliteConfig *cfg, const char *val, int source) {
     if (strcasecmp(val, "verify") == 0) { cfg->roleVerify = 1; cfg->roleSource = source; return; }
-    snprintf(gConfigError, sizeof(gConfigError), "role=%.40s: role= takes verify only (an audit connection); a sequencer needs no role=", val);
+    if (strcasecmp(val, "list") == 0) { cfg->roleVerify = cfg->roleList = 1; cfg->roleSource = source; return; }
+    snprintf(gConfigError, sizeof(gConfigError), "role=%.40s: role= takes verify (an audit connection) or list (its history listed, nothing applied); a sequencer needs no role=", val);
 }
 
 HppliteConfig *hpplite_config_create(void) {
@@ -958,7 +960,7 @@ void hpplite_config_print(const HppliteConfig *cfg) {
 
     printf("HPPLite Configuration:\n");
     printf("  nodeId:     %s\n", cfg->nodeId ? cfg->nodeId : "(auto)");
-    printf("  role:       %s (%s)\n", cfg->roleVerify ? "verify" : "-", source_str(cfg->roleSource));
+    printf("  role:       %s (%s)\n", cfg->roleList ? "list" : cfg->roleVerify ? "verify" : "-", source_str(cfg->roleSource));
     printf("  chainId:    %llu (%s)\n", (unsigned long long)cfg->chainId, source_str(cfg->chainIdSource));
     printf("  rpcUrl:     %s (%s)\n", cfg->rpcUrl, source_str(cfg->rpcUrlSource));
     printf("  contract:   %s", cfg->hasContract ? "0x" : "(not set)");

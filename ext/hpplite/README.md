@@ -180,7 +180,7 @@ The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`);
 | `contract` | No | The rollup to post on or read, by address: a rollup this key does not own (the sequencer the owner named, a verifier), or any rollup when the by-name lookup is not wanted. Wins over any factory set beside it - the alias's (`l1=hpp-sepolia`), `HPPLITE_FACTORY`, `factory=` (#271) - so an app on a platform's rollup never gets a rollup of its own |
 | `privkey` | Yes | Private key for signing (or `keyfile=/path`; see Keys) |
 | `chainid` | With `rpc` | Chain id of the RPC (set by `l1`) |
-| `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). The only value: any other refuses the open (#248); a sequencer needs no `role=` |
+| `role` | No | `verify`: an audit connection - rebuilds and compares, never posts, claims the lease or creates a rollup (what `hpplite-verify` uses, #5). `list`: a verifier that applies nothing - its rollup's batches are listed, not rebuilt (`hpplite-verify --list`, #397). Any other value refuses the open (#248); a sequencer needs no `role=` |
 | `snapshot` | No | With `store=` on a chain with ranges: how often the sequencer snapshots the database at an anchor - `24h`, `1h`; `0` (default) never (#221). The snapshot is the file at the anchored height, sealed like a batch, at the store in chunks under an index the anchor's manifest names, so a replica can start there instead of at batch 1. Also `HPPLITE_SNAPSHOT`. See Stores and commitments |
 | `store` | No | `on` for the network's canonical store (`l1=hpp-sepolia`: `https://store.sepolia.hpplite.hpp.io`; `l1=hpp-mainnet`: `https://store.hpplite.hpp.io`; a network without one refuses to open, #192), or `http://host:port` of a store speaking `hpplite-store/2` (`operators/store/hpplite_store.py`, or the canonical one): the rollup's bucket, kept while its funding wallet covers it (#214). The batch bytes go there and the chain holds the commitment - hash, reference, and with each anchor the store's signed bucket statement (#11, #33). A replica needs the same `store=` to rebuild. The protocol: [doc/store-protocol.md](doc/store-protocol.md). Also `HPPLITE_STORE` |
 | `funder` | No | `0x…`: the bucket's funding wallet is another's - a platform's treasury, bound to the bucket and given its permit from the platform's control plane (#272). The node derives no funding key, binds nothing, gives no permit and pays no 402: a bucket not bound to that wallet, or an uncovered account, keeps the batches pending with `waiting for the funder 0x…` (said once), and the write resumes when the platform has bound or covered it. `store_funder` shows the external wallet. A platform that owns the rollup binds the bucket alone (a Bind signed by the funder when the funder is the rollup's `owner()` on chain, #273); otherwise `SELECT hpplite_bind_signature('0x<funder>', issuedAt)` gives the app's half of the binding. The funder may bound the bucket's day (`Cap`, doc/store-protocol.md, #274: writes and bytes per rolling day; a batch is one write, its name, #296); past it the store answers 429, the node keeps the batch pending with `the bucket's daily cap is reached` and tries again at its next flush. Also `HPPLITE_FUNDER`. Default: the node's own derived funding wallet |
@@ -775,7 +775,7 @@ exits 2 (a gap in the parameters, not a verdict), after reporting what the chain
 anchors (#247). The rebuilt file is deleted unless `--keep <dir>`.
 `--to <height>` stops after that batch (#206): with `--keep`, the database as of that
 height stays, its own posted root matched; checkpoints past it are not compared.
-`--at <time>` (unix seconds or `YYYY-MM-DDTHH:MM:SSZ`) is point-in-time recovery (#205):
+`--at <time>` (unix seconds or `YYYY-MM-DDTHH:MM:SSZ`, either with `.mmm`) is point-in-time recovery (#205):
 every batch its writer wrote by then, by the time each batch carries; a transaction in
 flight at that moment is completed, never left halfway; with `--keep`, the database as of
 that time stays.
@@ -862,7 +862,8 @@ store has it (its height moves on, `pending` drops, a row waits in
 `_hpplite_unanchored`), and the **anchor**, every `anchor=` (30 min on HPP,
 the chain's own cadence), at close, and on `SELECT hpplite_anchor()`, writes
 a **manifest** to the store naming every batch since the last anchor (height,
-hash, reference, receipt) and commits the range in one transaction: the
+hash, reference, receipt, and since v0.12.0 the time its head carries and
+its bytes at the store: what `hpplite-verify --list` reads, #397) and commits the range in one transaction: the
 chain hash after it (the same fold the per-batch path keeps), the state root
 after its last batch (the anchor is the checkpoint, and renews the lease: a
 node that anchors sends no checkpoint or lease transactions of its own), the
@@ -1016,6 +1017,30 @@ than a short one. A line says where the reading began:
 
 A snapshot that cannot be used (its index gone, or not the anchored one)
 is said, and the history is read from height 1.
+
+**What there is to go back to (#397).** `hpplite-verify --list` lists the
+rollup's batches and rebuilds nothing: a JSON line a batch on stdout, oldest
+first.
+
+    {"height":41,"time":"2026-11-22T09:15:02.118Z","time_ms":1795338902118,"bytes":1873,"anchored":true}
+
+`time` is the time the batch's head carries, the one `--at` goes by: `--at`
+with a line's `time` rebuilds through that batch, as `--to` with its
+`height` does. `bytes` is the batch as the store holds it (deflated,
+sealed). `anchored` says whether a range on the chain covers it: the lines
+past the last anchor say `false` - the store's names, read one by one, each
+signed by the rollup's sequencer (its time is absent where the key given
+does not open the batch). Of the anchored history one object a range is
+read, its manifest, checked against the chain as a rebuild checks it (the
+digest the chain anchored, its batches folding to the anchored chain hash)
+- and no batch. The times and the bytes are what the sequencer wrote in the
+manifest: nothing compares them with the batches, and a rebuild `--at` goes
+by the batches themselves. A manifest written before v0.12.0 names neither,
+and its range is one line, `{"from":1,"to":20,"batches":20,"anchored":true}`;
+a range the store no longer holds (`keep=`) is that line with
+`"held":false`. Exit 0: listed to the end; 1: the listing stopped (why on
+stderr); 2: could not run. A rollup whose batches are on the chain itself
+is not listed.
 
 **Going back and going on (#392).** The two together are a database taken
 back to a moment and written from there, on its own rollup:

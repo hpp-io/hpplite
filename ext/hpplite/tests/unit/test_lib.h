@@ -77,6 +77,7 @@ typedef struct TestNodeOpts {
     int noCompress;                          /* the batch JSON as is (#12) */
     int localOnly;                           /* 0: when there is no L1; 1: always; -1: never (no chain: the log stays pending) */
     int verifyOnly;                          /* role=verify (#5) */
+    int listOnly;                            /* role=list (#397): with verifyOnly, a verifier that applies nothing */
     const char *dbName;                      /* dbname= (#61): its own rollup among the wallet's, named in its first batch and its snapshots */
     int noSync;                              /* attach the L1 without syncing from it first */
     int start;                               /* start the node even without an L1 */

@@ -243,6 +243,7 @@ static int node_init_common(HppliteNode *node, const HppliteNodeConfig *config) 
     node->config.noCompress = config->noCompress;
     node->config.localOnly = config->localOnly;
     node->config.verifyOnly = config->verifyOnly;
+    node->config.listOnly = config->listOnly;
 
     /* Generate unique instance ID (a file's sequencer replaces it with the
     ** file's own, node_take_file_lock) */
@@ -2086,10 +2087,12 @@ static int node_ranges(HppliteNode *node) {
 }
 
 /* the commitment of the batch being flushed, kept for the finalize's row */
-static void node_anchor_row(HppliteNode *node, const unsigned char hash[32], const char *zRef, const uint8_t *receipt, size_t nReceipt) {
+static void node_anchor_row(HppliteNode *node, const unsigned char hash[32], const char *zRef, const uint8_t *receipt, size_t nReceipt, uint64_t timeMs, size_t bytes) {
     free(node->zAnchorRef);
     node->zAnchorRef = strdup(zRef);
     memcpy(node->anchorRow.hash, hash, 32);
+    node->anchorRow.timeMs = timeMs;
+    node->anchorRow.bytes = bytes;
     node->anchorRow.zRef = node->zAnchorRef;
     node->anchorRow.receipt = NULL;
     node->anchorRow.nReceipt = 0;
@@ -2979,7 +2982,7 @@ static int node_anchor_once(HppliteNode *node) {
     cJSON_AddNumberToObject(m, "v", 1);
     hex32(node->instanceId, hx); cJSON_AddStringToObject(m, "instance", hx);
     expect = lastBatch + 1;
-    if (sqlite3_prepare_v2(ctx->bkDb, "SELECT height, hash, ref, receipt, chain_after, root, chain_before FROM _hpplite_unanchored ORDER BY height", -1, &q, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(ctx->bkDb, "SELECT height, hash, ref, receipt, chain_after, root, chain_before, time_ms, bytes FROM _hpplite_unanchored ORDER BY height", -1, &q, NULL) == SQLITE_OK) {
         while (sqlite3_step(q) == SQLITE_ROW) {
             uint64_t h = (uint64_t)sqlite3_column_int64(q, 0);
             cJSON *b;
@@ -2997,6 +3000,12 @@ static int node_anchor_once(HppliteNode *node) {
             if (sqlite3_column_type(q, 3) == SQLITE_BLOB && sqlite3_column_bytes(q, 3) > 0) {
                 char *rx = malloc((size_t)sqlite3_column_bytes(q, 3) * 2 + 3);
                 if (rx) { rx[0] = '0'; rx[1] = 'x'; hpplite_bytes_to_hex(sqlite3_column_blob(q, 3), (size_t)sqlite3_column_bytes(q, 3), rx + 2); cJSON_AddStringToObject(b, "receipt", rx); free(rx); }
+            }
+            /* each batch's time and bytes (#397): a listing reads them here, a manifest a range, and no batch. The
+            ** sequencer's word, under the digest the chain anchors; a row from before has neither */
+            if (sqlite3_column_int64(q, 7) > 0 && sqlite3_column_int64(q, 8) > 0) {
+                cJSON_AddNumberToObject(b, "t", (double)sqlite3_column_int64(q, 7));
+                cJSON_AddNumberToObject(b, "n", (double)sqlite3_column_int64(q, 8));
             }
             if (sqlite3_column_bytes(q, 4) == 32) memcpy(chainAfter, sqlite3_column_blob(q, 4), 32);
             if (sqlite3_column_bytes(q, 5) == 32) { memcpy(root, sqlite3_column_blob(q, 5), 32); hasRoot = 1; } else hasRoot = 0;
@@ -3222,6 +3231,47 @@ static void node_range_ahead(HppliteNode *node, HppliteL1 *l1, const HppliteRang
     hpplite_store_ahead_refs(node->store, refs, n);
 }
 
+/* A range's manifest from the bytes the store gave (#164): they must be the ones the chain's digest names, its batches
+** named in order and folding from its chain_before to the anchored chain hash. `at` (or NULL): the chain hash the
+** reader's history holds before the range, which the manifest must begin from. NULL: why is said */
+static cJSON *node_manifest_checked(HppliteNode *node, const HppliteRange *r, const uint8_t *text, size_t n, const unsigned char *at) {
+    uint8_t digest[32];
+    unsigned char chain[32], hash[32], got[32];
+    char hx[67];
+    cJSON *m, *arr;
+    const cJSON *cb, *e;
+    uint64_t h = r->fromHeight;
+    hpplite_store_sha256(text, n, digest);
+    if (memcmp(digest, r->manifestDigest, 32) != 0) { hpplite_error(node->ctx, "range %llu-%llu: the store's manifest is not the one the chain anchored", (unsigned long long)r->fromHeight, (unsigned long long)r->toHeight); return NULL; }
+    m = cJSON_ParseWithLength((const char *)text, n);
+    arr = m ? cJSON_GetObjectItemCaseSensitive(m, "batches") : NULL;
+    cb = m ? cJSON_GetObjectItemCaseSensitive(m, "chain_before") : NULL;
+    if (!arr || !cJSON_IsArray(arr) || !json_hex32(cb, chain)) {
+        hpplite_error(node->ctx, "range %llu-%llu: the manifest is malformed", (unsigned long long)r->fromHeight, (unsigned long long)r->toHeight);
+        cJSON_Delete(m); return NULL;
+    }
+    if (at && memcmp(chain, at, 32) != 0) {
+        hpplite_error(node->ctx, "range %llu-%llu: the manifest starts from a chain hash that is not this history's at %llu", (unsigned long long)r->fromHeight, (unsigned long long)r->toHeight, (unsigned long long)(h - 1));
+        cJSON_Delete(m); return NULL;
+    }
+    cJSON_ArrayForEach(e, arr) {
+        const cJSON *hh = cJSON_GetObjectItemCaseSensitive(e, "h"), *hs = cJSON_GetObjectItemCaseSensitive(e, "hash");
+        if (!cJSON_IsNumber(hh) || (uint64_t)hh->valuedouble != h || !json_hex32(hs, hash)) {
+            hpplite_error(node->ctx, "range %llu-%llu: the manifest does not name batch %llu in order", (unsigned long long)r->fromHeight, (unsigned long long)r->toHeight, (unsigned long long)h);
+            cJSON_Delete(m); return NULL;
+        }
+        hpplite_chain_hash_next(chain, h, hash, got);
+        memcpy(chain, got, 32);
+        h++;
+    }
+    if (h != r->toHeight + 1 || memcmp(chain, r->chainHashAfter, 32) != 0) {
+        hex32(r->chainHashAfter, hx);
+        hpplite_error(node->ctx, "range %llu-%llu: the manifest's batches do not fold to the anchored chain hash %s", (unsigned long long)r->fromHeight, (unsigned long long)r->toHeight, hx);
+        cJSON_Delete(m); return NULL;
+    }
+    return m;
+}
+
 /* a replica: the bytes of a height inside an anchored range, by the manifest the chain's digest names */
 static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t height, size_t *pLen) {
     HppliteRange r;
@@ -3242,48 +3292,18 @@ static uint8_t *node_fetch_from_range(HppliteNode *node, HppliteL1 *l1, uint64_t
         /* the manifest, by its digest's CID; it must be the bytes the chain named, and its batches must fold to the anchored chain hash.
         ** Keyed by the rollup too (#234): the lookup by name reads batch 1 of each of the wallet's rollups through here, and two
         ** rollups' first ranges have the same bounds more often than not */
-        char cid[64], hx[67];
+        char cid[64];
         size_t n = 0;
-        uint8_t *text, digest[32];
-        unsigned char chain[32], hash[32];
-        cJSON *m, *arr;
-        const cJSON *cb;
-        uint64_t h = r.fromHeight;
+        uint8_t *text;
+        unsigned char zero[32] = {0};
+        cJSON *m;
         hpplite_store_cid_from_sha256(r.manifestDigest, cid);
         text = hpplite_store_get(node->store, cid, &n);
         if (!text) { hpplite_error(node->ctx, "range %llu-%llu: the store did not give the manifest %s: %s", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, cid, hpplite_store_error(node->store)); hpplite_l1_range_clear(&r); return NULL; }
-        hpplite_store_sha256(text, n, digest);
-        if (memcmp(digest, r.manifestDigest, 32) != 0) { hpplite_error(node->ctx, "range %llu-%llu: the store's manifest is not the one the chain anchored", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight); free(text); hpplite_l1_range_clear(&r); return NULL; }
-        m = cJSON_ParseWithLength((const char *)text, n);
+        /* a history that holds a chain hash before the range: the manifest begins from it */
+        m = node_manifest_checked(node, &r, text, n, r.fromHeight == node->ctx->blockHeight && memcmp(node->ctx->chainHash, zero, 32) != 0 ? node->ctx->chainHash : NULL);
         free(text);
-        arr = m ? cJSON_GetObjectItemCaseSensitive(m, "batches") : NULL;
-        cb = m ? cJSON_GetObjectItemCaseSensitive(m, "chain_before") : NULL;
-        if (!arr || !cJSON_IsArray(arr) || !json_hex32(cb, chain)) {
-            hpplite_error(node->ctx, "range %llu-%llu: the manifest is malformed", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight);
-            cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
-        }
-        if (h == node->ctx->blockHeight && memcmp(chain, node->ctx->chainHash, 32) != 0) {
-            unsigned char zero[32] = {0};
-            if (memcmp(node->ctx->chainHash, zero, 32) != 0) {
-                hpplite_error(node->ctx, "range %llu-%llu: the manifest starts from a chain hash that is not this history's at %llu", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, (unsigned long long)(h - 1));
-                cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
-            }
-        }
-        cJSON_ArrayForEach(e, arr) {
-            const cJSON *hh = cJSON_GetObjectItemCaseSensitive(e, "h"), *hs = cJSON_GetObjectItemCaseSensitive(e, "hash");
-            if (!cJSON_IsNumber(hh) || (uint64_t)hh->valuedouble != h || !json_hex32(hs, hash)) {
-                hpplite_error(node->ctx, "range %llu-%llu: the manifest does not name batch %llu in order", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, (unsigned long long)h);
-                cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
-            }
-            hpplite_chain_hash_next(chain, h, hash, got);
-            memcpy(chain, got, 32);
-            h++;
-        }
-        if (h != r.toHeight + 1 || memcmp(chain, r.chainHashAfter, 32) != 0) {
-            hex32(r.chainHashAfter, hx);
-            hpplite_error(node->ctx, "range %llu-%llu: the manifest's batches do not fold to the anchored chain hash %s", (unsigned long long)r.fromHeight, (unsigned long long)r.toHeight, hx);
-            cJSON_Delete(m); hpplite_l1_range_clear(&r); return NULL;
-        }
+        if (!m) { hpplite_l1_range_clear(&r); return NULL; }
         if (node->manifest) cJSON_Delete(node->manifest);
         node->manifest = m;
         node->manifestFrom = r.fromHeight;
@@ -3450,7 +3470,9 @@ static uint64_t node_flush_pages(HppliteNode *node, int *pMore, size_t maxBytes)
                 node->warnedFunder = 0;
                 hpplite_keccak256(payload, payloadLen, h);
                 if (node_ranges(node)) {
-                    node_anchor_row(node, h, zRef, NULL, 0);   /* the chain's commitment comes with the anchor (#164); the store's word is its bucket statement there */
+                    uint64_t ms = 0;
+                    hpplite_pagebatch_meta(bytes, len, &ms, NULL);      /* the time in the batch's head, the one --at goes by: named in the manifest with the bytes as stored (#397) */
+                    node_anchor_row(node, h, zRef, NULL, 0, ms, payloadLen);   /* the chain's commitment comes with the anchor (#164); the store's word is its bucket statement there */
                     if (named == 0 && node_name_batch(node, height, payload, payloadLen) < 0 && !node->warnedNames) {
                         fprintf(stderr, "hpplite: the store did not take batch %llu under its name (%s): readers find it only through the anchor\n",
                                 (unsigned long long)height, hpplite_store_error(node->store));
@@ -3754,7 +3776,7 @@ static int node_soft_walk(HppliteNode *node) {
     if (strlen(zDa) != 42 || hpplite_hex_to_bytes(zDa + 2, da, 20) != 20) return 0;
     uint64_t start = node->ctx->blockHeight;                    /* where the walk starts: read ahead only past it */
     for (;;) {
-        uint64_t h = node->ctx->blockHeight, chainId;
+        uint64_t h = node->ctx->blockHeight, chainId, ms = 0;
         size_t n = 0;
         uint8_t *data;
         HppliteBatch *batch;
@@ -3840,11 +3862,14 @@ static int node_soft_walk(HppliteNode *node) {
         hpplite_chain_hash_next(before, h, k, after);
         hpplite_store_sha256(data, n, digest);
         hpplite_store_cid_from_sha256(digest, cid);
+        hpplite_pagebatch_meta(batch->pPagesRaw, batch->nPagesRaw, &ms, NULL);     /* for the manifest, as the flush that wrote it would have kept (#397) */
         rc = hppliteBkBegin(node->ctx, 1);
         if (rc == SQLITE_OK) {
             saved = hppliteBkEnter(node->ctx);
-            rc = sqlite3_prepare_v2(node->ctx->bkDb, "INSERT OR REPLACE INTO _hpplite_unanchored(height, hash, ref, receipt, chain_before, chain_after, root) VALUES(?1, ?2, ?3, NULL, ?4, ?5, NULL)", -1, &q, NULL);
+            rc = sqlite3_prepare_v2(node->ctx->bkDb, "INSERT OR REPLACE INTO _hpplite_unanchored(height, hash, ref, receipt, chain_before, chain_after, root, time_ms, bytes) VALUES(?1, ?2, ?3, NULL, ?4, ?5, NULL, ?6, ?7)", -1, &q, NULL);
             if (rc == SQLITE_OK) {
+                sqlite3_bind_int64(q, 6, (sqlite3_int64)ms);
+                sqlite3_bind_int64(q, 7, (sqlite3_int64)n);
                 sqlite3_bind_int64(q, 1, (sqlite3_int64)h);
                 sqlite3_bind_blob(q, 2, k, 32, SQLITE_STATIC);
                 sqlite3_bind_text(q, 3, cid, -1, SQLITE_STATIC);
@@ -4161,6 +4186,141 @@ static int node_soft_follow(HppliteNode *node) {
     return applied;
 }
 
+/*
+** A rollup's batches listed without a rebuild (#397): what a platform shows a person choosing a moment for
+** hpplite-verify --at. The anchored ranges' manifests are read - each the bytes the chain's digest names, folding
+** to the anchored chain hash and beginning from the range's before it; one read a range, a window of them asked
+** ahead (#413) - and every batch of a manifest that names each one's time and bytes (the sequencer writes them
+** since v0.12.0) is an entry; a range whose manifest names none is one entry, as is one the store no longer holds
+** (keep=, #223). Past the last anchor the store's names are read one by one, each signed by the rollup's sequencer,
+** the time from the batch's head. No batch of an anchored range is read: a manifest's times and sizes are the
+** sequencer's word, under the digest the chain anchored, and no rebuild checks them against the batches.
+*/
+int hpplite_node_list(HppliteNode *node, HppliteListFn fn, void *arg) {
+    HppliteRange w[HPPLITE_STORE_AHEAD_MAX];
+    char cids[HPPLITE_STORE_AHEAD_MAX][64], name[80];
+    const char *refs[HPPLITE_STORE_AHEAD_MAX];
+    unsigned char prev[32] = {0}, seq[20], da[20], who[20], inst[32];
+    uint8_t sig[65];
+    uint64_t anchored = 0, total = 0, next = 1, h, chainId;
+    HppliteL1State *st;
+    pthread_mutex_t *mutex;
+    int nw = 0, par = hpplite_store_parallel(), rc = 0, i, named = 0;
+    if (!node || !node->ctx || !fn) return -1;
+    mutex = (pthread_mutex_t *)node->flushMutex;
+    if (mutex) pthread_mutex_lock(mutex);
+    if (!node->l1 || !node->store || !hpplite_l1_has_ranges(node->l1)) {
+        hpplite_error(node->ctx, "list: a listing reads a rollup whose batches are at a store, anchored in ranges: %s",
+                      !node->l1 ? "no chain connection" : !node->store ? "no store= names one" : "this chain takes no ranges");
+        rc = -1;
+    } else if (hpplite_l1_get_da_state(node->l1, &anchored, &total, NULL) != 0) {
+        hpplite_error(node->ctx, "list: the chain's state could not be read");
+        rc = -1;
+    }
+    if (par < 1) par = 1;
+    if (par > HPPLITE_STORE_AHEAD_MAX) par = HPPLITE_STORE_AHEAD_MAX;
+    while (rc == 0) {
+        HppliteListed e;
+        size_t n = 0;
+        uint8_t *text;
+        while (nw < par && next <= anchored) {
+            memset(&w[nw], 0, sizeof w[nw]);
+            if (hpplite_l1_get_range(node->l1, next, &w[nw]) != 0 || w[nw].fromHeight != next || w[nw].toHeight < next) {
+                hpplite_l1_range_clear(&w[nw]);
+                hpplite_error(node->ctx, "list: batch %llu is not the first of a range the chain anchored (a listing reads a rollup whose batches are at a store)", (unsigned long long)next);
+                rc = -1;
+                break;
+            }
+            hpplite_store_cid_from_sha256(w[nw].manifestDigest, cids[nw]);
+            next = w[nw].toHeight + 1;
+            nw++;
+        }
+        if (rc != 0 || nw == 0) break;
+        for (i = 0; i < nw; i++) refs[i] = cids[i];
+        hpplite_store_ahead_refs(node->store, refs, nw);
+        memset(&e, 0, sizeof e);
+        e.from = w[0].fromHeight; e.to = w[0].toHeight; e.anchored = 1;
+        text = hpplite_store_get(node->store, cids[0], &n);
+        if (!text) {
+            if (hpplite_store_take_status(node->store) == 404) rc = fn(arg, &e);        /* let go of at the store (keep=) */
+            else {
+                hpplite_error(node->ctx, "list: range %llu-%llu: the store did not give the manifest %s: %s", (unsigned long long)e.from, (unsigned long long)e.to, cids[0], hpplite_store_error(node->store));
+                rc = -1;
+            }
+        } else {
+            /* the first range's begins from whatever it says, as a rebuild from batch 1 takes it */
+            cJSON *m = node_manifest_checked(node, &w[0], text, n, e.from > 1 ? prev : NULL);
+            const cJSON *b, *arr = m ? cJSON_GetObjectItemCaseSensitive(m, "batches") : NULL;
+            int all = 1;
+            free(text);
+            e.held = 1;
+            cJSON_ArrayForEach(b, arr) {
+                const cJSON *t = cJSON_GetObjectItemCaseSensitive(b, "t"), *nb = cJSON_GetObjectItemCaseSensitive(b, "n");
+                if (!cJSON_IsNumber(t) || !cJSON_IsNumber(nb) || t->valuedouble < 1 || nb->valuedouble < 1) { all = 0; break; }
+            }
+            if (!m) rc = -1;
+            else if (!all) rc = fn(arg, &e);            /* a manifest from before the times: the range */
+            else {
+                h = e.from;
+                cJSON_ArrayForEach(b, arr) {
+                    e.from = e.to = h++;
+                    e.timeMs = (uint64_t)cJSON_GetObjectItemCaseSensitive(b, "t")->valuedouble;
+                    e.bytes = (uint64_t)cJSON_GetObjectItemCaseSensitive(b, "n")->valuedouble;
+                    if ((rc = fn(arg, &e)) != 0) break;
+                }
+            }
+            cJSON_Delete(m);
+        }
+        memcpy(prev, w[0].chainHashAfter, 32);
+        hpplite_l1_range_clear(&w[0]);
+        nw--;
+        memmove(&w[0], &w[1], (size_t)nw * sizeof w[0]);
+        memmove(cids[0], cids[1], (size_t)nw * sizeof cids[0]);
+    }
+    for (i = 0; i < nw; i++) hpplite_l1_range_clear(&w[i]);
+    if (rc == 0 && !(st = hpplite_l1_get_state(node->l1))) {
+        hpplite_error(node->ctx, "list: the rollup's sequencer could not be read from the chain");
+        rc = -1;
+    } else if (rc == 0) {
+        memcpy(seq, st->sequencerWallet, 20);
+        hpplite_l1_state_free(st);
+        chainId = hpplite_l1_chain_id(node->l1);
+        if (!chainId) chainId = hpplite_l1_default_chain_id();
+        for (h = anchored + 1; rc == 0; h++) {
+            HppliteListed e;
+            HppliteBatch *batch;
+            size_t n = 0;
+            uint8_t *data;
+            if (named) node_names_ahead(node, h, 0);    /* past the first, a window of them (#195): an anchored history's listing asks for one */
+            if (node_store_name(node, h, name, da) != 0) break;
+            if (!(data = hpplite_store_get_named(node->store, name, &n, sig, inst))) {
+                if (hpplite_store_take_status(node->store) != 404) {
+                    hpplite_error(node->ctx, "list: the store did not give batch %llu under its name: %s", (unsigned long long)h, hpplite_store_error(node->store));
+                    rc = -1;
+                }
+                break;                                  /* 404: the last name is the one before */
+            }
+            if (hpplite_store_batch_signer(da, chainId, inst, h, data, n, sig, who) != 0 || memcmp(who, seq, 20) != 0) {
+                hpplite_error(node->ctx, "list: batch %llu at the store is not signed by the rollup's sequencer: the listing ends before it", (unsigned long long)h);
+                free(data);
+                rc = -1;
+                break;
+            }
+            memset(&e, 0, sizeof e);
+            e.from = e.to = h; e.bytes = n; e.held = 1;
+            if ((batch = node_decode_batch(node, h, data, n))) {       /* one this key does not open is listed without its time */
+                hpplite_pagebatch_meta(batch->pPagesRaw, batch->nPagesRaw, &e.timeMs, NULL);
+                hpplite_batch_free(batch);
+            }
+            free(data);
+            named = 1;
+            rc = fn(arg, &e);
+        }
+    }
+    if (mutex) pthread_mutex_unlock(mutex);
+    return rc;
+}
+
 /* *pHead: 1 the chain's head was read and the file is there, 0 the sync stopped before it, left as it is where the
 ** head could not be read (nothing learned) */
 static int node_sync_from_l1(HppliteNode *node, int *pHead) {
@@ -4168,6 +4328,7 @@ static int node_sync_from_l1(HppliteNode *node, int *pHead) {
     unsigned char latestHash[32];
     int synced = 0;
 
+    if (node->config.listOnly) return 0;                /* role=list (#397): the history is listed, none of it applied */
     if (node_check_rollup(node) < 0) { *pHead = 0; return -1; }
     if (hpplite_l1_get_da_state(node->l1, &lastBatch, &totalBatches, latestHash) != 0) return 0;
     *pHead = 0;

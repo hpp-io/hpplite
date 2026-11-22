@@ -5240,6 +5240,66 @@ static void test_sequencer_once(void) {
     PASS();
 }
 
+/* 76. hpplite-verify --list (#397): what there is to rebuild to, without a rebuild - the anchored ranges' manifests
+** read, each batch's time and bytes named there, and the store's names past the last anchor. A JSON line a batch;
+** the time of a line is one --at takes as it is */
+static void test_verify_list(void) {
+    TEST("hpplite-verify --list (#397): 6 batches anchored two at a time and 2 past the anchor - a JSON line a batch with its time and bytes, nothing rebuilt; --at a line's time goes through its batch");
+    const char *svc = getenv("HPPLITE_PIN_SERVICE");
+    static const char *NKEY = "0x7474747474747474747474747474747474747474747474747474747474747474";
+    char addr[48], cmd[600], extra[300], vparams[500], contract[80] = "", out[8192], at[80] = "", want[64];
+    const char *line, *q;
+    int port, b, rc, lines = 0;
+    pid_t pid;
+    sqlite3 *w;
+    if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
+    if (!getenv("HPPLITE_VERIFY_BIN")) FAIL("HPPLITE_VERIFY_BIN not set by anvil_test.sh");
+    (void)!system("rm -rf " DIR "/store_pins76 " DIR "/vl_writer.db*");
+    snprintf(cmd, sizeof cmd, "cast wallet address %s 2>/dev/null", NKEY);
+    if (run_cmd(cmd, out, sizeof out) != 0 || strncmp(out, "0x", 2) != 0) FAIL("cast wallet address");
+    snprintf(addr, sizeof addr, "%.42s", out);
+    snprintf(cmd, sizeof cmd, "cast rpc anvil_setBalance %s 0x21e19e0c9bab2400000 --rpc-url %s >/dev/null 2>&1", addr, RPC);
+    if (system(cmd) != 0) FAIL("fund the key");
+    port = test_free_port();
+    pid = start_pin_service_dir(svc, port, DIR "/store_pins76");
+    if (pid < 0) FAIL("the store did not come up");
+#define VL_END() do { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } while (0)
+    snprintf(extra, sizeof extra, "&store=http://127.0.0.1:%d&anchor=0&anchorclose=off", port);
+    w = open_db("vl_writer.db", NKEY, extra);
+    if (!w) { VL_END(); FAIL("open writer"); }
+    sqlite3_exec(w, "CREATE TABLE n(id INTEGER PRIMARY KEY, v TEXT)", NULL, NULL, NULL);
+    for (b = 1; b <= 8; b++) {
+        sqlite3_exec(w, "INSERT INTO n(v) VALUES(hex(randomblob(200)))", NULL, NULL, NULL);
+        if (scalar(w, "SELECT hpplite_flush()") <= 0) { printf("(%s) ", status_text(w, "last_error")); sqlite3_close(w); VL_END(); FAIL("a batch through the store"); }
+        usleep(5000);                           /* each batch its own millisecond */
+        if (b <= 6 && b % 2 == 0 && scalar(w, "SELECT hpplite_anchor()") != b) { printf("(anchor %d: %s) ", b, status_text(w, "last_error")); sqlite3_close(w); VL_END(); FAIL("an anchor"); }
+    }
+    snprintf(contract, sizeof contract, "%s", status_text(w, "contract"));
+    sqlite3_close(w);
+    snprintf(vparams, sizeof vparams, "rpc=%s&contract=%s&chainid=31337&privkey=%s&store=http://127.0.0.1:%d", RPC, contract, NKEY, port);
+    out[0] = 0;
+    rc = run_verify_with(vparams, "--list", out, sizeof out);
+    for (line = out; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) if (line[0] == '{') lines++;
+    printf("(%d lines) ", lines);
+    if (rc != 0 || lines != 8 || strstr(out, "verified") || strstr(out, "\"from\"")) { VL_END(); FAILF("--list should give 8 lines, a batch each, and rebuild nothing; exit %d\n%s", rc, out); }
+    for (b = 1; b <= 8; b++) {
+        snprintf(want, sizeof want, "{\"height\":%d,\"time\":\"20", b);
+        line = strstr(out, want);
+        q = line ? strchr(line, '\n') : NULL;
+        if (!line || !q || !(strstr(line, "\"bytes\":") && strstr(line, "\"bytes\":") < q) || !(strstr(line, b <= 6 ? "\"anchored\":true}" : "\"anchored\":false}") && strstr(line, b <= 6 ? "\"anchored\":true}" : "\"anchored\":false}") < q)) {
+            VL_END(); FAILF("batch %d's line: its height, time, bytes, and anchored %s\n%s", b, b <= 6 ? "true" : "false", out);
+        }
+        if (b == 4) { const char *t = strstr(line, "\"time\":\"") + 8; snprintf(at, sizeof at, "--at %.*s", (int)strcspn(t, "\""), t); }
+    }
+    out[0] = 0;
+    rc = run_verify_with(vparams, at, out, sizeof out);
+    VL_END();
+#undef VL_END
+    printf("(%s) ", at);
+    if (rc != 0 || !strstr(out, "through batch 4, written") || !strstr(out, "\nverified")) FAILF("%s, the time listed for batch 4, should rebuild through batch 4; exit %d\n%s", at, rc, out);
+    PASS();
+}
+
 int main(void) {
     RPC = getenv("HPPLITE_ANVIL_RPC"); FACTORY = getenv("HPPLITE_ANVIL_FACTORY");
     KEY0 = getenv("HPPLITE_ANVIL_KEY0"); KEY1 = getenv("HPPLITE_ANVIL_KEY1"); KEY2 = getenv("HPPLITE_ANVIL_KEY2");
@@ -5313,6 +5373,7 @@ int main(void) {
     if (wanted(73)) test_stop_past_anchor();
     if (wanted(74)) test_rebuild_chain_calls();
     if (wanted(75)) test_index_walk_spans();
+    if (wanted(76)) test_verify_list();
     if (wanted(54)) test_payment_on_chain_time();           /* last: the chain's clock stays ahead */     /* a measurement, minutes long: when named only */
     if (tests_passed == tests_run) remove_dir();           /* a failure leaves the files to look at */
     return test_report();

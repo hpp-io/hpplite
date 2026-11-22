@@ -130,7 +130,8 @@ extern "C" {
 typedef struct HppliteConfig {
     /* Node identity */
     char *nodeId;                    /* a label for diagnostics, set by the C API (tests); no URI or env form (#248) */
-    int roleVerify;                  /* role=verify: rebuild and compare only, never post, claim or create (#5); the only role */
+    int roleVerify;                  /* role=verify: rebuild and compare only, never post, claim or create (#5); role=list sets it too */
+    int roleList;                    /* role=list: a verifier that applies nothing - its rollup's history is listed (hpplite-verify --list, #397) */
     unsigned char privkey[32];       /* Node private key */
     int hasPrivkey;                  /* Whether privkey is set */
     unsigned char viewkey[32];       /* A viewing key (#15): reads batches sealed to its public key, signs nothing */

@@ -77,6 +77,7 @@ typedef struct HppliteNodeConfig {
     int noCompress;                 /* compress=off: post the batch JSON as is (#12); default: deflate when it shrinks */
     int localOnly;                  /* l1=local: finalize batches locally, keep no history (#38) */
     int verifyOnly;                 /* role=verify: rebuild and compare, never post, claim or create (#5) */
+    int listOnly;                   /* role=list: a verifier that applies nothing; its history is listed (hpplite_node_list, #397) */
     size_t maxTxBytes;              /* Largest batch per transaction (0 = by chain id, else unknown) */
     char *storeUrl;                 /* store=: where batch bytes live instead of the chain (#11); NULL = on chain */
     uint64_t storeCap;              /* HPPLITE_STORE_CAP: the most to pay a store per call, atomic units (0 = pay nothing) */
@@ -399,6 +400,22 @@ HppliteBatch *hpplite_node_decode(HppliteNode *node, uint64_t height, const uint
 ** have diverged.
 */
 int hpplite_node_sync_from_l1(HppliteNode *node, int useTxn);
+
+/*
+** A rollup's batches listed without a rebuild (#397): fn is called for each
+** in order - a batch, or a whole anchored range where its manifest names no
+** times (written before v0.12.0) or the store no longer holds it (keep=).
+** 0 listed to the end; -1 stopped, last_error says why; else what fn returned.
+*/
+typedef struct HppliteListed {
+    uint64_t from, to;              /* a batch: both its height; a range listed whole: its bounds */
+    uint64_t timeMs;                /* the time the batch's head carries, ms since the epoch; 0: not known */
+    uint64_t bytes;                 /* the batch's bytes at the store; 0: not known */
+    int anchored;                   /* 1: in a range the chain anchored; 0: at the store under its name, past the last anchor */
+    int held;                       /* 0: an anchored range whose manifest the store no longer holds (keep=, #223) */
+} HppliteListed;
+typedef int (*HppliteListFn)(void *arg, const HppliteListed *b);
+int hpplite_node_list(HppliteNode *node, HppliteListFn fn, void *arg);
 
 /*
 ** Get number of pending SQL statements.

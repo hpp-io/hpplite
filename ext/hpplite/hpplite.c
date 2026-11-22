@@ -61,7 +61,9 @@ static const char *HPPLITE_SCHEMA =
   "  receipt BLOB,"                /* the store's compact receipt */
   "  chain_before BLOB NOT NULL,"  /* the chain hash before this batch: the manifest starts from the first row's */
   "  chain_after BLOB NOT NULL,"   /* the chain hash after this batch */
-  "  root BLOB"                    /* the state root after it, when known at the finalize (page mode) */
+  "  root BLOB,"                   /* the state root after it, when known at the finalize (page mode) */
+  "  time_ms INTEGER NOT NULL DEFAULT 0,"  /* the time its head carries and its bytes at the store, for the manifest: */
+  "  bytes INTEGER NOT NULL DEFAULT 0"     /* ...a listing reads them there (#397); 0 in a row from before */
   ");"
   /* the part of a transaction a replica holds back until its end is posted (#57) */
   "CREATE TABLE IF NOT EXISTS _hpplite_carry("
@@ -234,7 +236,7 @@ static int bookkeepingIsCurrent(sqlite3 *db) {
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_pending') WHERE name IN ('mode','now')) = 2"
     "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_carry') WHERE name IN ('now','frag')) = 2"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_posted'))"
-    "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_unanchored'))"
+    "   AND (SELECT count(*) FROM pragma_table_info('_hpplite_unanchored') WHERE name IN ('time_ms','bytes')) = 2"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_snapshots'))"
     "   AND EXISTS(SELECT 1 FROM pragma_table_info('_hpplite_readers'))"
     "   AND EXISTS(SELECT 1 FROM _hpplite_meta WHERE id = 1)";
@@ -387,6 +389,10 @@ int hpplite_init_pages(sqlite3 *db, sqlite3 *bkDb, HppliteCtx **ppCtx) {
   if (!bookkeepingIsCurrent(bkDb)) {
     rc = hppliteInternalExec(pCtx, bkDb, HPPLITE_SCHEMA);
     if (rc != SQLITE_OK) { gInitError = "cannot create the bookkeeping tables in the sidecar"; sqlite3_free(pCtx); return rc; }
+    /* a file from before the manifest named each batch's time and bytes (#397): its rows say 0, not known */
+    rc = addColumnIfMissing(pCtx, bkDb, "_hpplite_unanchored", "time_ms");
+    if (rc == SQLITE_OK) rc = addColumnIfMissing(pCtx, bkDb, "_hpplite_unanchored", "bytes");
+    if (rc != SQLITE_OK) { gInitError = "cannot add the batches' time and bytes to the sidecar's bookkeeping"; sqlite3_free(pCtx); return rc; }
   }
   {
     /* the in-flight batch (a submit the process may not survive) */
@@ -675,6 +681,7 @@ static void config_to_node_config(const HppliteConfig *cfg, HppliteNodeConfig *n
     nc->noCompress = !cfg->compress;
     nc->localOnly = cfg->localOnly;
     nc->verifyOnly = cfg->roleVerify;
+    nc->listOnly = cfg->roleList;
     nc->dbName = cfg->dbName;
     nc->maxTxBytes = cfg->maxTxBytes;
     nc->maxTxGas = cfg->maxTxGas;

@@ -204,6 +204,8 @@ typedef struct HppliteAnchorRow {
   const char *zRef;                        /* the store's reference */
   const unsigned char *receipt;            /* the store's compact receipt, or NULL */
   size_t nReceipt;
+  uint64_t timeMs;                         /* the time the batch's head carries (ms), and... */
+  uint64_t bytes;                          /* ...its bytes at the store: the manifest names them, for a listing (#397) */
 } HppliteAnchorRow;
 /* A verifier's rebuilt root after batch height, when it is among the last HPPLITE_ROOT_RING replayed
 ** (bTrackRoots) or is the last posted root compared: 0, or -1 when not kept */

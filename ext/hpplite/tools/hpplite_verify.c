@@ -3,6 +3,7 @@
 **
 **   HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" \
 **     hpplite-verify [--db /path/to/live.db] [--keep <dir>] [--to <height> | --at <time>]
+**     hpplite-verify --list
 **
 ** Opens an empty file with role=verify and the same parameters the
 ** application uses (l1=/rpc=/factory=/contract=, the key, dbname=): every
@@ -29,7 +30,7 @@
 ** before the stop (#391), pruned or not, and says so: the state at a point
 ** is what is asked for. Without a stop every batch from batch 1 is read.
 **
-** --at <time> (unix seconds, or YYYY-MM-DDTHH:MM:SSZ): point-in-time recovery
+** --at <time> (unix seconds, or YYYY-MM-DDTHH:MM:SSZ; either with .mmm): point-in-time recovery
 ** (#205) - every batch its writer wrote by then, by the time each batch
 ** carries; a transaction in flight at that moment is completed, never left
 ** halfway. With --keep, the database as of that time stays.
@@ -41,6 +42,22 @@
 ** store's last batch cannot be met (exit 2); --at after it answers with the
 ** last batch the store holds. A batch there that is not the sequencer's or
 ** does not apply stops the rebuild before it (exit 1).
+**
+** --list (#397): the rollup's batches without a rebuild, a JSON line each on
+** stdout, oldest first - what there is to choose a --to or an --at from:
+**   {"height":h,"time":"YYYY-MM-DDTHH:MM:SS.mmmZ","time_ms":ms,"bytes":n,"anchored":true}
+** (--at takes that time as it is, and goes through that batch; --to its height).
+** The anchored ranges' manifests are read, one read a range, each checked
+** against the chain (its digest, its batches' fold to the anchored chain
+** hash) - and no batch: the time and the bytes are what the sequencer wrote
+** in the manifest (since v0.12.0), not compared with the batches by anyone.
+** A range whose manifest names no times is one line,
+**   {"from":a,"to":b,"batches":n,"anchored":true}
+** with "held":false where the store no longer holds the manifest (keep=).
+** Past the last anchor the store's batches are read one by one, each signed
+** by the rollup's sequencer ("anchored":false; the time is in the batch's
+** head, absent when this key does not open it). Nothing is verified: exit 0
+** listed to the end, 1 the listing stopped (why on stderr), 2 cannot run.
 **
 ** Exit 0: verified (and the live file equals the chain, with --db);
 ** 1: a root mismatch, a sync that stopped short, or a live file that
@@ -178,12 +195,30 @@ static int report_table_differences(sqlite3 *a, sqlite3 *b) {
 static uint64_t parse_time_ms(const char *z) {
     struct tm tm;
     const char *end;
+    uint64_t ms;
+    size_t d;
+    int iso = 0;
     if (!z || !z[0]) return 0;
-    if (strspn(z, "0123456789") == strlen(z)) return (uint64_t)atoll(z) * 1000;
-    memset(&tm, 0, sizeof tm);
-    end = strptime(z, "%Y-%m-%dT%H:%M:%S", &tm);
-    if (!end || (*end && strcmp(end, "Z") != 0)) return 0;
-    return (uint64_t)timegm(&tm) * 1000;
+    d = strspn(z, "0123456789");
+    if (d && (!z[d] || z[d] == '.')) { ms = (uint64_t)atoll(z) * 1000; end = z + d; }
+    else {
+        memset(&tm, 0, sizeof tm);
+        end = strptime(z, "%Y-%m-%dT%H:%M:%S", &tm);
+        if (!end) return 0;
+        ms = (uint64_t)timegm(&tm) * 1000;
+        iso = 1;
+    }
+    if (*end == '.') {
+        /* a fraction, to the millisecond: the time --list prints for a batch (#397) */
+        unsigned frac = 0;
+        int k;
+        for (k = 0, end++; k < 3 && *end >= '0' && *end <= '9'; k++, end++) frac = frac * 10 + (unsigned)(*end - '0');
+        if (k == 0) return 0;
+        for (; k < 3; k++) frac *= 10;
+        ms += frac;
+    }
+    if (*end && !(iso && strcmp(end, "Z") == 0)) return 0;
+    return ms;
 }
 
 static void fmt_time(uint64_t ms, char *out, size_t n) {
@@ -192,8 +227,26 @@ static void fmt_time(uint64_t ms, char *out, size_t n) {
 }
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: HPPLITE_PARAMS=\"l1=...&keyfile=...\" %s [--db <live database>] [--keep <dir>] [--to <height> | --at <time>]\n", argv0);
+    fprintf(stderr, "usage: HPPLITE_PARAMS=\"l1=...&keyfile=...\" %s [--db <live database>] [--keep <dir>] [--to <height> | --at <time>]\n"
+                    "       HPPLITE_PARAMS=\"l1=...&keyfile=...\" %s --list\n", argv0, argv0);
     return 2;
+}
+
+/* --list (#397): a batch, or a range listed whole, as a JSON line */
+static int list_line(void *arg, const HppliteListed *b) {
+    (void)arg;
+    if (b->from == b->to) printf("{\"height\":%llu", (unsigned long long)b->from);
+    else printf("{\"from\":%llu,\"to\":%llu,\"batches\":%llu", (unsigned long long)b->from, (unsigned long long)b->to, (unsigned long long)(b->to - b->from + 1));
+    if (b->timeMs) {
+        char z[40];
+        time_t t = (time_t)(b->timeMs / 1000);
+        strftime(z, sizeof z, "%Y-%m-%dT%H:%M:%S", gmtime(&t));
+        /* to the millisecond, as --at takes it: a rebuild --at this time goes through this batch */
+        printf(",\"time\":\"%s.%03uZ\",\"time_ms\":%llu", z, (unsigned)(b->timeMs % 1000), (unsigned long long)b->timeMs);
+    }
+    if (b->bytes) printf(",\"bytes\":%llu", (unsigned long long)b->bytes);
+    printf(",\"anchored\":%s%s}\n", b->anchored ? "true" : "false", b->held ? "" : ",\"held\":false");
+    return ferror(stdout) ? 1 : 0;
 }
 
 int main(int argc, char **argv) {
@@ -201,14 +254,16 @@ int main(int argc, char **argv) {
     uint64_t atMs = 0;              /* --at (#205) */
     const char *zLive = NULL, *zKeep = NULL;
     char dir[1024];
-    int rc = 0, i;
+    int rc = 0, i, list = 0;
     for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) zLive = argv[++i];
+        if (strcmp(argv[i], "--list") == 0) list = 1;
+        else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) zLive = argv[++i];
         else if (strcmp(argv[i], "--keep") == 0 && i + 1 < argc) zKeep = argv[++i];
         else if (strcmp(argv[i], "--to") == 0 && i + 1 < argc && atoll(argv[i + 1]) > 0) stopAt = (uint64_t)atoll(argv[++i]);
         else if (strcmp(argv[i], "--at") == 0 && i + 1 < argc && (atMs = parse_time_ms(argv[i + 1])) > 0) i++;
         else return usage(argv[0]);
     }
+    if (list && (zLive || zKeep || stopAt || atMs)) return usage(argv[0]);      /* a listing rebuilds nothing */
     const char *params = getenv("HPPLITE_PARAMS");
     if (!params || !params[0]) {
         fprintf(stderr, "hpplite-verify: HPPLITE_PARAMS must name the chain and the key (l1= or rpc=/factory=/contract=, keyfile=/privkey=)\n");
@@ -246,7 +301,8 @@ int main(int argc, char **argv) {
     { char to[40] = "";
       if (stopAt) snprintf(to, sizeof to, "&syncto=%llu", (unsigned long long)stopAt);    /* the stop, from the first sync at open */
       else if (atMs) snprintf(to, sizeof to, "&syncat=%llu", (unsigned long long)atMs);
-      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=verify&interval=0&datadir=%s%s&%s%s", dir, dir, to, params, zStore);
+      /* --list (#397): role=list, a verifier that applies nothing */
+      char *uri = sqlite3_mprintf("file:%s/rebuilt.db?hpplite=on&role=%s&interval=0&datadir=%s%s&%s%s", dir, list ? "list" : "verify", dir, to, params, zStore);
       db = uri ? hpplite_open(uri) : NULL;
       sqlite3_free(uri); }
     if (!db) {
@@ -261,6 +317,17 @@ int main(int argc, char **argv) {
             fprintf(stderr, "hpplite-verify: could not verify: the wallet's databases are named at a store and no store= names one; give store= (store=on for the network's canonical store)\n");
         else fprintf(stderr, "hpplite-verify: no chain connection (%s)\n", why);
         rc = 2;
+        goto close;
+    }
+
+    if (list) {
+        int lrc = hpplite_node_list(node, list_line, NULL);
+        fflush(stdout);
+        if (lrc != 0) {
+            const char *why = status_text(db, "last_error");
+            fprintf(stderr, "hpplite-verify: the listing stopped%s%s\n", why[0] ? ": " : "", why);
+            rc = 1;
+        }
         goto close;
     }
 

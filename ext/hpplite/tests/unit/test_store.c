@@ -606,6 +606,10 @@ static int manifest_names_snapshot(HppliteL1 *l1, HppliteStore *rs, uint64_t to,
     return found;
 }
 
+/* what a listing gave (#397) */
+typedef struct { HppliteListed e[32]; int n; } Listed;
+static int listed_add(void *arg, const HppliteListed *b) { Listed *l = arg; if (l->n < 32) l->e[l->n] = *b; l->n++; return 0; }
+
 /* 6d. keep= (#223): the history behind the newest snapshot made at least `keep` ago is pruned at the store;
 ** a replica still starts from the snapshot, and the manifest names the oldest snapshot still kept (#257) */
 static void test_keep(const char *url) {
@@ -664,10 +668,113 @@ static void test_keep(const char *url) {
         if (sp) { sp->l1 = NULL; hpplite_node_destroy(sp); }
         if (rows != 6 || !same || snap < 5) { printf("(rows %d, same %d, snapshot %lld) ", rows, same, (long long)snap); hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("a replica from the snapshot after the prune"); }
     }
+    {
+        /* a listing (#397) says which ranges the store let go of: the chain still names them */
+        TestNodeOpts lo = { .storeUrl = url, .verifyOnly = 1, .listOnly = 1, .nodeId = "keep_l", .privkey = kseq };
+        HppliteNode *ln = test_open_node(tpath("kp_l.db"), l1, &lo);
+        Listed got;
+        int lrc;
+        memset(&got, 0, sizeof got);
+        lrc = ln ? hpplite_node_list(ln, listed_add, &got) : -1;
+        if (ln) { ln->l1 = NULL; hpplite_node_destroy(ln); }
+        printf("(listed %d, the first %llu-%llu held %d, the last %llu) ", got.n, got.n ? (unsigned long long)got.e[0].from : 0, got.n ? (unsigned long long)got.e[0].to : 0, got.n ? got.e[0].held : -1, got.n && got.n <= 32 ? (unsigned long long)got.e[got.n - 1].to : 0);
+        if (lrc != 0 || got.n < 2 || got.n > 32 || got.e[0].from != 1 || got.e[0].to != 3 || !got.e[0].anchored || got.e[0].held || got.e[got.n - 1].to != 6 || !got.e[got.n - 1].held) {
+            hpplite_node_destroy(w); hpplite_store_close(rs); FAIL("a listing after the prune: the range 1-3 named as not held, the listing going on to batch 6");
+        }
+    }
     w->ownsL1 = 0;
     hpplite_node_destroy(w);
     hpplite_store_close(rs);
     hpplite_l1_disconnect(l1);
+    PASS();
+}
+
+/* 6d2. A listing without a rebuild (#397): what there is to choose a --to or an --at from. The anchored ranges'
+** manifests are read and no batch; a manifest names each batch's time and bytes since v0.12.0, and one whose rows
+** were written before (a file of v0.11: no such columns in its bookkeeping) is listed as its range */
+static uint64_t now_ms(void);
+/* the bytes the store holds under a batch's name */
+static size_t named_bytes(HppliteL1 *l1, HppliteStore *rs, uint64_t h) {
+    char c[43], d[43], name[80], *p;
+    uint8_t sig[65], *bytes;
+    size_t n = 0;
+    hpplite_l1_get_addresses(l1, c, d);
+    snprintf(name, sizeof name, "%.40s-%llu", (d[0] ? d : c) + 2, (unsigned long long)h);
+    for (p = name; *p && *p != '-'; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+    if (!(bytes = hpplite_store_get_named(rs, name, &n, sig, NULL))) return 0;
+    free(bytes);
+    return n;
+}
+static void test_list(const char *url) {
+    TEST("a listing without a rebuild (#397): 8 batches, 6 anchored two at a time - a line a batch with its time and its bytes at the store from the manifests, the two past the anchor from their names; a range written before the manifest had times is one line; nothing is applied");
+    static const unsigned char kseq[32] = { [31] = 0x3a };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o = { .storeUrl = url, .nodeId = "list_w", .privkey = kseq, .noAnchorAtClose = 1 };
+    HppliteNode *w = test_open_node(tpath("list_w.db"), l1, &o), *r = NULL;
+    HppliteStore *rs = hpplite_store_open(url, NULL, 0);
+    Listed got;
+    uint64_t t0 = now_ms(), t1;
+    char side[700];
+    sqlite3 *bk = NULL;
+    int i, rc;
+#define LIST_DONE() do { if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } if (rs) hpplite_store_close(rs); hpplite_l1_disconnect(l1); } while (0)
+    memset(&got, 0, sizeof got);
+    if (!w || !rs) { LIST_DONE(); FAIL("open the writer"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 1; i <= 8; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('a batch to list')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { printf("(flush %d: %s) ", i, status_text(w->db, "last_error")); LIST_DONE(); FAIL("a flush"); }
+        usleep(3000);                           /* each batch its own millisecond */
+        if (i == 2) {
+            /* batches 1-2 as v0.11 left them: at the store, not anchored, their rows without a time or a size */
+            hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+            snprintf(side, sizeof side, "%s-hpplite.db", tpath("list_w.db"));
+            rc = -1;
+            if (sqlite3_open(side, &bk) == SQLITE_OK) {
+                sqlite3_exec(bk, "ALTER TABLE _hpplite_unanchored DROP COLUMN time_ms", NULL, NULL, NULL);
+                sqlite3_exec(bk, "ALTER TABLE _hpplite_unanchored DROP COLUMN bytes", NULL, NULL, NULL);
+                rc = count_rows(bk, "_hpplite_unanchored") == 2 ? (int)scalar(bk, "SELECT count(*) FROM pragma_table_info('_hpplite_unanchored') WHERE name IN ('time_ms','bytes')") : -1;
+            }
+            sqlite3_close(bk);
+            if (rc != 0) { printf("(%d) ", rc); w = NULL; LIST_DONE(); FAIL("the test's own: the sidecar's two rows without the columns of a time and a size"); }
+            if (!(w = test_open_node(tpath("list_w.db"), l1, &o))) { LIST_DONE(); FAIL("reopen the writer on the file of before"); }
+        }
+        if (i <= 6 && i % 2 == 0 && hpplite_node_anchor(w) != (uint64_t)i) { printf("(anchor at %d: %s) ", i, status_text(w->db, "last_error")); LIST_DONE(); FAIL("an anchor of two batches"); }
+    }
+    t1 = now_ms();
+    {
+        TestNodeOpts lo = { .storeUrl = url, .verifyOnly = 1, .listOnly = 1, .nodeId = "list_r", .privkey = kseq };
+        if (!(r = test_open_node(tpath("list_r.db"), l1, &lo))) { LIST_DONE(); FAIL("open the listing node"); }
+    }
+    rc = hpplite_node_list(r, listed_add, &got);
+    printf("(%d:", got.n);
+    for (i = 0; i < got.n && i < 32; i++) {
+        if (got.e[i].from != got.e[i].to) printf(" %llu-%llu", (unsigned long long)got.e[i].from, (unsigned long long)got.e[i].to);
+        else printf(" %llu%s", (unsigned long long)got.e[i].from, got.e[i].anchored ? "" : "*");
+    }
+    printf(") ");
+    if (rc != 0) { printf("(%s) ", status_text(r->db, "last_error")); LIST_DONE(); FAIL("the listing reaches the end"); }
+    if (status_int(r->db, "height") != 1 || count_rows(r->db, "sqlite_master") != 0) { printf("(height %lld, %d tables) ", (long long)status_int(r->db, "height"), count_rows(r->db, "sqlite_master")); LIST_DONE(); FAIL("a listing applies nothing: the file stays empty, at height 1"); }
+    if (got.n < 1 || got.e[0].from != 1 || got.e[0].to != 2 || !got.e[0].anchored || !got.e[0].held || got.e[0].timeMs || got.e[0].bytes) { LIST_DONE(); FAIL("the range 1-2, its rows written before the times: one line, the range"); }
+    if (got.n != 7) { LIST_DONE(); FAIL("the ranges 3-4 and 5-6 should be a line a batch, by the time and the bytes their manifests name, and 7 and 8 a line each"); }
+    for (i = 1; i < 7; i++) {
+        const HppliteListed *e = &got.e[i];
+        uint64_t h = (uint64_t)i + 2;
+        size_t n = named_bytes(l1, rs, h);
+        if (e->from != h || e->to != h || e->anchored != (h <= 6) || !e->held) { printf("(entry %d: %llu-%llu anchored %d held %d) ", i, (unsigned long long)e->from, (unsigned long long)e->to, e->anchored, e->held); LIST_DONE(); FAIL("batches 3-8 in order, 3-6 anchored, 7 and 8 not"); }
+        if (e->timeMs < t0 || e->timeMs > t1 || e->timeMs <= got.e[i - 1].timeMs) { printf("(batch %llu: %llu, the test ran %llu-%llu) ", (unsigned long long)h, (unsigned long long)e->timeMs, (unsigned long long)t0, (unsigned long long)t1); LIST_DONE(); FAIL("each batch's time: within the test's run, later than the one before"); }
+        if (n == 0 || e->bytes != n) { printf("(batch %llu: listed %llu, at the store %zu) ", (unsigned long long)h, (unsigned long long)e->bytes, n); LIST_DONE(); FAIL("each batch's bytes: what the store holds under its name"); }
+    }
+    {
+        /* the listed time is the one --at goes by: a rebuild as of batch 5's holds the five */
+        TestNodeOpts ao = { .storeUrl = url, .verifyOnly = 1, .nodeId = "list_at", .privkey = kseq, .syncAtMs = got.e[3].timeMs };
+        HppliteNode *a = test_open_node(tpath("list_at.db"), l1, &ao);
+        int rows = a ? count_rows(a->db, "t") : -1;
+        if (a) { a->l1 = NULL; hpplite_node_destroy(a); }
+        if (rows != 5) { printf("(%d rows) ", rows); LIST_DONE(); FAIL("a rebuild as of the time listed for batch 5 holds five rows"); }
+    }
+    LIST_DONE();
+#undef LIST_DONE
     PASS();
 }
 
@@ -2820,6 +2927,7 @@ int main(int argc, char **argv) {
     test_snapshot_replica(url);
     test_snapshot_chunks(url);
     test_keep(url);
+    test_list(url);
     test_store_down_at_open(dir);
     test_recovery_store_down(dir);
     test_reads_ahead(dir);

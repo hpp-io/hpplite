@@ -66,7 +66,7 @@ int hppliteKeepUnanchored(HppliteCtx *pCtx, uint64_t height, const unsigned char
   sqlite3_stmt *pStmt = NULL;
   int rc;
   if (!a || !a->zRef) return SQLITE_MISUSE;
-  rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_unanchored(height, hash, ref, receipt, chain_before, chain_after, root) VALUES(?1, ?2, ?3, ?4, ?7, ?5, ?6)", -1, &pStmt, NULL);
+  rc = sqlite3_prepare_v2(pCtx->bkDb, "INSERT OR REPLACE INTO _hpplite_unanchored(height, hash, ref, receipt, chain_before, chain_after, root, time_ms, bytes) VALUES(?1, ?2, ?3, ?4, ?7, ?5, ?6, ?8, ?9)", -1, &pStmt, NULL);
   if (rc != SQLITE_OK) return rc;
   sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)height);
   sqlite3_bind_blob(pStmt, 2, a->hash, HPPLITE_HASH_SIZE, SQLITE_STATIC);
@@ -75,6 +75,8 @@ int hppliteKeepUnanchored(HppliteCtx *pCtx, uint64_t height, const unsigned char
   sqlite3_bind_blob(pStmt, 5, chainAfter, HPPLITE_HASH_SIZE, SQLITE_STATIC);
   if (root) sqlite3_bind_blob(pStmt, 6, root, HPPLITE_HASH_SIZE, SQLITE_STATIC); else sqlite3_bind_null(pStmt, 6);
   sqlite3_bind_blob(pStmt, 7, pCtx->chainHash, HPPLITE_HASH_SIZE, SQLITE_STATIC);   /* the mirror still holds the hash before this batch */
+  sqlite3_bind_int64(pStmt, 8, (sqlite3_int64)a->timeMs);
+  sqlite3_bind_int64(pStmt, 9, (sqlite3_int64)a->bytes);
   rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
   sqlite3_finalize(pStmt);
   return rc;
