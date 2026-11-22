@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include <time.h>
 
+#define RANGE_KEEP 32              /* ranges kept from their logs (#412) */
+
 typedef struct EthL1 {
     HppliteL1 base;               /* the function table first: l1.c dispatches through it */
     EthClient *eth;
@@ -55,7 +57,11 @@ typedef struct EthL1 {
     uint64_t indexedHeight;
     uint64_t lastIndexedBlock; /* the block the last walk started from: the next walk stops there */
     uint64_t indexSpanMax;     /* the walk asks eth_getLogs for no more blocks than this (#411: more was refused, or left a commitment out); 0: no such limit met */
-    HppliteRange lastRange;    /* the range last read from its log (#410): a rebuild asks for it once a batch; fromHeight 0: none */
+    /* The ranges read last from their logs (#410: a rebuild asks for a range once a batch), the one asked for and those
+    ** after it whose logs the same request gave (#412): a rebuild of short ranges asked the chain once a range */
+    HppliteRange aRange[RANGE_KEEP];
+    int nRange;
+    uint64_t rangeSpan;        /* the blocks a request for ranges' logs asks for; 0: INDEX_SPAN, 1: a range a request (a span was refused down to that) */
 
     /* relay= (#126): the signed forms of the node's writes go through it,
     ** paid over x402; the plain call only when it fails and the wallet
@@ -233,11 +239,16 @@ static HppliteL1 *eth_connect_config(const HppliteNetworkConfig *config) {
     return l1;
 }
 
+static void eth_ranges_clear(HppliteL1 *l1) {
+    for (int i = 0; i < self->nRange; i++) hpplite_l1_range_clear(&self->aRange[i]);
+    self->nRange = 0;
+}
+
 static void eth_disconnect(HppliteL1 *l1) {
     if (!l1) return;
     free(self->aBlock);
     free(self->aRangeFrom);
-    hpplite_l1_range_clear(&self->lastRange);
+    eth_ranges_clear(l1);
     if (self->cached_state) hpplite_l1_state_free(self->cached_state);
     if (self->cached_system_config) hpplite_l1_system_config_free(self->cached_system_config);
     if (self->rpcUrl) free(self->rpcUrl);
@@ -1496,49 +1507,93 @@ static char *eth_commit_range(HppliteL1 *l1, const uint8_t instanceId[32], const
 
 static uint8_t *abi_dynamic_bytes(const uint8_t *raw, size_t raw_len, int i, size_t *pLen);
 
-/* RangeCommitted(from, to, chainHashAfter, stateRoot, manifestDigest, bytes receipt, prevBlock) for the range `height` is inside */
-static int eth_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
-    uint8_t topic1[32], topic2[32], *raw, *rcpt;
-    size_t raw_len = 0, rcptLen = 0;
-    uint64_t from;
-    if (!l1 || !out || !ensure_da_contract(l1) || self->version < 9) return -1;
-    if (eth_index_cover(l1, height) != 0 || height == 0 || height > self->indexedHeight) return -1;
-    from = self->aRangeFrom[height];
-    if (from == 0) return -1;
-    if (self->lastRange.fromHeight == from) {             /* the range of the batch before (#410): its log is not read again */
-        *out = self->lastRange;
-        out->receipt = NULL; out->nReceipt = 0;
-        if (self->lastRange.receipt && self->lastRange.nReceipt) {
-            out->receipt = sqlite3_malloc((int)self->lastRange.nReceipt);
-            if (out->receipt) { memcpy(out->receipt, self->lastRange.receipt, self->lastRange.nReceipt); out->nReceipt = self->lastRange.nReceipt; }
-        }
-        return 0;
+/* a kept range, the receipt copied; 0 when it could not be copied whole */
+static int eth_range_copy(const HppliteRange *in, HppliteRange *out) {
+    *out = *in;
+    out->receipt = NULL; out->nReceipt = 0;
+    if (in->receipt && in->nReceipt) {
+        out->receipt = sqlite3_malloc((int)in->nReceipt);
+        if (!out->receipt) return 0;
+        memcpy(out->receipt, in->receipt, in->nReceipt);
+        out->nReceipt = in->nReceipt;
     }
-    abi_encode_uint64(from, topic1);
-    raw = eth_client_get_log(self->eth, self->da_contract, self->aBlock[height], TOPIC3_RANGE_COMMITTED, topic1, &raw_len, topic2);
-    if (!raw || raw_len < 5 * 32) { free(raw); return -1; }
+    return 1;
+}
+
+/* a RangeCommitted log's data (chainHashAfter, stateRoot, manifestDigest, bytes receipt, prevBlock) as a range; 0 when it is not one */
+static int eth_range_of_log(const uint8_t *raw, size_t raw_len, uint64_t from, uint64_t to, HppliteRange *out) {
+    uint8_t *rcpt;
+    size_t rcptLen = 0;
+    if (!raw || raw_len < 5 * 32) return 0;
+    memset(out, 0, sizeof *out);
     out->fromHeight = from;
-    out->toHeight = abi_decode_uint64(topic2);
+    out->toHeight = to;
     memcpy(out->chainHashAfter, raw, 32);
     memcpy(out->stateRoot, raw + 32, 32);
     memcpy(out->manifestDigest, raw + 64, 32);
     rcpt = abi_dynamic_bytes(raw, raw_len, 3, &rcptLen);
-    free(raw);
-    out->receipt = NULL; out->nReceipt = 0;
     if (rcpt && rcptLen) {
         out->receipt = sqlite3_malloc((int)rcptLen);
         if (out->receipt) { memcpy(out->receipt, rcpt, rcptLen); out->nReceipt = rcptLen; }
     }
-    hpplite_l1_range_clear(&self->lastRange);
-    self->lastRange = *out;
-    self->lastRange.receipt = NULL; self->lastRange.nReceipt = 0;
-    if (out->receipt) {
-        self->lastRange.receipt = sqlite3_malloc((int)rcptLen);
-        if (self->lastRange.receipt) { memcpy(self->lastRange.receipt, out->receipt, rcptLen); self->lastRange.nReceipt = rcptLen; }
-        else self->lastRange.fromHeight = 0;              /* not kept whole: not kept */
-    }
     free(rcpt);
-    return 0;
+    return 1;
+}
+
+/* RangeCommitted(from, to, chainHashAfter, stateRoot, manifestDigest, bytes receipt, prevBlock) for the range `height` is inside.
+** The index knows the block of every range's log, so the logs of the ranges after this one are asked for with it, a
+** span of blocks a request (#412), and kept for the lookups that follow: a rebuild reads the ranges in order. A log
+** is kept only where the index has that range in that block. An RPC that refuses the span is asked for this range's
+** block alone, as before, and for a quarter of the span the next time; an answer that does not hold this range's
+** log (one cut short) is not relied on either */
+static int eth_get_range(HppliteL1 *l1, uint64_t height, HppliteRange *out) {
+    uint8_t topic1[32], topic2[32], *raw;
+    size_t raw_len = 0;
+    uint64_t from, block, span;
+    int i, ok;
+    if (!l1 || !out || !ensure_da_contract(l1) || self->version < 9) return -1;
+    if (eth_index_cover(l1, height) != 0 || height == 0 || height > self->indexedHeight) return -1;
+    from = self->aRangeFrom[height];
+    if (from == 0) return -1;
+    for (i = 0; i < self->nRange; i++)                    /* a range read before (#410): its log is not read again */
+        if (self->aRange[i].fromHeight == from) return eth_range_copy(&self->aRange[i], out) ? 0 : -1;
+    block = self->aBlock[height];
+    span = self->rangeSpan ? self->rangeSpan : INDEX_SPAN;
+    if (self->indexSpanMax && span > self->indexSpanMax) span = self->indexSpanMax;
+    if (block + span - 1 > self->lastIndexedBlock) span = self->lastIndexedBlock >= block ? self->lastIndexedBlock - block + 1 : 1;
+    if (span > 1) {
+        EthLog *logs = NULL;
+        int n = 0, seen = 0;
+        if (eth_client_get_logs(self->eth, self->da_contract, block, block + span - 1, &logs, &n) != 0) {
+            self->rangeSpan = span / 4 ? span / 4 : 1;
+        } else {
+            eth_ranges_clear(l1);
+            for (i = 0; i < n; i++) {
+                EthLog *e = &logs[i];
+                uint64_t f, t;
+                if (e->nTopics < 3 || memcmp(e->topics[0], TOPIC3_RANGE_COMMITTED, 32) != 0) continue;
+                f = abi_decode_uint64(e->topics[1]);
+                t = abi_decode_uint64(e->topics[2]);
+                if (f < from || f > self->indexedHeight || self->aRangeFrom[f] != f || self->aBlock[f] != e->block) continue;
+                seen++;
+                if (self->nRange < RANGE_KEEP && eth_range_of_log(e->data, e->nData, f, t, &self->aRange[self->nRange])) self->nRange++;
+            }
+            eth_logs_free(logs, n);
+            /* the span follows what it gave: more ranges than are kept, half of it the next time; few, twice */
+            if (seen > RANGE_KEEP) self->rangeSpan = span / 2;
+            else if (seen < RANGE_KEEP / 2 && span < ((uint64_t)1 << 40)) self->rangeSpan = span * 2;
+            for (i = 0; i < self->nRange; i++)
+                if (self->aRange[i].fromHeight == from) return eth_range_copy(&self->aRange[i], out) ? 0 : -1;
+        }
+    }
+    abi_encode_uint64(from, topic1);
+    raw = eth_client_get_log(self->eth, self->da_contract, block, TOPIC3_RANGE_COMMITTED, topic1, &raw_len, topic2);
+    eth_ranges_clear(l1);
+    ok = eth_range_of_log(raw, raw_len, from, raw ? abi_decode_uint64(topic2) : 0, &self->aRange[0]);
+    free(raw);
+    if (!ok) return -1;
+    self->nRange = 1;
+    return eth_range_copy(&self->aRange[0], out) ? 0 : -1;
 }
 
 /*

@@ -4224,15 +4224,18 @@ static void test_rebuild_chain_calls(void) {
 ** a commitment, down to genesis, at every open and in every handle (HPP Sepolia, a rollup of 718 commitments:
 ** minutes before the first batch was read). It asks for a span of blocks a request and follows the names inside
 ** the answer; an RPC that refuses a span is asked for less, and one whose answer for a span leaves out a block a
-** commitment names is asked for that block alone and for shorter spans from then on. */
+** commitment names is asked for that block alone and for shorter spans from then on.
+** The ranges' own logs (#412): a rebuild learns each anchored range from its RangeCommitted log, and asked for one
+** range's log a request - on a history of short ranges a request of the chain for every batch or two. The logs of the
+** ranges that follow are asked for in the same request, a span of blocks as the walk's. */
 static void test_index_walk_spans(void) {
     TEST("the index's walk asks for a span of blocks, not a block a commitment (#411): 30 batches each anchored, hpplite-verify --to 1 through the counting proxy; then an RPC that refuses more than 8 blocks a request, and one that cuts a span's answer to its first 3 logs: the whole history verified at each");
     const char *svc = getenv("HPPLITE_PIN_SERVICE");
     static const char *NKEY = "0x7373737373737373737373737373737373737373737373737373737373737373";
     static const char *modeFile = DIR "/proxy75.mode";
-    char addr[48], cmd[600], extra[300], vparams[500], contract[80] = "", out[3][8192], proxyRpc[64];
-    long logs[3], refused, cut;
-    int port, pport, b, rc[3];
+    char addr[48], cmd[600], extra[300], vparams[500], contract[80] = "", out[4][8192], proxyRpc[64];
+    long logs[4], refused, cut;
+    int port, pport, b, rc[4];
     pid_t pid;
     sqlite3 *w;
     if (!svc) { printf("SKIP (no pin service in the environment) "); PASS(); return; }
@@ -4267,6 +4270,10 @@ static void test_index_walk_spans(void) {
     out[0][0] = 0;
     rc[0] = run_verify_with(vparams, "--to 1", out[0], sizeof out[0]);
     logs[0] = proxy_count(modeFile, "eth_getLogs") - logs[0];
+    logs[3] = proxy_count(modeFile, "eth_getLogs");
+    out[3][0] = 0;
+    rc[3] = run_verify_with(vparams, "", out[3], sizeof out[3]);
+    logs[3] = proxy_count(modeFile, "eth_getLogs") - logs[3];
     set_proxy_mode(modeFile, "logs_span=8\n");
     logs[1] = proxy_count(modeFile, "eth_getLogs");
     out[1][0] = 0;
@@ -4281,9 +4288,11 @@ static void test_index_walk_spans(void) {
     cut = proxy_count(modeFile, "cut");
     IW_END();
 #undef IW_END
-    printf("(30 commitments: --to 1 asked eth_getLogs %ld times; at an RPC refusing more than 8 blocks a request the whole history %ld times, %ld of them refused; at one cutting a span's answer to 3 logs %ld times, %ld answers cut) ", logs[0], logs[1], refused, logs[2], cut);
+    printf("(30 commitments: --to 1 asked eth_getLogs %ld times, the whole history of 30 ranges %ld times; at an RPC refusing more than 8 blocks a request the whole history %ld times, %ld of them refused; at one cutting a span's answer to 3 logs %ld times, %ld answers cut) ", logs[0], logs[3], logs[1], refused, logs[2], cut);
     if (rc[0] != 0 || !strstr(out[0], "the database as of batch 1: state root")) FAILF("--to 1 through the proxy should verify; exit %d\n%s", rc[0], out[0]);
     if (logs[0] > 6) FAILF("an open on a rollup of 30 commitments should not ask eth_getLogs once a commitment: %ld times", logs[0]);
+    if (rc[3] != 0 || !strstr(out[3], "chain hash over 30 batches: matches")) FAILF("the whole history through the proxy should verify; exit %d\n%s", rc[3], out[3]);
+    if (logs[3] > 10) FAILF("a rebuild of 30 anchored ranges should not ask eth_getLogs once a range (#412): %ld times", logs[3]);
     if (rc[1] != 0 || !strstr(out[1], "chain hash over 30 batches: matches")) FAILF("at an RPC that refuses a span the walk asks for less and the history verifies; exit %d\n%s", rc[1], out[1]);
     if (refused < 1) FAIL("the proxy refused no request: the span was not asked for");
     if (rc[2] != 0 || !strstr(out[2], "chain hash over 30 batches: matches")) FAILF("at an RPC that cuts a span's answer short the named blocks are asked for alone and the history verifies; exit %d\n%s", rc[2], out[2]);
