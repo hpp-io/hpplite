@@ -118,7 +118,9 @@ taken; `410` a read of a parked bucket (the body says what restores it);
 daily cap (below), nothing charged, `Retry-After` and `retryAfter` the
 seconds to the next window; a `429` with any other `error` is the store's
 own rate limit, with `Retry-After`: nothing was charged and the write is
-sent again later. A read past a store's limit is answered the same way,
+sent again later - a batch at the next flush; an anchor's own puts (a
+snapshot's chunks, its name and index, the manifest) after the
+`Retry-After`, within the anchor (#407). A read past a store's limit is answered the same way,
 and a node waits its `Retry-After` and asks again (at most two minutes a
 wait, five such answers in a row before the read fails, #402): a store
 that limits reads should always give the header. JSON bodies with `error`; for `402` also

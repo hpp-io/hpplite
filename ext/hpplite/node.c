@@ -2310,7 +2310,7 @@ static int snap_put_chunk(SnapStream *s) {
     unsigned char d[32];
     cJSON *ch;
     if (s->nChunk == 0) return 0;
-    zRef = hpplite_store_put_at(s->node->store, s->height, s->chunk, s->nChunk);
+    zRef = hpplite_store_put_at_waiting(s->node->store, s->height, s->chunk, s->nChunk);
     if (!zRef) { hpplite_error(s->node->ctx, "snapshot at %llu: the store did not take a chunk: %s", (unsigned long long)s->height, hpplite_store_error(s->node->store)); return -1; }
     /* each chunk with its sha-256: a reader checks what any store serves */
     ch = cJSON_CreateObject();
@@ -2470,7 +2470,7 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
         sqlite3_free(nbytes);
         if (nsealed) {
             zNameWhy = hpplite_store_error(node->store);
-            zRef = hpplite_store_put_at(node->store, height, nsealed, slen);
+            zRef = hpplite_store_put_at_waiting(node->store, height, nsealed, slen);
             if (zRef) {
                 cJSON *nm = cJSON_AddObjectToObject(ix, "name");
                 unsigned char d[32];
@@ -2491,7 +2491,7 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
     }
     text = cJSON_PrintUnformatted(ix);
     if (!text) goto done;
-    zRef = hpplite_store_put_at(node->store, height, (const uint8_t *)text, strlen(text));
+    zRef = hpplite_store_put_at_waiting(node->store, height, (const uint8_t *)text, strlen(text));
     if (!zRef || strlen(zRef) >= sizeof node->snapIndex) { hpplite_error(ctx, "snapshot at %llu: the store did not take its index: %s", (unsigned long long)height, hpplite_store_error(node->store)); goto done; }
     node->snapHeight = height;
     snprintf(node->snapIndex, sizeof node->snapIndex, "%s", zRef);
@@ -2502,6 +2502,10 @@ static int node_make_snapshot(HppliteNode *node, uint64_t height, const unsigned
     node->warnedSnapshot = 0;
     rc = 0;
 done:
+    /* what a snapshot that was not made leaves (#407): its chunks are content at the store, in no index */
+    if (rc != 0 && cJSON_GetArraySize(ss.chunks) > 0)
+        fprintf(stderr, "hpplite: snapshot at %llu not made: %d of its chunks are at the store, named by no index, until a prune lets them go; the next anchor's snapshot begins from its first\n",
+                (unsigned long long)height, cJSON_GetArraySize(ss.chunks));
     node->storeBalanceOk = 0;
     sqlite3_free(zRef);
     free(text);
@@ -3027,7 +3031,7 @@ static int node_anchor_once(HppliteNode *node) {
     hpplite_store_sha256((const uint8_t *)text, strlen(text), digest);
     hpplite_store_cid_from_sha256(digest, cid);
     node_store_bucket(node);
-    zRef = hpplite_store_put_at(node->store, to, (const uint8_t *)text, strlen(text));
+    zRef = hpplite_store_put_at_waiting(node->store, to, (const uint8_t *)text, strlen(text));
     node->storeBalanceOk = 0;
     if (!zRef) {
         hpplite_error(ctx, "anchor: the store did not take the manifest of batches %llu-%llu: %s", (unsigned long long)from, (unsigned long long)to, hpplite_store_error(node->store));

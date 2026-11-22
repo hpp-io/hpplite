@@ -779,12 +779,14 @@ static void test_list(const char *url) {
 }
 
 /* a store of this test's own, on a port and directory it chooses, so it can be killed and started again */
+static int busy_retry_after = 60;           /* the Retry-After of the --busy-put answer, seconds */
 static pid_t start_store_at(const char *dir, int port, const char *storeDir, int failPut, int busyPut) {
-    char portStr[16], keyPath[600], script[600], failStr[16], busyStr[16];
+    char portStr[16], keyPath[600], script[600], failStr[16], busyStr[16], retryStr[16];
     pid_t pid;
     snprintf(portStr, sizeof portStr, "%d", port);
     snprintf(failStr, sizeof failStr, "%d", failPut);
     snprintf(busyStr, sizeof busyStr, "%d", busyPut);
+    snprintf(retryStr, sizeof retryStr, "%d", busy_retry_after);
     snprintf(keyPath, sizeof keyPath, "%s/signer.key", test_dir());
     snprintf(script, sizeof script, "%s/hpplite_store.py", dir);
     pid = fork();
@@ -795,6 +797,7 @@ static pid_t start_store_at(const char *dir, int port, const char *storeDir, int
                "--pay-to", "0x1111111111111111111111111111111111111111", "--price-per-write", "0", "--price-per-mib-month", "0",
                "--fail-put", failStr,                      /* a test hook: the k-th content put answers 503; 0 none */
                "--busy-put", busyStr,                      /* and: the k-th answers 429 as an operator's rate limit does */
+               "--busy-retry-after", retryStr,
                (char *)NULL);
         _exit(127);
     }
@@ -1293,6 +1296,57 @@ static void test_snapshot_name_refused(const char *dir) {
     hpplite_l1_disconnect(l1);
     kill(pid, SIGTERM); waitpid(pid, NULL, 0);
     if (!got) FAIL("the snapshot at 4 carries the name");
+    PASS();
+}
+
+/* 6h2. An anchor's own puts - a snapshot's chunks, its name, its index, the manifest - at a store that limits a
+** bucket's writes (#407): a 429 with Retry-After is waited out and the put made again, where the snapshot ended at
+** the refused chunk and the next anchor began another from its first */
+static void test_anchor_put_waits(const char *dir, int snapshot) {
+    if (snapshot) { TEST("a snapshot's chunk the store answers 429 with Retry-After waits and is put again (#407): the anchor names the snapshot, where it named none and the next anchor began another"); }
+    else { TEST("an anchor's manifest the store answers 429 with Retry-After waits and is put again (#407): the anchor is made, where it failed and waited for the next"); }
+    int port = test_free_port();
+    char url[64], storeDir[600], zIndex[64];
+    uint64_t h = 0, t0, took, got;
+    pid_t pid;
+    unsigned char kseq[32] = {0};
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    TestNodeOpts o;
+    HppliteNode *w;
+    HppliteStore *rs;
+    const char *why = NULL;
+    kseq[31] = snapshot ? 0x3b : 0x3c;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/aw_pins%d", test_dir(), snapshot);
+    busy_retry_after = 1;
+    pid = start_store_at(dir, port, storeDir, 0, 4);              /* puts: batches 1-3 by name, then the fourth - the snapshot's chunk, or with no snapshot the manifest */
+    busy_retry_after = 60;
+    if (pid < 0) FAIL("the test's store did not start");
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = snapshot ? "aw_s" : "aw_m"; o.privkey = kseq;
+    if (snapshot) { o.snapshotMs = 1; o.keepSeconds = 3600; o.dbName = "waits"; }
+    w = test_open_node(tpath(snapshot ? "aw_s.db" : "aw_m.db"), l1, &o);
+    rs = hpplite_store_open(url, NULL, 0);
+    if (!w || !rs) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (int i = 0; i < 3 && !why; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('first three')", NULL); if (hpplite_node_flush_batch(w) == 0) why = "a batch at the store"; }
+    t0 = now_ms();
+    got = why ? 0 : hpplite_node_anchor(w);
+    took = now_ms() - t0;
+    if (!why) {
+        printf("(anchor %llu in %.2f s", (unsigned long long)got, (double)took / 1000);
+        if (snapshot) printf(", snapshot_height %lld", (long long)status_int(w->db, "snapshot_height"));
+        printf(") ");
+        if (got != 3) { printf("(%s) ", status_text(w->db, "last_error")); why = "the anchor 1-3 is made: the refused put waited its Retry-After and was made again"; }
+        else if (snapshot && (status_int(w->db, "snapshot_height") != 3 || range_snapshot(l1, rs, 3, &h, zIndex) != 0 || h != 3)) why = "the anchor names the snapshot at 3: its chunk waited the store's Retry-After and was put again";
+        else if (took < 900) why = "the test's own: the store should have answered the fourth put 429";
+    }
+    w->ownsL1 = 0;
+    hpplite_node_destroy(w);
+    hpplite_store_close(rs);
+    hpplite_l1_disconnect(l1);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (why) FAIL(why);
     PASS();
 }
 
@@ -2937,6 +2991,8 @@ int main(int argc, char **argv) {
     test_connections_kept(dir);
     test_restart_store_down(dir);
     test_snapshot_name_refused(dir);
+    test_anchor_put_waits(dir, 1);
+    test_anchor_put_waits(dir, 0);
     test_manifest_short_hex(url);
     test_snapshot_reused_after_refusal(url);
     test_anchor_timer(url);

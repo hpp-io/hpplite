@@ -73,6 +73,7 @@ struct HppliteStore {
     int retryAfter;                 /* the last answer's Retry-After on a 429 or 503, seconds (somaro#48); 0: none */
     volatile int noWait;            /* a read answered 429 is not waited for: the node is closing (#402) */
     int saidLimited;                /* the store's read limit, said once */
+    int saidWriteLimited;           /* and its limit of a bucket's writes, at an anchor's put (#407) */
     long nRequests, nConnects;      /* the requests sent, and the connections opened for them (#405) */
     CURL *curl;                     /* the client's handle and, in it, the connection of its last request (#405) */
     CURLM *multi;                   /* ...and the connections of its reads ahead */
@@ -1924,6 +1925,34 @@ static long storeRead(HppliteStore *s, const char *path, Buf *out) {
     }
 }
 void hpplite_store_no_wait(HppliteStore *s, int on) { if (s) s->noWait = on; }
+
+/* An anchor's own put - a snapshot's chunk, its name, its index, the manifest - at a store that limits a bucket's
+** writes (#407; the canonical stores: 60 a minute a bucket, then 429 with Retry-After): the answer is waited out and
+** the put made again, as a read is (#402). A batch's put waits for the next flush and loses nothing by it; a
+** snapshot ended at the refused chunk, and the next anchor began another from its first - one of more chunks than
+** the limit was never made. The funder's daily cap (bucket_capped, #274) is not waited for: its window is a day.
+** The same bounds as a read's: STORE_READ_WAITS answers in a row, STORE_READ_WAIT_MAX seconds each, none while the
+** node is closing */
+char *hpplite_store_put_at_waiting(HppliteStore *s, uint64_t height, const uint8_t *data, size_t len) {
+    int waits = 0;
+    for (;;) {
+        char *zRef = hpplite_store_put_at(s, height, data, len);
+        int ms;
+        if (zRef || !s || s->lastStatus != 429 || s->funderWait || s->retryAfter <= 0 || s->noWait) return zRef;
+        if (waits >= STORE_READ_WAITS) {
+            snprintf(s->error, sizeof s->error, "the store's rate limit is reached, and was at each of %d tries a Retry-After apart", waits + 1);
+            return NULL;
+        }
+        if (!s->saidWriteLimited) {
+            s->saidWriteLimited = 1;
+            fprintf(stderr, "hpplite: the store %s limits the writes of one bucket (429, Retry-After %d s): an anchor's put past the limit - a snapshot's chunk, the manifest - waits and is made again; the flushes wait behind the anchor\n", s->url, s->retryAfter);
+        }
+        waits++;
+        ms = (s->retryAfter < STORE_READ_WAIT_MAX ? s->retryAfter : STORE_READ_WAIT_MAX) * 1000;
+        for (; ms > 0 && !s->noWait; ms -= 100) usleep(100 * 1000);
+        if (s->noWait) return NULL;
+    }
+}
 
 uint8_t *hpplite_store_get_named(HppliteStore *s, const char *zName, size_t *pLen, uint8_t sig[65], unsigned char instance[32]) {
     Buf out = {0};

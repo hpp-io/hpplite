@@ -63,6 +63,9 @@ char *hpplite_store_put(HppliteStore *store, const uint8_t *data, size_t len);
 /* ...at a batch height: a hpplite-store/2 store takes the bytes into the rollup's bucket, signed for that
 ** height (what a prune point counts); put is put_at height 0 */
 char *hpplite_store_put_at(HppliteStore *store, uint64_t height, const uint8_t *data, size_t len);
+/* the same for an anchor's own puts (a snapshot's chunks, name and index, the manifest): a 429 with Retry-After is
+** waited out and the put made again, up to five times in a row, not while the node is closing (#407) */
+char *hpplite_store_put_at_waiting(HppliteStore *store, uint64_t height, const uint8_t *data, size_t len);
 /*
 ** hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket at the store, paid from a funding
 ** wallet whose key is derived from the node's. set_bucket names the rollup (its DA) and what the
