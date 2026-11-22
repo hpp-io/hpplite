@@ -1279,6 +1279,14 @@ a script, `tools/acceptance.sh` (#258): four runs, each saying what it
 proves, and no pass reported while one is missing; its real-L1 build
 compiles the examples CI compiles (#261).
 
+**v0.12.0** (2026-11-22): what there is to go back to.
+
+- **`hpplite-verify --list` (#397).** The rollup's batches listed, nothing rebuilt: a JSON line a batch on stdout - its height, the time its head carries (the one `--at` goes by), its bytes at the store, whether a range on the chain covers it. Of the anchored history it reads one object a range, the manifest, checked against the chain as a rebuild checks it, and no batch; past the last anchor, the store's names one by one, each signed by the rollup's sequencer. The connection is `role=list`, a verifier that applies nothing (`hpplite_node_list`).
+- **The manifest names each batch's time and bytes.** A sequencer of v0.12.0 writes `"t"` (ms) and `"n"` beside each batch's height, hash and reference, about 28 bytes more a batch (computed). A manifest written before names neither and its range is one line; v0.11 readers pass over the two keys. The sidecar's `_hpplite_unanchored` gains two columns at the first open.
+- **`--at` takes milliseconds** (`.mmm` after either form), so a listed line's `time` rebuilds through that batch.
+- **Measured** on HPP Sepolia from a Mac in Korea, the demo rollup (its sequencer is v0.11, so a line a range): 15,414 batches listed in 60 s with the default eight in flight - 771 ranges and the 13 batches past the anchor - where v0.11.2's rebuild of 15,353 of them took 387 s at 32 in flight.
+- `role=` now takes `verify` or `list`; the refusal of any other says both. No other message a platform may match is changed.
+
 **v0.11.2** (2026-11-22): a rebuild's reads run ahead.
 
 - **The reads run ahead across the ranges (#413).** The reads ahead were groups inside one anchored range, each waited for whole: a group waited for its slowest, nothing was in flight while the node applied what it read, and a history of short ranges - a batch or a few an anchor - was read a round trip after another. A window of reads now stays in flight ahead of the batch being applied, across the ranges, each range's manifest among them, and a read waits for its own answer only. Nothing read ahead is relied on: every manifest and batch is checked where the reading comes to it, as before.
