@@ -3316,6 +3316,172 @@ static void test_stale_name_leaves_file(const char *dir) {
     PASS();
 }
 
+/* A node on the file dies with half the pages of batch `height` written into it (#425) */
+static int dies_mid_apply(HppliteL1 *l1, const char *file, const TestNodeOpts *o, int height) {
+    pid_t pid;
+    int st = 0;
+    char h[16];
+    fflush(stdout);
+    pid = fork();
+    if (pid == 0) {
+        snprintf(h, sizeof h, "%d", height);
+        setenv("HPPLITE_TEST_CRASH_AT", "mid_apply", 1);
+        setenv("HPPLITE_TEST_CRASH_HEIGHT", h, 1);
+        test_open_node(tpath(file), l1, o);
+        _exit(3);
+    }
+    waitpid(pid, &st, 0);
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 137) return 1;
+    printf("(the child on %s: %d) ", file, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return 0;
+}
+/* The names a store holds, each with the sum of its bytes */
+static void store_names(const char *storeDir, char *out, size_t n) {
+    char cmd[1500];
+    FILE *p;
+    size_t k;
+    snprintf(cmd, sizeof cmd, "cd %s/b && for f in */n/*; do printf '%%s:' \"${f##*/}\"; cksum < \"$f\" | cut -d' ' -f1; done | tr '\\n' ' '", storeDir);
+    out[0] = 0;
+    if (!(p = popen(cmd, "r"))) return;
+    k = fread(out, 1, n - 1, p);
+    out[k] = 0;
+    pclose(p);
+}
+/* A node killed while it writes a batch's pages (#425): the pages go into the file in place, and the bookkeeping moves
+** when all of them are in, so the file a kill leaves is no height's state - part of batch N on the state at N-1, the
+** sidecar at N-1. What its next start does with it: a sequencer's whose recovery was in a batch read by name past the
+** anchor, a verifier's in one, a verifier's and a sequencer's in an anchored batch. Two batches: one that makes the
+** file longer (page 1 among its pages: the file then says it has pages it does not have), and one that writes rows
+** over in place (the file reads, with rows of both heights). A start on such a file either does not open or is in
+** the state "error", and puts nothing to the store */
+static void test_killed_mid_apply(const char *dir, int grow) {
+    if (grow) TEST("a node killed with half of a batch's pages in the file, a batch that makes the file longer: its next start does not run on that file and posts nothing from it - a sequencer's and a verifier's in a batch read by name, a verifier's and a sequencer's in an anchored one (#425)");
+    else TEST("...and a batch that writes rows over in place: the file reads, with rows of both heights (#425)");
+#ifndef HPPLITE_TEST_HOOKS
+    /* the kill is a crash point of the node's, compiled only where the test hooks are (the mock-chain builds) */
+    (void)dir; (void)dies_mid_apply; (void)store_names;
+    printf("SKIP (no test hooks) "); PASS(); return;
+#else
+    int port = test_free_port();
+    char url[64], storeDir[600], n0[300], n1[300], n3[300], e1[500], s1[40], r1[200], e1b[500], e2[500], s2[40], r2[200], e3[500], s3[40], r3[200], e3b[500], rf[200], e4[500], s4[40], r4[200];
+    static const unsigned char kg[32] = { [31] = 0x41 }, ku[32] = { [31] = 0x42 };
+    const unsigned char *kseq = grow ? kg : ku;
+    const char *rows = "SELECT (SELECT group_concat(v, ' ') FROM (SELECT v FROM t ORDER BY id)) || ' / ' || (SELECT group_concat(substr(z, length(z) - 2), ' ') FROM (SELECT z FROM u ORDER BY k))";
+    const char *want = grow ? "x x x / 001 002 003 004 005 006 007 008 009" : "x x x / 101 102 103 104 105 106 107 108";
+    const char *f[6] = { grow ? "klg_a.db" : "klu_a.db", grow ? "klg_c.db" : "klu_c.db", grow ? "klg_v.db" : "klu_v.db", grow ? "klg_d.db" : "klu_d.db", grow ? "klg_f.db" : "klu_f.db", grow ? "klg_w.db" : "klu_w.db" };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w, *v;
+    TestNodeOpts o, vo;
+    pid_t pid;
+    int i, d1, d2, d3, d4, ok, runs;
+    unsigned long long f1 = 0, a1 = 0, f3 = 0, a3 = 0;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/%s", test_dir(), grow ? "killg_pins" : "killu_pins");
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "kl_a"; o.privkey = kseq; o.noAnchorAtClose = 1;
+    w = test_open_node(tpath(f[0]), l1, &o);
+    if (!w) { hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(w, "CREATE TABLE u(k INTEGER PRIMARY KEY, z)", NULL);
+    /* eight rows of a page each */
+    hpplite_node_exec(w, "WITH RECURSIVE c(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM c WHERE k < 8) INSERT INTO u SELECT k, printf('%03000d', k) FROM c", NULL);
+    for (i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('x')", NULL); hpplite_node_flush_batch(w); }
+    hpplite_node_anchor(w);
+    /* batch 4, at the store and not anchored */
+    hpplite_node_exec(w, grow ? "INSERT INTO u VALUES(9, printf('%030000d', 9))" : "UPDATE u SET z = printf('%03000d', k + 100)", NULL);
+    hpplite_node_flush_batch(w);
+    hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    hpplite_l1_mock_advance_time(l1, 400);
+    store_names(storeDir, n0, sizeof n0);
+    /* 1: a successor on an empty file takes the anchored three and dies in batch 4, read by name; then starts again */
+    o.nodeId = "kl_c";
+    d1 = dies_mid_apply(l1, f[1], &o, 4);
+    e1[0] = s1[0] = r1[0] = e1b[0] = 0;
+    w = test_open_node(tpath(f[1]), l1, &o);
+    if (w) {
+        snprintf(e1, sizeof e1, "%s", status_text(w->db, "last_error"));
+        snprintf(s1, sizeof s1, "%s", status_text(w->db, "state"));
+        text_of(w->db, rows, r1, sizeof r1);
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('mine')", NULL);
+        f1 = hpplite_node_flush_batch(w);
+        a1 = hpplite_node_anchor(w);
+        snprintf(e1b, sizeof e1b, "%s", status_text(w->db, "last_error"));
+        hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    } else snprintf(e1, sizeof e1, "did not open: %s", hpplite_init_error() ? hpplite_init_error() : "no reason given");
+    hpplite_l1_mock_advance_time(l1, 400);
+    store_names(storeDir, n1, sizeof n1);
+    /* 4: a verifier on an empty file dies in batch 4, read by name; then starts again */
+    memset(&vo, 0, sizeof vo);
+    vo.storeUrl = url; vo.nodeId = "kl_w"; vo.verifyOnly = 1; vo.privkey = kseq;
+    d4 = dies_mid_apply(l1, f[5], &vo, 4);
+    e4[0] = s4[0] = r4[0] = 0;
+    v = test_open_node(tpath(f[5]), l1, &vo);
+    if (v) {
+        snprintf(e4, sizeof e4, "%s", status_text(v->db, "last_error"));
+        snprintf(s4, sizeof s4, "%s", status_text(v->db, "state"));
+        text_of(v->db, rows, r4, sizeof r4);
+        v->l1 = NULL; hpplite_node_destroy(v);
+    } else snprintf(e4, sizeof e4, "did not open: %s", hpplite_init_error() ? hpplite_init_error() : "no reason given");
+    printf("(names '%s') (1, a sequencer by name: %s; '%s', state %s, rows '%s'; a row of its own: flush %llu, anchor %llu, '%s'; names '%s') (4, a verifier by name: %s; '%s', state %s, rows '%s') ",
+           n0, d1 ? "killed" : "not killed", e1, s1, r1, f1, a1, e1b, n1, d4 ? "killed" : "not killed", e4, s4, r4);
+    /* the first host anchors its 4 */
+    o.nodeId = "kl_a";
+    w = test_open_node(tpath(f[0]), l1, &o);
+    if (!w) { hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the first host did not open again"); }
+    hpplite_node_anchor(w);
+    hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    hpplite_l1_mock_advance_time(l1, 400);
+    /* 2: a verifier on an empty file dies in batch 4, anchored now; then starts again */
+    memset(&vo, 0, sizeof vo);
+    vo.storeUrl = url; vo.nodeId = "kl_v"; vo.verifyOnly = 1; vo.privkey = kseq;
+    d2 = dies_mid_apply(l1, f[2], &vo, 4);
+    e2[0] = s2[0] = r2[0] = 0;
+    v = test_open_node(tpath(f[2]), l1, &vo);
+    if (v) {
+        snprintf(e2, sizeof e2, "%s", status_text(v->db, "last_error"));
+        snprintf(s2, sizeof s2, "%s", status_text(v->db, "state"));
+        text_of(v->db, rows, r2, sizeof r2);
+        v->l1 = NULL; hpplite_node_destroy(v);
+    } else snprintf(e2, sizeof e2, "did not open: %s", hpplite_init_error() ? hpplite_init_error() : "no reason given");
+    /* 3: a sequencer on an empty file dies in the anchored batch 4; then starts again */
+    o.nodeId = "kl_d";
+    d3 = dies_mid_apply(l1, f[3], &o, 4);
+    e3[0] = s3[0] = r3[0] = e3b[0] = 0;
+    w = test_open_node(tpath(f[3]), l1, &o);
+    if (w) {
+        snprintf(e3, sizeof e3, "%s", status_text(w->db, "last_error"));
+        snprintf(s3, sizeof s3, "%s", status_text(w->db, "state"));
+        text_of(w->db, rows, r3, sizeof r3);
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('mine')", NULL);
+        f3 = hpplite_node_flush_batch(w);
+        a3 = hpplite_node_anchor(w);
+        snprintf(e3b, sizeof e3b, "%s", status_text(w->db, "last_error"));
+        hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    } else snprintf(e3, sizeof e3, "did not open: %s", hpplite_init_error() ? hpplite_init_error() : "no reason given");
+    hpplite_l1_mock_advance_time(l1, 400);
+    store_names(storeDir, n3, sizeof n3);
+    /* what the history is after all three: a verifier on an empty file */
+    memset(&vo, 0, sizeof vo);
+    vo.storeUrl = url; vo.nodeId = "kl_f"; vo.verifyOnly = 1; vo.privkey = kseq;
+    v = test_open_node(tpath(f[4]), l1, &vo);
+    rf[0] = 0;
+    if (v) { text_of(v->db, rows, rf, sizeof rf); v->l1 = NULL; hpplite_node_destroy(v); }
+    printf("(2, a verifier in an anchored batch: %s; '%s', state %s, rows '%s') (3, a sequencer in an anchored batch: %s; '%s', state %s, rows '%s'; a row of its own: flush %llu, anchor %llu, '%s'; names '%s') (a verifier on an empty file: rows '%s') ",
+           d2 ? "killed" : "not killed", e2, s2, r2, d3 ? "killed" : "not killed", e3, s3, r3, f3, a3, e3b, n3, rf);
+    ok = d1 && d2 && d3 && d4 && strcmp(n0, n1) == 0 && strcmp(n0, n3) == 0 && strcmp(rf, want) == 0;
+    /* one that opened is in the state "error" */
+    runs = (strncmp(e1, "did not open", 12) != 0 && strcmp(s1, "error") != 0) || (strncmp(e2, "did not open", 12) != 0 && strcmp(s2, "error") != 0)
+        || (strncmp(e3, "did not open", 12) != 0 && strcmp(s3, "error") != 0) || (strncmp(e4, "did not open", 12) != 0 && strcmp(s4, "error") != 0);
+    hpplite_l1_disconnect(l1);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (!ok) FAIL("a node on the file a kill left with half a batch put a batch to the store, or the history is not what it was");
+    if (runs) FAIL("a node opened on the file a kill left with half a batch and is not in the state error");
+    PASS();
+#endif
+}
+
 
 /* The suites' kill() (#426): a store that did not start leaves -1 for its pid, and kill(-1, sig) by an ordinary user
 ** is the signal for every process of that user. Signal 0 sends nothing, whatever answers */
@@ -3398,6 +3564,8 @@ int main(int argc, char **argv) {
     test_soft_past_ring(url);
     test_soft_disagreement(url);
     test_stale_name_leaves_file(dir);
+    test_killed_mid_apply(dir, 1);
+    test_killed_mid_apply(dir, 0);
     stop_service();
     remove_dir();
     return test_report();

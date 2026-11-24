@@ -975,7 +975,18 @@ before that batch (#424): the pages it wrote over are kept in a file beside
 the database until its root is compared (at most what the batch writes, gone
 with the comparison) and put back where it differs, so the node's next batch
 takes the name and carries nothing of it. A verifier that follows the store
-does the same. A height without a name is the store's 404: a store that
+does the same. A file that is not the state its bookkeeping holds is another
+matter, and no batch is tried on it (#425): a node killed while it writes a
+batch's pages - a rebuild, a recovery, a replica's sync - leaves half of the
+batch in the file, since the pages go into the file in place and the
+bookkeeping moves when all of them are in. The next start says "the database
+file is not at the root its bookkeeping (...) recorded at height N: remove
+the sidecar with the file, or restore the file", its state is "error" and it
+posts nothing; where the batch made the file longer the node may not start
+on the file at all ("cannot read the database: database disk image is
+malformed"). Either way the file is not repaired: remove it with its sidecar
+(`<db>-hpplite.db`) and start on an empty file, which rebuilds it from the
+history. A height without a name is the store's 404: a store that
 does not answer, or answers anything else (a 5xx, a 429, a parked bucket's
 410), has not said there is none (#382), and the successor then posts
 nothing, to the store or to the chain (`HPPLITE_STORE_FALLBACK` does not

@@ -1803,7 +1803,8 @@ static int node_ensure_lease(HppliteNode *node) {
 /*
 ** Deterministic crash points for the crash harness (tests/stress/crash_hpplite.c):
 ** HPPLITE_TEST_CRASH_AT=after_submit|after_finalize|mid_series makes the
-** process die (like kill -9) at that point of a flush. Compiled only into
+** process die (like kill -9) at that point of a flush, and mid_apply with
+** half of a batch's pages written into the file (#425). Compiled only into
 ** mock-L1 builds.
 */
 #ifdef HPPLITE_TEST_HOOKS
@@ -1929,15 +1930,19 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
     int rc, fresh = node->ctx->blockHeight == 1, differs = 0, urc = SQLITE_OK;
     if (!b) { hpplite_error(node->ctx, "batch %llu: page batch that does not decode", (unsigned long long)batch->height); return SQLITE_CORRUPT; }
     if (!node->pm) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu is a page batch and this node is not in page mode (capture=pages)", (unsigned long long)batch->height); return SQLITE_MISMATCH; }
+    node->fileOffRoot = 0;
     if (batch->height > 1 && batch->height == node->ctx->blockHeight && b->piece <= 1 && !node->ctx->openTxnId) {
         /* the file must be where the sidecar says the last batch left it: a
         ** file deleted or restored while its sidecar stayed would take diffs
         ** onto the wrong pages (the root check below catches that, this says why).
         ** Not between the pieces of one commit, nor after a series the sequencer
         ** did not finish (open_txn in the sidecar): the sidecar holds the commit's
-        ** final root from its first piece on (#152) */
+        ** final root from its first piece on (#152). A node killed while it wrote
+        ** a batch's pages leaves such a file too (#425): the callers that read a
+        ** batch by name must not take this for a batch of another history */
         hpplite_pagemode_root(node->pm, root);
         if (memcmp(root, node->ctx->stateRoot, 32) != 0) {
+            node->fileOffRoot = 1;
             hpplite_pagebatch_free(b);
             hpplite_error(node->ctx, "the database file is not at the root its bookkeeping (%s-hpplite.db) recorded at height %llu: remove the sidecar with the file, or restore the file", zFile, (unsigned long long)node->ctx->blockHeight);
             return SQLITE_MISMATCH;
@@ -2011,6 +2016,13 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
         rc = node_undo_keep(node, pf, rPgno, b->pageSize, undo);
         if (rc == SQLITE_OK) rc = pf->pMethods->xWrite(pf, page, (int)b->pageSize, off);
         if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, rPgno, page);
+#ifdef HPPLITE_TEST_HOOKS
+        if (rc == SQLITE_OK && i + 1 == (b->nPages + 1) / 2) {
+            /* the crash harness: dead with half the pages of batch HPPLITE_TEST_CRASH_HEIGHT (any batch, where it is not set) in the file (#425) */
+            const char *zh = getenv("HPPLITE_TEST_CRASH_HEIGHT");
+            if (!zh || strtoull(zh, NULL, 10) == batch->height) test_crash_point("mid_apply");
+        }
+#endif
     }
     if (rc == SQLITE_OK) {
         /* page 1 as the file has it, rollback-journal mode, its change counter moved past the one this file had
@@ -4007,6 +4019,7 @@ static int node_soft_walk(HppliteNode *node) {
         held = strstr(node->ctx->zLastError, "the file is held by another connection") != NULL;
         if (held) { node->ctx->quiet = 1; node->ctx->zQuietError[0] = 0; }   /* said already: tried again without saying it at every flush */
         node->undoArmed = 1;                                         /* the store's word alone: taken back where it does not apply (#424) */
+        node->fileOffRoot = 0;
         rc = (node->pm && !node->config.verifyOnly && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
         node->undoArmed = 0;
         node->ctx->quiet = 0;
@@ -4023,6 +4036,15 @@ static int node_soft_walk(HppliteNode *node) {
             break;
         }
         if (held && rc != SQLITE_OK && node->ctx->zQuietError[0]) hpplite_error(node->ctx, "%s", node->ctx->zQuietError);
+        if (rc != SQLITE_OK && node->fileOffRoot) {
+            /* the file is no height's state (a kill while a batch's pages were written, a file restored beside its
+            ** sidecar), and the batch was not tried on it: not a name to write over. A batch of this file would put
+            ** half of another into the history (#425). The reason is said where it was found */
+            node->state = HPPLITE_STATE_ERROR;
+            owed = 2;
+            hpplite_batch_free(batch);
+            break;
+        }
         if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
             hpplite_error(node->ctx, "batch %llu at the store does not apply on this history (rc=%d); recovery stops before it", (unsigned long long)h, rc);
             hpplite_batch_free(batch);
@@ -4371,9 +4393,16 @@ static int node_soft_follow(HppliteNode *node) {
         memcpy(before, node->ctx->chainHash, 32);
         hpplite_chain_hash_next(before, h, k, after);
         node->undoArmed = 1;                          /* as the sequencer's walk: taken back where it does not apply (#424) */
+        node->fileOffRoot = 0;
         rc = node_apply_pages(node, batch);
         node->undoArmed = 0;
         hpplite_batch_free(batch);
+        if (rc != SQLITE_OK && node->fileOffRoot) {
+            /* the file's fault and not the batch's (#425): what this replica serves is no height's state */
+            node->state = HPPLITE_STATE_ERROR;
+            node->softRefused = h;
+            break;
+        }
         if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
             fprintf(stderr, "hpplite: batch %llu at the store does not apply on this history (rc=%d): the soft tier stops before it\n", (unsigned long long)h, rc);
             node->softRefused = h;
