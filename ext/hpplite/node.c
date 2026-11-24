@@ -3183,7 +3183,9 @@ static void node_ahead_ranges_clear(HppliteNode *node, uint64_t upTo) {
 ** together. A run is asked for once (runNext: the store client says how many of the window it came to), and none
 ** past a verifier's stop at a height: a stop by time is not known ahead, and a run reaches up to 63 batches past it. The
 ** window grows by two heights at each read in order, to HPPLITE_STORE_PARALLEL runs: a reading of a few batches
-** asks for one run */
+** asks for one run. Where the reading knows the height it reads to (readTo: a rebuild, a sync, a recovery, a stop at
+** a height) the window is what is left to it, to the same bound (#421): at a far store a run takes seconds whatever
+** its length, and a window that grew from one height had the first run asked for alone and waited for */
 static void node_range_ahead(HppliteNode *node, HppliteL1 *l1, const HppliteRange *r, const char *of, uint64_t height, const cJSON *b, const char *da40) {
     HppliteStoreAhead a[3 * HPPLITE_STORE_AHEAD_MAX];
     char cids[NODE_AHEAD_RANGES][64];
@@ -3208,6 +3210,11 @@ static void node_range_ahead(HppliteNode *node, HppliteL1 *l1, const HppliteRang
         node->aheadNone = 0;
         node->runNext = 0;
         snprintf(node->aheadOf, sizeof node->aheadOf, "%s", of);
+    }
+    if (da40 && l1 == node->l1 && node->readTo >= height) {
+        uint64_t left = node->readTo - height + 1, most = (uint64_t)par * HPPLITE_STORE_RUN_MAX;
+        if (left > most) left = most;
+        if ((uint64_t)win < left) win = (int)left;
     }
     node->aheadLast = height;
     node->aheadWin = win;
@@ -4492,7 +4499,11 @@ static int node_sync_from_l1(HppliteNode *node, int *pHead) {
         HppliteBatch *batch;
         int rc;
         if (mayFallBack) { node->ctx->quiet = 1; node->ctx->zQuietError[0] = 0; }
+        /* where this reading ends, for what is asked ahead of it (#421): not known with a stop by time, and not said
+        ** for the one read that may find its history pruned */
+        if (!mayFallBack && !node->syncAtMs) node->readTo = node->syncTo && node->syncTo < lastBatch ? node->syncTo : lastBatch;
         batch = node_fetch_batch(node, node->ctx->blockHeight);
+        node->readTo = 0;
         node->ctx->quiet = 0;
         if (batch && node->syncAtMs) {
             /* a stop by time (#205): no batch written after it begins; one that continues a transaction in flight

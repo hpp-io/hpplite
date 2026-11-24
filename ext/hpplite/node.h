@@ -206,6 +206,7 @@ typedef struct HppliteNode {
     ** run should have given them, and below runsOffTo the batches are asked for by their references as before; and
     ** the names past the anchor read in a row, which is how far their runs are asked ahead */
     uint64_t runNext, runExpect, runsOffTo;
+    uint64_t readTo;                /* ...and the height a reading in progress reads to, where it is known (#421): the window is what is left of it */
     int runMiss, namesRow;
     unsigned long long fileDev, fileIno;
     uint64_t syncTo;                /* a verifier's stop (hpplite-verify --to, #206): no batch past it is applied; 0: none */

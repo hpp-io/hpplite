@@ -1130,6 +1130,69 @@ static void test_runs_in_flight(const char *dir) {
     PASS();
 }
 
+/* 6e2e. The first runs together (#421): the window of what is asked ahead began at one height and grew two a read, so
+** the first run of a reading was asked for alone - the node waited its whole time with the other slots idle - and the
+** runs after it only once its batches were being applied. At a far store a run takes seconds whatever its length, and
+** a history of two or three runs (HPP Sepolia: 100 batches, a run of 64 alone for 4.1 s and then one of 34 for 1.9 s)
+** read them one after the other. A rebuild, a replica's sync and a recovery know where they read to: the window is
+** what is left of it. 150 batches anchored ten at a time, at a store whose reads take 0.2 s and whose runs 1.5 s: a
+** verifier that stops at 100 has its two runs in flight together, one that reads all 150 its three */
+static void test_runs_from_the_first(const char *dir) {
+    TEST("6e2e. a reading whose end is known asks for its runs together from the first: a verifier's 100 batches at a store whose runs take 1.5 s have both runs in flight at once, its 150 all three (#421)");
+    int port = test_free_port();
+    char url[64], storeDir[600];
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x3f };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = NULL, *r = NULL;
+    TestNodeOpts o;
+    int i, most[2] = { -1, -1 }, ok[2] = { 0, 0 };
+    double t0, took[2] = { 0, 0 };
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/first_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
+#define FIRST_DONE() do { unsetenv("HPPLITE_STORE_COUNT_READS"); unsetenv("HPPLITE_STORE_GET_DELAY"); unsetenv("HPPLITE_STORE_NAMES_DELAY"); \
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); r = NULL; } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } \
+        hpplite_l1_disconnect(l1); if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } } while (0)
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "first_w"; o.privkey = kseq;
+    if (!(w = test_open_node(tpath("first_w.db"), l1, &o))) { FIRST_DONE(); FAIL("open the writer"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 1; i <= 150; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('from the first')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { FIRST_DONE(); FAIL("a flush"); }
+        if (i % 10 == 0 && hpplite_node_anchor(w) != (uint64_t)i) { FIRST_DONE(); FAIL("an anchor of ten batches"); }
+    }
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    setenv("HPPLITE_STORE_COUNT_READS", "1", 1);
+    setenv("HPPLITE_STORE_GET_DELAY", "0.2", 1);
+    setenv("HPPLITE_STORE_NAMES_DELAY", "1.3", 1);              /* on top of a read's 0.2 s */
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { FIRST_DONE(); FAIL("the test's store did not start again"); }
+    /* a verifier that stops at 100 (two runs: 64 and 34 after the two batches read alone), then one that reads all 150
+    ** (three); the store's count is the most it has had in flight since it started, so the smaller reading is first */
+    for (i = 0; i < 2; i++) {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = i ? "first_r2" : "first_r1", .privkey = kseq, .syncTo = i ? 0 : 100 };
+        int rows = i ? 150 : 100;
+        t0 = now_s();
+        r = test_open_node(tpath(i ? "first_r2.db" : "first_r1.db"), l1, &ro);
+        took[i] = now_s() - t0;
+        if (!r) { FIRST_DONE(); FAIL("open a verifier"); }
+        ok[i] = status_int(r->db, "height") == rows + 1 && count_rows(r->db, "t") == rows && (!i || same_root(w, r));
+        most[i] = store_reads(port, "\"runsInFlightMost\":");
+        printf("(%s: %d runs in flight at most, %.2f s%s) ", i ? "all 150" : "to 100", most[i], took[i], ok[i] ? "" : ", NOT the writer's batches");
+        r->l1 = NULL; hpplite_node_destroy(r); r = NULL;
+    }
+    FIRST_DONE();
+#undef FIRST_DONE
+    if (!ok[0]) FAIL("the verifier that stops at 100 holds the first 100 batches");
+    if (!ok[1]) FAIL("the verifier holds the 150 batches, the writer's root");
+    if (most[0] < 2) FAIL("a reading of 100 batches had its two runs in flight one after the other: the first was asked for alone");
+    if (most[1] < 3) FAIL("a reading of 150 batches did not have its three runs in flight together");
+    PASS();
+}
+
 /* 6e3. A sync that stops midway (#403): a sequencer on a file behind the chain applies the history's pages in
 ** rollback-journal mode and switches back to WAL when the sync ends; one that stops at a read that failed returns
 ** before the switch. The WAL upkeep ran at the next tick all the same: its pin is a read transaction, in that mode a
@@ -3197,6 +3260,7 @@ int main(int argc, char **argv) {
     test_reads_ahead_across_ranges(dir);
     test_runs_of_names(dir);
     test_runs_in_flight(dir);
+    test_runs_from_the_first(dir);
     test_sync_stopped_midway(dir);
     test_read_limit(dir);
     test_connections_kept(dir);
