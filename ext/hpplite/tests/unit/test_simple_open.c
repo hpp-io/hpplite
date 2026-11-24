@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include "hpplite.h"
 #include "node.h"
@@ -418,6 +419,51 @@ int main(void) {
         sqlite3_finalize(q);
         hpplite_close(db);
         if (pending < 1) FAIL("the write after the open was not captured");   /* page capture: the file as opened counts too */
+        PASS();
+        passed++;
+    }
+
+    /* a refused setting's line on stderr names the file and none of the settings (#428) */
+    tests++;
+    TEST("a setting the configuration refuses: the line on stderr names the file and not the settings - the key and the rpc URL's are in them (#428)");
+    {
+#define REFUSED_URI "file:/tmp/test_simple_open.db?hpplite=on&l1=local&interval=bogus&rpc=https://rpc.example/v2/PROVIDERSECRET&datadir=/tmp/hpplite_test_simple" \
+                    "&privkey=0x0707070707070707070707070707070707070707070707070707070707070707"
+        char said[2000] = "", msg2[600] = "";
+        int saved, fd, opened2 = 0;
+        sqlite3 *db;
+        ssize_t n;
+        unlink("/tmp/test_simple_open.err");
+        fflush(stderr);
+        saved = dup(2);
+        fd = open("/tmp/test_simple_open.err", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (saved < 0 || fd < 0) FAIL("cannot keep what is written to stderr");
+        dup2(fd, 2);
+        db = hpplite_open(REFUSED_URI);
+        /* ...and the same URI through sqlite3_open_v2: what the connection says, and anything it adds on stderr */
+        {
+            sqlite3 *db2 = NULL;
+            int rc2 = sqlite3_open_v2(REFUSED_URI, &db2, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI, NULL);
+            snprintf(msg2, sizeof msg2, "%s", db2 ? sqlite3_errmsg(db2) : "");
+            opened2 = rc2 == SQLITE_OK && hpplite_get_node(db2) != NULL;
+            sqlite3_close(db2);
+        }
+        fflush(stderr);
+        dup2(saved, 2); close(saved);
+        n = pread(fd, said, sizeof said - 1, 0);
+        close(fd); unlink("/tmp/test_simple_open.err");
+        said[n > 0 ? n : 0] = 0;
+        if (db) { hpplite_close(db); FAIL("interval=bogus should refuse the open"); }
+        if (opened2) FAIL("interval=bogus should refuse sqlite3_open_v2 too");
+        if (strstr(msg2, "0707070707") || strstr(msg2, "PROVIDERSECRET")) FAIL("the refused sqlite3_open_v2's message carries the settings");
+        if (!strstr(msg2, "interval=bogus is not a duration")) FAIL("the refused sqlite3_open_v2 should say the reason");
+        {
+            int leaks = strstr(said, "0707070707") || strstr(said, "PROVIDERSECRET");
+            printf("(stderr '%.*s'; sqlite3_open_v2: '%.90s') ", leaks ? 48 : (int)strcspn(said, "\n"), leaks ? "[with the settings: not repeated here]" : said, msg2);
+        }
+        if (strstr(said, "0707070707")) FAIL("the refused open's line on stderr carries the key");
+        if (strstr(said, "PROVIDERSECRET") || strchr(said, '?')) FAIL("the refused open's line on stderr carries the settings");
+        if (!strstr(said, "hpplite: cannot open file:/tmp/test_simple_open.db: interval=bogus is not a duration")) FAIL("the refused open's line should name the file and the reason");
         PASS();
         passed++;
     }

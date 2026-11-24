@@ -730,7 +730,8 @@ sqlite3 *hpplite_open(const char *uri) {
     if (!config) return NULL;
     hpplite_config_resolve_operators(config);
     if (hpplite_config_error()) {
-        fprintf(stderr, "hpplite: cannot open %s: %s\n", uri, hpplite_config_error());
+        /* the file, not the URI: its settings carry the key and an rpc URL's (#428); the reason names the one refused */
+        fprintf(stderr, "hpplite: cannot open %.*s: %s\n", (int)strcspn(uri, "?"), uri, hpplite_config_error());
         hpplite_config_free(config);
         return NULL;
     }
