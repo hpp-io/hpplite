@@ -967,7 +967,15 @@ the same file or a fresh one on another machine, replays the chain, then
 reads the names past the anchored height, takes each batch whose signature
 recovers to its own wallet and that applies on its history, and anchors them
 with its own. It stops at the first height without a name, or at one signed
-by another wallet. A height without a name is the store's 404: a store that
+by another wallet. A batch with the wallet's signature that does not apply -
+its pages do not give the root it carries: a name left at the store from
+another history of the rollup - stops it too, "batch N at the store does not
+apply on this history; recovery stops before it", and the file is as it was
+before that batch (#424): the pages it wrote over are kept in a file beside
+the database until its root is compared (at most what the batch writes, gone
+with the comparison) and put back where it differs, so the node's next batch
+takes the name and carries nothing of it. A verifier that follows the store
+does the same. A height without a name is the store's 404: a store that
 does not answer, or answers anything else (a 5xx, a 429, a parked bucket's
 410), has not said there is none (#382), and the successor then posts
 nothing, to the store or to the chain (`HPPLITE_STORE_FALLBACK` does not

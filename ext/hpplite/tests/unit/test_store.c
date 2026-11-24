@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <fcntl.h>
 #include <math.h>
@@ -3217,6 +3218,104 @@ static void test_protocol(const char *dir) {
     PASS();
 }
 
+/* A batch that does not apply leaves the file as it was (#424): the store holds, under a name past the anchor, a batch
+** this wallet signed for that height on another history (#408's case: the names 4 and 5 taken out of the store by
+** hand, a second host's own batch 4, the first host's 5 put back). A sequencer reads it at its start, applies its
+** pages to find the root they give, and says "does not apply on this history; recovery stops before it" - with the
+** pages left in the file, which then went whole as the next height: a row of the batch it stopped before was in the
+** state, and every verifier agreed */
+static void test_stale_name_leaves_file(const char *dir) {
+    TEST("a batch at the store that does not apply on this history leaves the file as it was: a sequencer's on a restart, a verifier's that follows the store, a successor's empty one, and what is posted after it has none of its rows (#424)");
+    int port = test_free_port();
+    char url[64], storeDir[600], cmd[2000], e2[400], e3[400], r2[200], rr[200], r3[200], r4[200], rv[200], i2[200], i3[200];
+    struct stat st0, st1;
+    static const unsigned char kseq[32] = { [31] = 0x40 };
+    const char *rows = "SELECT group_concat(v, ' ') FROM (SELECT v FROM t ORDER BY id)", *want = "x x x new4", *want4 = "x x x new4 b5";
+    const char *whole = "SELECT (SELECT * FROM pragma_integrity_check) || ', ' || (SELECT length(z) FROM big)", *wantWhole = "ok, 40000";
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w, *v;
+    TestNodeOpts o, vo;
+    pid_t pid;
+    int i, ok, sameV;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/stale_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "sn_a"; o.privkey = kseq; o.noAnchorAtClose = 1;
+    w = test_open_node(tpath("sn_a.db"), l1, &o);
+    if (!w) { hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("open"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    hpplite_node_exec(w, "CREATE TABLE big(z)", NULL);
+    hpplite_node_exec(w, "INSERT INTO big VALUES(zeroblob(40000))", NULL);
+    for (i = 0; i < 3; i++) { hpplite_node_exec(w, "INSERT INTO t(v) VALUES('x')", NULL); hpplite_node_flush_batch(w); }
+    hpplite_node_anchor(w);
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('old4')", NULL); hpplite_node_flush_batch(w);
+    /* the batch that will be the stale one: a row, and the file cut short (its pages written over, its end cut off) */
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('old5')", NULL);
+    hpplite_node_exec(w, "DELETE FROM big", NULL);
+    hpplite_node_exec(w, "VACUUM", NULL);
+    hpplite_node_flush_batch(w);
+    hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    hpplite_l1_mock_advance_time(l1, 400);
+    snprintf(cmd, sizeof cmd, "cp %s/b/*/n/5 %s/stale5 && rm %s/b/*/n/4 %s/b/*/n/5", storeDir, storeDir, storeDir, storeDir);
+    ok = system(cmd) == 0;
+    /* a second host on an empty file: the history ends at 3, and its own batch is 4 */
+    o.nodeId = "sn_b";
+    w = ok ? test_open_node(tpath("sn_b.db"), l1, &o) : NULL;
+    if (!w) { hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the second host did not open"); }
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('new4')", NULL); hpplite_node_flush_batch(w);
+    hpplite_node_anchor(w);                                          /* at its next start it is where the anchors end, and reads the store's names from there */
+    hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    hpplite_l1_mock_advance_time(l1, 400);
+    snprintf(cmd, sizeof cmd, "for d in %s/b/*/n; do cp %s/stale5 $d/5; done", storeDir, storeDir);
+    ok = system(cmd) == 0;
+    memset(&st0, 0, sizeof st0); memset(&st1, 0, sizeof st1);
+    stat(tpath("sn_b.db"), &st0);
+    /* the second host again, on its own file: the store's 5 is not its history's */
+    w = ok ? test_open_node(tpath("sn_b.db"), l1, &o) : NULL;
+    if (!w) { hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the second host did not open again"); }
+    snprintf(e2, sizeof e2, "%s", status_text(w->db, "last_error"));
+    text_of(w->db, rows, r2, sizeof r2);
+    text_of(w->db, whole, i2, sizeof i2);
+    hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    stat(tpath("sn_b.db"), &st1);
+    hpplite_l1_mock_advance_time(l1, 400);
+    /* a verifier: the anchored four, then the store's names */
+    memset(&vo, 0, sizeof vo);
+    vo.storeUrl = url; vo.nodeId = "sn_r"; vo.verifyOnly = 1; vo.privkey = kseq;
+    v = test_open_node(tpath("sn_r.db"), l1, &vo);
+    rr[0] = 0;
+    if (v) { text_of(v->db, rows, rr, sizeof rr); v->l1 = NULL; hpplite_node_destroy(v); }
+    /* a successor on an empty file: the anchored four and the same 5 */
+    o.nodeId = "sn_c";
+    w = test_open_node(tpath("sn_c.db"), l1, &o);
+    if (!w) { hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); FAIL("the successor did not open"); }
+    snprintf(e3, sizeof e3, "%s", status_text(w->db, "last_error"));
+    text_of(w->db, rows, r3, sizeof r3);
+    text_of(w->db, whole, i3, sizeof i3);
+    hpplite_node_exec(w, "INSERT INTO t(v) VALUES('b5')", NULL); hpplite_node_flush_batch(w);
+    hpplite_node_anchor(w);
+    text_of(w->db, rows, r4, sizeof r4);
+    memset(&vo, 0, sizeof vo);
+    vo.storeUrl = url; vo.nodeId = "sn_v"; vo.verifyOnly = 1; vo.privkey = kseq;
+    v = test_open_node(tpath("sn_v.db"), l1, &vo);
+    rv[0] = 0;
+    if (v) text_of(v->db, rows, rv, sizeof rv);
+    sameV = v ? same_root(w, v) : 0;
+    printf("(its own file: '%s', rows '%s', %lld bytes then %lld, '%s') (a verifier: rows '%s') (an empty file: '%s', rows '%s', '%s'; after its batch '%s'; a verifier '%s', %s) ",
+           e2, r2, (long long)st0.st_size, (long long)st1.st_size, i2, rr, e3, r3, i3, r4, rv, sameV ? "the writer's root" : "another root");
+    ok = st0.st_size > 0 && st0.st_size == st1.st_size && strcmp(i2, wantWhole) == 0 && strcmp(i3, wantWhole) == 0
+         && strcmp(r2, want) == 0 && strcmp(rr, want) == 0 && strcmp(r3, want) == 0 && strcmp(r4, want4) == 0 && strcmp(rv, want4) == 0 && sameV
+         && strstr(e2, "does not apply on this history") && strstr(e3, "does not apply on this history");
+    if (v) { v->l1 = NULL; hpplite_node_destroy(v); }
+    hpplite_node_stop_timer(w); w->ownsL1 = 0; w->l1 = NULL; hpplite_node_destroy(w);
+    hpplite_l1_disconnect(l1);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    if (!ok) FAIL("a batch the node said it stopped before left its pages in the file: its rows are in the state");
+    PASS();
+}
+
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = test_free_port();
@@ -3285,6 +3384,7 @@ int main(int argc, char **argv) {
     test_soft_replica(url);
     test_soft_past_ring(url);
     test_soft_disagreement(url);
+    test_stale_name_leaves_file(dir);
     stop_service();
     remove_dir();
     return test_report();

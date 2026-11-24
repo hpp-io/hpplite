@@ -1198,6 +1198,7 @@ void hpplite_node_destroy(HppliteNode *node) {
     }
 
     if (node->pieceDb) { sqlite3_exec(node->pieceDb, "ROLLBACK", NULL, NULL, NULL); sqlite3_close(node->pieceDb); node->pieceDb = NULL; }
+    if (node->undoOn) { close(node->undoFd); node->undoOn = 0; }
     node_ck_close(node);
     node_pins_close(node);
     if (node->bkDb) {
@@ -1866,13 +1867,66 @@ static int node_apply_pages(HppliteNode *node, const HppliteBatch *batch) {
     return node_apply_pagesrc(node, batch, b, &src);
 }
 
+/* A batch read by name past the anchor may not be this history's (#424): the store gave it, no anchor names it, and
+** only the root its pages give says whether it applies. What it writes over is kept until that root is compared -
+** each page as it was, in a file beside the database, unlinked while it is open - and put back, the last kept first,
+** where the root is not the posted one: left in the file, a sequencer's next batch carried the pages of a batch it
+** had said it stopped before. One commit's, over its pieces (#152) */
+static int node_undo_begin(HppliteNode *node, sqlite3_file *pf) {
+    char *z = sqlite3_mprintf("%s-hpplite-undo", sqlite3_db_filename(node->db, "main"));
+    if (!z) return SQLITE_NOMEM;
+    node->undoFd = open(z, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (node->undoFd >= 0) unlink(z);
+    sqlite3_free(z);
+    if (node->undoFd < 0) return SQLITE_CANTOPEN;
+    if (pf->pMethods->xFileSize(pf, &node->undoSize) != SQLITE_OK) { close(node->undoFd); return SQLITE_IOERR; }
+    node->undoBytes = 0;
+    node->undoOn = 1;
+    return SQLITE_OK;
+}
+static void node_undo_end(HppliteNode *node) {
+    if (node->undoOn) close(node->undoFd);
+    node->undoOn = 0;
+}
+/* page pgno is about to be written or cut off: kept as it is. A page past the file's end as it was before the
+** commit is not: the file's length put back takes it away. buf: 4 + pageSize bytes */
+static int node_undo_keep(HppliteNode *node, sqlite3_file *pf, unsigned pgno, unsigned pageSize, unsigned char *buf) {
+    sqlite3_int64 off = (sqlite3_int64)(pgno - 1) * (sqlite3_int64)pageSize;
+    int rc;
+    if (!node->undoOn || off >= node->undoSize) return SQLITE_OK;
+    buf[0] = (unsigned char)(pgno >> 24); buf[1] = (unsigned char)(pgno >> 16); buf[2] = (unsigned char)(pgno >> 8); buf[3] = (unsigned char)pgno;
+    memset(buf + 4, 0, pageSize);
+    rc = pf->pMethods->xRead(pf, buf + 4, (int)pageSize, off);
+    if (rc == SQLITE_IOERR_SHORT_READ) rc = SQLITE_OK;
+    if (rc != SQLITE_OK) return rc;
+    if (pwrite(node->undoFd, buf, 4 + (size_t)pageSize, (off_t)node->undoBytes) != (ssize_t)(4 + (size_t)pageSize)) return SQLITE_IOERR_WRITE;
+    node->undoBytes += 4 + (sqlite3_int64)pageSize;
+    return SQLITE_OK;
+}
+/* the commit taken back: the file, its length and the page tree as they were before it */
+static int node_undo_back(HppliteNode *node, sqlite3_file *pf, unsigned pageSize, unsigned char *buf) {
+    sqlite3_int64 rec = 4 + (sqlite3_int64)pageSize, at;
+    int rc = SQLITE_OK;
+    for (at = node->undoBytes - rec; rc == SQLITE_OK && at >= 0; at -= rec) {
+        unsigned pgno;
+        if (pread(node->undoFd, buf, (size_t)rec, (off_t)at) != (ssize_t)rec) { rc = SQLITE_IOERR_READ; break; }
+        pgno = ((unsigned)buf[0] << 24) | ((unsigned)buf[1] << 16) | ((unsigned)buf[2] << 8) | buf[3];
+        rc = pf->pMethods->xWrite(pf, buf + 4, (int)pageSize, (sqlite3_int64)(pgno - 1) * (sqlite3_int64)pageSize);
+        if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, pgno, buf + 4);
+    }
+    if (rc == SQLITE_OK) rc = pf->pMethods->xTruncate(pf, node->undoSize);
+    if (rc == SQLITE_OK) rc = hpplite_pagemode_applied_size(node->pm, (unsigned)(node->undoSize / (sqlite3_int64)pageSize));
+    if (rc == SQLITE_OK) rc = pf->pMethods->xSync(pf, SQLITE_SYNC_NORMAL);
+    return rc;
+}
+
 static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, HpplitePageBatch *b, PageSrc *src) {
     const char *zFile = sqlite3_db_filename(node->db, "main");
     sqlite3 *adb = NULL;
     sqlite3_file *pf = NULL;
-    unsigned char *page = NULL, root[32];
+    unsigned char *page = NULL, *undo = NULL, root[32];
     unsigned i, counter = 0;
-    int rc, fresh = node->ctx->blockHeight == 1;
+    int rc, fresh = node->ctx->blockHeight == 1, differs = 0, urc = SQLITE_OK;
     if (!b) { hpplite_error(node->ctx, "batch %llu: page batch that does not decode", (unsigned long long)batch->height); return SQLITE_CORRUPT; }
     if (!node->pm) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu is a page batch and this node is not in page mode (capture=pages)", (unsigned long long)batch->height); return SQLITE_MISMATCH; }
     if (batch->height > 1 && batch->height == node->ctx->blockHeight && b->piece <= 1 && !node->ctx->openTxnId) {
@@ -1927,6 +1981,15 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
     }
     page = sqlite3_malloc64((sqlite3_uint64)b->pageSize);
     if (rc == SQLITE_OK && (!pf || !pf->pMethods || !page)) rc = SQLITE_ERROR;
+    /* read by name past the anchor (#424): what this commit writes over is kept, from its first piece. A commit
+    ** before it that its sequencer never finished stays as it is, and so does one whose first pieces were not read
+    ** by name: taken back to its middle the file would be no height's state either */
+    if (node->undoOn && (!node->undoArmed || b->piece <= 1)) node_undo_end(node);
+    if (node->undoArmed && !node->snapApply && (node->undoOn || b->piece <= 1)) {
+        undo = sqlite3_malloc64(4 + (sqlite3_uint64)b->pageSize);
+        if (rc == SQLITE_OK && !undo) rc = SQLITE_NOMEM;
+        if (rc == SQLITE_OK && !node->undoOn) rc = node_undo_begin(node, pf);
+    }
     if (rc == SQLITE_OK) {
         /* this file's change counter, before anything is written: the one written at the end is past it (#384) */
         unsigned char c[4];
@@ -1945,7 +2008,8 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
             for (k = 0; k < b->pageSize; k++) page[k] ^= rBody[k];
         } else memcpy(page, rBody, b->pageSize);
         if (rPgno == 1) page[18] = page[19] = 1;
-        rc = pf->pMethods->xWrite(pf, page, (int)b->pageSize, off);
+        rc = node_undo_keep(node, pf, rPgno, b->pageSize, undo);
+        if (rc == SQLITE_OK) rc = pf->pMethods->xWrite(pf, page, (int)b->pageSize, off);
         if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, rPgno, page);
     }
     if (rc == SQLITE_OK) {
@@ -1953,7 +2017,8 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
         ** - not past the batch's (#384): a connection that read the file before, this node's own among them, would
         ** take its cached pages for current where the two counters met, and the node's switch back to WAL, which
         ** writes page 1, put the old page 1 over the one applied (a restored file under the history's pages) */
-        rc = pf->pMethods->xRead(pf, page, (int)b->pageSize, 0);
+        rc = node_undo_keep(node, pf, 1, b->pageSize, undo);
+        if (rc == SQLITE_OK) rc = pf->pMethods->xRead(pf, page, (int)b->pageSize, 0);
         if (rc == SQLITE_OK) {
             counter++;
             page[24] = (unsigned char)(counter >> 24); page[25] = (unsigned char)(counter >> 16); page[26] = (unsigned char)(counter >> 8); page[27] = (unsigned char)counter;
@@ -1963,9 +2028,25 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
             if (rc == SQLITE_OK) rc = hpplite_pagemode_applied(node->pm, 1, page);
         }
     }
+    if (rc == SQLITE_OK && node->undoOn) {
+        /* the pages the commit cuts off */
+        sqlite3_int64 size = 0;
+        unsigned pg, last;
+        rc = pf->pMethods->xFileSize(pf, &size);
+        last = (unsigned)(size / (sqlite3_int64)b->pageSize);
+        for (pg = b->commitSize + 1; rc == SQLITE_OK && pg <= last; pg++)
+            if (pg != hpplite_lock_page((int)b->pageSize)) rc = node_undo_keep(node, pf, pg, b->pageSize, undo);
+    }
     if (rc == SQLITE_OK) rc = pf->pMethods->xTruncate(pf, (sqlite3_int64)b->commitSize * (sqlite3_int64)b->pageSize);
     if (rc == SQLITE_OK) rc = hpplite_pagemode_applied_size(node->pm, b->commitSize);
     if (rc == SQLITE_OK) rc = pf->pMethods->xSync(pf, SQLITE_SYNC_NORMAL);
+    /* a piece with more after it carries the whole commit's root: checked at the last piece (#152) */
+    if (rc == SQLITE_OK && !b->bMore) { hpplite_pagemode_root(node->pm, root); differs = memcmp(root, b->root, 32) != 0; }
+    if (node->undoOn) {
+        /* not this history's, or not written: taken back while the lock is held (#424) */
+        if ((rc != SQLITE_OK || differs) && pf && pf->pMethods) urc = undo ? node_undo_back(node, pf, b->pageSize, undo) : SQLITE_NOMEM;
+        if (rc != SQLITE_OK || !b->bMore) node_undo_end(node);
+    }
     if (rc == SQLITE_OK && b->bMore) {
         /* a piece with more after it: the lock stays until the last, so no
         ** reader of this replica sees half a commit */
@@ -1976,18 +2057,21 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
         node->pieceDb = NULL; node->piecePf = NULL;
     }
     sqlite3_free(page);
+    sqlite3_free(undo);
+    if (urc != SQLITE_OK) {
+        hpplite_error(node->ctx, "batch %llu does not apply and what it wrote could not be taken back (rc=%d): the file is not the state at any height. Rebuild it from the history on an empty file", (unsigned long long)batch->height, urc);
+        node->state = HPPLITE_STATE_ERROR;
+    }
     /* the first of the history onto this file: whatever this node's connection read of the file before was another
     ** file's (a restored copy the application held at the open), and a schema cookie equal in both - two files with
     ** one CREATE each - would keep that schema on the connection (#384). Once the lock has gone: between the pieces
     ** of a commit it is held, and the connection would wait on it */
     if (fresh && !node->pieceDb) hppliteInternalExec(node->ctx, node->db, "PRAGMA writable_schema=RESET");
-    if (rc != SQLITE_OK) { hpplite_pagebatch_free(b); hpplite_error(node->ctx, "batch %llu: its pages could not be written (rc=%d)", (unsigned long long)batch->height, rc); return rc; }
-    hpplite_pagemode_root(node->pm, root);
-    /* a piece with more after it carries the whole commit's root: checked at the last piece (#152) */
+    if (rc != SQLITE_OK) { hpplite_pagebatch_free(b); if (urc == SQLITE_OK) hpplite_error(node->ctx, "batch %llu: its pages could not be written (rc=%d)", (unsigned long long)batch->height, rc); return rc; }
     if (!b->bMore) node->ctx->nRootsCompared++;
-    if (!b->bMore && memcmp(root, b->root, 32) != 0) {
+    if (differs) {
         node->ctx->nRootMismatches++;
-        {
+        if (urc == SQLITE_OK) {
             char hr[65], hb[65];
             hpplite_bytes_to_hex(root, 32, hr); hpplite_bytes_to_hex(b->root, 32, hb);
             hpplite_error(node->ctx, "batch %llu: the root after applying it differs from the posted one (applied 0x%.16s.., posted 0x%.16s..)",
@@ -3922,7 +4006,9 @@ static int node_soft_walk(HppliteNode *node) {
         memcpy(before, node->ctx->chainHash, 32);
         held = strstr(node->ctx->zLastError, "the file is held by another connection") != NULL;
         if (held) { node->ctx->quiet = 1; node->ctx->zQuietError[0] = 0; }   /* said already: tried again without saying it at every flush */
+        node->undoArmed = 1;                                         /* the store's word alone: taken back where it does not apply (#424) */
         rc = (node->pm && !node->config.verifyOnly && node->lockFd >= 0) ? node_adopt_pages(node, batch) : node_apply_pages(node, batch);
+        node->undoArmed = 0;
         node->ctx->quiet = 0;
         if (rc == SQLITE_BUSY) {
             /* the store gave the batch and its pages cannot be written yet: the application holds the file. Not the
@@ -4284,7 +4370,9 @@ static int node_soft_follow(HppliteNode *node) {
         hpplite_keccak256(data, n, k);
         memcpy(before, node->ctx->chainHash, 32);
         hpplite_chain_hash_next(before, h, k, after);
+        node->undoArmed = 1;                          /* as the sequencer's walk: taken back where it does not apply (#424) */
         rc = node_apply_pages(node, batch);
+        node->undoArmed = 0;
         hpplite_batch_free(batch);
         if (rc != SQLITE_OK || node->ctx->blockHeight != h + 1) {
             fprintf(stderr, "hpplite: batch %llu at the store does not apply on this history (rc=%d): the soft tier stops before it\n", (unsigned long long)h, rc);

@@ -153,6 +153,10 @@ typedef struct HppliteNode {
     int fileMatched;                /* ...and whether fileKey is set */
     sqlite3 *pieceDb;               /* a commit cut over batches (#152): the connection holding the exclusive lock from the first piece to the last */
     sqlite3_file *piecePf;
+    int undoArmed;                  /* the batch being applied was read by name past the anchor (#424): what it writes over is kept until its root is compared */
+    int undoOn, undoFd;             /* ...in a file beside the database, unlinked while it is open: one commit's, over its pieces */
+    sqlite3_int64 undoSize;         /* ...the file's length before the commit */
+    sqlite3_int64 undoBytes;        /* ...and how much is kept */
     int pagesWalSuspended;          /* a WAL node in rollback-journal mode while chain pages are applied */
 
     /* L1 connection */
