@@ -97,6 +97,7 @@ stay 65-byte signatures that recover to it.
 | `POST /name/<da>-<height>`, the body the bytes, the instance (32 bytes) and the signature (65 bytes) | the sequencer; `402` if not covered | `200 {name, bytes, signer}`: the name is the write - its bytes are held in the bucket |
 | `POST /put?bucket=<da>&height=<n>`, the body the bytes, `X-HPPLite-Signature` the `Content` signature | the sequencer; `402` if not covered | `200 {cid, bytes}` |
 | `GET /name/<da>-<height>`, `GET /get/<cid>` | - | the bytes, as /1 (`X-HPPLite-Signer` on names); a name's batch bytes are also read by their CID |
+| `GET /names/<da>?from=<height>&limit=<n>` (a store that names it in `/status`, #404) | - | `200` the batches by name from `from` up, in order: each name's body behind its length (below) |
 | `POST /account/<funder>/permit`, body `{value, deadline, signature[, asset]}` (hex: 65 bytes, or a smart account's, #356; `{v, r, s}` taken too; `asset` one of `buckets.assets`, else `400`; `value` a number or a decimal string) | the funder (the permit, in `asset`'s EIP-712 domain) | `200` the account |
 | `POST /account/<funder>/pay?amount=<units>` | x402 `exact` | `200` the account: `credit` raised by the amount |
 | `GET /account/<funder>` | - | `200 {funder, credit, asset, balance, allowance, permit, deadline, dailyCost, coveredUntil, buckets, state}` (`asset` the permit's token, `balance` and `allowance` in it) |
@@ -108,6 +109,35 @@ domain; a signer other than the DA's sequencer `403`, an instance other than
 the lease's `409`, the chain unreadable `503` (#198); the same body again
 `200`. The first-signer rule and "content before name" (#199) are gone: a
 name is taken only from the chain's sequencer, into a bucket it bound.
+
+A run of names (#404): `GET /names/<da>?from=<height>&limit=<n>` answers
+the bucket's batches from `from` up in one body, for a reader that takes
+a history in order - a rebuild asks for every batch, and one request a
+batch is what a far store's round trip and a store's read limit are
+counted in. The body is what `GET /name/<da>-<height>` answers for each
+height (the batch's bytes, the instance, the signature), one after
+another in the order of the heights, each behind its length: 4 bytes,
+big-endian, counting the three together. Nothing else is in it: the
+reader counts the records that came and asks on from the next height. A
+run ends at the first of: `limit` batches (64 by default and at most, a
+larger one is taken as 64; a store may give fewer); 4 MiB of body (the
+first batch is given whatever its size); the first height the bucket
+holds no name for. `from` is a height from 1; without it, or with a
+`limit` that is no number from 1, `400`. No name at `from`: `404`, as
+the single read; a parked bucket `410`; a read limit `429` with
+`Retry-After`, where a run is one read. There is no `X-HPPLite-Signer`:
+a reader recovers each record's signer as it does a name's. The call is
+an addition to `hpplite-store/2`: a store that has it says so in
+`/status` (`"reads": ["names"]`), a store without it answers `404`, and
+a reader asks for a run only where `/status` names it and reads singly
+what a run did not give. What a reader checks is what it checks of a
+single read - a batch under an anchor against the hash the anchor's
+manifest names, one past it by the sequencer's signature in its record -
+so a store that leaves a batch out of a run, or changes one, is found as
+it is today. That anchored batches can be read by height rests on every
+batch being put under its name and on a `Prune` letting go of names and
+content at the same height. The framing has a vector
+(`operators/conformance/vectors.json`, `nameRuns`).
 
 Errors: `400` malformed; `401` a signature that does not recover to the
 sequencer (or the funder, or that a smart-account funder does not accept); `402` a write its account cannot cover, or an
@@ -341,9 +371,14 @@ bytes above a prune point, is caught by its own signature on chain.
               "pullThreshold": 1000000, "pullIntervalSeconds": 2592000, "parkSeconds": 2592000,
               "assets": [{"asset": "0x…", "name": "Bridged USDC", "version": "2", "decimals": 6, "unitsPerToken": "1000000", "exact": true},
                          {"asset": "0x…", "name": "HousePartyProtocol", "version": "1", "decimals": 18, "unitsPerToken": "10000", "exact": false}]},
-  "payment": {"scheme": "exact", "network": "eip155:190415", "facilitator": "https://…", "minPay": 1000000}
+  "payment": {"scheme": "exact", "network": "eip155:190415", "facilitator": "https://…", "minPay": 1000000},
+  "reads": ["names"]
 }
 ```
+
+`reads` lists the read calls a store has beyond the single ones:
+`"names"` is `GET /names/<da>` (#404). A store without the member has
+none, and is read one name a request.
 
 `payment` is `null` for a store without x402 (permit pulls only). A free
 store (development) has `buckets` with zero prices and charges nothing.

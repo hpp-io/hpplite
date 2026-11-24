@@ -65,6 +65,8 @@ PRUNE_TYPE = "Prune(address da,uint256 height,uint256 issuedAt)"
 CAP_TYPE = "Cap(address da,uint256 writesPerDay,uint256 bytesPerDay,uint256 issuedAt)"   # the funder's daily bound (#274)
 UNPIN_TYPE = "Unpin(address da,bytes32 cids,uint256 issuedAt)"      # a key's bucket lets go of CIDs (#349)
 UNPIN_MAX = 1000                                                    # CIDs an unpin, and a listing's page
+NAMES_MAX = 64                                                      # batches a run of names answers at most (#404)
+NAMES_BYTES = 4 * 1024 * 1024                                       # ...and its body's bytes, the first batch whatever its size
 DAY = 86400
 STATEMENT_TYPE = "BucketStatement(address da,uint256 height,uint256 pruneHeight,uint256 coveredUntil,uint256 issuedAt)"
 BATCH_TYPE = "Batch(bytes32 instanceId,uint256 height,bytes32 batchHash)"
@@ -1248,6 +1250,12 @@ def write_quote(nbytes, per_write, per_mib_month) -> int:
     unit, in IEEE doubles in this order (the node's hpplite_store_quote; the vectors)"""
     import math
     return per_write + math.ceil(per_mib_month * nbytes / MIB * 1.0 - 1e-9)
+
+
+def names_body(records) -> bytes:
+    """a run of names in one answer (#404, GET /names/<da>?from=&limit=): each name's record as its single read gives it
+    (the batch's bytes, the instance, the signature) behind its length, 4 bytes big-endian, in the order of the heights"""
+    return b"".join(len(r).to_bytes(4, "big") + r for r in records)
 
 
 def batch_digest(chain_id, da, instance, height, data):

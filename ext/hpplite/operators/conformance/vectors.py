@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Test vectors for the store and relay protocols (#189): fixed inputs and
 what the reference computes from them - keccak, addresses, signatures
-(RFC 6979, so deterministic), CIDs, the name's EIP-712 digest and
+(RFC 6979, so deterministic), CIDs, the name's EIP-712 digest, a run of
+names' framing (#404) and
 hpplite-store/2's (Bind, Release, Content, Prune, BucketStatement, #213),
 MAC and the selectors it takes. vectors.json is what another implementation (the
 canonical operators' TypeScript) tests itself against; this script checks
@@ -92,6 +93,16 @@ def generate():
         v["names"].append({"chainId": 181228, "name": name, "instance": instance, "data": "0x" + d.hex(), "key": KEYS[1],
                            "digest": "0x" + digest.hex(), "signature": "0x" + eth.sign(key(1), digest).hex(),
                            "signer": eth.address(key(1))})
+
+    # a run of names in one answer (#404): GET /names/<da>?from=7 of a bucket holding 7, 8 and 9 - each record as its
+    # single read gives it (the bytes, the instance, the signature) behind its length, 4 bytes big-endian; 8 is empty
+    run = []
+    for h, d in ((7, b"first batch"), (8, b""), (9, bytes(range(256)))):
+        sig = eth.sign(key(1), hpplite_store.batch_digest(181228, "0x" + da, instance, h, d))
+        run.append({"height": h, "data": "0x" + d.hex(), "signature": "0x" + sig.hex(),
+                    "record": "0x" + (d + bytes.fromhex(instance[2:]) + sig).hex()})
+    v["nameRuns"] = [{"chainId": 181228, "da": "0x" + da, "from": 7, "instance": instance, "key": KEYS[1], "batches": run,
+                      "body": "0x" + hpplite_store.names_body([bytes.fromhex(b["record"][2:]) for b in run]).hex()}]
 
     # prices: the store's write quote (#172, #213), the relay's per call (#170); IEEE doubles in this order
     v["writePrices"] = [{"bytes": n, "pricePerWrite": pw, "pricePerMiBMonth": pm, "amount": hpplite_store.write_quote(n, pw, pm)}
