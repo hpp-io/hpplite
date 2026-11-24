@@ -211,6 +211,7 @@ static void check(const char *what) {
 
 static int run_child(const char *crashAt, int rows, int intervalMs, size_t limit, int killAfterMs) {
     pid_t pid = fork();
+    if (pid < 0) { CHECK(0, "fork failed"); return -1; }       /* -1 signalled below would be every process of the user (#426) */
     if (pid == 0) {
         if (crashAt) setenv("HPPLITE_TEST_CRASH_AT", crashAt, 1);
         else unsetenv("HPPLITE_TEST_CRASH_AT");
@@ -343,6 +344,7 @@ static int store_rounds(const char *svc, int rounds) {
         if (start_pins(svc, r) != 0) { CHECK(0, "store round %d: the pin service did not start (see " PINDIR "/service.log)", r); stop_pins(); break; }
         printf("  store: kill -9 after %3d ms, before any anchor (round %d) ", after, r + 1);
         pid_t pid = fork();
+        if (pid < 0) { CHECK(0, "store round %d: fork failed", r); stop_pins(); break; }
         if (pid == 0) { store_writer(r); _exit(0); }
         usleep(after * 1000);
         kill(pid, SIGKILL);

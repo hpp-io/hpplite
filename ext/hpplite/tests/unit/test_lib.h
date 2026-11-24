@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/types.h>
 
 /* The tally: TEST at the top of a case, PASS at its end, FAIL/FAILF on the
 ** way out (they return from a void case) */
@@ -37,6 +39,10 @@ int test_free_port(void);
 /* A service the suite forked is still running: a probe that gets an answer
 ** after it exited is talking to someone else's server (#177) */
 int test_child_alive(pid_t pid);
+/* kill() in a suite is this one (#426): a pid of 0 or below is no child's - -1, what a fork or a start that failed
+** leaves in the variable, is every process of the user. Refused with -1 and a line on stderr; nothing is signalled */
+int test_kill(pid_t pid, int sig);
+#define kill(pid, sig) test_kill((pid), (sig))
 
 /* The end of main: the tally, and the process's exit code */
 int test_report(void);

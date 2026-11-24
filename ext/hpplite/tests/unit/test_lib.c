@@ -342,6 +342,11 @@ int test_free_port(void) {
     return port;
 }
 
+int test_kill(pid_t pid, int sig) {
+    if (pid <= 0) { fprintf(stderr, "test: kill(%d, %d) refused: not the pid of a child (a start that failed?)\n", (int)pid, sig); return -1; }
+    return (kill)(pid, sig);                 /* in parentheses: the function, not the header's macro */
+}
+
 int test_child_alive(pid_t pid) {
     return pid > 0 && waitpid(pid, NULL, WNOHANG) == 0;
 }

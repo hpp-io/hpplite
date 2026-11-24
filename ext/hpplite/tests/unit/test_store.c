@@ -3240,6 +3240,7 @@ static void test_stale_name_leaves_file(const char *dir) {
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/stale_pins", test_dir());
     pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
     memset(&o, 0, sizeof o);
     o.storeUrl = url; o.nodeId = "sn_a"; o.privkey = kseq; o.noAnchorAtClose = 1;
     w = test_open_node(tpath("sn_a.db"), l1, &o);
@@ -3316,6 +3317,17 @@ static void test_stale_name_leaves_file(const char *dir) {
 }
 
 
+/* The suites' kill() (#426): a store that did not start leaves -1 for its pid, and kill(-1, sig) by an ordinary user
+** is the signal for every process of that user. Signal 0 sends nothing, whatever answers */
+static void test_kill_refuses_no_child(void) {
+    TEST("the suites' kill() refuses a pid that is no child's: -1, every process of the user, and 0, the group (#426)");
+    int a = kill(-1, 0), b = kill(0, 0), c = kill(getpid(), 0);
+    printf("(kill(-1, 0) = %d, kill(0, 0) = %d, kill(this process, 0) = %d) ", a, b, c);
+    if (a != -1 || b != -1) FAIL("a signal for pid -1 or 0 would have gone out");
+    if (c != 0) FAIL("a signal for a real pid is refused too");
+    PASS();
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : getenv("HPPLITE_PIN_SERVICE");
     int port = test_free_port();
@@ -3323,6 +3335,7 @@ int main(int argc, char **argv) {
     reset_dir();
     printf("Store client (#11)\n");
     if (!dir) { printf("SKIP: the pin service directory is not given\n"); return 77; }
+    test_kill_refuses_no_child();
     if (start_service(dir, port) != 0) { stop_service(); printf("FAIL: the pin service did not start\n"); return 1; }
     char url[64];
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
