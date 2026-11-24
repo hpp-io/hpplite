@@ -686,6 +686,9 @@ static HppliteBatch *node_decode_batch(HppliteNode *node, uint64_t height,
 ** A named database's rollup among its wallet's (#61): the one it is bound to
 ** already; else the one whose first batch carries its name (a replica, or a
 ** writer that lost its file); else a new one. 1 with the address, 0 not.
+** *pL1: the chain client that read the first batch of the rollup found, for the
+** node to keep (#423) - it has walked the rollup's commitments back to batch 1,
+** and a second client would walk them again. NULL where none read it.
 */
 /* Why the factory gave this wallet no rollup (#370): said where it is met, once while it stays the same (the
 ** connection is tried again every ten seconds), and kept for the 'not connected' line of the flushes after */
@@ -707,7 +710,7 @@ static void node_create_refused(HppliteNode *node) {
 }
 
 static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
-                             const char *factoryHex, uint8_t rollup[20]) {
+                             const char *factoryHex, uint8_t rollup[20], HppliteL1 **pL1) {
     const char *zName = node->ctx->zDbName;
     const char *colon = strchr(node->ctx->zRollup, ':');
     uint8_t (*all)[20] = NULL;
@@ -764,13 +767,14 @@ static int node_named_rollup(HppliteNode *node, const HppliteNodeConfig *config,
             sqlite3_free(zSnap);
             hpplite_batch_free(b);
             free(data);
-            hpplite_l1_disconnect(l1);
             if (match) {
                 memcpy(rollup, all[i], 20);
                 sqlite3_free(all);
                 sqlite3_free(zOthers);
+                *pL1 = l1;
                 return 1;
             }
+            hpplite_l1_disconnect(l1);
         }
     }
     sqlite3_free(all);
@@ -862,8 +866,9 @@ static void node_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) 
 
         /* Check if rollup exists */
         unsigned char rollup[20];
+        HppliteL1 *found = NULL;        /* the lookup's client of the rollup it found (#423) */
         int named = node->ctx && node->ctx->zDbName;
-        int result = named ? node_named_rollup(node, config, factoryHex, rollup)
+        int result = named ? node_named_rollup(node, config, factoryHex, rollup, &found)
                            : hpplite_l1_factory_get_my_rollup(config->rpcUrl, factoryHex, config->privkey, rollup);
         if (result == 1 && !named && node->ctx->blockHeight <= 1) {
             /* an empty file, unnamed, on a wallet with named databases: it
@@ -914,7 +919,7 @@ static void node_connect_l1(HppliteNode *node, const HppliteNodeConfig *config) 
             char rollupHex[43];
             snprintf(rollupHex, sizeof(rollupHex), "0x");
             for (int i = 0; i < 20; i++) snprintf(rollupHex + 2 + i * 2, 3, "%02x", rollup[i]);
-            node->l1 = hpplite_l1_connect(config->rpcUrl, rollupHex);
+            node->l1 = found ? found : hpplite_l1_connect(config->rpcUrl, rollupHex);
             if (node->l1) hpplite_l1_set_privkey(node->l1, config->privkey);
             node->ownsL1 = (node->l1 != NULL);
         } else if (result == 1) {

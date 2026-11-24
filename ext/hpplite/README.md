@@ -786,7 +786,9 @@ HPPLITE_PARAMS="l1=hpp-sepolia&keyfile=/path/to/key" hpplite-verify --db /path/t
 ```
 
 It opens an empty file with `role=verify` and the application's own
-parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`), rebuilds
+parameters (`l1=`/`rpc=`/`factory=`/`contract=`, the key, `dbname=`; where the
+rollup's address is known, `contract=` spares the lookup by name, which reads
+the first batch of each rollup the wallet registered before it, #422), rebuilds
 from the chain and the store, compares every posted root with the rebuilt
 file's page root, and compares the root the chain holds - the last
 anchor's with `store=`, the last checkpoint's without (#256) - with the
