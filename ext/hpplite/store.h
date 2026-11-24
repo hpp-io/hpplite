@@ -24,9 +24,10 @@ typedef struct HppliteStore HppliteStore;
 /* Reads asked ahead (#195, #413): these batches' refs (/get/<ref>) or names (/name/<name>) are asked for without
 ** waiting for their answers, up to hpplite_store_parallel() in flight (HPPLITE_STORE_PARALLEL, default 8; 1: none
 ** ahead), and each 200 answer is kept for the read that asks for it next. A read of one still in flight waits for
-** that one alone. What is held, in flight, or does not fit in flight is passed over: the caller names its whole
-** window every time. hpplite_store_ahead_copy: a copy of an answer held (malloc'd; NULL when it is not), left there
-** for its read */
+** that one alone. What is held or in flight is passed over: the caller names its whole window every time. What
+** finds no slot free is kept until the next asking and begun, in its order, as slots come free (#420): a caller
+** waiting for one read asks for nothing while it waits. hpplite_store_ahead_copy: a copy of an answer held
+** (malloc'd; NULL when it is not), left there for its read */
 #define HPPLITE_STORE_AHEAD_MAX 32
 int hpplite_store_parallel(void);
 uint8_t *hpplite_store_ahead_copy(HppliteStore *s, const char *zRef, size_t *pLen);
@@ -39,8 +40,9 @@ void hpplite_store_ahead_names(HppliteStore *s, const char *const *zNames, int n
 ** GET /names/<da>?from=<height>&limit=<n> with up to HPPLITE_STORE_RUN_MAX batches of one rollup in one answer, each
 ** as its read by name gives it. hpplite_store_runs: this store does (and reads ahead are on). hpplite_store_ahead:
 ** refs and runs asked ahead in the caller's order - an entry is a ref (zRef), or the run of `limit` names of zDa (40
-** hex digits, lower case) from `from`; how many of the first entries are held, in flight or begun now is returned,
-** so a caller that asks for a run once knows which it has asked for. A run's answer is held as its names' answers:
+** hex digits, lower case) from `from`; how many of the first entries are held, in flight or begun - now, or since
+** the last asking from what it left without a slot (#420) - is returned, whether or not a slot is free, so a caller
+** that asks for a run once knows which it has asked for. A run's answer is held as its names' answers:
 ** the read by name of a height finds it, and waits for a run in flight that covers it. A run that ends before its
 ** limit is asked again from where it ended; one that is refused is dropped as any read ahead is. What is held of
 ** runs and what is in flight of them is at most hpplite_store_parallel() times the 4 MiB a run's body stops at.

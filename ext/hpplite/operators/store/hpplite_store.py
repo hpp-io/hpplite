@@ -53,6 +53,8 @@ GET_DELAY = float(os.environ.get("HPPLITE_STORE_GET_DELAY") or 0)   # a test hoo
 READS = {"lock": threading.Lock(), "now": 0, "most": 0, "count": 0} # ...the delayed reads in flight, the most there were at once (#413), and
 COUNT_READS = bool(os.environ.get("HPPLITE_STORE_COUNT_READS"))     # a test hook: the batch reads answered so far, in /status (#404)
 NAMES_NONE = bool(os.environ.get("HPPLITE_STORE_NAMES_NONE"))       # a test hook: /status names the run of names and every run is a 404 (#419)
+NAMES_DELAY = float(os.environ.get("HPPLITE_STORE_NAMES_DELAY") or 0)   # a test hook: seconds more for every run of names - a run of 64 at a far
+RUNS = {"lock": threading.Lock(), "now": 0, "most": 0}              # ...store takes ten of its other reads - and the most runs in flight at once (#420)
 FAIL_GET = int(os.environ.get("HPPLITE_STORE_FAIL_GET") or 0)       # a test hook: the k-th read of an object answers 503, once (#403)
 GETS = {"lock": threading.Lock(), "count": 0}
 READ_LIMIT = os.environ.get("HPPLITE_STORE_READ_LIMIT") or ""       # a test hook: "N/S", N batch reads in a window of S seconds, the rest 429 (#402)
@@ -776,6 +778,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             time.sleep(GET_DELAY)                       # a test hook: a far store's round trip on every read (#195)
             with READS["lock"]:
                 READS["now"] -= 1
+        if NAMES_DELAY and path.startswith("/names/"):
+            with RUNS["lock"]:
+                RUNS["now"] += 1
+                RUNS["most"] = max(RUNS["most"], RUNS["now"])
+            time.sleep(NAMES_DELAY)
+            with RUNS["lock"]:
+                RUNS["now"] -= 1
         if READ_LIMIT and batch_read:
             # a test hook: an operator's read limit an address, as the canonical stores have (600 a minute)
             limit, window = (float(x) for x in READ_LIMIT.split("/"))
@@ -799,6 +808,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 status["test"] = {"readsInFlightMost": READS["most"]}      # the test hook's count, for the test to read
             if COUNT_READS:
                 status.setdefault("test", {})["reads"] = READS["count"]
+            if NAMES_DELAY:
+                status.setdefault("test", {})["runsInFlightMost"] = RUNS["most"]
             return self.reply(200, status)
         m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})/objects$", path)
         if m:

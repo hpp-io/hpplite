@@ -111,6 +111,9 @@ struct HppliteStore {
     /* reads asked ahead (#195, #413): a GET's 200 answer by its path, held in the order it came and taken once;
     ** and the reads in flight, each in a slot that stays where it is while its answer is written into it */
     struct { char *path; char *p; size_t n; time_t at; } aAhead[STORE_HELD_MAX];
+    char *aWant[3 * HPPLITE_STORE_AHEAD_MAX];   /* asked ahead at the last asking and not begun: no slot was free (#420) */
+    char *aBegun[3 * HPPLITE_STORE_AHEAD_MAX];  /* ...and those of them begun since, for the next asking to count */
+    int nWant, nBegun;
     int nAhead;
     struct { CURL *h; char *path; Buf out; char runDa[41]; uint64_t runFrom; int runLimit; } aFly[HPPLITE_STORE_AHEAD_MAX];  /* runLimit: a run of names (#404) */
     int nFly;
@@ -284,6 +287,50 @@ static int runHold(HppliteStore *s, const char *da, uint64_t from, int limit, co
     return k;
 }
 
+/* this read ahead is not to be begun: it is held or in flight - a run, where its first name is (its own path is
+** never held: its answer is held name by name) */
+static int aheadHas(HppliteStore *s, const char *path) {
+    unsigned long long from = 0;
+    char name[120];
+    if (aheadHeld(s, path) >= 0 || aheadFlying(s, path) >= 0) return 1;
+    if (strncmp(path, "/names/", 7) != 0 || strlen(path) < 48 || sscanf(path + 47, "?from=%llu", &from) != 1) return 0;
+    snprintf(name, sizeof name, "/name/%.40s-%llu", path + 7, from);
+    return aheadHeld(s, name) >= 0 || aheadFlying(s, name) >= 0;
+}
+
+static int runsFull(HppliteStore *s, int par);
+
+static void wantClear(HppliteStore *s) {
+    while (s->nWant) sqlite3_free(s->aWant[--s->nWant]);
+}
+static void begunClear(HppliteStore *s) {
+    while (s->nBegun) sqlite3_free(s->aBegun[--s->nBegun]);
+}
+static int begunHas(HppliteStore *s, const char *path) {
+    for (int i = 0; i < s->nBegun; i++) if (strcmp(s->aBegun[i], path) == 0) return 1;
+    return 0;
+}
+
+/* What was asked ahead and found no slot is begun, in its order, as slots come free (#420): the caller may be
+** waiting for one read - a run of some seconds - while the short ones around it come back, and it asks for nothing
+** while it waits. One begun here is remembered until the next asking, which counts it as come to whatever became
+** of it: a caller that asks for a run once does not ask for it again. How many were begun */
+static int wantStart(HppliteStore *s) {
+    int par = hpplite_store_parallel(), k = 0, started = 0;
+    for (; k < s->nWant; k++) {
+        if (aheadHas(s, s->aWant[k])) continue;
+        if (s->nFly >= par) break;
+        if (strncmp(s->aWant[k], "/names/", 7) == 0 && runsFull(s, par)) break;
+        if (!aheadStart(s, s->aWant[k])) break;
+        started++;
+        if (s->nBegun < 3 * HPPLITE_STORE_AHEAD_MAX) { s->aBegun[s->nBegun++] = s->aWant[k]; s->aWant[k] = NULL; }
+    }
+    for (int i = 0; i < k; i++) sqlite3_free(s->aWant[i]);
+    memmove(&s->aWant[0], &s->aWant[k], (size_t)(s->nWant - k) * sizeof s->aWant[0]);
+    s->nWant -= k;
+    return started;
+}
+
 /* the reads in flight that are done: a 200's bytes are held for the read that asks for them (the oldest held gives
 ** way when there is no room); any other answer is dropped, and the read itself asks again and says why. A run's
 ** 200 is held name by name, and one that ended before its limit - at the bytes a body stops at, or where a store
@@ -327,7 +374,8 @@ static void aheadHarvest(HppliteStore *s) {
         memset(&s->aFly[i], 0, sizeof s->aFly[i]);
         s->nFly--;
     }
-    if (again) curl_multi_perform(s->multi, &left);     /* the rest of a run goes out now */
+    again += wantStart(s);
+    if (again) curl_multi_perform(s->multi, &left);     /* the rest of a run, and what waited for a slot, go out now */
 }
 
 /* what has come for the reads in flight is taken in; nothing is waited for */
@@ -363,6 +411,8 @@ static int aheadTake(HppliteStore *s, const char *path, Buf *out) {
 
 /* at close: what is held, and what is still in flight */
 static void aheadClear(HppliteStore *s) {
+    wantClear(s);
+    begunClear(s);
     while (s->nAhead) aheadDrop(s, s->nAhead - 1);
     for (int i = 0; i < HPPLITE_STORE_AHEAD_MAX; i++) {
         if (!s->aFly[i].h) continue;
@@ -385,20 +435,27 @@ static int runsFull(HppliteStore *s, int par) {
     return held + (size_t)(flying + 1) * STORE_RUN_BYTES > (size_t)par * STORE_RUN_BYTES;
 }
 
-/* GET these paths ahead, in their order, as many as fit in flight; one held or in flight already is passed over.
-** How many of the first were passed over or begun: the ones after them were not come to */
+/* GET these paths ahead, in their order, as many as fit in flight; one held or in flight already, or begun from
+** what the last asking left, is passed over, whether or not a slot is free. How many of the first were passed over
+** or begun: the ones after them were not come to, and are kept in place of what was kept before - begun as slots
+** come free, until the next asking (#420) */
 static int storeAhead(HppliteStore *s, char **paths, int n) {
     int par = hpplite_store_parallel(), added = 0, running = 0, i = 0;
     if (!s || n <= 0 || par <= 1 || !aheadLock(s)) return 0;
     if (!s->multi) s->multi = curl_multi_init();
     if (s->multi) {
         aheadPump(s);
-        for (i = 0; i < n && s->nFly < par; i++) {
-            if (!paths[i] || aheadHeld(s, paths[i]) >= 0 || aheadFlying(s, paths[i]) >= 0) continue;
+        for (i = 0; i < n; i++) {
+            if (!paths[i] || aheadHas(s, paths[i]) || begunHas(s, paths[i])) continue;
+            if (s->nFly >= par) break;
             if (strncmp(paths[i], "/names/", 7) == 0 && runsFull(s, par)) break;
             if (!aheadStart(s, paths[i])) break;
             added++;
         }
+        begunClear(s);
+        wantClear(s);
+        for (int j = i; j < n && s->nWant < 3 * HPPLITE_STORE_AHEAD_MAX; j++)
+            if (paths[j] && (s->aWant[s->nWant] = sqlite3_mprintf("%s", paths[j]))) s->nWant++;
         if (added) {                            /* the requests go out now, not at the caller's next call */
             curl_multi_perform(s->multi, &running);
             aheadHarvest(s);

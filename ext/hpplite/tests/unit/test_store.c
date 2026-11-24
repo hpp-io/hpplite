@@ -1040,6 +1040,96 @@ static void test_runs_of_names(const char *dir) {
     PASS();
 }
 
+/* 6e2d. The runs in flight (#420): at a far store a run of 64 takes some seconds and a manifest a tenth of that, and
+** at ranges of ten a run covers six manifests - the eight reads in flight are a run and seven manifests. The manifests
+** are back long before the run, and the reads asked for after them, the next runs among them, were begun only when
+** the node read on: it was waiting for the run, so one run was in flight where eight are allowed (HPP Sepolia: 2.3 on
+** average, 36 batches a second where the store gave more). What is asked ahead and finds no slot is kept and begun
+** as slots come free. 320 batches anchored ten at a time, at a store whose reads take 0.2 s and whose runs 1.5 s:
+** the client alone first, two in flight - a run and two reads asked for, the count of what it came to at a second
+** asking while both slots are taken, the third read begun while the run is waited for, and not again when it is
+** asked for after that - then a verifier's rebuild, eight in flight, and the most runs the store had in flight */
+static void test_runs_in_flight(const char *dir) {
+    TEST("6e2d. a read ahead that found no free slot is begun when one comes free, while the node waits for a run: a rebuild at a store whose runs take 1.5 s and whose manifests 0.2 s keeps three runs or more in flight; an entry in flight is counted as come to with every slot taken (#420)");
+    int port = test_free_port();
+    char url[64], storeDir[600], c[43], d[43], da40[41], name[80], *p;
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x3e };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = NULL, *r = NULL;
+    HppliteStore *rs = NULL;
+    HppliteStoreAhead a[3];
+    TestNodeOpts o;
+    int i, n1 = -1, n2 = -1, n3 = -1, reads3 = -1, reads4 = -1, most = -1, ok = 0;
+    uint8_t *bytes = NULL;
+    size_t n = 0;
+    double t0, took = 0;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/flight_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
+#define FLIGHT_DONE() do { unsetenv("HPPLITE_STORE_COUNT_READS"); unsetenv("HPPLITE_STORE_GET_DELAY"); unsetenv("HPPLITE_STORE_NAMES_DELAY"); unsetenv("HPPLITE_STORE_PARALLEL"); \
+        free(bytes); if (rs) hpplite_store_close(rs); if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } \
+        hpplite_l1_disconnect(l1); if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } } while (0)
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "flight_w"; o.privkey = kseq;
+    if (!(w = test_open_node(tpath("flight_w.db"), l1, &o))) { FLIGHT_DONE(); FAIL("open the writer"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 1; i <= 320; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('in flight')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { FLIGHT_DONE(); FAIL("a flush"); }
+        if (i % 10 == 0 && hpplite_node_anchor(w) != (uint64_t)i) { FLIGHT_DONE(); FAIL("an anchor of ten batches"); }
+    }
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    setenv("HPPLITE_STORE_COUNT_READS", "1", 1);
+    setenv("HPPLITE_STORE_GET_DELAY", "0.2", 1);
+    setenv("HPPLITE_STORE_NAMES_DELAY", "1.3", 1);              /* on top of a read's 0.2 s */
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { FLIGHT_DONE(); FAIL("the test's store did not start again"); }
+    /* the client alone, two in flight: a run and a read take the slots, a third entry waits */
+    hpplite_l1_get_addresses(l1, c, d);
+    snprintf(da40, sizeof da40, "%.40s", (d[0] ? d : c) + 2);
+    for (p = da40; *p; p++) if (*p >= 'A' && *p <= 'F') *p = (char)(*p - 'A' + 'a');
+    snprintf(name, sizeof name, "%s-1", da40);
+    memset(a, 0, sizeof a);
+    a[0].zDa = da40; a[0].from = 1; a[0].limit = HPPLITE_STORE_RUN_MAX;
+    a[1].zRef = "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";      /* at no store: a 404 after the read's 0.2 s */
+    a[2].zRef = "bafkreibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    setenv("HPPLITE_STORE_PARALLEL", "2", 1);
+    if (!(rs = hpplite_store_open(url, NULL, 0))) { FLIGHT_DONE(); FAIL("open the store"); }
+    n1 = hpplite_store_ahead(rs, a, 3);
+    n2 = hpplite_store_ahead(rs, a, 3);
+    bytes = hpplite_store_take_named(rs, name, &n);             /* waits for the run, its second in flight */
+    reads3 = store_reads(port, "\"reads\":");
+    n3 = hpplite_store_ahead(rs, a + 2, 1);                     /* the third again: begun meanwhile, and a 404 since */
+    usleep(300 * 1000);
+    reads4 = store_reads(port, "\"reads\":");
+    unsetenv("HPPLITE_STORE_PARALLEL");
+    printf("(two in flight: %d then %d of three come to, batch 1 %s, %d reads when the run is in, %d after the third is asked for again: %d come to) ",
+           n1, n2, bytes ? "taken" : "NOT given", reads3, reads4, n3);
+    /* a verifier's rebuild, eight in flight */
+    {
+        TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "flight_r", .privkey = kseq };
+        t0 = now_s();
+        r = test_open_node(tpath("flight_r.db"), l1, &ro);
+        took = now_s() - t0;
+    }
+    if (!r) { FLIGHT_DONE(); FAIL("open a verifier"); }
+    ok = status_int(r->db, "height") == 321 && count_rows(r->db, "t") == 320 && same_root(w, r);
+    most = store_reads(port, "\"runsInFlightMost\":");
+    printf("(a rebuild of 320: %d runs in flight at most, %.2f s%s) ", most, took, ok ? "" : ", NOT the writer's 320 batches");
+    FLIGHT_DONE();
+#undef FLIGHT_DONE
+    if (!ok) FAIL("the verifier holds the 320 batches, the writer's root");
+    if (n1 != 2) FAIL("the test's premise: with two in flight a run and a read are begun, the third entry is not come to");
+    if (!bytes) FAIL("the run gave batch 1");
+    if (n2 != 2) FAIL("with both slots taken the two entries in flight are not counted as come to: a caller that asks for a run once would name its runs anew, a height off");
+    if (reads3 != 3) FAIL("the third read was not begun when a slot came free: it waits for the caller's next asking, and the caller is waiting for the run");
+    if (n3 != 1 || reads4 != 3) FAIL("an entry begun when a slot came free is asked for again at the next asking: it counts as come to, whatever became of it");
+    if (most < 3) FAIL("a rebuild kept fewer than three runs in flight where eight reads are allowed");
+    PASS();
+}
+
 /* 6e3. A sync that stops midway (#403): a sequencer on a file behind the chain applies the history's pages in
 ** rollback-journal mode and switches back to WAL when the sync ends; one that stops at a read that failed returns
 ** before the switch. The WAL upkeep ran at the next tick all the same: its pin is a read transaction, in that mode a
@@ -3106,6 +3196,7 @@ int main(int argc, char **argv) {
     test_reads_ahead(dir);
     test_reads_ahead_across_ranges(dir);
     test_runs_of_names(dir);
+    test_runs_in_flight(dir);
     test_sync_stopped_midway(dir);
     test_read_limit(dir);
     test_connections_kept(dir);
