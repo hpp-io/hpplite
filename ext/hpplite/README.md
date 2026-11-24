@@ -352,7 +352,14 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   posts nothing more from then on (#320), and a supervisor that restarts
   on failure (`Restart=on-failure`) starts it on the file there now. The
   node finds it at its next post, or when it compares the file with what
-  it last sent: once a minute (`HPPLITE_FILE_CHECK_SECONDS`).
+  it last sent: once a minute (`HPPLITE_FILE_CHECK_SECONDS`). A database
+  file that is not at the root its bookkeeping holds (#425: a node killed
+  while it wrote a batch's pages, a file restored beside its sidecar) ends
+  the process with exit 5, after the node's line and the tool's
+  "... stopping (exit 5): ..." (#427): a restart meets the same file, so a
+  supervisor that restarts on 4 should not on 5; `--once` exits 5 on such
+  a copy too. An open that fails (exit 1) says the node's reason with the
+  tool's "cannot open" line.
 - **Many databases on one host** (a platform with many apps' databases):
   `hpplite-sequencer --dir <directory>` holds every database named by a
   `<name>.conf` there - `db=<path>`, `params=<HPPLITE_PARAMS with
@@ -365,7 +372,9 @@ const db = new DatabaseSync("file:app.db?hpplite=on&l1=hpp-sepolia");
   `<name>: closed`, `<name>: error: ...`. One
   failing does not stop the rest; one whose file was replaced or removed
   under it says its error, is closed and is opened again on the file there
-  now (#379); SIGTERM closes all within
+  now (#379); one whose file is not at the root its bookkeeping holds says
+  its error, is closed and is not opened again until SIGHUP (#427); SIGTERM
+  closes all within
   `HPPLITE_STOP_SECONDS` (30). One trust domain only: the process follows
   each `db=` (links included) with the keys its files give it, so over
   several tenants' volumes in one mount namespace a tenant's link could make
@@ -731,7 +740,11 @@ how many times the chain committed another batch than the store served, each
 followed by a rebuild), `snapshot_height` (#221: the latest snapshot the
 anchors name, NULL for none), and `file_replaced` (1 once the database file
 was replaced or removed under this sequencer, #320: it posts nothing more,
-and `hpplite-sequencer` stops on it, #379), and `synced` (#381: 1 when the
+and `hpplite-sequencer` stops on it, #379), `file_off_root` (1 once a start
+or a sync found the database file not at the root its bookkeeping holds,
+#425: no batch is tried on it, `state` is `error`, and `hpplite-sequencer`
+stops on it with exit 5, #427; 0 again once a sync finds the file at that
+root), and `synced` (#381: 1 when the
 last sync that read the chain's head reached it, and the store's names past
 the anchor were read (#382); 0 after an open whose sync
 stopped or could not read the chain or the store, until a later one is made - the open
@@ -986,7 +999,8 @@ posts nothing; where the batch made the file longer the node may not start
 on the file at all ("cannot read the database: database disk image is
 malformed"). Either way the file is not repaired: remove it with its sidecar
 (`<db>-hpplite.db`) and start on an empty file, which rebuilds it from the
-history. A height without a name is the store's 404: a store that
+history. `hpplite_status.file_off_root` is 1 on such a file and
+`hpplite-sequencer` ends on it with exit 5 (#427). A height without a name is the store's 404: a store that
 does not answer, or answers anything else (a 5xx, a 429, a parked bucket's
 410), has not said there is none (#382), and the successor then posts
 nothing, to the store or to the chain (`HPPLITE_STORE_FALLBACK` does not

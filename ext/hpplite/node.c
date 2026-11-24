@@ -1942,11 +1942,12 @@ static int node_apply_pagesrc(HppliteNode *node, const HppliteBatch *batch, Hppl
         ** batch by name must not take this for a batch of another history */
         hpplite_pagemode_root(node->pm, root);
         if (memcmp(root, node->ctx->stateRoot, 32) != 0) {
-            node->fileOffRoot = 1;
+            node->fileOffRoot = node->fileOffRootSeen = 1;
             hpplite_pagebatch_free(b);
             hpplite_error(node->ctx, "the database file is not at the root its bookkeeping (%s-hpplite.db) recorded at height %llu: remove the sidecar with the file, or restore the file", zFile, (unsigned long long)node->ctx->blockHeight);
             return SQLITE_MISMATCH;
         }
+        node->fileOffRootSeen = 0;
     }
     if (!node->config.verifyOnly) {
         /* a node that may post later keeps WAL for its own writes; pages are

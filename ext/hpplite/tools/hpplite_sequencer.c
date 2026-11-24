@@ -27,7 +27,10 @@
 ** (#396; --dir: every database, on stdout); commits pending for HPPLITE_STUCK_SECONDS (30) with nothing
 ** posted are said once, with the node's last error (#368). A database file replaced or removed under the sequencer
 ** (#320: the node says so and posts nothing more) ends the process, exit 4 (#379): to a supervisor it is a failure,
-** and its restart is on the file there now.
+** and its restart is on the file there now. A database file that is not at the root its bookkeeping holds (#425: a
+** node killed while it wrote a batch's pages, a file restored beside its sidecar) ends it too, exit 5, after the
+** node's line and "... stopping (exit 5): ..." with what to do (#427): a restart meets the same file, so a
+** supervisor that restarts on 4 does not on 5. An open that fails says the node's reason with it (exit 1).
 **
 ** Many databases in one process:
 **
@@ -45,7 +48,8 @@
 ** N" ("<name>: not synced: ..." until it is, #381), "<name>: closed", "<name>:
 ** error: ...", and the sequencer role as it changes. One database failing does not stop the rest. A database whose file
 ** was replaced or removed under it (#320) says "<name>: error: ...", is closed
-** and opened again on the file there now (#379). SIGTERM or SIGINT
+** and opened again on the file there now (#379); one whose file is not at the root its bookkeeping holds is closed
+** and not opened again until the directory is read again (SIGHUP), the others undisturbed (#427). SIGTERM or SIGINT
 ** closes them all, each posting what is pending, within
 ** HPPLITE_STOP_SECONDS (default 30); a database not closed by then is named
 ** and keeps its pending pages in its file for the next start (exit 1).
@@ -65,7 +69,8 @@
 ** started on an empty volume) is refused, never sent as the newest state. One line on
 ** stdout, "<copy>: sent height N" or "<copy>: unchanged at height N", exit 0;
 ** exit 1 with the reason on stderr (the open refused, the send kept pending:
-** it goes at the next run); exit 3 when another process holds the copy. A close
+** it goes at the next run); exit 3 when another process holds the copy; exit 5
+** when the copy is not at the root its bookkeeping holds (#427). A close
 ** refused after the run says why on stderr, with the statements left open, and
 ** closes again: the exit stays the run's.
 */
@@ -87,6 +92,10 @@
 
 static volatile sig_atomic_t stop, reread, asked;
 #define EXIT_REPLACED 4             /* the database file was replaced or removed under the sequencer (#379) */
+#define EXIT_OFF_ROOT 5             /* the database file is not at the root its bookkeeping holds (#425): a restart meets the same file (#427) */
+/* what the open's failure is said with: the parameters' reason, or the node's (a file it cannot read) */
+static const char *open_why(void) { return hpplite_config_error() ? hpplite_config_error() : hpplite_init_error(); }
+static const char OFF_ROOT_REMEDY[] = "set the file aside with its sidecar (<file>-hpplite.db) and start on an empty file, which is rebuilt from the history, or restore the file its bookkeeping belongs to";
 static void on_signal(int sig) { (void)sig; stop = 1; }
 static volatile sig_atomic_t askedGen;     /* --dir: each database's thread answers each SIGUSR1 once */
 static void on_usr1(int sig) { (void)sig; asked = 1; askedGen++; }
@@ -185,11 +194,11 @@ static void *db_thread(void *arg) {
     Db *d = (Db *)arg;
     sqlite3 *db = hpplite_open(d->uri);
     char err[512] = "", seen[512] = "", state[32];
-    int role = -1, gen = askedGen, agen = anchorGen, replaced = 0, synced;
+    int role = -1, gen = askedGen, agen = anchorGen, replaced = 0, offRoot = 0, synced;
     wipe_free(d->uri);
     d->uri = NULL;
     if (!db) {
-        const char *why = hpplite_config_error();
+        const char *why = open_why();
         say(d->name, "error: cannot open with HPPLite%s%s", why ? ": " : "", why ? why : " (its params?)");
         d->failed = 1;
         d->done = 1;
@@ -229,10 +238,17 @@ static void *db_thread(void *arg) {
         }
         snprintf(seen, sizeof seen, "%s", strcmp(state, "error") == 0 ? err : "");
         if (status_int(db, "file_replaced") == 1) { replaced = 1; break; }   /* said above, as the node's error (#379) */
+        if (status_int(db, "file_off_root") == 1) { offRoot = 1; break; }    /* likewise (#427) */
         for (int i = 0; i < 10 && !d->quit; i++) usleep(100000);
     }
     sqlite3_close(db);              /* what is pending is posted */
     say(d->name, "closed");
+    if (offRoot && !d->quit) {
+        /* not opened again by itself: the same file is refused at every open (#427). An entry that failed is one
+        ** the next reading of the directory (SIGHUP) opens anew, on what is there then */
+        say(d->name, "error: its file is not at the root its bookkeeping holds: not opened again; %s, then SIGHUP", OFF_ROOT_REMEDY);
+        d->failed = 1;
+    }
     if (replaced && !d->quit) {
         /* opened again on the file there now: the directory is read again, as at SIGHUP, and an entry that
         ** failed is one it opens anew - its key is read from its file, this thread kept none */
@@ -413,11 +429,17 @@ static int once_main(const char *copy, const char *app) {
     char *uri = sqlite3_mprintf("file:%s?hpplite=on%s%s", copy, params && params[0] ? "&" : "", params ? params : "");
     sqlite3 *db = uri ? hpplite_open(uri) : NULL;
     sqlite3_free(uri);
-    if (!db) { fprintf(stderr, "hpplite-sequencer: cannot open %s with HPPLite (HPPLITE_PARAMS?)\n", copy); return 1; }
+    if (!db) { fprintf(stderr, "hpplite-sequencer: cannot open %s with HPPLite%s%s\n", copy, open_why() ? ": " : " (HPPLITE_PARAMS?)", open_why() ? open_why() : ""); return 1; }
     if (status_int(db, "sequencer") != 1) {
         fprintf(stderr, "hpplite-sequencer: %s: another process sequences it; nothing done\n", copy);
         sqlite3_close(db);
         return 3;
+    }
+    if (status_int(db, "file_off_root") == 1) {
+        /* the node said why; the next run meets the same copy (#427) */
+        fprintf(stderr, "hpplite-sequencer: %s is not at the root its bookkeeping holds: nothing done, stopping (exit %d): %s\n", copy, EXIT_OFF_ROOT, OFF_ROOT_REMEDY);
+        sqlite3_close(db);
+        return EXIT_OFF_ROOT;
     }
     int before = status_int(db, "height");
     snprintf(keyPath, sizeof keyPath, "%s-once", copy);
@@ -501,7 +523,7 @@ int main(int argc, char **argv) {
     sqlite3 *db = uri ? hpplite_open(uri) : NULL;
     sqlite3_free(uri);
     if (!db) {
-        fprintf(stderr, "hpplite-sequencer: cannot open %s with HPPLite (HPPLITE_PARAMS?)\n", argv[1]);
+        fprintf(stderr, "hpplite-sequencer: cannot open %s with HPPLite%s%s\n", argv[1], open_why() ? ": " : " (HPPLITE_PARAMS?)", open_why() ? open_why() : "");
         return 1;
     }
     /* the line is the signal: out before anything else happens - and only when the node is synced (#381): after a
@@ -526,6 +548,13 @@ int main(int argc, char **argv) {
     while (!stop) {
         int seq = status_int(db, "sequencer"), height = status_int(db, "height"), pending = status_int(db, "pending");
         char state[32], err[512];
+        if (status_int(db, "file_off_root") == 1) {
+            /* the node said why, and tries no batch on the file (#425); a process that stayed up was a healthy one to
+            ** its supervisor, and one restarted meets the same file: an exit of its own, for a supervisor not to (#427) */
+            fprintf(stderr, "hpplite-sequencer: %s is not at the root its bookkeeping holds: stopping (exit %d): %s\n", argv[1], EXIT_OFF_ROOT, OFF_ROOT_REMEDY);
+            sqlite3_close(db);
+            return EXIT_OFF_ROOT;
+        }
         if (!synced && status_int(db, "synced") == 1) {
             synced = 1;
             printf("hpplite-sequencer: %s synced height %d\n", argv[1], height);

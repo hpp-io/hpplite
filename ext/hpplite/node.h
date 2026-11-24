@@ -156,6 +156,7 @@ typedef struct HppliteNode {
     int undoArmed;                  /* the batch being applied was read by name past the anchor (#424): what it writes over is kept until its root is compared */
     int undoOn, undoFd;             /* ...in a file beside the database, unlinked while it is open: one commit's, over its pieces */
     int fileOffRoot;                /* the batch last given to apply was not applied because the file is not at the root its bookkeeping holds (#425): the file's fault, not the batch's */
+    int fileOffRootSeen;            /* ...and stays 1 until an apply finds the file at that root: hpplite_status.file_off_root, for the process to stop on (#427) */
     sqlite3_int64 undoSize;         /* ...the file's length before the commit */
     sqlite3_int64 undoBytes;        /* ...and how much is kept */
     int pagesWalSuspended;          /* a WAL node in rollback-journal mode while chain pages are applied */
