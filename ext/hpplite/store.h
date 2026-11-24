@@ -35,6 +35,22 @@ uint8_t *hpplite_store_ahead_copy(HppliteStore *s, const char *zRef, size_t *pLe
 void hpplite_store_traffic(HppliteStore *store, long *pnRequests, long *pnConnects);
 void hpplite_store_ahead_refs(HppliteStore *s, const char *const *zRefs, int n);
 void hpplite_store_ahead_names(HppliteStore *s, const char *const *zNames, int n);
+/* A run of names (#404, doc/store-protocol.md): a store whose /status lists "names" among its reads answers
+** GET /names/<da>?from=<height>&limit=<n> with up to HPPLITE_STORE_RUN_MAX batches of one rollup in one answer, each
+** as its read by name gives it. hpplite_store_runs: this store does (and reads ahead are on). hpplite_store_ahead:
+** refs and runs asked ahead in the caller's order - an entry is a ref (zRef), or the run of `limit` names of zDa (40
+** hex digits, lower case) from `from`; how many of the first entries are held, in flight or begun now is returned,
+** so a caller that asks for a run once knows which it has asked for. A run's answer is held as its names' answers:
+** the read by name of a height finds it, and waits for a run in flight that covers it. A run that ends before its
+** limit is asked again from where it ended; one that is refused is dropped as any read ahead is. What is held of
+** runs and what is in flight of them is at most hpplite_store_parallel() times the 4 MiB a run's body stops at.
+** hpplite_store_take_named: the batch a run has given for this name (malloc'd, the 97 bytes after it taken off), or
+** NULL - no request is made for it */
+#define HPPLITE_STORE_RUN_MAX 64
+typedef struct HppliteStoreAhead { const char *zRef; const char *zDa; uint64_t from; int limit; } HppliteStoreAhead;
+int hpplite_store_runs(HppliteStore *s);
+int hpplite_store_ahead(HppliteStore *s, const HppliteStoreAhead *a, int n);
+uint8_t *hpplite_store_take_named(HppliteStore *s, const char *zName, size_t *pLen);
 
 /* Open a store by URL; NULL when the scheme is unknown. The key (may be
 ** NULL) pays for calls the provider charges for; cap is the most to pay per

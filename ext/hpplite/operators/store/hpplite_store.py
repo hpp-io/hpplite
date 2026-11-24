@@ -52,6 +52,7 @@ MONTH = 30 * 24 * 3600
 GET_DELAY = float(os.environ.get("HPPLITE_STORE_GET_DELAY") or 0)   # a test hook: seconds added to every batch read (#195)
 READS = {"lock": threading.Lock(), "now": 0, "most": 0, "count": 0} # ...the delayed reads in flight, the most there were at once (#413), and
 COUNT_READS = bool(os.environ.get("HPPLITE_STORE_COUNT_READS"))     # a test hook: the batch reads answered so far, in /status (#404)
+NAMES_NONE = bool(os.environ.get("HPPLITE_STORE_NAMES_NONE"))       # a test hook: /status names the run of names and every run is a 404 (#419)
 FAIL_GET = int(os.environ.get("HPPLITE_STORE_FAIL_GET") or 0)       # a test hook: the k-th read of an object answers 503, once (#403)
 GETS = {"lock": threading.Lock(), "count": 0}
 READ_LIMIT = os.environ.get("HPPLITE_STORE_READ_LIMIT") or ""       # a test hook: "N/S", N batch reads in a window of S seconds, the rest 429 (#402)
@@ -855,6 +856,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def get_names(self, da, query):
         """a run of names in one answer (#404): the records from `from` up, each behind its length, to `limit`, to
         --names-bytes of body (the first whatever its size) or to the first height without a name"""
+        if NAMES_NONE:
+            return self.reply(404, {"error": "no such name", "detail": "test hook: no run is answered (HPPLITE_STORE_NAMES_NONE)"})
         try:
             height, limit = int(query["from"][0]), int(query.get("limit", [NAMES_MAX])[0])
         except (KeyError, ValueError):

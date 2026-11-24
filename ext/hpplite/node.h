@@ -201,6 +201,12 @@ typedef struct HppliteNode {
     struct { uint64_t from, to; unsigned char digest[32]; int bad; struct cJSON *m; } aAheadRange[NODE_AHEAD_RANGES];
     int nAheadRange;
     uint64_t namesFrom, namesNext;  /* ...and the store's names asked ahead: [namesFrom, namesNext) */
+    /* a store that answers runs of names (#404): the anchored heights below runNext have been asked for in runs (the
+    ** height runExpect is one a run should give), runMiss anchored batches in a row came by their references where a
+    ** run should have given them, and below runsOffTo the batches are asked for by their references as before; and
+    ** the names past the anchor read in a row, which is how far their runs are asked ahead */
+    uint64_t runNext, runExpect, runsOffTo;
+    int runMiss, namesRow;
     unsigned long long fileDev, fileIno;
     uint64_t syncTo;                /* a verifier's stop (hpplite-verify --to, #206): no batch past it is applied; 0: none */
     uint64_t syncAtMs;              /* ...by time (--at, #205): no batch written after it begins (a transaction in flight completes) */

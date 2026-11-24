@@ -139,6 +139,27 @@ batch being put under its name and on a `Prune` letting go of names and
 content at the same height. The framing has a vector
 (`operators/conformance/vectors.json`, `nameRuns`).
 
+What the node does with it (#419): a rebuild, a replica's sync and a
+sequencer's recovery ask a store that names the call for the batches in
+runs of 64 heights, ahead of the batch being applied - up to
+`HPPLITE_STORE_PARALLEL` runs in flight, the anchored ranges' manifests
+among them by their references as before - and keep each record under
+its name until the reading comes to it. A run that ends before its limit
+is asked again from where it ended; where the names end, that one is the
+`404`. An anchored batch is the run's where its bytes hash to what the
+manifest names, and is read by its reference where no run gave it or
+gave other bytes; three in a row that a run should have given and did
+not, and the next 64 heights are asked for by their references as
+before. A run that is refused (`429`, any other answer) is dropped and
+its batches read singly, which wait a `Retry-After` out. A stop at a
+height (`--to`) asks for no run past it; a stop by time is not known
+ahead, and a run reaches up to 63 batches past it. What is held of runs
+and in flight of them is at most `HPPLITE_STORE_PARALLEL` times a body's
+4 MiB (32 MiB by default; a first batch larger than a body is over it by
+its size). A manifest is still one request a range: a history of one or
+two batches a range has about as many manifests as batches, and gains
+little.
+
 Errors: `400` malformed; `401` a signature that does not recover to the
 sequencer (or the funder, or that a smart-account funder does not accept); `402` a write its account cannot cover, or an
 unpaid `/pay` (x402 requirements, below); `403`/`409`/`503` as above; `404`

@@ -33,7 +33,9 @@
 /* a response's bytes, kept; or handed to xSink as they come (#364: a snapshot's chunk is never held whole) */
 typedef struct Buf { char *p; size_t n; int (*xSink)(void *, const uint8_t *, size_t); void *pSinkArg; CURL *curl; } Buf;
 
-#define STORE_HELD_MAX (3 * HPPLITE_STORE_AHEAD_MAX)   /* answers held: a window of reads and the manifests among them */
+/* answers held: a window of reads and the manifests among them, and the names of the runs a window may hold (#404) */
+#define STORE_HELD_MAX (HPPLITE_STORE_AHEAD_MAX * (HPPLITE_STORE_RUN_MAX + 3))
+#define STORE_RUN_BYTES ((size_t)4 << 20)               /* where a run's body stops (doc/store-protocol.md) */
 
 struct HppliteStore {
     char *url;                      /* as given, no trailing slash: what the status row shows */
@@ -64,6 +66,7 @@ struct HppliteStore {
     HppliteSpend *spend;            /* the node's ledger (#173): HPPLITE_SPEND_CAP checked before signing, charges recorded; not owned */
     /* hpplite-store/2 (#214, doc/store-protocol.md): the rollup's bucket, paid from a funding wallet */
     int v2;                         /* /status says hpplite-store/2 */
+    int runs;                       /* ...and lists "names" among its reads: GET /names answers a run of them (#404) */
     int hasBucket;                  /* bucketDa below is set (hpplite_store_set_bucket) */
     unsigned char bucketDa[20];
     int bound;                      /* the store has the bucket bound to this node's funding wallet */
@@ -109,7 +112,7 @@ struct HppliteStore {
     ** and the reads in flight, each in a slot that stays where it is while its answer is written into it */
     struct { char *path; char *p; size_t n; time_t at; } aAhead[STORE_HELD_MAX];
     int nAhead;
-    struct { CURL *h; char *path; Buf out; } aFly[HPPLITE_STORE_AHEAD_MAX];
+    struct { CURL *h; char *path; Buf out; char runDa[41]; uint64_t runFrom; int runLimit; } aFly[HPPLITE_STORE_AHEAD_MAX];  /* runLimit: a run of names (#404) */
     int nFly;
 };
 
@@ -206,17 +209,88 @@ static int aheadHeld(HppliteStore *s, const char *path) {
     return -1;
 }
 
+/* the slot this path is in flight in, or -1. A name is in flight too while a run that covers its height is (#404) */
 static int aheadFlying(HppliteStore *s, const char *path) {
-    for (int i = 0; i < HPPLITE_STORE_AHEAD_MAX; i++)
-        if (s->aFly[i].h && strcmp(s->aFly[i].path, path) == 0) return i;
+    int named = strncmp(path, "/name/", 6) == 0 && strlen(path) > 47 && path[46] == '-';
+    uint64_t h = named ? strtoull(path + 47, NULL, 10) : 0;
+    for (int i = 0; i < HPPLITE_STORE_AHEAD_MAX; i++) {
+        if (!s->aFly[i].h) continue;
+        if (strcmp(s->aFly[i].path, path) == 0) return i;
+        if (named && s->aFly[i].runLimit && h >= s->aFly[i].runFrom && h - s->aFly[i].runFrom < (uint64_t)s->aFly[i].runLimit
+            && strncmp(s->aFly[i].runDa, path + 6, 40) == 0) return i;
+    }
     return -1;
 }
 
+/* A GET of this path begun in a free slot: 1, or 0. "/names/<da>?from=<h>&limit=<n>" is a run of names (#404) */
+static int aheadStart(HppliteStore *s, const char *path) {
+    char url[1200];
+    int k;
+    unsigned long long from = 0;
+    int limit = 0;
+    CURL *h;
+    for (k = 0; k < HPPLITE_STORE_AHEAD_MAX && s->aFly[k].h; k++);
+    if (k == HPPLITE_STORE_AHEAD_MAX || !(h = curl_easy_init())) return 0;
+    memset(&s->aFly[k], 0, sizeof s->aFly[k]);
+    if (!(s->aFly[k].path = sqlite3_mprintf("%s", path))) { curl_easy_cleanup(h); return 0; }
+    if (strncmp(path, "/names/", 7) == 0 && strlen(path) > 48 && sscanf(path + 47, "?from=%llu&limit=%d", &from, &limit) == 2 && limit > 0) {
+        memcpy(s->aFly[k].runDa, path + 7, 40);
+        s->aFly[k].runFrom = from;
+        s->aFly[k].runLimit = limit;
+    }
+    snprintf(url, sizeof url, "%s%s", s->base, path);
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    hpplite_tls_trust(h);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, bufWrite);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &s->aFly[k].out);
+    if (curl_multi_add_handle(s->multi, h) != CURLM_OK) {
+        curl_easy_cleanup(h);
+        sqlite3_free(s->aFly[k].path);
+        memset(&s->aFly[k], 0, sizeof s->aFly[k]);
+        return 0;
+    }
+    s->aFly[k].h = h;
+    s->nFly++;
+    return 1;
+}
+
+/* A run's answer (#404): each name's record behind its 4-byte length, in the order of the heights from `from`.
+** Each is held as the answer of its read by name; one held already stays. How many heights the answer gave */
+static int runHold(HppliteStore *s, const char *da, uint64_t from, int limit, const char *p, size_t n) {
+    int k = 0;
+    size_t at = 0;
+    while (k < limit && n - at >= 4) {
+        size_t len = ((size_t)(uint8_t)p[at] << 24) | ((size_t)(uint8_t)p[at + 1] << 16) | ((size_t)(uint8_t)p[at + 2] << 8) | (size_t)(uint8_t)p[at + 3];
+        char *path, *q;
+        at += 4;
+        if (len < 97 || len > n - at) break;            /* not a record: what came before it is kept */
+        if (!(path = sqlite3_mprintf("/name/%s-%llu", da, (unsigned long long)(from + (uint64_t)k)))) break;
+        if (aheadHeld(s, path) >= 0) {
+            sqlite3_free(path);
+        } else {
+            if (!(q = malloc(len + 1))) { sqlite3_free(path); break; }
+            memcpy(q, p + at, len);
+            q[len] = 0;
+            if (s->nAhead == STORE_HELD_MAX) aheadDrop(s, 0);
+            s->aAhead[s->nAhead].path = path;
+            s->aAhead[s->nAhead].p = q; s->aAhead[s->nAhead].n = len;
+            s->aAhead[s->nAhead].at = time(NULL);
+            s->nAhead++;
+        }
+        at += len;
+        k++;
+    }
+    return k;
+}
+
 /* the reads in flight that are done: a 200's bytes are held for the read that asks for them (the oldest held gives
-** way when there is no room); any other answer is dropped, and the read itself asks again and says why */
+** way when there is no room); any other answer is dropped, and the read itself asks again and says why. A run's
+** 200 is held name by name, and one that ended before its limit - at the bytes a body stops at, or where a store
+** chose to - is asked again from where it ended, in the slot it had: where the names end, that one is a 404 (#404) */
 static void aheadHarvest(HppliteStore *s) {
     CURLMsg *msg;
-    int left;
+    int left, again = 0;
     while ((msg = curl_multi_info_read(s->multi, &left))) {
         CURL *h = msg->easy_handle;
         long status = 0;
@@ -228,6 +302,17 @@ static void aheadHarvest(HppliteStore *s) {
         curl_multi_remove_handle(s->multi, h);
         curl_easy_cleanup(h);
         if (i == HPPLITE_STORE_AHEAD_MAX) continue;
+        if (s->aFly[i].runLimit) {
+            int got = status == 200 && s->aFly[i].out.p ? runHold(s, s->aFly[i].runDa, s->aFly[i].runFrom, s->aFly[i].runLimit, s->aFly[i].out.p, s->aFly[i].out.n) : 0;
+            char *more = got > 0 && got < s->aFly[i].runLimit
+                ? sqlite3_mprintf("/names/%s?from=%llu&limit=%d", s->aFly[i].runDa, (unsigned long long)(s->aFly[i].runFrom + (uint64_t)got), s->aFly[i].runLimit - got) : NULL;
+            sqlite3_free(s->aFly[i].path);
+            free(s->aFly[i].out.p);
+            memset(&s->aFly[i], 0, sizeof s->aFly[i]);
+            s->nFly--;
+            if (more) { again += aheadStart(s, more); sqlite3_free(more); }
+            continue;
+        }
         if (status == 200 && !s->aFly[i].out.p && (s->aFly[i].out.p = malloc(1))) s->aFly[i].out.p[0] = 0;
         if (status == 200 && s->aFly[i].out.p) {
             if (s->nAhead == STORE_HELD_MAX) aheadDrop(s, 0);
@@ -242,6 +327,7 @@ static void aheadHarvest(HppliteStore *s) {
         memset(&s->aFly[i], 0, sizeof s->aFly[i]);
         s->nFly--;
     }
+    if (again) curl_multi_perform(s->multi, &left);     /* the rest of a run goes out now */
 }
 
 /* what has come for the reads in flight is taken in; nothing is waited for */
@@ -289,36 +375,28 @@ static void aheadClear(HppliteStore *s) {
     s->nFly = 0;
 }
 
-/* GET these paths ahead, in their order, as many as fit in flight; one held or in flight already is passed over */
-static void storeAhead(HppliteStore *s, char **paths, int n) {
-    int par = hpplite_store_parallel(), added = 0, running = 0;
-    if (!s || n <= 0 || par <= 1 || !aheadLock(s)) return;
+/* a run begun now would pass what the runs may hold: the bytes held of names and a body for each run in flight,
+** against a body for each read that may be in flight (#404) */
+static int runsFull(HppliteStore *s, int par) {
+    size_t held = 0;
+    int flying = 0;
+    for (int i = 0; i < s->nAhead; i++) if (strncmp(s->aAhead[i].path, "/name/", 6) == 0) held += s->aAhead[i].n;
+    for (int i = 0; i < HPPLITE_STORE_AHEAD_MAX; i++) if (s->aFly[i].h && s->aFly[i].runLimit) flying++;
+    return held + (size_t)(flying + 1) * STORE_RUN_BYTES > (size_t)par * STORE_RUN_BYTES;
+}
+
+/* GET these paths ahead, in their order, as many as fit in flight; one held or in flight already is passed over.
+** How many of the first were passed over or begun: the ones after them were not come to */
+static int storeAhead(HppliteStore *s, char **paths, int n) {
+    int par = hpplite_store_parallel(), added = 0, running = 0, i = 0;
+    if (!s || n <= 0 || par <= 1 || !aheadLock(s)) return 0;
     if (!s->multi) s->multi = curl_multi_init();
     if (s->multi) {
         aheadPump(s);
-        for (int i = 0; i < n && s->nFly < par; i++) {
-            char url[1200];
-            int k;
-            CURL *h;
-            if (aheadHeld(s, paths[i]) >= 0 || aheadFlying(s, paths[i]) >= 0) continue;
-            for (k = 0; k < HPPLITE_STORE_AHEAD_MAX && s->aFly[k].h; k++);
-            if (k == HPPLITE_STORE_AHEAD_MAX || !(h = curl_easy_init())) break;
-            memset(&s->aFly[k], 0, sizeof s->aFly[k]);
-            if (!(s->aFly[k].path = sqlite3_mprintf("%s", paths[i]))) { curl_easy_cleanup(h); break; }
-            snprintf(url, sizeof url, "%s%s", s->base, paths[i]);
-            curl_easy_setopt(h, CURLOPT_URL, url);
-            hpplite_tls_trust(h);
-            curl_easy_setopt(h, CURLOPT_TIMEOUT, 60L);
-            curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, bufWrite);
-            curl_easy_setopt(h, CURLOPT_WRITEDATA, &s->aFly[k].out);
-            if (curl_multi_add_handle(s->multi, h) != CURLM_OK) {
-                curl_easy_cleanup(h);
-                sqlite3_free(s->aFly[k].path);
-                memset(&s->aFly[k], 0, sizeof s->aFly[k]);
-                break;
-            }
-            s->aFly[k].h = h;
-            s->nFly++;
+        for (i = 0; i < n && s->nFly < par; i++) {
+            if (!paths[i] || aheadHeld(s, paths[i]) >= 0 || aheadFlying(s, paths[i]) >= 0) continue;
+            if (strncmp(paths[i], "/names/", 7) == 0 && runsFull(s, par)) break;
+            if (!aheadStart(s, paths[i])) break;
             added++;
         }
         if (added) {                            /* the requests go out now, not at the caller's next call */
@@ -327,6 +405,7 @@ static void storeAhead(HppliteStore *s, char **paths, int n) {
         }
     }
     aheadUnlock(s);
+    return i;
 }
 
 void hpplite_store_ahead_refs(HppliteStore *s, const char *const *zRefs, int n) {
@@ -345,6 +424,37 @@ void hpplite_store_ahead_names(HppliteStore *s, const char *const *zNames, int n
         if (zNames[i] && nameOk(zNames[i])) paths[k++] = sqlite3_mprintf("/name/%s", zNames[i]);
     storeAhead(s, paths, k);
     for (int i = 0; i < k; i++) sqlite3_free(paths[i]);
+}
+
+int hpplite_store_runs(HppliteStore *s) { return s && s->runs && hpplite_store_parallel() > 1; }
+
+int hpplite_store_ahead(HppliteStore *s, const HppliteStoreAhead *a, int n) {
+    char *paths[3 * HPPLITE_STORE_AHEAD_MAX];
+    int k = 0, done;
+    for (; k < n && k < 3 * HPPLITE_STORE_AHEAD_MAX; k++) {         /* an entry that is neither is passed over */
+        paths[k] = NULL;
+        if (a[k].zRef) {
+            if (a[k].zRef[0] && strlen(a[k].zRef) <= 500 && !strchr(a[k].zRef, '/')) paths[k] = sqlite3_mprintf("/get/%s", a[k].zRef);
+        } else if (a[k].zDa && strlen(a[k].zDa) == 40 && a[k].limit >= 1 && a[k].limit <= HPPLITE_STORE_RUN_MAX) {
+            paths[k] = sqlite3_mprintf("/names/%s?from=%llu&limit=%d", a[k].zDa, (unsigned long long)a[k].from, a[k].limit);
+        }
+    }
+    done = storeAhead(s, paths, k);
+    for (int i = 0; i < k; i++) sqlite3_free(paths[i]);
+    return done;
+}
+
+uint8_t *hpplite_store_take_named(HppliteStore *s, const char *zName, size_t *pLen) {
+    Buf out = {0};
+    char path[120];
+    if (pLen) *pLen = 0;
+    if (!s || !nameOk(zName) || !(s->nAhead || s->nFly)) return NULL;
+    snprintf(path, sizeof path, "/name/%s", zName);
+    if (!aheadTake(s, path, &out) || !out.p || out.n < 98) { free(out.p); return NULL; }
+    out.n -= 97;
+    out.p[out.n] = 0;
+    if (pLen) *pLen = out.n;
+    return (uint8_t *)out.p;
 }
 
 uint8_t *hpplite_store_ahead_copy(HppliteStore *s, const char *zRef, size_t *pLen) {
@@ -1072,6 +1182,12 @@ static long statusRead(HppliteStore *s) {
             cJSON *bk = cJSON_GetObjectItem(st, "buckets"), *ad = bk ? cJSON_GetObjectItem(bk, "assetDomain") : NULL;
             const char *zAsset = jstr(bk, "asset"), *zSpender = jstr(bk, "spender");
             s->v2 = 1;
+            s->runs = 0;
+            {
+                /* the read calls it has beyond the single ones (#404) */
+                cJSON *reads = cJSON_GetObjectItem(st, "reads"), *rd;
+                cJSON_ArrayForEach(rd, reads) if (cJSON_IsString(rd) && strcmp(rd->valuestring, "names") == 0) s->runs = 1;
+            }
             domain = cJSON_GetObjectItem(st, "domain");
             if (zAsset && strlen(zAsset) == 42 && hpplite_hex_to_bytes(zAsset + 2, s->asset, 20) >= 0) s->hasPayment = 1;
             if (zSpender && strlen(zSpender) == 42) hpplite_hex_to_bytes(zSpender + 2, s->spender, 20);

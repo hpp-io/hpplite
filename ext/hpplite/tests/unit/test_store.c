@@ -780,6 +780,7 @@ static void test_list(const char *url) {
 
 /* a store of this test's own, on a port and directory it chooses, so it can be killed and started again */
 static int busy_retry_after = 60;           /* the Retry-After of the --busy-put answer, seconds */
+static const char *store_more[3];           /* two more arguments for the store, or none */
 static pid_t start_store_at(const char *dir, int port, const char *storeDir, int failPut, int busyPut) {
     char portStr[16], keyPath[600], script[600], failStr[16], busyStr[16], retryStr[16];
     pid_t pid;
@@ -798,6 +799,7 @@ static pid_t start_store_at(const char *dir, int port, const char *storeDir, int
                "--fail-put", failStr,                      /* a test hook: the k-th content put answers 503; 0 none */
                "--busy-put", busyStr,                      /* and: the k-th answers 429 as an operator's rate limit does */
                "--busy-retry-after", retryStr,
+               store_more[0], store_more[0] ? store_more[1] : NULL,     /* e.g. --names-bytes 2048; --no-names alone */
                (char *)NULL);
         _exit(127);
     }
@@ -925,6 +927,119 @@ static void test_reads_ahead_across_ranges(const char *dir) {
     PASS();
 }
 
+/* 6e2c. Runs of names (#404, #419): a rebuild read its history one batch a request - 15,000 requests for 15,000
+** batches, eight in flight, and at a store that limits an address's reads no faster than its limit. A store that
+** names the call in /status answers up to 64 batches of a rollup in one request (GET /names/<da>?from=&limit=), and
+** the node asks for the batches in runs: an anchored batch is the one a run gave under its name where it is the bytes
+** the range's manifest names. 150 batches anchored 50 at a time at a store that counts the batch reads it answers:
+** a verifier rebuilds them in a tenth of the reads a store without the call is asked for, to the same root; from
+** runs that end short (a store whose body stops at 2048 bytes) the same; and at a store that names the call and
+** answers no run, the batches are read by their references, a window of them in flight, as before. Then 20 more
+** past the anchor and a lost host's successor: the anchored history and the names after it, in runs */
+static int store_reads(int port, const char *what) {
+    char cmd[200], buf[4096] = "";
+    const char *p;
+    FILE *f;
+    size_t n;
+    snprintf(cmd, sizeof cmd, "curl -s -m 5 http://127.0.0.1:%d/status 2>/dev/null", port);
+    if (!(f = popen(cmd, "r"))) return -1;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    buf[n] = 0;
+    pclose(f);
+    if (!(p = strstr(buf, "\"test\":")) || !(p = strstr(p, what))) return -1;
+    return atoi(p + strlen(what));
+}
+
+static void test_runs_of_names(const char *dir) {
+    TEST("6e2c. a rebuild reads its history in runs of names where the store answers them: 150 anchored batches in a tenth of the reads, the same root; one read a batch at a store without the call; runs that end short; a store whose runs give nothing; a successor reads 20 past the anchor in runs too (#404)");
+    int port = test_free_port();
+    char url[64], storeDir[600], file[40];
+    pid_t pid;
+    static const unsigned char kseq[32] = { [31] = 0x3d };
+    HppliteL1 *l1 = hpplite_l1_create_mock();
+    HppliteNode *w = NULL, *r = NULL;
+    TestNodeOpts o;
+    /* the stores the one history is read from: what each is started with */
+    static const struct { const char *what, *arg, *val, *env; } aStore[4] = {
+        { "runs", NULL, NULL, NULL },
+        { "no call", "--no-names", NULL, NULL },
+        { "short runs", "--names-bytes", "2048", NULL },
+        { "runs of nothing", NULL, NULL, "HPPLITE_STORE_NAMES_NONE" },
+    };
+    int i, v, reads[4] = {0}, most[4] = {0}, ok[4] = {0}, readsW = -1, rowsW = -1;
+    long long hW = 0, un = -1;
+    double took[4] = {0};
+    snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
+    snprintf(storeDir, sizeof storeDir, "%s/runs_pins", test_dir());
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
+#define RUNS_DONE() do { store_more[0] = store_more[1] = NULL; unsetenv("HPPLITE_STORE_COUNT_READS"); unsetenv("HPPLITE_STORE_GET_DELAY"); unsetenv("HPPLITE_STORE_NAMES_NONE"); \
+        if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } hpplite_l1_disconnect(l1); if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } } while (0)
+    memset(&o, 0, sizeof o);
+    o.storeUrl = url; o.nodeId = "runs_w"; o.privkey = kseq;
+    if (!(w = test_open_node(tpath("runs_w.db"), l1, &o))) { RUNS_DONE(); FAIL("open the writer"); }
+    hpplite_node_exec(w, "CREATE TABLE t(id INTEGER PRIMARY KEY, v)", NULL);
+    for (i = 1; i <= 150; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('a run of names')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { RUNS_DONE(); FAIL("a flush"); }
+        if (i % 50 == 0 && hpplite_node_anchor(w) != (uint64_t)i) { RUNS_DONE(); FAIL("an anchor of fifty batches"); }
+    }
+    for (v = 0; v < 4; v++) {
+        double t0;
+        kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+        setenv("HPPLITE_STORE_COUNT_READS", "1", 1);
+        setenv("HPPLITE_STORE_GET_DELAY", "0.02", 1);           /* a round trip, so that reads in flight together are seen */
+        if (aStore[v].env) setenv(aStore[v].env, "1", 1);
+        store_more[0] = aStore[v].arg; store_more[1] = aStore[v].val;
+        pid = start_store_at(dir, port, storeDir, 0, 0);
+        if (aStore[v].env) unsetenv(aStore[v].env);
+        if (pid < 0) { RUNS_DONE(); FAIL("the test's store did not start again"); }
+        {
+            TestNodeOpts ro = { .storeUrl = url, .verifyOnly = 1, .nodeId = "runs_r", .privkey = kseq };
+            snprintf(file, sizeof file, "runs_r%d.db", v);
+            t0 = now_s();
+            r = test_open_node(tpath(file), l1, &ro);
+            took[v] = now_s() - t0;
+        }
+        if (!r) { RUNS_DONE(); FAIL("open a verifier"); }
+        ok[v] = status_int(r->db, "height") == 151 && count_rows(r->db, "t") == 150 && same_root(w, r);
+        reads[v] = store_reads(port, "\"reads\":");
+        most[v] = store_reads(port, "\"readsInFlightMost\":");
+        r->l1 = NULL; hpplite_node_destroy(r); r = NULL;
+        printf("(%s: %d reads, %d in flight at most, %.2f s%s) ", aStore[v].what, reads[v], most[v], took[v], ok[v] ? "" : ", NOT the writer's 150 batches");
+    }
+    /* the lost host: 20 more batches at the store, none anchored; its successor reads the history and them, in runs */
+    for (i = 0; i < 20; i++) {
+        hpplite_node_exec(w, "INSERT INTO t(v) VALUES('past the anchor')", NULL);
+        if (hpplite_node_flush_batch(w) < 1) { RUNS_DONE(); FAIL("a flush of the lost host"); }
+    }
+    hpplite_node_stop_timer(w);
+    w->ownsL1 = 0; w->l1 = NULL;
+    hpplite_node_destroy(w); w = NULL;
+    hpplite_l1_mock_advance_time(l1, 400);
+    kill(pid, SIGTERM); waitpid(pid, NULL, 0);
+    store_more[0] = store_more[1] = NULL;
+    unsetenv("HPPLITE_STORE_GET_DELAY");
+    pid = start_store_at(dir, port, storeDir, 0, 0);
+    if (pid < 0) { RUNS_DONE(); FAIL("the test's store did not start for the successor"); }
+    o.nodeId = "runs_w2";
+    if (!(w = test_open_node(tpath("runs_w2.db"), l1, &o))) { RUNS_DONE(); FAIL("open the successor"); }
+    hW = status_int(w->db, "height"); rowsW = count_rows(w->db, "t");
+    un = scalar(w->ctx->bkDb, "SELECT count(*) FROM _hpplite_unanchored");
+    readsW = store_reads(port, "\"reads\":");
+    printf("(the successor: height %lld, %d rows, %lld past the anchor, %d reads) ", hW, rowsW, un, readsW);
+    RUNS_DONE();
+#undef RUNS_DONE
+    for (v = 0; v < 4; v++) if (!ok[v]) FAIL("each verifier holds the 150 batches, the writer's root");
+    if (reads[1] < 150) FAIL("the test's premise: a store without the call is asked for a read a batch");
+    if (reads[0] < 1 || reads[0] * 10 > reads[1]) FAIL("the history was not read in runs: a tenth of the reads of one a batch, or fewer");
+    if (reads[2] <= reads[0] || reads[2] * 2 > reads[1]) FAIL("runs that end short are asked on from where they ended: more reads than whole runs, and fewer than half of one a batch");
+    if (reads[3] < 150 || most[3] < 6) FAIL("a store whose runs give nothing: the batches by their references, a window of them in flight");
+    if (hW != 171 || rowsW != 170 || un != 20) FAIL("the successor holds the 170 batches, 20 of them past the anchor");
+    if (readsW < 1 || readsW * 5 > 173) FAIL("the successor did not read the history and the names past the anchor in runs");
+    PASS();
+}
+
 /* 6e3. A sync that stops midway (#403): a sequencer on a file behind the chain applies the history's pages in
 ** rollback-journal mode and switches back to WAL when the sync ends; one that stops at a read that failed returns
 ** before the switch. The WAL upkeep ran at the next tick all the same: its pin is a read transaction, in that mode a
@@ -1006,7 +1121,9 @@ static void test_connections_kept(const char *dir) {
     int i;
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/kept_pins", test_dir());
+    store_more[0] = "--no-names";                                 /* a read a batch: what the connections are counted against */
     pid = start_store_at(dir, port, storeDir, 0, 0);
+    store_more[0] = NULL;
     if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
 #define KEPT_DONE() do { if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } hpplite_l1_disconnect(l1); kill(pid, SIGTERM); waitpid(pid, NULL, 0); } while (0)
     memset(&o, 0, sizeof o);
@@ -1050,10 +1167,11 @@ static void test_read_limit(const char *dir) {
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     snprintf(storeDir, sizeof storeDir, "%s/limit_pins", test_dir());
     setenv("HPPLITE_STORE_READ_LIMIT", "20/2", 1);
+    store_more[0] = "--no-names";                                 /* a read a batch: in runs (#404) this history is under the limit */
     pid = start_store_at(dir, port, storeDir, 0, 0);
     unsetenv("HPPLITE_STORE_READ_LIMIT");
     if (pid < 0) { hpplite_l1_disconnect(l1); FAIL("the test's store did not start"); }
-#define LIMIT_DONE() do { if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } hpplite_l1_disconnect(l1); if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } } while (0)
+#define LIMIT_DONE() do { store_more[0] = NULL; if (r) { r->l1 = NULL; hpplite_node_destroy(r); } if (w) { w->ownsL1 = 0; hpplite_node_destroy(w); } hpplite_l1_disconnect(l1); if (pid > 0) { kill(pid, SIGTERM); waitpid(pid, NULL, 0); } } while (0)
     memset(&o, 0, sizeof o);
     o.storeUrl = url; o.nodeId = "limit_w"; o.privkey = kseq;
     if (!(w = test_open_node(tpath("limit_w.db"), l1, &o))) { LIMIT_DONE(); FAIL("open the writer"); }
@@ -1103,6 +1221,7 @@ static void test_read_limit(const char *dir) {
     setenv("HPPLITE_STORE_READ_LIMIT", "5/30", 1);
     pid = start_store_at(dir, port2, storeDir, 0, 0);
     unsetenv("HPPLITE_STORE_READ_LIMIT");
+    store_more[0] = NULL;
     if (pid < 0) { LIMIT_DONE(); FAIL("the test's second store did not start"); }
     o.storeUrl = url2; o.nodeId = "limit_w3"; o.noSync = 1; o.intervalMs = 100;
     if (!(w = test_open_node(tpath("limit_w3.db"), l1, &o))) { LIMIT_DONE(); FAIL("open the host that is closed"); }
@@ -2986,6 +3105,7 @@ int main(int argc, char **argv) {
     test_recovery_store_down(dir);
     test_reads_ahead(dir);
     test_reads_ahead_across_ranges(dir);
+    test_runs_of_names(dir);
     test_sync_stopped_midway(dir);
     test_read_limit(dir);
     test_connections_kept(dir);
