@@ -1036,7 +1036,16 @@ between two pieces of a commit its sequencer never finished is adopted
 onto the same way. What `adopt=on` does not do: it changes nothing where
 the file has its bookkeeping (a second start with it is an ordinary
 start), where the file has no table (it is rebuilt from the history, and
-a line says so), on a new rollup, or on a replica. A file with its
+a line says so), on a new rollup, or on a replica. Nor does it check the
+store's batches past the last anchor against the history (#408): it takes
+each by its signature and its height and applies none of them, so no root
+is compared. A batch there that the wallet signed for its height on
+another history of the rollup - a name a store kept from a chain that came
+back older - is taken with the rest, the next anchor commits it, and a
+rebuild or `hpplite-verify` from batch 1 then ends at it ("the root after
+applying it differs from the posted one"). The state is not lost: the file
+is whole in the batch after. A start without `adopt=on` applies each of
+those batches, and stops before one that does not apply. A file with its
 bookkeeping that is behind the history - carried with its sidecar from
 somewhere else - has the history applied to it as at any start, and with
 `adopt=on` given a line says that it was not adopted (#398):
