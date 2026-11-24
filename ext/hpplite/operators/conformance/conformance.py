@@ -7,7 +7,8 @@ reference in ctest, the canonical Workers under wrangler dev and on staging.
     conformance.py --relay http://host:port
 
 A free store is checked through every call: binding, content and names,
-the bucket and its statement, prune, release. A store that reads the chain
+a run of names where /status names the call (#404), the bucket and its
+statement, prune, release. A store that reads the chain
 needs a real rollup (--da, its sequencer's key, the instance its lease
 names). A paid one has its 402 checked as a top-up (its money paths are
 the reference's anvil selftest, operators/store/bucket_selftest.py).
@@ -203,7 +204,31 @@ def store(url, da=None, sequencer_key=None, instance=None):
     check(st == 404, "a name never put: 404")
     st, _, _ = request(url, "POST", "/name/not-a-name", b"x" * 100)
     check(st == 400, "a malformed name: 400")
-    named(seq, 3, b"batch three", instance)
+    body3, _ = named(seq, 3, b"batch three", instance)
+
+    # --- a run of names (#404): where /status names the call; a store without it answers 404 and is read singly ---
+    runs = "names" in (status.get("reads") or [])
+
+    def frame(*records):
+        return b"".join(len(r).to_bytes(4, "big") + r for r in records)
+    v = VECTORS["nameRuns"][0]
+    check(frame(*[bytes.fromhex(b["record"][2:]) for b in v["batches"]]) == bytes.fromhex(v["body"][2:]), "the suite frames a run as the vector does")
+    st, h, got = request(url, "GET", "/names/%s?from=2" % da[2:])
+    if not runs:
+        check(st == 404, "a store whose /status names no run of names: GET /names 404 (%d)" % st)
+    else:
+        check(st == 200 and got == frame(body, body3), "a run from 2: the names 2 and 3 as their single reads, each behind its length (%d, %d bytes)" % (st, len(got)))
+        st, _, got = request(url, "GET", "/names/%s?from=2&limit=1" % da[2:])
+        check(st == 200 and got == frame(body), "limit=1: the first alone")
+        st, _, got = request(url, "GET", "/names/%s?from=3&limit=1000" % da[2:])
+        check(st == 200 and got == frame(body3), "from the last name, a limit past the most: what there is (%d)" % st)
+        st, _, _ = request(url, "GET", "/names/%s?from=4" % da[2:])
+        check(st == 404, "a run from a height with no name: 404 (%d)" % st)
+        st, _, _ = request(url, "GET", "/names/%s?from=1" % da[2:])
+        check(st == 404, "a run from 1, where only 2 and 3 are named: 404, it does not skip (%d)" % st)
+        st, _, _ = request(url, "GET", "/names/%s" % da[2:])
+        st2, _, _ = request(url, "GET", "/names/%s?from=2&limit=0" % da[2:])
+        check(st == 400 and st2 == 400, "no from, or a limit of 0: 400 (%d, %d)" % (st, st2))
 
     # --- the bucket, its statement ---
     st, _, out = request(url, "GET", "/bucket/" + da)
@@ -225,6 +250,9 @@ def store(url, da=None, sequencer_key=None, instance=None):
     st, _, out = request(url, "POST", "/bucket/%s/prune" % da, json.dumps({"height": 3, "issuedAt": issued, "signature": "0x" + psig.hex()}).encode())
     check(st == 200 and (as_json(out) or {}).get("pruneHeight") == 3, "a prune at 3 by the sequencer: 200")
     check(request(url, "GET", "/name/%s-2" % da[2:])[0] == 404 and request(url, "GET", "/name/%s-3" % da[2:])[0] == 200, "names below 3 gone, 3 kept")
+    if runs:
+        st, _, got = request(url, "GET", "/names/%s?from=3" % da[2:])
+        check(request(url, "GET", "/names/%s?from=2" % da[2:])[0] == 404 and st == 200 and got == frame(body3), "a run from 2 after the prune: 404; from 3: the one name")
     st, _, _ = request(url, "POST", "/bucket/%s/prune" % da, json.dumps({"height": 3, "issuedAt": issued, "signature": "0x" + psig.hex()}).encode())
     check(st == 409, "the same prune again: 409 (%d)" % st)
     osig = eth.sign(other, eth.typed_digest(domain, PRUNE, da, 4, issued + 1))
@@ -238,6 +266,9 @@ def store(url, da=None, sequencer_key=None, instance=None):
     check(st == 200 and (as_json(out) or {}).get("state") == "parked", "released by its funder: parked (%d)" % st)
     st, _, _ = request(url, "GET", "/name/%s-3" % da[2:])
     check(st == 410, "a parked bucket's name: 410 (%d)" % st)
+    if runs:
+        st, _, _ = request(url, "GET", "/names/%s?from=3" % da[2:])
+        check(st == 410, "a parked bucket's run of names: 410 (%d)" % st)
     _, (st, _, out) = named(seq, 4, b"into a parked bucket", instance)
     check(st == 402, "a write into a parked bucket: 402 (%d)" % st)
 

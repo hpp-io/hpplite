@@ -1,6 +1,7 @@
 #!/bin/sh
 # The conformance suite against the reference store, hpplite-store/2 (#189, #213): free,
-# and paid (its 402s checked as top-ups; no facilitator is asked), and against a
+# and paid (its 402s checked as top-ups; no facilitator is asked), one without the
+# run of names (#404: an addition a store may not have), and against a
 # service that claims another protocol, which must not conform. The relay is
 # checked by operators/relay/selftest.py on anvil. ctest test_conformance.
 set -u
@@ -22,7 +23,8 @@ start() {   # name, then the service's extra arguments
 free=$(start free --price-per-write 0 --price-per-mib-month 0)
 paid=$(start paid --facilitator http://127.0.0.1:1)
 other=$(start other --advertise-protocol hpplite-store/1)
-python3 -I "$here/conformance.py" --store "$free" --store "$paid"
+singly=$(start singly --price-per-write 0 --price-per-mib-month 0 --no-names)
+python3 -I "$here/conformance.py" --store "$free" --store "$paid" --store "$singly"
 rc=$?
 if python3 -I "$here/conformance.py" --store "$other" > "$work/other.out" 2>&1; then
     echo "  FAIL    a store claiming hpplite-store/1 conformed"; rc=1

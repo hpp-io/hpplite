@@ -50,7 +50,8 @@ PROTOCOL = "hpplite-store/2"
 MIB = 1024 * 1024
 MONTH = 30 * 24 * 3600
 GET_DELAY = float(os.environ.get("HPPLITE_STORE_GET_DELAY") or 0)   # a test hook: seconds added to every batch read (#195)
-READS = {"lock": threading.Lock(), "now": 0, "most": 0}             # ...the delayed reads in flight, and the most there were at once (#413)
+READS = {"lock": threading.Lock(), "now": 0, "most": 0, "count": 0} # ...the delayed reads in flight, the most there were at once (#413), and
+COUNT_READS = bool(os.environ.get("HPPLITE_STORE_COUNT_READS"))     # a test hook: the batch reads answered so far, in /status (#404)
 FAIL_GET = int(os.environ.get("HPPLITE_STORE_FAIL_GET") or 0)       # a test hook: the k-th read of an object answers 503, once (#403)
 GETS = {"lock": threading.Lock(), "count": 0}
 READ_LIMIT = os.environ.get("HPPLITE_STORE_READ_LIMIT") or ""       # a test hook: "N/S", N batch reads in a window of S seconds, the rest 429 (#402)
@@ -632,6 +633,7 @@ class Service:
             "payment": {"scheme": "exact", "network": a.network, "facilitator": a.facilitator, "minPay": a.min_pay,
                         "extra": {"name": a.asset_name, "version": a.asset_version}} if self.payments.enabled else None,
             "chain": bool(a.rpc), "warnings": self.ledger.warnings, "uptime": int(time.time()) - self.started,
+            **({} if a.no_names else {"reads": ["names"]}),
         }
 
     # --- who may act for a bucket ---
@@ -762,14 +764,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         path = url.path
-        if GET_DELAY and (path.startswith("/get/") or path.startswith("/name/")):
+        batch_read = path.startswith("/get/") or path.startswith("/name/") or path.startswith("/names/")
+        if batch_read:
+            with READS["lock"]:
+                READS["count"] += 1                     # a test reads it in /status: what a rebuild asked (#404)
+        if GET_DELAY and batch_read:
             with READS["lock"]:
                 READS["now"] += 1
                 READS["most"] = max(READS["most"], READS["now"])
             time.sleep(GET_DELAY)                       # a test hook: a far store's round trip on every read (#195)
             with READS["lock"]:
                 READS["now"] -= 1
-        if READ_LIMIT and (path.startswith("/get/") or path.startswith("/name/")):
+        if READ_LIMIT and batch_read:
             # a test hook: an operator's read limit an address, as the canonical stores have (600 a minute)
             limit, window = (float(x) for x in READ_LIMIT.split("/"))
             with READ_WINDOW["lock"]:
@@ -790,6 +796,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             status = self.service.status()
             if GET_DELAY:
                 status["test"] = {"readsInFlightMost": READS["most"]}      # the test hook's count, for the test to read
+            if COUNT_READS:
+                status.setdefault("test", {})["reads"] = READS["count"]
             return self.reply(200, status)
         m = re.match(r"^/bucket/(0x[0-9a-fA-F]{40})/objects$", path)
         if m:
@@ -827,6 +835,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                         "detail": "the bucket's account cannot pay: paying restores it"})
             signer = eth.recover(batch_digest(self.service.chain_id, da, "0x" + rec[:32].hex(), height, data), rec[32:97])
             return self.reply_bytes(data + rec[:97], {"X-HPPLite-Signer": signer})
+        if path.startswith("/names/") and not self.service.args.no_names:
+            return self.get_names(path[7:], urllib.parse.parse_qs(url.query))
         if path.startswith("/get/"):
             cid = path[5:]
             refs = self.service.disk.json("c/%s.refs" % cid) if CID_RE.match(cid) else None
@@ -841,6 +851,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(410, {"error": "bucket_parked", "cid": cid})
             return self.reply_bytes(data)
         return self.reply(404, {"error": "no such endpoint"})
+
+    def get_names(self, da, query):
+        """a run of names in one answer (#404): the records from `from` up, each behind its length, to `limit`, to
+        --names-bytes of body (the first whatever its size) or to the first height without a name"""
+        try:
+            height, limit = int(query["from"][0]), int(query.get("limit", [NAMES_MAX])[0])
+        except (KeyError, ValueError):
+            return self.reply(400, {"error": "from=<height> is needed, and limit a number"})
+        if height < 1 or limit < 1:
+            return self.reply(400, {"error": "from is a height from 1, limit a number from 1"})
+        b = self.L.bucket("0x" + da) if re.match(r"^[0-9a-f]{40}$", da) else None
+        records, size = [], 0
+        while b and b["state"] != "deleted" and len(records) < min(limit, NAMES_MAX):
+            rec = self.service.disk.read("b/0x%s/n/%d" % (da, height + len(records)))
+            data = self.service.disk.read("c/%s" % rec[97:].decode()) if rec else None
+            if data is None or (records and size + 4 + len(data) + 97 > self.service.args.names_bytes):
+                break
+            records.append(data + rec[:97])
+            size += 4 + len(data) + 97
+        if not records:
+            return self.reply(404, {"error": "no such name", "name": "%s-%d" % (da, height)})
+        if b["state"] == "parked":
+            return self.reply(410, {"error": "bucket_parked", "da": "0x" + da, "funder": b.get("funder"),
+                                    "detail": "the bucket's account cannot pay: paying restores it"})
+        return self.reply_bytes(names_body(records))
 
     def get_objects(self, da, query):
         """a bucket's content by CID, ascending, a page at a time (#349)"""
@@ -1303,6 +1338,8 @@ def main():
     ap.add_argument("--max-bytes", type=int, default=16 * 1024 * 1024)
     ap.add_argument("--advertise-protocol", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--fail-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th content put or batch name answers 503
+    ap.add_argument("--names-bytes", type=int, default=NAMES_BYTES, help="the most bytes a run of names answers, the first batch whatever its size (#404)")
+    ap.add_argument("--no-names", action="store_true", help=argparse.SUPPRESS)   # a test hook: a store without GET /names (#404)
     ap.add_argument("--busy-put", type=int, default=0, help=argparse.SUPPRESS)   # a test hook: the k-th answers 429 as an operator's rate limit does
     ap.add_argument("--busy-retry-after", type=int, default=60, help=argparse.SUPPRESS)   # ...with this Retry-After (somaro#48)
     ap.add_argument("--verbose", action="store_true")

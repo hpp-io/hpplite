@@ -410,6 +410,60 @@ def main():
         b6 = http_("GET", url6 + "/bucket/" + da6)[1]
         held6 = sum(1 for i in range(17) if os.path.exists(os.path.join(work, "swept", "c", cid_of(b"swept past %d" % i))))
         check(b6.get("objects") == 17 and held6 == 17, "and leaves the 17 that a bucket holds (%s in the bucket, %d files)" % (b6.get("objects"), held6))
+
+        # --- a run of names (#404): where it ends, and the reads a test counts ---
+        os.environ["HPPLITE_STORE_COUNT_READS"] = "1"
+        p7, url7 = start_store(work, "runs", "--price-per-write", "0", "--price-per-mib-month", "0", "--names-bytes", "4096")
+        del os.environ["HPPLITE_STORE_COUNT_READS"]
+        procs.append(p7)
+        st7 = http_("GET", url7 + "/status")[1]
+        check("names" in (st7.get("reads") or []), "/status names the run of names (reads: %r)" % st7.get("reads"))
+        dom7 = eth.domain_separator("HPPLiteStore", "2", CHAIN_ID, st7["domain"]["verifyingContract"])
+        seq7, fund7, inst7 = secrets.token_bytes(32), secrets.token_bytes(32), secrets.token_bytes(32)
+        da7 = eth.address(secrets.token_bytes(32)).lower()
+        code, _ = http_("POST", url7 + "/bucket/" + da7, bind_body(dom7, da7, seq7, fund7, int(time.time())))
+        check(code == 200, "bound")
+        rec7 = {}
+
+        def name7(height, data):
+            rec7[height] = data + inst7 + eth.sign(seq7, batch_digest(CHAIN_ID, da7, "0x" + inst7.hex(), height, data))
+            return http_("POST", "%s/name/%s-%d" % (url7, da7[2:], height), rec7[height])[0]
+
+        def run7(query):
+            code, got = http_("GET", "%s/names/%s?%s" % (url7, da7[2:], query))
+            out = []
+            while code == 200 and len(got) >= 4 and len(got) >= 4 + int.from_bytes(got[:4], "big"):
+                n = int.from_bytes(got[:4], "big")
+                out.append(got[4:4 + n])
+                got = got[4 + n:]
+            return code, out, got
+
+        # 1-3: 1500 bytes each (a body of 4096 holds two); 4: 6000, more than a body; 5-70: small
+        sizes = {1: 1500, 2: 1500, 3: 1500, 4: 6000}
+        check(all(name7(h, bytes([h]) * sizes.get(h, 20)) == 200 for h in range(1, 71)), "70 batches named")
+        reads0 = http_("GET", url7 + "/status")[1].get("test", {}).get("reads")
+        code, out, rest = run7("from=1")
+        check(code == 200 and out == [rec7[1], rec7[2]] and not rest, "a run ends before the batch that would pass the body's bytes: 1 and 2 of 1-3 (%d, %d records)" % (code, len(out)))
+        code, out, rest = run7("from=3")
+        check(code == 200 and out == [rec7[3]] and not rest, "...and 3 alone before the large one (%d records)" % len(out))
+        code, out, rest = run7("from=4")
+        check(code == 200 and out == [rec7[4]] and not rest, "the first batch of a run is given whatever its size: 6000 bytes where a body is 4096 (%d records)" % len(out))
+        code, out, rest = run7("from=5")
+        check(code == 200 and out == [rec7[h] for h in range(5, 38)] and not rest, "small ones to the body's bytes: 5-37, 33 of 121 bytes each behind its length (%d records)" % len(out))
+        reads1 = http_("GET", url7 + "/status")[1].get("test", {}).get("reads")
+        check(reads0 is not None and reads1 == reads0 + 4, "the store counts a run as one read: four runs, four reads (%s then %s)" % (reads0, reads1))
+        procs.remove(p7)
+        p7.terminate()
+        p7.wait()
+        # the same bucket at a store with the protocol's bytes: the most batches a run gives
+        p7, url7 = start_store(work, "runs")
+        procs.append(p7)
+        code, out, rest = run7("from=5")
+        code2, out2, _ = run7("from=5&limit=1000")
+        check(code == 200 and out == [rec7[h] for h in range(5, 69)] and out2 == out and not rest,
+              "a run gives 64 batches at most, asked for none or for 1000: 5-68 (%d, %d records)" % (len(out), len(out2)))
+        code, out, rest = run7("from=69")
+        check(code == 200 and out == [rec7[69], rec7[70]] and not rest, "and ends at the last name: 69 and 70 (%d records)" % len(out))
     finally:
         for p in procs:
             p.terminate()
