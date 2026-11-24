@@ -20,8 +20,8 @@ that dies loses at most what it hadn't flushed: its successor recovers the
 rest from the store.
 
 Stock SQLite, loadable extension, no patches. One sequencer posts. The
-store is paid in USDC.e by the rollup's funding wallet, by permit as the
-bytes accrue. A wallet with no ETH can run a rollup through a relay that
+store is paid in USDC.e, CHIP or HPP by the rollup's funding wallet, by
+permit as the bytes accrue. A wallet with no ETH can run a rollup through a relay that
 sends its transactions, paid per call over x402.
 
 What HPPLite is **not**:
@@ -149,10 +149,13 @@ checkable, and it is what a second machine rebuilds from.
 
 ## What is HPP?
 
-HPP is the Ethereum-compatible network HPPLite is built for; its Sepolia
-testnet is chain id **181228**, RPC `https://sepolia.hpp.io`, explorer
-`https://sepolia-explorer.hpp.io`. The `hpp-sepolia` alias bakes those in
-together with the factory below. Any EVM chain works with `rpc=` plus
+HPP is the Ethereum-compatible network HPPLite is built for. HPP Mainnet
+is chain id **190415**, RPC `https://mainnet.hpp.io`, explorer
+`https://explorer.hpp.io`; its Sepolia testnet is chain id **181228**, RPC
+`https://sepolia.hpp.io`, explorer `https://sepolia-explorer.hpp.io`. The
+`hpp-mainnet` and `hpp-sepolia` aliases bake those in together with the
+factories below and the canonical store and relay of each network
+(`store=on`, `relay=on`). Any EVM chain works with `rpc=` plus
 `factory=` (or `contract=`) once the contracts in `contracts/` are deployed
 there. You need a funded wallet for gas; the integration runner derives a
 fresh test wallet from the key in `.env` for each run.
@@ -167,7 +170,13 @@ Deployed on **HPP Sepolia** (Chain ID: 181228, RPC: `https://sepolia.hpp.io`):
 | HPPLite | *(per rollup)* | Your rollup's coordination contract: sequencer lease (only the owner-set sequencer wallet can claim it), checkpoints |
 | HPPLiteDA | *(per rollup)* | Your rollup's data-availability contract: batch data |
 
-The factory address lives in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`); `ctest` fails if this README disagrees with it.
+Deployed on **HPP Mainnet** (Chain ID: 190415, RPC: `https://mainnet.hpp.io`) since 2026-11-19 (#337):
+
+| Contract | Address | Description |
+|----------|---------|-------------|
+| HPPLiteFactory | `0x76A2922e179c0F21B7e4eC1D0c43Fe1db753AFc4` | The same contracts as HPP Sepolia's factory (VERSION 10, DA version 3); built into the `hpp-mainnet` alias, with the mainnet store (`https://store.hpplite.hpp.io`) and relay (`https://relay.hpplite.hpp.io`) |
+
+The factory addresses live in one place in code (`da_uri.c`, `HPPLITE_NETWORKS`); `ctest` fails if this README disagrees with either, or leaves one out (`tools/check_docs.sh`).
 
 ## URI Parameters
 
@@ -509,7 +518,7 @@ resident AI agents (written by a model behind an OpenAI-compatible endpoint:
 HPP's router by default, where `ollama/gpt-oss:120b` is free with a key in
 `.env`, or LM Studio/Ollama by `HPPLITE_DEMO_LLM_URL`; else Claude, else
 templates; #262): stock Python `sqlite3` loads the module, every entry
-becomes an encrypted batch at a pin service within 90 s and the chain gets
+becomes an encrypted batch at the store within 90 s and the chain gets
 one anchor per 30 minutes (#164, since 2026-11-03: `store=` and `anchor=30m`
 on the VERSION 10 factory since 2026-11-04, page capture), a panel shows the ciphertext the
 store holds while it waits for its anchor, with explorer links to the rollup
@@ -572,6 +581,16 @@ On a chain priced like Ethereum mainnet (10 gwei) every figure is 1000x,
 and the bytes still live on the chain: the off-chain stores of #11 are the
 next step down.
 
+**HPP Mainnet** answered `eth_gasPrice` with 0.01 gwei as well (read
+2026-11-23), so the gas figures above are what a call costs there in ETH;
+none of them was measured on mainnet. Through the canonical relay a call
+costs its gas at the chain's price, in the token at the ETH price the relay
+reads, with no margin and never under $0.0001: an anchor of 73.5k gas is
+about $0.0015 at ETH $2,100 and $0.0026 at $3,500 (computed, not read from
+a mainnet receipt). An anchor's gas does not grow with its range: the call
+carries the range's digest, and the manifest is one put at the store (read
+from the code; measured at short ranges).
+
 **Cost driver, and what #33 changed**: until version 8 `HPPLiteDA` kept
 batch bytes in contract storage (`batchData[height]`), the most expensive
 place to put them: ~0.7k gas per byte, the figures in the table above.
@@ -610,6 +629,15 @@ when something is pending, so an idle database costs nothing.
 | `l1.c` | L1 dispatch: every build has every backend, the endpoint picks one (`"mock"` or an RPC URL); `l1_backend.h` is the function table |
 | `l1_eth.c` | Ethereum backend: the rollup contracts over JSON-RPC |
 | `l1_mock.c` | Mock backend: in memory, or in a directory for the crash harness |
+| `l1_dir.c` | Directory backend (#35): the coordinator and the store in a directory, `l1=file:///path` - no chain, no wallet |
+| `da_uri.c` | The built-in networks (`HPPLITE_NETWORKS`: chain id, RPC, factory, the chain's limits, the anchor cadence, the canonical store and relay) and the DA URI |
+| `store.c` | The client of an `hpplite-store/2` store (#214): the bucket's binding and permit, puts and names with the sequencer's signature, reads, x402 payments (`exact` and `upto`) to the store and the relay |
+| `spend.c` | The per-wallet spending ledger behind `HPPLITE_SPEND_CAP` (#173) |
+| `keystore.c` | Ethereum keystore V3 files (#17) |
+| `envelope_pk.c` | The public-key envelope: a batch's key wrapped for each reader (#15) |
+| `compress.c` | Batch compression (#12): zlib's deflate |
+| `tls.c` | The certificates the HTTPS clients trust: the distribution's bundle, `HPPLITE_CA_BUNDLE` (#269, #377) |
+| `sha256.c` | SHA-256 |
 | `eth/` | Web3 primitives (RLP, ABI, keccak256) |
 
 ## Contract Interface
@@ -1190,7 +1218,8 @@ node pays a top-up by x402 from the funding wallet, up to `HPPLITE_STORE_CAP`. A
 refused pull (the wallet empty, the permit spent or revoked) parks the
 bucket - not served, restorable by paying - for 30 days, then deletes it;
 the store's own failures never do. The funding wallet needs no ETH: top it
-up by sending USDC.e to `store_funder`. One Python file, standard library
+up by sending USDC.e to `store_funder` (or CHIP or HPP where the store takes
+them and `HPPLITE_PAY_ASSET` names one, #358). One Python file, standard library
 only; ctest runs it free and without a chain (`test_store`), and on anvil
 with real rollups, the permit and x402 (`test_store_buckets`, anvil
 scenarios 19, 20 and 30).
@@ -1413,7 +1442,8 @@ sequencer's "synced" line (#264), `keeplease=on` (#265), `anchorclose=off`
 relay protocol: accounts and sponsorship (#276). The canonical operators
 carry all of it from `sepolia-v0.4.0`.
 
-Paying in the HPP token itself is open (#175).
+The canonical stores and relays take USDC.e, CHIP and HPP, and a node pays
+in the one `HPPLITE_PAY_ASSET` names (#175, #357, #361, #358).
 
 | Version | Scope | Database size | DA |
 |---------|-------|---------------|----|
@@ -1427,6 +1457,8 @@ Paying in the HPP token itself is open (#175).
 | v0.8 | One capture (#253): pages, nothing else; the persona review's removals (#247-#252, #254-#258) | same | same |
 | v0.9 | A platform's sidecar (#263: one sequencer per app database, apps that sleep): the sequencer says when the file is synced (#264), `keeplease=on` (#265), `anchorclose=off` (#266), the owner's `hpplite_set_lease_duration()` and `hpplite_expire_lease()` (#267), the platform shape end to end on anvil (#268), the first-tick anchor fixed (#270), the static musl build of the tools and `HPPLITE_CA_BUNDLE` (#269), `contract=` wins over a factory set beside it (#271), `funder=` for a bucket paid by a platform's treasury (#272), a Bind by the rollup's owner alone (#273), the funder's daily cap on a bucket (#274), a release that deletes the bucket now (#275), relay accounts and sponsorship - a treasury pays the relay for its apps' rollups (#276), a store's rate limit reported as that and not as the funder's daily cap (#280) | same | same |
 | v0.10 | Memory and mainnet: memory independent of the database's size (#364, #365), databases past 1 GiB (#363), HPP Mainnet's store, relay and factory (#337), several tokens per store and relay (#357, #361), smart-account funders (#356) | same | same |
+| v0.11 | Going back to a moment (somaro's rewind): `hpplite-verify --to` / `--at` past the last anchor (#390), from the newest snapshot before the stop (#391), an anchor when asked (#396), `adopt=on` onto a pruned history (#395), durations checked and `d` a unit (#393); a rebuild on a real chain at 39.7 batches a second with 32 reads in flight where v0.11.0 made 1.25 (#410-#413, HPP Sepolia), a store's read limit waited out (#402) | same | same |
+| v0.12 | What there is to go back to: `hpplite-verify --list` and the manifest's time and bytes per batch (#397); an anchor's puts wait out a store's write limit (#407) | same | same |
 | v1.0 | Frozen batch / meta / URI formats, language bindings | — | — |
 
 Why the size bound in v0.1: its state root was a content hash, O(database
